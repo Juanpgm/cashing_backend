@@ -35,12 +35,11 @@ structlog.configure(
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Startup/shutdown lifecycle."""
-    if settings.is_development:
-        import app.models  # noqa: F401 — register all models
-        from app.core.database import Base, engine
+    import app.models  # noqa: F401 — register all models
+    from app.core.database import Base, engine
 
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
     yield
 
 
@@ -48,8 +47,6 @@ app = FastAPI(
     title="CashIn Backend",
     description="AI Agent-first backend for Colombian contractor billing automation",
     version="0.1.0",
-    docs_url="/docs" if settings.is_development else None,
-    redoc_url="/redoc" if settings.is_development else None,
     lifespan=lifespan,
 )
 
