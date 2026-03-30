@@ -1,0 +1,58 @@
+# Core
+fastapi>=0.115,<0.116
+uvicorn[standard]>=0.34,<0.35
+pydantic>=2.10,<3
+pydantic[email]
+pydantic-settings>=2.7,<3
+
+# Database
+sqlalchemy[asyncio]>=2.0,<3
+asyncpg>=0.30,<1
+alembic>=1.15,<2
+
+# Auth
+python-jose[cryptography]>=3.3,<4
+passlib[bcrypt]>=1.7,<2
+bcrypt>=4.0,<4.1
+
+# Agent
+langgraph>=0.4,<1
+litellm>=1.60,<2
+tenacity>=9,<10
+
+# Document Processing
+python-docx>=1.1,<2
+pdfplumber>=0.11,<1
+openpyxl>=3.1,<4
+python-multipart>=0.0.18,<1
+
+# PDF Generation
+jinja2>=3.1,<4
+weasyprint>=63,<64
+
+# Google Workspace
+google-api-python-client>=2.160,<3
+google-auth>=2.38,<3
+google-auth-oauthlib>=1.2,<2
+
+# Storage (S3-compatible)
+boto3>=1.36,<2
+
+# Payments / HTTP
+httpx>=0.28,<1
+
+# Security
+cryptography>=44,<45
+
+# Rate Limiting
+slowapi>=0.1,<1
+
+# Logging
+structlog>=24,<25
+
+# File Validation
+python-magic>=0.4,<1
+
+# Utils
+orjson>=3,<4
+python-dotenv>=1,<2

@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find A:programing_workspacecashin-backendapptemplates -name *.html)",
+      "Bash(find A:programing_workspacecashin-backendappagent -type f -name *.py)",
+      "Bash(uv run:*)",
+      "Bash(uv run python -c \":*)",
+      "Bash(docker compose:*)",
+      "Bash(railway version:*)",
+      "Bash(railway whoami:*)",
+      "Bash(railway status:*)"
+    ]
+  }
+}
