@@ -1,0 +1,72 @@
+[project]
+name = "cashin-backend"
+version = "0.1.0"
+description = "AI Agent-first backend for automating Colombian contractor billing (cuentas de cobro)"
+requires-python = ">=3.12"
+readme = "README.md"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+src = ["app", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "N",    # pep8-naming
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "S",    # flake8-bandit (security)
+    "T20",  # flake8-print
+    "SIM",  # flake8-simplify
+    "RUF",  # ruff-specific
+]
+ignore = [
+    "S101",  # assert used (ok in tests)
+    "S104",  # hardcoded-bind-all-interfaces (ok in dev config)
+    "S105",  # hardcoded passwords (dev defaults, overridden by env vars)
+    "B008",  # Depends() in args (standard FastAPI pattern)
+    "UP042", # str+Enum (needed for Pydantic/SQLAlchemy serialization compat)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S106"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = [
+    "litellm.*",
+    "langgraph.*",
+    "weasyprint.*",
+    "pdfplumber.*",
+    "docx.*",
+    "openpyxl.*",
+    "moto.*",
+    "slowapi.*",
+    "magic.*",
+    "jose.*",
+    "passlib.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.coverage.run]
+source = ["app"]
+omit = ["*/tests/*", "*/alembic/*"]
+
+[tool.coverage.report]
+fail_under = 70
+show_missing = true

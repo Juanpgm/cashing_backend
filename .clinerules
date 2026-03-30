@@ -1,0 +1,59 @@
+# CashIn Backend — Cline Rules
+
+## Fuente de Verdad
+
+Leer estos archivos antes de sugerir código:
+
+1. `.github/INSTRUCTIONS.md` — Arquitectura, reglas, roadmap
+2. `.github/SKILLS.md` — Competencias técnicas
+3. `.github/TOOLS.md` — Tooling y deploy
+4. `.github/AGENTS.md` — Playbooks por tarea
+
+## Cloud-Agnostic (Railway MVP)
+
+- **No depender de AWS, GCP ni Azure** — MVP 100% en Railway
+- Arquitectura Ports & Adapters: `StoragePort`, `LLMPort` en `app/adapters/`
+- Core (`services/`, `agent/`, `models/`) **nunca** importa SDKs de cloud
+- Storage: MinIO (dev) / Cloudflare R2 (prod) — ambos S3-compatible
+- Auth: JWT custom (python-jose HS256) — sin Cognito/Firebase
+- LLM: LiteLLM (Gemini → OpenAI → Ollama) — sin acoplamiento a un proveedor
+- Migrar a cloud = escribir nuevo adapter, no refactorizar core
+
+## Stack
+
+- Python 3.12, FastAPI 0.115+, SQLAlchemy 2.0 async (asyncpg)
+- PostgreSQL 16, LangGraph 0.4+, LiteLLM 1.60+
+- Pydantic v2, structlog, slowapi, WeasyPrint, pdfplumber
+
+## Reglas de Código
+
+- Tipado estricto (`mypy --strict`)
+- `Decimal` para montos, nunca `float`
+- `structlog` para logging, nunca `print()`
+- `UTC` siempre: `datetime.now(timezone.utc)`
+- Line length: 120 chars (Ruff)
+- Excepciones de dominio (`core/exceptions.py`), nunca `HTTPException` en services
+- Capas: API → Service → Model (sin saltar)
+
+## Testing
+
+- `pytest-asyncio` (auto mode), `httpx` (AsyncClient), `aiosqlite` (DB test)
+- `moto[s3]` para mock de storage, `factory-boy` para datos
+- Cobertura mínima: 70%
+- Ejecutar: `make lint && make test` antes de commit
+
+## Deploy
+
+- Railway: Dockerfile + railway.toml
+- Sin Lambda, Cloud Functions, Container Apps
+- Health check: GET /health
+
+## Workflow
+
+1. Leer caso de uso y constraints
+2. Definir/ajustar schema Pydantic
+3. Implementar service con validaciones de negocio
+4. Exponer endpoint con dependencias de seguridad
+5. Agregar tests unitarios + integración
+6. `make lint && make test`
+7. Verificar migraciones si hubo cambios de modelo

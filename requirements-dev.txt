@@ -1,0 +1,21 @@
+-r requirements.txt
+
+# Testing
+pytest>=8,<9
+pytest-asyncio>=0.25,<1
+httpx>=0.28,<1
+coverage[toml]>=7,<8
+moto[s3]>=5,<6
+factory-boy>=3,<4
+aiosqlite>=0.20,<1
+
+# Linting & Typing
+ruff>=0.9,<1
+mypy>=1.15,<2
+
+# Security Scanning
+bandit>=1.8,<2
+pip-audit>=2,<3
+safety>=3,<4
+pre-commit>=4,<5
+detect-secrets>=1.5,<2
