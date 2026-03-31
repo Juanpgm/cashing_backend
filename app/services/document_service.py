@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 
 import structlog
@@ -15,11 +16,65 @@ from app.core.config import settings
 from app.core.exceptions import NotFoundError
 from app.models.contrato import Contrato
 from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
+from app.models.obligacion import Obligacion, TipoObligacion
 from app.models.plantilla import Plantilla, TipoPlantilla
-from app.schemas.agent import DocumentProcessResponse, DocumentUploadResponse
+from app.schemas.agent import DocumentProcessResponse, DocumentUploadResponse, LLMMessage, ObligacionExtraida
 from app.schemas.documento_fuente import ContratoConfiguracionResponse, DocumentoFuenteResponse
 
 logger = structlog.get_logger("services.document")
+
+_OBLIGACION_RE = re.compile(r"^OBLIGACION\|(general|especifica)\|(.+)$", re.IGNORECASE)
+# Max chars of contract text sent to LLM for obligation extraction
+_MAX_TEXTO_CHARS = 12_000
+
+
+def _parse_obligaciones_llm(response: str) -> list[ObligacionExtraida]:
+    """Parse pipe-delimited OBLIGACION lines from LLM output."""
+    result: list[ObligacionExtraida] = []
+    for i, line in enumerate(response.splitlines()):
+        m = _OBLIGACION_RE.match(line.strip())
+        if m:
+            tipo_raw, descripcion = m.group(1).lower(), m.group(2).strip()
+            if descripcion:
+                result.append(ObligacionExtraida(descripcion=descripcion, tipo=tipo_raw, orden=i))
+    return result
+
+
+async def _extraer_obligaciones(
+    texto_contrato: str,
+    contrato_id: uuid.UUID,
+    db: AsyncSession,
+) -> list[ObligacionExtraida]:
+    """Call LLM to extract obligations and persist them. Returns extracted list."""
+    from app.adapters.llm import get_llm
+    from app.agent.prompts.obligaciones import OBLIGACIONES_EXTRACTION_PROMPT
+
+    llm = get_llm()
+    prompt = OBLIGACIONES_EXTRACTION_PROMPT.format(texto_contrato=texto_contrato[:_MAX_TEXTO_CHARS])
+    messages = [LLMMessage(role="user", content=prompt)]
+
+    try:
+        resp = await llm.complete(messages, temperature=0.1, max_tokens=2048)
+    except Exception as exc:
+        await logger.awarning("obligaciones_llm_failed", contrato_id=str(contrato_id), error=str(exc))
+        return []
+
+    extraidas = _parse_obligaciones_llm(resp.content)
+    if not extraidas:
+        await logger.awarning("obligaciones_llm_empty", contrato_id=str(contrato_id), raw=resp.content[:200])
+        return []
+
+    # Persist — re-number orden starting at 1
+    for idx, ob in enumerate(extraidas, start=1):
+        db.add(Obligacion(
+            contrato_id=contrato_id,
+            descripcion=ob.descripcion,
+            tipo=TipoObligacion(ob.tipo),
+            orden=idx,
+        ))
+    await db.flush()
+    await logger.ainfo("obligaciones_extraidas", contrato_id=str(contrato_id), total=len(extraidas))
+    return extraidas
 
 _SYSTEM_PROMPT_TEMPLATE = """\
 Eres un asistente especializado en contratos de prestación de servicios para el Estado colombiano.
@@ -97,6 +152,18 @@ async def upload_document(
         texto_extraido=texto_extraido,
     )
     db.add(doc)
+    await db.flush()
+
+    # Auto-extract obligations when uploading a contract document
+    obligaciones_extraidas: list[ObligacionExtraida] = []
+    if tipo == TipoDocumentoFuente.CONTRATO and contrato_id is not None and texto_extraido:
+        # Only extract if the contract has no obligations yet (don't overwrite manual ones)
+        existing = await db.execute(
+            select(Obligacion).where(Obligacion.contrato_id == contrato_id).limit(1)
+        )
+        if existing.scalar_one_or_none() is None:
+            obligaciones_extraidas = await _extraer_obligaciones(texto_extraido, contrato_id, db)
+
     await db.commit()
     await db.refresh(doc)
 
@@ -107,6 +174,7 @@ async def upload_document(
         nombre=doc.nombre,
         tipo=doc.tipo.value,
         texto_extraido=texto_extraido,
+        obligaciones_extraidas=obligaciones_extraidas,
     )
 
 
