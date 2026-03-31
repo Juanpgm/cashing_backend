@@ -46,11 +46,21 @@ class ConversationHistoryResponse(BaseModel):
 # --- Document schemas ---
 
 
+class ObligacionExtraida(BaseModel):
+    descripcion: str
+    tipo: str  # "general" | "especifica"
+    orden: int
+
+
 class DocumentUploadResponse(BaseModel):
     id: uuid.UUID
     nombre: str
     tipo: str
     texto_extraido: str | None = None
+    obligaciones_extraidas: list[ObligacionExtraida] = Field(
+        default_factory=list,
+        description="Obligaciones detectadas automáticamente del contrato (solo cuando tipo=contrato)",
+    )
 
     model_config = {"from_attributes": True}
 
