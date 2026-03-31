@@ -424,6 +424,7 @@ async def importar_contratos_secop(
     db: AsyncSession,
     documento_proveedor: str,
     usuario_id: uuid.UUID,
+    confirmar: bool = True,
 ) -> SecopImportResult:
     """Fetch all SECOP contracts for a documento_proveedor and persist them
     into the user's contratos table, skipping duplicates and invalid rows."""
@@ -454,6 +455,8 @@ async def importar_contratos_secop(
     omitidos_duplicados = 0
     omitidos_invalidos = 0
 
+    from sqlalchemy.orm import selectinload
+
     for row in rows:
         data = _mapear_a_contrato_create(row)
         if data is None:
@@ -462,6 +465,28 @@ async def importar_contratos_secop(
 
         if data.numero_contrato in existing_numeros:
             omitidos_duplicados += 1
+            continue
+
+        if not confirmar:
+            # Preview mode: build response without persisting
+            importados.append(ContratoResponse(
+                id=uuid.uuid4(),
+                usuario_id=usuario_id,
+                numero_contrato=data.numero_contrato,
+                objeto=data.objeto,
+                valor_total=data.valor_total,
+                valor_mensual=data.valor_mensual,
+                fecha_inicio=data.fecha_inicio,
+                fecha_fin=data.fecha_fin,
+                supervisor_nombre=data.supervisor_nombre,
+                entidad=data.entidad,
+                dependencia=data.dependencia,
+                documento_proveedor=documento_proveedor,
+                obligaciones=[],
+                created_at=datetime.now(tz=UTC),
+                updated_at=datetime.now(tz=UTC),
+            ))
+            existing_numeros.add(data.numero_contrato)
             continue
 
         contrato = Contrato(
@@ -481,7 +506,6 @@ async def importar_contratos_secop(
         await db.flush()
         existing_numeros.add(data.numero_contrato)
 
-        from sqlalchemy.orm import selectinload
         result = await db.execute(
             select(Contrato)
             .options(selectinload(Contrato.obligaciones))
@@ -489,7 +513,8 @@ async def importar_contratos_secop(
         )
         importados.append(ContratoResponse.model_validate(result.scalar_one()))
 
-    await db.commit()
+    if confirmar:
+        await db.commit()
     log.info(
         "secop_importar_done",
         documento_proveedor=documento_proveedor,

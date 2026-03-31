@@ -60,12 +60,19 @@ async def importar_contratos(
         description="Documento del proveedor/contratista (cédula o NIT)",
         pattern=r"^\d{5,15}$",
     ),
+    confirmar: bool = Query(
+        False,
+        description=(
+            "false → solo muestra los contratos que se importarían (preview, sin guardar). "
+            "true → guarda los contratos en la base de datos."
+        ),
+    ),
     db: AsyncSession = Depends(get_db),
 ) -> SecopImportResult:
-    """Busca en SECOP todos los contratos del documento_proveedor y los guarda
-    en la base de datos como contratos del usuario autenticado.
-    Omite duplicados (mismo numero_contrato ya existente) y registros inválidos."""
-    return await secop_service.importar_contratos_secop(db, documento_proveedor, user.id)
+    """Busca en SECOP todos los contratos del documento_proveedor.
+    Con confirmar=false devuelve una vista previa sin persistir nada.
+    Con confirmar=true guarda los contratos nuevos en la base de datos."""
+    return await secop_service.importar_contratos_secop(db, documento_proveedor, user.id, confirmar=confirmar)
 
 
 @router.get("/consulta", response_model=SecopConsultaCompletaResponse)
