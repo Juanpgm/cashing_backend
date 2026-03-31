@@ -10,7 +10,7 @@ from typing import Any
 
 import httpx
 import structlog
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -295,32 +295,76 @@ async def buscar_documentos_contrato(
     numero_contrato: str,
     refresh: bool = False,
 ) -> list[SecopDocumentoResponse]:
-    """Fetch documents for a contract by its numero_contrato (CO1.PCCNTR.xxx format)."""
-    result = await db.execute(select(SecopDocumento).where(SecopDocumento.numero_contrato == numero_contrato))
-    cached = result.scalars().all()
+    """Fetch ALL documents for a contract by both numero_contrato and proceso_de_compra.
+
+    SECOP documents are linked to contracts via two different keys:
+    - n_mero_de_contrato (CO1.PCCNTR.xxx) — direct contract docs
+    - proceso (CO1.BDOS.xxx) — process docs, often contain the contract minute / obligations
+    Both sets are merged and deduplicated to return the full document set.
+    """
+    # Resolve SecopContrato → get proceso_de_compra and FK id
+    contrato_result = await db.execute(
+        select(SecopContrato).where(SecopContrato.numero_contrato == numero_contrato)
+    )
+    secop_contrato = contrato_result.scalar_one_or_none()
+    contrato_id = secop_contrato.id if secop_contrato else None
+    proceso_de_compra = secop_contrato.proceso_de_compra if secop_contrato else None
+
+    # Resolve SecopProceso FK if we have proceso_de_compra
+    proceso_id: uuid.UUID | None = None
+    if proceso_de_compra:
+        proceso_result = await db.execute(
+            select(SecopProceso).where(SecopProceso.id_proceso_secop == proceso_de_compra)
+        )
+        secop_proceso = proceso_result.scalar_one_or_none()
+        proceso_id = secop_proceso.id if secop_proceso else None
+
+    # Check cache: docs linked by either key
+    cache_conditions = [SecopDocumento.numero_contrato == numero_contrato]
+    if proceso_de_compra:
+        cache_conditions.append(SecopDocumento.proceso == proceso_de_compra)
+    cached_result = await db.execute(select(SecopDocumento).where(or_(*cache_conditions)))
+    cached = cached_result.scalars().all()
 
     needs_refresh = refresh or not cached or (cached and not _is_fresh(cached[0].updated_at))
 
     if needs_refresh:
         safe_num = numero_contrato.replace("'", "''")
-        rows = await _query_socrata(
+
+        # Query 1: docs linked directly by numero_contrato (CO1.PCCNTR.xxx)
+        rows_by_num = await _query_socrata(
             _DS_DOCUMENTOS,
             where_clause=f"n_mero_de_contrato = '{safe_num}'",
-            limit=100,
+            limit=200,
         )
-        # Resolve the secop_contrato FK from numero_contrato
-        contrato_fk_result = await db.execute(
-            select(SecopContrato).where(SecopContrato.numero_contrato == numero_contrato)
-        )
-        secop_contrato = contrato_fk_result.scalar_one_or_none()
-        contrato_id = secop_contrato.id if secop_contrato else None
 
-        for row in rows:
-            await _upsert_documento(db, row, secop_contrato_id=contrato_id)
-        if rows:
+        # Query 2: docs linked by proceso_de_compra (CO1.BDOS.xxx) — includes contract minute
+        rows_by_proceso: list[dict[str, Any]] = []
+        if proceso_de_compra:
+            safe_proceso = proceso_de_compra.replace("'", "''")
+            rows_by_proceso = await _query_socrata(
+                _DS_DOCUMENTOS,
+                where_clause=f"proceso = '{safe_proceso}'",
+                limit=200,
+            )
+
+        # Merge and deduplicate by id_documento
+        seen: set[str] = set()
+        for row in rows_by_num:
+            id_doc = str(row.get("id_documento") or "").strip()
+            if id_doc and id_doc not in seen:
+                seen.add(id_doc)
+                await _upsert_documento(db, row, secop_contrato_id=contrato_id, secop_proceso_id=proceso_id)
+        for row in rows_by_proceso:
+            id_doc = str(row.get("id_documento") or "").strip()
+            if id_doc and id_doc not in seen:
+                seen.add(id_doc)
+                await _upsert_documento(db, row, secop_contrato_id=contrato_id, secop_proceso_id=proceso_id)
+
+        if seen:
             await db.commit()
-            result = await db.execute(select(SecopDocumento).where(SecopDocumento.numero_contrato == numero_contrato))
-            cached = result.scalars().all()
+            cached_result = await db.execute(select(SecopDocumento).where(or_(*cache_conditions)))
+            cached = cached_result.scalars().all()
 
     return [SecopDocumentoResponse.model_validate(d) for d in cached]
 
