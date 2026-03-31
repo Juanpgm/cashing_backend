@@ -110,17 +110,46 @@ async def _extraer_obligaciones(
         )
         return []
 
-    # Persist — number orden starting at 1
-    for idx, ob in enumerate(extraidas, start=1):
-        db.add(Obligacion(
-            contrato_id=contrato_id,
-            descripcion=ob.descripcion,
-            tipo=TipoObligacion(ob.tipo),
-            orden=idx,
-        ))
+    # Load existing obligations to deduplicate by normalized description
+    existing_result = await db.execute(
+        select(Obligacion).where(Obligacion.contrato_id == contrato_id)
+    )
+    existing_obs = existing_result.scalars().all()
+    existing_norm = {ob.descripcion.lower().strip(): ob for ob in existing_obs}
+
+    # Determine next orden value
+    next_orden = max((ob.orden for ob in existing_obs), default=0) + 1
+
+    insertadas: list[ObligacionExtraida] = []
+    actualizadas: list[ObligacionExtraida] = []
+
+    for ob in extraidas:
+        norm_key = ob.descripcion.lower().strip()
+        if norm_key in existing_norm:
+            # Update tipo/orden only if changed
+            existing_ob = existing_norm[norm_key]
+            if existing_ob.tipo.value != ob.tipo:
+                existing_ob.tipo = TipoObligacion(ob.tipo)
+                actualizadas.append(ob)
+        else:
+            db.add(Obligacion(
+                contrato_id=contrato_id,
+                descripcion=ob.descripcion,
+                tipo=TipoObligacion(ob.tipo),
+                orden=next_orden,
+            ))
+            insertadas.append(ob)
+            next_orden += 1
+
     await db.flush()
-    await logger.ainfo("obligaciones_extraidas", contrato_id=str(contrato_id), total=len(extraidas))
-    return extraidas
+    await logger.ainfo(
+        "obligaciones_extraidas",
+        contrato_id=str(contrato_id),
+        insertadas=len(insertadas),
+        actualizadas=len(actualizadas),
+        duplicadas_omitidas=len(extraidas) - len(insertadas) - len(actualizadas),
+    )
+    return insertadas + actualizadas
 
 _SYSTEM_PROMPT_TEMPLATE = """\
 Eres un asistente especializado en contratos de prestación de servicios para el Estado colombiano.
@@ -199,13 +228,10 @@ async def upload_document(
             contrato_id=str(contrato_id),
         )
         if tipo == TipoDocumentoFuente.CONTRATO and contrato_id is not None and existing_doc.texto_extraido:
-            ob_check = await db.execute(
-                select(Obligacion).where(Obligacion.contrato_id == contrato_id).limit(1)
+            obligaciones_extraidas = await _extraer_obligaciones(
+                existing_doc.texto_extraido, contrato_id, db
             )
-            if ob_check.scalar_one_or_none() is None:
-                obligaciones_extraidas = await _extraer_obligaciones(
-                    existing_doc.texto_extraido, contrato_id, db
-                )
+            if obligaciones_extraidas:
                 await db.commit()
         return DocumentUploadResponse(
             id=existing_doc.id,
@@ -240,11 +266,7 @@ async def upload_document(
 
     # Auto-extract obligations when uploading a contract document
     if tipo == TipoDocumentoFuente.CONTRATO and contrato_id is not None and texto_extraido:
-        ob_check = await db.execute(
-            select(Obligacion).where(Obligacion.contrato_id == contrato_id).limit(1)
-        )
-        if ob_check.scalar_one_or_none() is None:
-            obligaciones_extraidas = await _extraer_obligaciones(texto_extraido, contrato_id, db)
+        obligaciones_extraidas = await _extraer_obligaciones(texto_extraido, contrato_id, db)
 
     await db.commit()
     await db.refresh(doc)
