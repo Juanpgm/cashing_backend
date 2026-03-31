@@ -24,7 +24,7 @@ from app.schemas.secop import (
 
 log = structlog.get_logger("service.secop")
 
-_SECOP_BASE = "https://www.datos.gov.co/api/v3/views"
+_SECOP_BASE = "https://www.datos.gov.co/resource"
 _DS_CONTRATOS = "jbjy-vk9h"
 _DS_PROCESOS = "p6dx-8zbt"
 _DS_DOCUMENTOS = "dmgg-8hin"
@@ -67,14 +67,14 @@ def _is_fresh(updated_at: datetime) -> bool:
 
 
 async def _query_socrata(dataset_id: str, where_clause: str, limit: int = 500) -> list[dict[str, Any]]:
-    """Execute a SoQL query against a datos.gov.co dataset."""
-    url = f"{_SECOP_BASE}/{dataset_id}/query.json"
-    soql = f"SELECT * WHERE {where_clause} LIMIT {limit}"
+    """Execute a Socrata REST query against a datos.gov.co dataset."""
+    url = f"{_SECOP_BASE}/{dataset_id}.json"
     headers = {"X-App-Token": settings.SECOP_APP_TOKEN}
+    params = {"$where": where_clause, "$limit": str(limit)}
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(url, params={"$query": soql}, headers=headers)
+            response = await client.get(url, params=params, headers=headers)
             response.raise_for_status()
     except httpx.HTTPStatusError as exc:
         log.error("secop_api_http_error", dataset=dataset_id, status=exc.response.status_code)
@@ -140,7 +140,8 @@ async def _upsert_contrato(db: AsyncSession, row: dict[str, Any]) -> SecopContra
 
 
 async def _upsert_proceso(db: AsyncSession, row: dict[str, Any]) -> SecopProceso | None:
-    id_secop = str(row.get("id_del_proceso") or "").strip()
+    # Integration key: proceso_de_compra in contratos matches id_del_portafolio in procesos
+    id_secop = str(row.get("id_del_portafolio") or "").strip()
     if not id_secop:
         return None
 
@@ -148,7 +149,7 @@ async def _upsert_proceso(db: AsyncSession, row: dict[str, Any]) -> SecopProceso
     obj = result.scalar_one_or_none()
 
     fields: dict[str, Any] = {
-        "id_proceso_secop": id_secop,
+        "id_proceso_secop": id_secop,  # = id_del_portafolio (CO1.BDOS.xxx)
         "referencia_del_proceso": row.get("referencia_del_proceso"),
         "nombre_del_procedimiento": row.get("nombre_del_procedimiento"),
         "descripcion": row.get("descripci_n_del_procedimiento"),
@@ -197,7 +198,9 @@ async def _upsert_documento(db: AsyncSession, row: dict[str, Any]) -> SecopDocum
         "fecha_carga": _parse_date(row.get("fecha_carga")),
         "entidad": row.get("entidad"),
         "nit_entidad": row.get("nit_entidad"),
-        "url_descarga": row.get("url_descarga_documento"),
+        "url_descarga": (row.get("url_descarga_documento") or {}).get("url")
+        if isinstance(row.get("url_descarga_documento"), dict)
+        else row.get("url_descarga_documento"),
         "datos_raw": row,
     }
 
@@ -260,7 +263,7 @@ async def obtener_proceso(
     if cached is None or refresh or not _is_fresh(cached.updated_at):
         rows = await _query_socrata(
             _DS_PROCESOS,
-            where_clause=f"id_del_proceso = '{id_proceso}'",
+            where_clause=f"id_del_portafolio = '{id_proceso}'",
             limit=1,
         )
         if not rows:
