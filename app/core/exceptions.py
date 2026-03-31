@@ -64,6 +64,13 @@ class RateLimitExceededError(DomainError):
         super().__init__(detail)
 
 
+class ExternalServiceError(DomainError):
+    """External API call failed."""
+
+    def __init__(self, service: str = "External service", detail: str = "unavailable") -> None:
+        super().__init__(f"{service}: {detail}")
+
+
 # --- HTTP Exception mapping ---
 
 EXCEPTION_STATUS_MAP: dict[type[DomainError], int] = {
@@ -74,6 +81,7 @@ EXCEPTION_STATUS_MAP: dict[type[DomainError], int] = {
     UnauthorizedError: status.HTTP_401_UNAUTHORIZED,
     ForbiddenError: status.HTTP_403_FORBIDDEN,
     RateLimitExceededError: status.HTTP_429_TOO_MANY_REQUESTS,
+    ExternalServiceError: status.HTTP_502_BAD_GATEWAY,
 }
 
 

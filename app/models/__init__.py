@@ -12,6 +12,7 @@ from app.models.google_token import GoogleToken  # noqa: F401
 from app.models.obligacion import Obligacion  # noqa: F401
 from app.models.pago import Pago  # noqa: F401
 from app.models.plantilla import Plantilla  # noqa: F401
+from app.models.secop import SecopContrato, SecopDocumento, SecopProceso  # noqa: F401
 from app.models.suscripcion import Suscripcion  # noqa: F401
 from app.models.token_blacklist import TokenBlacklist  # noqa: F401
 from app.models.usuario import Usuario  # noqa: F401
