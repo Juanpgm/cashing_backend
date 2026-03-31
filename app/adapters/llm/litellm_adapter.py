@@ -46,12 +46,17 @@ class LiteLLMAdapter:
     ) -> LLMResponse:
         import litellm
 
-        response = await litellm.acompletion(
-            model=model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
+        kwargs: dict = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        # LiteLLM requires api_base when routing to a local Ollama instance
+        if model.startswith("ollama/"):
+            kwargs["api_base"] = settings.OLLAMA_BASE_URL
+
+        response = await litellm.acompletion(**kwargs)
         choice = response.choices[0]  # type: ignore[union-attr]
         usage = response.usage  # type: ignore[union-attr]
         return LLMResponse(
@@ -106,13 +111,17 @@ class LiteLLMAdapter:
         target_model = model or self._default_model
         await logger.ainfo("llm_stream_start", model=target_model)
 
-        response = await litellm.acompletion(
-            model=target_model,
-            messages=litellm_msgs,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            stream=True,
-        )
+        stream_kwargs: dict = {
+            "model": target_model,
+            "messages": litellm_msgs,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+        if target_model.startswith("ollama/"):
+            stream_kwargs["api_base"] = settings.OLLAMA_BASE_URL
+
+        response = await litellm.acompletion(**stream_kwargs)
         async for chunk in response:  # type: ignore[union-attr]
             delta = chunk.choices[0].delta  # type: ignore[union-attr]
             if delta and delta.content:

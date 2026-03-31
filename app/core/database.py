@@ -14,15 +14,20 @@ _engine_kwargs: dict = {
     "echo": settings.is_development,
 }
 if not _is_sqlite:
-    _ssl_ctx = ssl.create_default_context()
-    _ssl_ctx.check_hostname = False
-    _ssl_ctx.verify_mode = ssl.CERT_NONE
     _engine_kwargs.update(
         pool_size=10,
         max_overflow=5,
         pool_pre_ping=True,
-        connect_args={"ssl": _ssl_ctx},
     )
+    if settings.is_production:
+        # Production (Railway): require SSL but skip cert verification for managed DBs
+        _ssl_ctx = ssl.create_default_context()
+        _ssl_ctx.check_hostname = False
+        _ssl_ctx.verify_mode = ssl.CERT_NONE
+        _engine_kwargs["connect_args"] = {"ssl": _ssl_ctx}
+    else:
+        # Local dev: disable SSL entirely (Docker / local PostgreSQL)
+        _engine_kwargs["connect_args"] = {"ssl": False}
 
 engine = create_async_engine(settings.DATABASE_URL, **_engine_kwargs)
 
