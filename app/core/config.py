@@ -20,6 +20,16 @@ class Settings(BaseSettings):
     # Database
     DATABASE_URL: str = "postgresql+asyncpg://cashin:password@localhost:5432/cashin"
 
+    @field_validator("DATABASE_URL", mode="before")
+    @classmethod
+    def normalize_database_url(cls, v: str) -> str:
+        """Railway and some providers give postgres:// or postgresql:// — normalize to asyncpg."""
+        if v.startswith("postgres://"):
+            return v.replace("postgres://", "postgresql+asyncpg://", 1)
+        if v.startswith("postgresql://"):
+            return v.replace("postgresql://", "postgresql+asyncpg://", 1)
+        return v
+
     # JWT
     JWT_SECRET_KEY: str = "your-secret-key-min-32-chars-change-me"
     JWT_ALGORITHM: str = "HS256"
