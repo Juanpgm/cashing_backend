@@ -16,7 +16,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.exceptions import ExternalServiceError, ValidationError
 from app.models.contrato import Contrato
-from app.models.obligacion import Obligacion
 from app.models.secop import SecopContrato, SecopDocumento, SecopProceso
 from app.schemas.contrato import ContratoCreate, ContratoResponse
 from app.schemas.secop import (
@@ -191,8 +190,8 @@ async def _upsert_proceso(db: AsyncSession, row: dict[str, Any]) -> SecopProceso
 async def _upsert_documento(
     db: AsyncSession,
     row: dict[str, Any],
-    secop_contrato_id: "uuid.UUID | None" = None,
-    secop_proceso_id: "uuid.UUID | None" = None,
+    secop_contrato_id: uuid.UUID | None = None,
+    secop_proceso_id: uuid.UUID | None = None,
 ) -> SecopDocumento | None:
     id_secop = str(row.get("id_documento") or "").strip()
     if not id_secop:
