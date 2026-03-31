@@ -18,7 +18,8 @@ from app.schemas.contrato import (
     ObligacionCreate,
     ObligacionResponse,
 )
-from app.services import contrato_service
+from app.schemas.documento_fuente import ContratoConfiguracionResponse
+from app.services import contrato_service, document_service
 
 logger = structlog.get_logger("api.contratos")
 
@@ -91,6 +92,25 @@ async def agregar_obligacion(
 ) -> ObligacionResponse:
     """Add an obligation to a contract."""
     return await contrato_service.agregar_obligacion(db, user.id, contrato_id, data)
+
+
+@router.get("/{contrato_id}/configuracion", response_model=ContratoConfiguracionResponse)
+async def verificar_configuracion(
+    contrato_id: uuid.UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ContratoConfiguracionResponse:
+    """Verifica si el contrato tiene toda la documentación necesaria para generar cuentas de cobro.
+
+    Comprueba:
+    - **texto_contrato**: PDF/Word del contrato subido con tipo=contrato y texto extraído.
+    - **instrucciones**: Documento con directivas del usuario (tipo=instrucciones) para guiar al agente.
+    - **plantilla**: Plantilla HTML activa (custom o por defecto del sistema).
+    - **obligaciones**: Al menos una obligación contractual registrada.
+
+    Si `listo=true`, el campo `system_prompt` contiene el prompt del agente listo para usar.
+    """
+    return await document_service.verificar_configuracion_contrato(db, user.id, contrato_id)
 
 
 @router.delete(
