@@ -28,7 +28,7 @@ class SecopContrato(UUIDMixin, TimestampMixin, Base):
     cedula_contratista: Mapped[str] = mapped_column(String(30), nullable=False)
 
     # Relationships
-    documentos: Mapped[list["SecopDocumento"]] = relationship(back_populates="contrato", lazy="select")  # noqa: F821
+    documentos: Mapped[list[SecopDocumento]] = relationship(back_populates="contrato", lazy="select")
     tipodocproveedor: Mapped[str | None] = mapped_column(String(50))
     nombre_contratista: Mapped[str | None] = mapped_column(String(500))
     nombre_entidad: Mapped[str | None] = mapped_column(String(500))
@@ -79,7 +79,7 @@ class SecopProceso(UUIDMixin, TimestampMixin, Base):
     datos_raw: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
 
     # Relationships
-    documentos: Mapped[list["SecopDocumento"]] = relationship(back_populates="proceso_rel", lazy="select")  # noqa: F821
+    documentos: Mapped[list[SecopDocumento]] = relationship(back_populates="proceso_rel", lazy="select")
 
 
 class SecopDocumento(UUIDMixin, TimestampMixin, Base):
@@ -102,8 +102,8 @@ class SecopDocumento(UUIDMixin, TimestampMixin, Base):
     )
 
     # Relationships
-    contrato: Mapped["SecopContrato | None"] = relationship(back_populates="documentos")  # noqa: F821
-    proceso_rel: Mapped["SecopProceso | None"] = relationship(back_populates="documentos")  # noqa: F821
+    contrato: Mapped[SecopContrato | None] = relationship(back_populates="documentos")
+    proceso_rel: Mapped[SecopProceso | None] = relationship(back_populates="documentos")
     nombre_archivo: Mapped[str | None] = mapped_column(String(500))
     tamanno_archivo: Mapped[str | None] = mapped_column(String(50))
     extension: Mapped[str | None] = mapped_column(String(20))
