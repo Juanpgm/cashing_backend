@@ -47,7 +47,7 @@ class Settings(BaseSettings):
     S3_BUCKET_PDFS: str = "cashin-pdfs"
 
     # LLM
-    LLM_DEFAULT_MODEL: str = "gemini/gemini-2.0-flash-lite"
+    LLM_DEFAULT_MODEL: str = "gemini/gemini-2.5-flash"
     LLM_FALLBACK_MODEL: str = "openai/gpt-4o-mini"
     LLM_LOCAL_MODEL: str = "ollama/llama3.1"
     OLLAMA_BASE_URL: str = "http://localhost:11434"
