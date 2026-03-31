@@ -35,11 +35,31 @@ structlog.configure(
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Startup/shutdown lifecycle."""
+    import asyncio
+
     import app.models  # noqa: F401 — register all models
     from app.core.database import Base, engine
 
+    # Run Alembic migrations (handles ALTER TABLE for existing columns)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "alembic", "upgrade", "head",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        log = structlog.get_logger("startup")
+        if proc.returncode == 0:
+            await log.ainfo("alembic_upgrade_ok", output=stdout.decode().strip())
+        else:
+            await log.awarning("alembic_upgrade_failed", stderr=stderr.decode().strip())
+    except Exception as exc:
+        structlog.get_logger("startup").warning("alembic_upgrade_error", error=str(exc))
+
+    # create_all handles any new tables not covered by migrations
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
     yield
 
 
