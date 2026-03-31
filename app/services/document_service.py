@@ -23,20 +23,58 @@ from app.schemas.documento_fuente import ContratoConfiguracionResponse, Document
 
 logger = structlog.get_logger("services.document")
 
-_OBLIGACION_RE = re.compile(r"^OBLIGACION\|(general|especifica)\|(.+)$", re.IGNORECASE)
-# Max chars of contract text sent to LLM for obligation extraction
-_MAX_TEXTO_CHARS = 12_000
+# More lenient: accepts optional leading/trailing spaces and markdown bold markers
+_OBLIGACION_RE = re.compile(r"^\*{0,2}OBLIGACION\*{0,2}\s*\|\s*(general|especifica)\s*\|\s*(.+)$", re.IGNORECASE)
+# Max chars sent to LLM — enough to cover full contract text for most Colombian PSC contracts
+_MAX_TEXTO_CHARS = 20_000
+# Keywords that signal the obligations section — used to find the most relevant slice
+_OBLIGACION_SECTION_KEYWORDS = [
+    "OBLIGACIONES DEL CONTRATISTA",
+    "OBLIGACIONES ESPECIFICAS",
+    "OBLIGACIONES ESPECÍFICAS",
+    "OBLIGACIONES GENERALES",
+    "CLAUSULA DE OBLIGACIONES",
+    "CLÁUSULA DE OBLIGACIONES",
+    "OBLIGACIONES Y RESPONSABILIDADES",
+]
+
+
+def _extract_relevant_slice(texto: str, max_chars: int) -> str:
+    """Return the most obligation-rich slice of the contract text.
+
+    Tries to find the obligations section and center the window around it.
+    Falls back to the full text truncated if no section found.
+    """
+    texto_upper = texto.upper()
+    best_pos = -1
+    for kw in _OBLIGACION_SECTION_KEYWORDS:
+        pos = texto_upper.find(kw)
+        if pos != -1 and (best_pos == -1 or pos < best_pos):
+            best_pos = pos
+
+    if best_pos != -1:
+        # Include context before the section header + full obligations text after
+        start = max(0, best_pos - 500)
+        return texto[start : start + max_chars]
+    return texto[:max_chars]
 
 
 def _parse_obligaciones_llm(response: str) -> list[ObligacionExtraida]:
-    """Parse pipe-delimited OBLIGACION lines from LLM output."""
+    """Parse pipe-delimited OBLIGACION lines from LLM output.
+
+    Tolerant to: leading/trailing whitespace, markdown bold markers (**OBLIGACION**),
+    extra spaces around pipes, and mixed case tipo values.
+    """
     result: list[ObligacionExtraida] = []
-    for i, line in enumerate(response.splitlines()):
+    orden = 0
+    for line in response.splitlines():
         m = _OBLIGACION_RE.match(line.strip())
         if m:
-            tipo_raw, descripcion = m.group(1).lower(), m.group(2).strip()
-            if descripcion:
-                result.append(ObligacionExtraida(descripcion=descripcion, tipo=tipo_raw, orden=i))
+            tipo_raw = m.group(1).lower().strip()
+            descripcion = m.group(2).strip().rstrip(".")
+            if descripcion and len(descripcion) > 5:
+                result.append(ObligacionExtraida(descripcion=descripcion, tipo=tipo_raw, orden=orden))
+                orden += 1
     return result
 
 
@@ -47,24 +85,32 @@ async def _extraer_obligaciones(
 ) -> list[ObligacionExtraida]:
     """Call LLM to extract obligations and persist them. Returns extracted list."""
     from app.adapters.llm import get_llm
-    from app.agent.prompts.obligaciones import OBLIGACIONES_EXTRACTION_PROMPT
+    from app.agent.prompts.obligaciones import OBLIGACIONES_SYSTEM, OBLIGACIONES_USER
 
-    llm = get_llm()
-    prompt = OBLIGACIONES_EXTRACTION_PROMPT.format(texto_contrato=texto_contrato[:_MAX_TEXTO_CHARS])
-    messages = [LLMMessage(role="user", content=prompt)]
+    llm = get_llm(model=settings.LLM_FALLBACK_MODEL)  # prefer OpenAI for structured extraction
+    texto_slice = _extract_relevant_slice(texto_contrato, _MAX_TEXTO_CHARS)
+    messages = [
+        LLMMessage(role="system", content=OBLIGACIONES_SYSTEM),
+        LLMMessage(role="user", content=OBLIGACIONES_USER.format(texto_contrato=texto_slice)),
+    ]
 
     try:
-        resp = await llm.complete(messages, temperature=0.1, max_tokens=2048)
+        resp = await llm.complete(messages, temperature=0.0, max_tokens=3000)
     except Exception as exc:
         await logger.awarning("obligaciones_llm_failed", contrato_id=str(contrato_id), error=str(exc))
         return []
 
     extraidas = _parse_obligaciones_llm(resp.content)
     if not extraidas:
-        await logger.awarning("obligaciones_llm_empty", contrato_id=str(contrato_id), raw=resp.content[:200])
+        await logger.awarning(
+            "obligaciones_llm_empty",
+            contrato_id=str(contrato_id),
+            raw=resp.content[:300],
+            texto_chars=len(texto_slice),
+        )
         return []
 
-    # Persist — re-number orden starting at 1
+    # Persist — number orden starting at 1
     for idx, ob in enumerate(extraidas, start=1):
         db.add(Obligacion(
             contrato_id=contrato_id,
