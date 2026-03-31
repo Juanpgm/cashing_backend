@@ -1,5 +1,6 @@
 """Async SQLAlchemy 2.0 database engine and session management."""
 
+import ssl
 from collections.abc import AsyncGenerator
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -13,11 +14,14 @@ _engine_kwargs: dict = {
     "echo": settings.is_development,
 }
 if not _is_sqlite:
+    _ssl_ctx = ssl.create_default_context()
+    _ssl_ctx.check_hostname = False
+    _ssl_ctx.verify_mode = ssl.CERT_NONE
     _engine_kwargs.update(
         pool_size=10,
         max_overflow=5,
         pool_pre_ping=True,
-        connect_args={"ssl": False},
+        connect_args={"ssl": _ssl_ctx},
     )
 
 engine = create_async_engine(settings.DATABASE_URL, **_engine_kwargs)
