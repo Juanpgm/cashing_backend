@@ -67,6 +67,8 @@ class SecopDocumentoResponse(BaseModel):
     id_documento_secop: str
     numero_contrato: str | None
     proceso: str | None
+    secop_contrato_id: uuid.UUID | None
+    secop_proceso_id: uuid.UUID | None
     nombre_archivo: str | None
     extension: str | None
     descripcion: str | None
@@ -77,6 +79,18 @@ class SecopDocumentoResponse(BaseModel):
     updated_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class SecopSincronizarDocumentosResult(BaseModel):
+    """Resultado de sincronizar documentos de contratos y procesos SECOP."""
+
+    contratos_procesados: int
+    procesos_procesados: int
+    documentos_encontrados: int
+    documentos_guardados: int
+    documentos_omitidos_duplicados: int
+    confirmar: bool
+    documentos: list[SecopDocumentoResponse]
 
 
 class SecopContratoDetalleResponse(BaseModel):

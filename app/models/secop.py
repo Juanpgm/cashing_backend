@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import date
 from typing import Any
 
-from sqlalchemy import Date, Index, Numeric, String, Text
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy import Date, ForeignKey, Index, Numeric, String, Text, Uuid
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
 
 from app.core.database import Base
@@ -25,6 +26,9 @@ class SecopContrato(UUIDMixin, TimestampMixin, Base):
 
     id_contrato_secop: Mapped[str] = mapped_column(String(200), unique=True, nullable=False)
     cedula_contratista: Mapped[str] = mapped_column(String(30), nullable=False)
+
+    # Relationships
+    documentos: Mapped[list["SecopDocumento"]] = relationship(back_populates="contrato", lazy="select")  # noqa: F821
     tipodocproveedor: Mapped[str | None] = mapped_column(String(50))
     nombre_contratista: Mapped[str | None] = mapped_column(String(500))
     nombre_entidad: Mapped[str | None] = mapped_column(String(500))
@@ -74,6 +78,9 @@ class SecopProceso(UUIDMixin, TimestampMixin, Base):
     unidad_de_duracion: Mapped[str | None] = mapped_column(String(50))
     datos_raw: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
 
+    # Relationships
+    documentos: Mapped[list["SecopDocumento"]] = relationship(back_populates="proceso", lazy="select")  # noqa: F821
+
 
 class SecopDocumento(UUIDMixin, TimestampMixin, Base):
     """Cache de documentos de contratos SECOP — dataset dmgg-8hin."""
@@ -85,8 +92,18 @@ class SecopDocumento(UUIDMixin, TimestampMixin, Base):
     )
 
     id_documento_secop: Mapped[str] = mapped_column(String(200), unique=True, nullable=False)
-    numero_contrato: Mapped[str | None] = mapped_column(String(200))
-    proceso: Mapped[str | None] = mapped_column(String(200))
+    numero_contrato: Mapped[str | None] = mapped_column(String(200))  # = referencia_del_contrato in contratos
+    proceso: Mapped[str | None] = mapped_column(String(200))          # = proceso_de_compra in contratos
+    secop_contrato_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("secop_contratos.id"), nullable=True, index=True
+    )
+    secop_proceso_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("secop_procesos.id"), nullable=True, index=True
+    )
+
+    # Relationships
+    contrato: Mapped["SecopContrato | None"] = relationship(back_populates="documentos")  # noqa: F821
+    proceso_rel: Mapped["SecopProceso | None"] = relationship(back_populates="documentos")  # noqa: F821
     nombre_archivo: Mapped[str | None] = mapped_column(String(500))
     tamanno_archivo: Mapped[str | None] = mapped_column(String(50))
     extension: Mapped[str | None] = mapped_column(String(20))

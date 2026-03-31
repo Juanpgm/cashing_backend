@@ -26,6 +26,7 @@ from app.schemas.secop import (
     SecopDocumentoResponse,
     SecopImportResult,
     SecopProcesoResponse,
+    SecopSincronizarDocumentosResult,
 )
 
 log = structlog.get_logger("service.secop")
@@ -120,7 +121,9 @@ async def _upsert_contrato(db: AsyncSession, row: dict[str, Any]) -> SecopContra
         "departamento": row.get("departamento"),
         "ciudad": row.get("ciudad"),
         "proceso_de_compra": row.get("proceso_de_compra"),
-        "numero_contrato": row.get("numero_contrato"),
+        # numero_contrato is often NULL in SECOP; fallback to referencia_del_contrato
+        # (CO1.PCCNTR.xxx format) which is the key that links to documentos dataset
+        "numero_contrato": row.get("numero_contrato") or row.get("referencia_del_contrato"),
         "referencia_del_contrato": row.get("referencia_del_contrato"),
         "tipo_de_contrato": row.get("tipo_de_contrato"),
         "modalidad_de_contratacion": row.get("modalidad_de_contratacion"),
@@ -185,7 +188,12 @@ async def _upsert_proceso(db: AsyncSession, row: dict[str, Any]) -> SecopProceso
     return obj
 
 
-async def _upsert_documento(db: AsyncSession, row: dict[str, Any]) -> SecopDocumento | None:
+async def _upsert_documento(
+    db: AsyncSession,
+    row: dict[str, Any],
+    secop_contrato_id: "uuid.UUID | None" = None,
+    secop_proceso_id: "uuid.UUID | None" = None,
+) -> SecopDocumento | None:
     id_secop = str(row.get("id_documento") or "").strip()
     if not id_secop:
         return None
@@ -197,6 +205,8 @@ async def _upsert_documento(db: AsyncSession, row: dict[str, Any]) -> SecopDocum
         "id_documento_secop": id_secop,
         "numero_contrato": row.get("n_mero_de_contrato"),
         "proceso": row.get("proceso"),
+        "secop_contrato_id": secop_contrato_id,
+        "secop_proceso_id": secop_proceso_id,
         "nombre_archivo": row.get("nombre_archivo"),
         "tamanno_archivo": str(row.get("tamanno_archivo") or "") or None,
         "extension": row.get("extensi_n"),
@@ -285,7 +295,7 @@ async def buscar_documentos_contrato(
     numero_contrato: str,
     refresh: bool = False,
 ) -> list[SecopDocumentoResponse]:
-    """Fetch documents for a contract number."""
+    """Fetch documents for a contract by its numero_contrato (CO1.PCCNTR.xxx format)."""
     result = await db.execute(select(SecopDocumento).where(SecopDocumento.numero_contrato == numero_contrato))
     cached = result.scalars().all()
 
@@ -298,8 +308,15 @@ async def buscar_documentos_contrato(
             where_clause=f"n_mero_de_contrato = '{safe_num}'",
             limit=100,
         )
+        # Resolve the secop_contrato FK from numero_contrato
+        contrato_fk_result = await db.execute(
+            select(SecopContrato).where(SecopContrato.numero_contrato == numero_contrato)
+        )
+        secop_contrato = contrato_fk_result.scalar_one_or_none()
+        contrato_id = secop_contrato.id if secop_contrato else None
+
         for row in rows:
-            await _upsert_documento(db, row)
+            await _upsert_documento(db, row, secop_contrato_id=contrato_id)
         if rows:
             await db.commit()
             result = await db.execute(select(SecopDocumento).where(SecopDocumento.numero_contrato == numero_contrato))
@@ -530,4 +547,179 @@ async def importar_contratos_secop(
         omitidos_duplicados=omitidos_duplicados,
         omitidos_invalidos=omitidos_invalidos,
         contratos=importados,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sincronizar documentos para todos los contratos y procesos cacheados
+# ---------------------------------------------------------------------------
+
+
+async def sincronizar_documentos_secop(
+    db: AsyncSession,
+    cedula: str,
+    confirmar: bool = False,
+) -> SecopSincronizarDocumentosResult:
+    """Fetch and link all SECOP documents for every cached contrato and proceso of a cedula.
+
+    confirmar=False → preview only, shows what would be saved without persisting.
+    confirmar=True  → saves documents to DB linked to their contrato/proceso.
+    """
+    if not re.match(r"^\d{5,15}$", cedula):
+        raise ValidationError("La cédula debe contener entre 5 y 15 dígitos")
+
+    # Load all cached contratos for this cedula
+    contratos_result = await db.execute(
+        select(SecopContrato).where(SecopContrato.cedula_contratista == cedula)
+    )
+    contratos = contratos_result.scalars().all()
+
+    # Load all cached procesos via proceso_de_compra links
+    proceso_ids = {c.proceso_de_compra for c in contratos if c.proceso_de_compra}
+    procesos: list[SecopProceso] = []
+    if proceso_ids:
+        procesos_result = await db.execute(
+            select(SecopProceso).where(SecopProceso.id_proceso_secop.in_(list(proceso_ids)))
+        )
+        procesos = procesos_result.scalars().all()
+
+    # Track existing document IDs to detect duplicates
+    existing_ids_result = await db.execute(select(SecopDocumento.id_documento_secop))
+    existing_ids = {r[0] for r in existing_ids_result.all()}
+
+    all_docs: list[SecopDocumento] = []
+    docs_guardados = 0
+    docs_omitidos = 0
+
+    # Fetch documents for each contrato
+    for contrato in contratos:
+        if not contrato.numero_contrato:
+            continue
+        safe_num = contrato.numero_contrato.replace("'", "''")
+        rows = await _query_socrata(
+            _DS_DOCUMENTOS,
+            where_clause=f"n_mero_de_contrato = '{safe_num}'",
+            limit=100,
+        )
+        for row in rows:
+            id_doc = str(row.get("id_documento") or "").strip()
+            if not id_doc:
+                continue
+            if id_doc in existing_ids:
+                docs_omitidos += 1
+                # Build a temp response for preview
+                tmp = SecopDocumento(
+                    id_documento_secop=id_doc,
+                    numero_contrato=row.get("n_mero_de_contrato"),
+                    proceso=row.get("proceso"),
+                    secop_contrato_id=contrato.id,
+                    nombre_archivo=row.get("nombre_archivo"),
+                    extension=row.get("extensi_n"),
+                    descripcion=row.get("descripci_n"),
+                    url_descarga=(row.get("url_descarga_documento") or {}).get("url")
+                    if isinstance(row.get("url_descarga_documento"), dict)
+                    else row.get("url_descarga_documento"),
+                    dados_raw=row,
+                )
+                all_docs.append(tmp)
+                continue
+            if confirmar:
+                doc = await _upsert_documento(db, row, secop_contrato_id=contrato.id)
+                if doc:
+                    all_docs.append(doc)
+                    existing_ids.add(id_doc)
+                    docs_guardados += 1
+            else:
+                # Preview: build in-memory object
+                all_docs.append(SecopDocumento(
+                    id_documento_secop=id_doc,
+                    numero_contrato=row.get("n_mero_de_contrato"),
+                    proceso=row.get("proceso"),
+                    secop_contrato_id=contrato.id,
+                    nombre_archivo=row.get("nombre_archivo"),
+                    extension=row.get("extensi_n"),
+                    descripcion=row.get("descripci_n"),
+                    url_descarga=(row.get("url_descarga_documento") or {}).get("url")
+                    if isinstance(row.get("url_descarga_documento"), dict)
+                    else row.get("url_descarga_documento"),
+                ))
+                existing_ids.add(id_doc)
+                docs_guardados += 1
+
+    # Fetch documents for each proceso
+    for proceso in procesos:
+        safe_proc = proceso.id_proceso_secop.replace("'", "''")
+        rows = await _query_socrata(
+            _DS_DOCUMENTOS,
+            where_clause=f"proceso = '{safe_proc}'",
+            limit=100,
+        )
+        for row in rows:
+            id_doc = str(row.get("id_documento") or "").strip()
+            if not id_doc or id_doc in existing_ids:
+                docs_omitidos += 1
+                continue
+            if confirmar:
+                doc = await _upsert_documento(db, row, secop_proceso_id=proceso.id)
+                if doc:
+                    all_docs.append(doc)
+                    existing_ids.add(id_doc)
+                    docs_guardados += 1
+            else:
+                all_docs.append(SecopDocumento(
+                    id_documento_secop=id_doc,
+                    numero_contrato=row.get("n_mero_de_contrato"),
+                    proceso=row.get("proceso"),
+                    secop_proceso_id=proceso.id,
+                    nombre_archivo=row.get("nombre_archivo"),
+                    extension=row.get("extensi_n"),
+                    descripcion=row.get("descripci_n"),
+                    url_descarga=(row.get("url_descarga_documento") or {}).get("url")
+                    if isinstance(row.get("url_descarga_documento"), dict)
+                    else row.get("url_descarga_documento"),
+                ))
+                existing_ids.add(id_doc)
+                docs_guardados += 1
+
+    if confirmar:
+        await db.commit()
+
+    log.info(
+        "secop_sincronizar_docs",
+        cedula=cedula,
+        contratos=len(contratos),
+        procesos=len(procesos),
+        guardados=docs_guardados,
+        omitidos=docs_omitidos,
+        confirmar=confirmar,
+    )
+
+    # Build response — in-memory objects don't have .id, so use placeholder UUID
+    docs_response: list[SecopDocumentoResponse] = []
+    for d in all_docs:
+        docs_response.append(SecopDocumentoResponse(
+            id=getattr(d, "id", None) or uuid.uuid4(),
+            id_documento_secop=d.id_documento_secop,
+            numero_contrato=d.numero_contrato,
+            proceso=d.proceso,
+            secop_contrato_id=d.secop_contrato_id,
+            secop_proceso_id=d.secop_proceso_id,
+            nombre_archivo=d.nombre_archivo,
+            extension=d.extension,
+            descripcion=d.descripcion,
+            fecha_carga=d.fecha_carga if hasattr(d, "fecha_carga") else None,
+            entidad=d.entidad if hasattr(d, "entidad") else None,
+            nit_entidad=d.nit_entidad if hasattr(d, "nit_entidad") else None,
+            url_descarga=d.url_descarga,
+            updated_at=d.updated_at if hasattr(d, "updated_at") and d.updated_at else datetime.now(tz=UTC),
+        ))
+
+    return SecopSincronizarDocumentosResult(
+        contratos_procesados=len(contratos),
+        procesos_procesados=len(procesos),
+        documentos_encontrados=len(all_docs),
+        documentos_guardados=docs_guardados,
+        documentos_omitidos_duplicados=docs_omitidos,
+        confirmar=confirmar,
+        documentos=docs_response,
     )

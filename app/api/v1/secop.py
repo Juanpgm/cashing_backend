@@ -13,6 +13,7 @@ from app.schemas.secop import (
     SecopDocumentoResponse,
     SecopImportResult,
     SecopProcesoResponse,
+    SecopSincronizarDocumentosResult,
 )
 from app.services import secop_service
 
@@ -73,6 +74,27 @@ async def importar_contratos(
     Con confirmar=false devuelve una vista previa sin persistir nada.
     Con confirmar=true guarda los contratos nuevos en la base de datos."""
     return await secop_service.importar_contratos_secop(db, documento_proveedor, user.id, confirmar=confirmar)
+
+
+@router.post("/sincronizar-documentos", response_model=SecopSincronizarDocumentosResult)
+async def sincronizar_documentos(
+    user: CurrentUser,
+    cedula: str = Query(..., description="Cédula del contratista cuyos contratos/procesos se sincronizarán", pattern=r"^\d{5,15}$"),
+    confirmar: bool = Query(
+        False,
+        description=(
+            "false → muestra los documentos que se importarían (preview, sin guardar). "
+            "true → guarda los documentos en la base de datos vinculados a sus contratos y procesos."
+        ),
+    ),
+    db: AsyncSession = Depends(get_db),
+) -> SecopSincronizarDocumentosResult:
+    """Sincroniza todos los documentos SECOP asociados a los contratos y procesos cacheados de una cédula.
+
+    Requiere que primero se haya ejecutado GET /secop/contratos o POST /secop/importar para cachear los contratos.
+    Los documentos quedan vinculados por FK a secop_contratos y secop_procesos.
+    """
+    return await secop_service.sincronizar_documentos_secop(db, cedula, confirmar=confirmar)
 
 
 @router.get("/consulta", response_model=SecopConsultaCompletaResponse)
