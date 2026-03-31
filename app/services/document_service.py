@@ -307,17 +307,27 @@ async def upload_document(
             obligaciones_extraidas=obligaciones_extraidas,
         )
 
-    storage = S3StorageAdapter(bucket=settings.S3_BUCKET_DOCUMENTOS)
-    storage_key = f"usuarios/{user_id}/documentos/{uuid.uuid4()}/{filename}"
-
-    await storage.upload(key=storage_key, data=content, content_type=content_type)
-
-    # Try to extract text immediately
+    # Extract text first (in-memory, no network) so obligations can be parsed
+    # even if storage upload fails or is slow.
     texto_extraido: str | None = None
     try:
         texto_extraido = parse_document(content, filename)
     except (ValueError, Exception) as exc:
         await logger.awarning("text_extraction_failed", filename=filename, error=str(exc))
+
+    # Upload to S3-compatible storage — non-blocking on failure so text+obligations
+    # are always persisted even when MinIO/R2 is unavailable (e.g. local dev).
+    storage_key = f"usuarios/{user_id}/documentos/{uuid.uuid4()}/{filename}"
+    try:
+        storage = S3StorageAdapter(bucket=settings.S3_BUCKET_DOCUMENTOS)
+        await storage.upload(key=storage_key, data=content, content_type=content_type)
+    except Exception as exc:
+        await logger.awarning(
+            "storage_upload_failed",
+            filename=filename,
+            error=str(exc),
+            note="Document text and obligations will still be persisted",
+        )
 
     doc = DocumentoFuente(
         usuario_id=user_id,
