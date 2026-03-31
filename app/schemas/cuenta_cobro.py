@@ -15,6 +15,17 @@ class ActividadCreate(BaseModel):
     fecha_realizacion: date | None = None
     obligacion_id: uuid.UUID | None = None
 
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "descripcion": "Desarrollo e implementación del módulo de autenticación con OAuth 2.0 para el sistema de información institucional",
+                "justificacion": "Se cumple con la obligación técnica de desarrollar los módulos del sistema. Se entregó documentación técnica y código fuente al supervisor.",
+                "fecha_realizacion": "2025-03-15",
+                "obligacion_id": None,
+            }
+        }
+    }
+
 
 class ActividadResponse(BaseModel):
     id: uuid.UUID
@@ -32,6 +43,17 @@ class CuentaCobroCreate(BaseModel):
     mes: int = Field(ge=1, le=12)
     anio: int = Field(ge=2020, le=2099)
     valor: Decimal = Field(gt=0, decimal_places=2)
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "contrato_id": "00000000-0000-0000-0000-000000000000",
+                "mes": 3,
+                "anio": 2025,
+                "valor": "2000000.00",
+            }
+        }
+    }
 
 
 class CuentaCobroResponse(BaseModel):
@@ -67,6 +89,12 @@ class CuentaCobroListItem(BaseModel):
 
 class CambiarEstadoRequest(BaseModel):
     estado: EstadoCuentaCobro
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {"estado": "enviada"}
+        }
+    }
 
 
 class GenerarPDFResponse(BaseModel):

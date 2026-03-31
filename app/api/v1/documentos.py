@@ -28,20 +28,39 @@ async def upload_document(
     file: UploadFile,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
-    tipo: TipoDocumentoFuente = Query(TipoDocumentoFuente.CONTRATO, description="Tipo de documento"),
+    tipo: TipoDocumentoFuente = Query(
+        TipoDocumentoFuente.CONTRATO,
+        description=(
+            "Tipo de documento: "
+            "**contrato** = texto del contrato firmado (PDF/Word), "
+            "**instrucciones** = directivas del usuario para el agente IA, "
+            "**plantilla** = plantilla HTML personalizada para el PDF de cuenta de cobro."
+        ),
+    ),
     contrato_id: uuid.UUID | None = Query(
         None,
         description=(
-            "ID del contrato al que pertenece este documento. "
-            "Requerido para que el agente use el documento como contexto del contrato."
+            "UUID del contrato al que pertenece este documento. "
+            "**Requerido** para que el agente use el documento como contexto del contrato. "
+            "Obtenlo en `GET /contratos/`."
         ),
+        example="00000000-0000-0000-0000-000000000000",
     ),
 ) -> DocumentUploadResponse:
-    """Upload a source document (contract PDF/Word, instructions, template) linked to a contract.
+    """Sube un documento fuente vinculado a un contrato específico.
 
-    - **tipo=contrato**: el texto del contrato que el agente usará como contexto normativo.
-    - **tipo=instrucciones**: directivas del usuario para guiar al agente en la redacción.
-    - **tipo=plantilla**: plantilla HTML personalizada para el PDF de cuenta de cobro.
+    ### Tipos de documento
+    | tipo | Descripción | Uso por el agente |
+    |------|-------------|-------------------|
+    | `contrato` | PDF/Word del contrato firmado | Contexto normativo y obligaciones |
+    | `instrucciones` | Archivo .txt/.docx con directivas | Guía de redacción para actividades |
+    | `plantilla` | HTML de la plantilla del PDF | Formato visual de la cuenta de cobro |
+
+    ### Flujo recomendado
+    1. Importar contrato: `POST /secop/importar`
+    2. Subir texto del contrato: `POST /documentos/upload?tipo=contrato&contrato_id=...`
+    3. Subir instrucciones: `POST /documentos/upload?tipo=instrucciones&contrato_id=...`
+    4. Verificar: `GET /contratos/{id}/configuracion`
     """
     if not file.filename:
         raise ValidationError("Filename is required")
@@ -74,7 +93,10 @@ async def process_document(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> DocumentProcessResponse:
-    """Re-process an existing document to extract/update text."""
+    """Re-procesa un documento existente para extraer o actualizar su texto.
+
+    Útil si la extracción de texto falló en la subida inicial o si el documento fue actualizado.
+    """
     return await document_service.process_document(
         db=db,
         user_id=user.id,
@@ -88,5 +110,9 @@ async def listar_documentos_contrato(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> list[DocumentoFuenteResponse]:
-    """Lista todos los documentos cargados para un contrato específico."""
+    """Lista todos los documentos cargados para un contrato específico.
+
+    Muestra qué tipos de documentos ya están configurados y si tienen texto extraído.
+    Use `GET /contratos/{id}/configuracion` para ver el estado de completitud.
+    """
     return await document_service.listar_documentos_contrato(db, user.id, contrato_id)
