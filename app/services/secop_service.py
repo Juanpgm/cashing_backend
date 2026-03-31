@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import re
+import uuid
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import httpx
@@ -13,12 +15,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.exceptions import ExternalServiceError, ValidationError
+from app.models.contrato import Contrato
+from app.models.obligacion import Obligacion
 from app.models.secop import SecopContrato, SecopDocumento, SecopProceso
+from app.schemas.contrato import ContratoCreate, ContratoResponse
 from app.schemas.secop import (
     SecopConsultaCompletaResponse,
     SecopContratoDetalleResponse,
     SecopContratoResponse,
     SecopDocumentoResponse,
+    SecopImportResult,
     SecopProcesoResponse,
 )
 
@@ -338,4 +344,164 @@ async def consulta_completa(
         cedula=cedula,
         total_contratos=len(contratos),
         contratos=detalles,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Importar contratos SECOP → tabla contratos del usuario
+# ---------------------------------------------------------------------------
+
+
+def _calcular_valor_mensual(valor_total: Decimal, fecha_inicio: date, fecha_fin: date) -> Decimal:
+    dias = (fecha_fin - fecha_inicio).days
+    meses = max(1, round(dias / 30))
+    try:
+        return (valor_total / Decimal(meses)).quantize(Decimal("0.01"))
+    except (InvalidOperation, ZeroDivisionError):
+        return valor_total
+
+
+def _mapear_a_contrato_create(row: dict[str, Any]) -> ContratoCreate | None:
+    """Map a raw SECOP row to ContratoCreate. Returns None if data is insufficient."""
+    # --- numero_contrato ---
+    numero = (
+        str(row.get("numero_contrato") or "").strip()
+        or str(row.get("referencia_del_contrato") or "").strip()
+        or str(row.get("id_contrato") or "").strip()
+    )[:100]
+    if not numero:
+        return None
+
+    # --- objeto ---
+    objeto = (
+        str(row.get("objeto_del_contrato") or "").strip()
+        or str(row.get("descripcion_del_proceso") or "").strip()
+    )[:2000]
+    if len(objeto) < 10:
+        return None
+
+    # --- valor_total ---
+    try:
+        valor_total = Decimal(str(row.get("valor_del_contrato") or 0)).quantize(Decimal("0.01"))
+    except InvalidOperation:
+        return None
+    if valor_total <= 0:
+        return None
+
+    # --- fechas ---
+    fecha_inicio = _parse_date(row.get("fecha_de_inicio_del_contrato"))
+    fecha_fin = _parse_date(row.get("fecha_de_fin_del_contrato"))
+    if not fecha_inicio or not fecha_fin or fecha_fin <= fecha_inicio:
+        return None
+
+    # --- valor_mensual (calculado) ---
+    valor_mensual = _calcular_valor_mensual(valor_total, fecha_inicio, fecha_fin)
+
+    # --- campos opcionales ---
+    supervisor = (str(row.get("nombre_supervisor") or "").strip() or None)
+    if supervisor:
+        supervisor = supervisor[:255]
+
+    entidad = (str(row.get("nombre_entidad") or "").strip() or None)
+    if entidad:
+        entidad = entidad[:255]
+
+    return ContratoCreate(
+        numero_contrato=numero,
+        objeto=objeto,
+        valor_total=valor_total,
+        valor_mensual=valor_mensual,
+        fecha_inicio=fecha_inicio,
+        fecha_fin=fecha_fin,
+        supervisor_nombre=supervisor,
+        entidad=entidad,
+        dependencia=None,
+        obligaciones=[],
+    )
+
+
+async def importar_contratos_secop(
+    db: AsyncSession,
+    documento_proveedor: str,
+    usuario_id: uuid.UUID,
+) -> SecopImportResult:
+    """Fetch all SECOP contracts for a documento_proveedor and persist them
+    into the user's contratos table, skipping duplicates and invalid rows."""
+    if not re.match(r"^\d{5,15}$", documento_proveedor):
+        raise ValidationError("El documento_proveedor debe contener entre 5 y 15 dígitos")
+
+    rows = await _query_socrata(
+        _DS_CONTRATOS,
+        where_clause=f"documento_proveedor = '{documento_proveedor}'",
+        limit=500,
+    )
+    log.info("secop_importar_fetched", documento_proveedor=documento_proveedor, total=len(rows))
+
+    # Cache in secop_contratos as side-effect
+    for row in rows:
+        await _upsert_contrato(db, row)
+
+    # Load existing numero_contrato for this user to detect duplicates
+    existing_result = await db.execute(
+        select(Contrato.numero_contrato).where(
+            Contrato.usuario_id == usuario_id,
+            Contrato.deleted_at.is_(None),
+        )
+    )
+    existing_numeros = {r[0] for r in existing_result.all()}
+
+    importados: list[ContratoResponse] = []
+    omitidos_duplicados = 0
+    omitidos_invalidos = 0
+
+    for row in rows:
+        data = _mapear_a_contrato_create(row)
+        if data is None:
+            omitidos_invalidos += 1
+            continue
+
+        if data.numero_contrato in existing_numeros:
+            omitidos_duplicados += 1
+            continue
+
+        contrato = Contrato(
+            usuario_id=usuario_id,
+            numero_contrato=data.numero_contrato,
+            objeto=data.objeto,
+            valor_total=data.valor_total,
+            valor_mensual=data.valor_mensual,
+            fecha_inicio=data.fecha_inicio,
+            fecha_fin=data.fecha_fin,
+            supervisor_nombre=data.supervisor_nombre,
+            entidad=data.entidad,
+            dependencia=data.dependencia,
+        )
+        db.add(contrato)
+        await db.flush()
+        existing_numeros.add(data.numero_contrato)
+
+        from sqlalchemy.orm import selectinload
+        result = await db.execute(
+            select(Contrato)
+            .options(selectinload(Contrato.obligaciones))
+            .where(Contrato.id == contrato.id)
+        )
+        importados.append(ContratoResponse.model_validate(result.scalar_one()))
+
+    await db.commit()
+    log.info(
+        "secop_importar_done",
+        documento_proveedor=documento_proveedor,
+        importados=len(importados),
+        omitidos_duplicados=omitidos_duplicados,
+        omitidos_invalidos=omitidos_invalidos,
+    )
+
+    return SecopImportResult(
+        documento_proveedor=documento_proveedor,
+        encontrados_en_secop=len(rows),
+        importados=len(importados),
+        omitidos_duplicados=omitidos_duplicados,
+        omitidos_invalidos=omitidos_invalidos,
+        contratos=importados,
     )
