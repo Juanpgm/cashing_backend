@@ -1,4 +1,4 @@
-"""Contratos API — CRUD and obligaciones management."""
+"""Contratos API — CRUD, obligaciones, and agent context."""
 
 from __future__ import annotations
 
@@ -11,12 +11,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import CurrentUser
 from app.core.database import get_db
 from app.schemas.contrato import (
+    ContratoContextoAgenteResponse,
     ContratoCreate,
     ContratoListItem,
     ContratoResponse,
     ContratoUpdate,
     ObligacionCreate,
     ObligacionResponse,
+    PeriodoPendienteResponse,
 )
 from app.schemas.documento_fuente import ContratoConfiguracionResponse
 from app.services import contrato_service, document_service
@@ -32,7 +34,7 @@ async def crear_contrato(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> ContratoResponse:
-    """Create a new contract. Optionally include obligaciones in the same request."""
+    """Crea un nuevo contrato. Se pueden incluir las obligaciones en la misma solicitud."""
     return await contrato_service.crear_contrato(db, user.id, data)
 
 
@@ -41,7 +43,7 @@ async def listar_contratos(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> list[ContratoListItem]:
-    """List all contracts for the authenticated user, newest first."""
+    """Lista todos los contratos activos del usuario autenticado, más recientes primero."""
     return await contrato_service.listar_contratos(db, user.id)
 
 
@@ -51,7 +53,7 @@ async def obtener_contrato(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> ContratoResponse:
-    """Get a single contract with its obligaciones."""
+    """Obtiene un contrato con todas sus obligaciones."""
     return await contrato_service.obtener_contrato(db, user.id, contrato_id)
 
 
@@ -62,7 +64,7 @@ async def actualizar_contrato(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> ContratoResponse:
-    """Partially update a contract. Only provided fields are changed."""
+    """Actualiza parcialmente un contrato. Solo se modifican los campos enviados."""
     return await contrato_service.actualizar_contrato(db, user.id, contrato_id, data)
 
 
@@ -72,11 +74,57 @@ async def eliminar_contrato(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> None:
-    """
-    Soft-delete a contract.
-    Blocked if the contract has cuentas de cobro in enviada, aprobada, or pagada state.
-    """
+    """Elimina (soft-delete) un contrato. Bloqueado si tiene cuentas en estado enviada, aprobada o pagada."""
     await contrato_service.eliminar_contrato(db, user.id, contrato_id)
+
+
+@router.get("/{contrato_id}/configuracion", response_model=ContratoConfiguracionResponse)
+async def verificar_configuracion(
+    contrato_id: uuid.UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ContratoConfiguracionResponse:
+    """Verifica si el contrato tiene toda la documentación necesaria para generar cuentas de cobro.
+
+    Comprueba:
+    - **texto_contrato**: PDF/Word del contrato subido con `tipo=contrato` y texto extraído.
+    - **instrucciones**: Documento con directivas del usuario (`tipo=instrucciones`) para guiar al agente.
+    - **plantilla**: Plantilla HTML activa (custom o por defecto del sistema).
+    - **obligaciones**: Al menos una obligación contractual registrada.
+
+    Si `listo=true`, el campo `system_prompt` contiene el prompt del agente listo para usar.
+    """
+    return await document_service.verificar_configuracion_contrato(db, user.id, contrato_id)
+
+
+@router.get("/{contrato_id}/contexto-agente", response_model=ContratoContextoAgenteResponse)
+async def obtener_contexto_agente(
+    contrato_id: uuid.UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ContratoContextoAgenteResponse:
+    """Devuelve el contexto completo que el agente IA necesita para generar una cuenta de cobro.
+
+    Incluye: datos del contrato, obligaciones, texto extraído del contrato,
+    instrucciones del usuario, cuentas de cobro previas y el `system_prompt` ensamblado.
+
+    Use este endpoint para alimentar el agente antes de generar actividades.
+    """
+    return await contrato_service.obtener_contexto_agente(db, user.id, contrato_id)
+
+
+@router.get("/{contrato_id}/periodos-pendientes", response_model=list[PeriodoPendienteResponse])
+async def listar_periodos_pendientes(
+    contrato_id: uuid.UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> list[PeriodoPendienteResponse]:
+    """Lista todos los meses de la vigencia del contrato indicando cuáles no tienen cuenta de cobro.
+
+    Solo muestra hasta el mes actual. Los períodos con `pendiente=true` son los que
+    aún no han sido facturados.
+    """
+    return await contrato_service.listar_periodos_pendientes(db, user.id, contrato_id)
 
 
 @router.post(
@@ -90,27 +138,8 @@ async def agregar_obligacion(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> ObligacionResponse:
-    """Add an obligation to a contract."""
+    """Agrega una obligación contractual al contrato."""
     return await contrato_service.agregar_obligacion(db, user.id, contrato_id, data)
-
-
-@router.get("/{contrato_id}/configuracion", response_model=ContratoConfiguracionResponse)
-async def verificar_configuracion(
-    contrato_id: uuid.UUID,
-    user: CurrentUser,
-    db: AsyncSession = Depends(get_db),
-) -> ContratoConfiguracionResponse:
-    """Verifica si el contrato tiene toda la documentación necesaria para generar cuentas de cobro.
-
-    Comprueba:
-    - **texto_contrato**: PDF/Word del contrato subido con tipo=contrato y texto extraído.
-    - **instrucciones**: Documento con directivas del usuario (tipo=instrucciones) para guiar al agente.
-    - **plantilla**: Plantilla HTML activa (custom o por defecto del sistema).
-    - **obligaciones**: Al menos una obligación contractual registrada.
-
-    Si `listo=true`, el campo `system_prompt` contiene el prompt del agente listo para usar.
-    """
-    return await document_service.verificar_configuracion_contrato(db, user.id, contrato_id)
 
 
 @router.delete(
@@ -124,8 +153,5 @@ async def eliminar_obligacion(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> None:
-    """
-    Delete an obligation from a contract.
-    Blocked if any actividad in a cuenta de cobro references it.
-    """
+    """Elimina una obligación del contrato. Bloqueado si alguna actividad la referencia."""
     await contrato_service.eliminar_obligacion(db, user.id, contrato_id, obligacion_id)
