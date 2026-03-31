@@ -36,6 +36,7 @@ class ContratoCreate(BaseModel):
     supervisor_nombre: str | None = Field(default=None, max_length=255)
     entidad: str | None = Field(default=None, max_length=255)
     dependencia: str | None = Field(default=None, max_length=255)
+    documento_proveedor: str | None = Field(default=None, max_length=30)
     obligaciones: list[ObligacionCreate] = Field(default_factory=list)
 
 
@@ -49,6 +50,7 @@ class ContratoUpdate(BaseModel):
     supervisor_nombre: str | None = Field(default=None, max_length=255)
     entidad: str | None = Field(default=None, max_length=255)
     dependencia: str | None = Field(default=None, max_length=255)
+    documento_proveedor: str | None = Field(default=None, max_length=30)
 
 
 class ContratoResponse(BaseModel):
@@ -63,6 +65,7 @@ class ContratoResponse(BaseModel):
     supervisor_nombre: str | None
     entidad: str | None
     dependencia: str | None
+    documento_proveedor: str | None
     obligaciones: list[ObligacionResponse]
     created_at: datetime
     updated_at: datetime
