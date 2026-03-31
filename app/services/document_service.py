@@ -13,7 +13,7 @@ from sqlalchemy.orm import selectinload
 from app.adapters.storage.s3_adapter import S3StorageAdapter
 from app.agent.tools.document_parser import parse_document
 from app.core.config import settings
-from app.core.exceptions import NotFoundError
+from app.core.exceptions import AlreadyExistsError, NotFoundError
 from app.models.contrato import Contrato
 from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
 from app.models.obligacion import Obligacion, TipoObligacion
@@ -176,6 +176,18 @@ async def upload_document(
         )
         if r.scalar_one_or_none() is None:
             raise NotFoundError("Contrato", str(contrato_id))
+
+    # Deduplicate: reject if same filename + tipo already exists for this contrato
+    dup_conditions = [
+        DocumentoFuente.usuario_id == user_id,
+        DocumentoFuente.nombre == filename,
+        DocumentoFuente.tipo == tipo,
+    ]
+    if contrato_id is not None:
+        dup_conditions.append(DocumentoFuente.contrato_id == contrato_id)
+    dup_result = await db.execute(select(DocumentoFuente).where(*dup_conditions).limit(1))
+    if dup_result.scalar_one_or_none() is not None:
+        raise AlreadyExistsError(f"Ya existe un documento '{filename}' de tipo '{tipo.value}' para este contrato")
 
     storage = S3StorageAdapter(bucket=settings.S3_BUCKET_DOCUMENTOS)
     storage_key = f"usuarios/{user_id}/documentos/{uuid.uuid4()}/{filename}"
