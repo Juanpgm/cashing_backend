@@ -11,6 +11,7 @@ from app.schemas.secop import (
     SecopConsultaCompletaResponse,
     SecopContratoResponse,
     SecopDocumentoResponse,
+    SecopImportResult,
     SecopProcesoResponse,
 )
 from app.services import secop_service
@@ -49,6 +50,22 @@ async def buscar_documentos(
 ) -> list[SecopDocumentoResponse]:
     """Lista los documentos/archivos asociados a un número de contrato."""
     return await secop_service.buscar_documentos_contrato(db, numero_contrato, refresh=refresh)
+
+
+@router.post("/importar", response_model=SecopImportResult, status_code=201)
+async def importar_contratos(
+    user: CurrentUser,
+    documento_proveedor: str = Query(
+        ...,
+        description="Documento del proveedor/contratista (cédula o NIT)",
+        pattern=r"^\d{5,15}$",
+    ),
+    db: AsyncSession = Depends(get_db),
+) -> SecopImportResult:
+    """Busca en SECOP todos los contratos del documento_proveedor y los guarda
+    en la base de datos como contratos del usuario autenticado.
+    Omite duplicados (mismo numero_contrato ya existente) y registros inválidos."""
+    return await secop_service.importar_contratos_secop(db, documento_proveedor, user.id)
 
 
 @router.get("/consulta", response_model=SecopConsultaCompletaResponse)

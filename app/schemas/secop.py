@@ -8,6 +8,8 @@ from decimal import Decimal
 
 from pydantic import BaseModel
 
+from app.schemas.contrato import ContratoResponse
+
 
 class SecopContratoResponse(BaseModel):
     id: uuid.UUID
@@ -91,3 +93,14 @@ class SecopConsultaCompletaResponse(BaseModel):
     cedula: str
     total_contratos: int
     contratos: list[SecopContratoDetalleResponse]
+
+
+class SecopImportResult(BaseModel):
+    """Resultado de importar contratos SECOP a la base de datos del usuario."""
+
+    documento_proveedor: str
+    encontrados_en_secop: int
+    importados: int
+    omitidos_duplicados: int
+    omitidos_invalidos: int
+    contratos: list[ContratoResponse]
