@@ -17,7 +17,7 @@ if not _is_sqlite:
         pool_size=10,
         max_overflow=5,
         pool_pre_ping=True,
-        connect_args={"ssl": None},
+        connect_args={"ssl": False},
     )
 
 engine = create_async_engine(settings.DATABASE_URL, **_engine_kwargs)
