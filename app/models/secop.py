@@ -79,7 +79,7 @@ class SecopProceso(UUIDMixin, TimestampMixin, Base):
     datos_raw: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
 
     # Relationships
-    documentos: Mapped[list["SecopDocumento"]] = relationship(back_populates="proceso", lazy="select")  # noqa: F821
+    documentos: Mapped[list["SecopDocumento"]] = relationship(back_populates="proceso_rel", lazy="select")  # noqa: F821
 
 
 class SecopDocumento(UUIDMixin, TimestampMixin, Base):
