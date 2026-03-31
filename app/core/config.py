@@ -50,6 +50,10 @@ class Settings(BaseSettings):
     LLM_DEFAULT_MODEL: str = "gemini/gemini-2.5-flash"
     LLM_FALLBACK_MODEL: str = "openai/gpt-4o-mini"
     LLM_LOCAL_MODEL: str = "ollama/llama3.1"
+    # LLM_EXTRACTION_MODEL: model used specifically for document/obligation extraction.
+    # If empty, falls back to LLM_DEFAULT_MODEL.
+    # Set to "ollama/qwen2.5:7b" (or llama3.1) for fully local, zero-cost extraction.
+    LLM_EXTRACTION_MODEL: str = ""
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     GEMINI_API_KEY: str = ""
     OPENAI_API_KEY: str = ""

@@ -25,9 +25,11 @@ logger = structlog.get_logger("services.document")
 
 # More lenient: accepts optional leading/trailing spaces and markdown bold markers
 _OBLIGACION_RE = re.compile(r"^\*{0,2}OBLIGACION\*{0,2}\s*\|\s*(general|especifica)\s*\|\s*(.+)$", re.IGNORECASE)
-# Max chars sent to LLM — enough to cover full contract text for most Colombian PSC contracts
-_MAX_TEXTO_CHARS = 20_000
-# Keywords that signal the obligations section — used to find the most relevant slice
+# Max chars per LLM call for obligation extraction
+_MAX_CHUNK_CHARS = 18_000
+# Overlap between chunks to avoid cutting mid-clause
+_CHUNK_OVERLAP = 800
+# Keywords that signal the obligations section
 _OBLIGACION_SECTION_KEYWORDS = [
     "OBLIGACIONES DEL CONTRATISTA",
     "OBLIGACIONES ESPECIFICAS",
@@ -36,27 +38,53 @@ _OBLIGACION_SECTION_KEYWORDS = [
     "CLAUSULA DE OBLIGACIONES",
     "CLÁUSULA DE OBLIGACIONES",
     "OBLIGACIONES Y RESPONSABILIDADES",
+    "OBJETO DEL CONTRATO",
+    "ALCANCE DEL TRABAJO",
 ]
 
 
-def _extract_relevant_slice(texto: str, max_chars: int) -> str:
-    """Return the most obligation-rich slice of the contract text.
+def _extract_obligation_sections(texto: str) -> list[str]:
+    """Extract ALL obligation-rich sections from the contract text.
 
-    Tries to find the obligations section and center the window around it.
-    Falls back to the full text truncated if no section found.
+    Scans for every occurrence of every section keyword and builds windows around each.
+    Overlapping windows are merged. Returns a list of text chunks to process independently,
+    falling back to full-text chunking if no keywords are found.
     """
     texto_upper = texto.upper()
-    best_pos = -1
+    # Collect all (start, end) ranges around keyword occurrences
+    ranges: list[tuple[int, int]] = []
     for kw in _OBLIGACION_SECTION_KEYWORDS:
-        pos = texto_upper.find(kw)
-        if pos != -1 and (best_pos == -1 or pos < best_pos):
-            best_pos = pos
+        pos = 0
+        while True:
+            idx = texto_upper.find(kw, pos)
+            if idx == -1:
+                break
+            start = max(0, idx - 300)
+            end = min(len(texto), idx + _MAX_CHUNK_CHARS)
+            ranges.append((start, end))
+            pos = idx + len(kw)
 
-    if best_pos != -1:
-        # Include context before the section header + full obligations text after
-        start = max(0, best_pos - 500)
-        return texto[start : start + max_chars]
-    return texto[:max_chars]
+    if not ranges:
+        # No keywords found — chunk the full text with overlap
+        chunks: list[str] = []
+        pos = 0
+        while pos < len(texto):
+            chunks.append(texto[pos : pos + _MAX_CHUNK_CHARS])
+            pos += _MAX_CHUNK_CHARS - _CHUNK_OVERLAP
+            if pos + _CHUNK_OVERLAP >= len(texto):
+                break
+        return chunks or [texto[:_MAX_CHUNK_CHARS]]
+
+    # Merge overlapping/adjacent ranges
+    ranges.sort()
+    merged: list[tuple[int, int]] = []
+    for start, end in ranges:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+        else:
+            merged.append((start, end))
+
+    return [texto[s:e] for s, e in merged]
 
 
 def _parse_obligaciones_llm(response: str) -> list[ObligacionExtraida]:
@@ -83,30 +111,68 @@ async def _extraer_obligaciones(
     contrato_id: uuid.UUID,
     db: AsyncSession,
 ) -> list[ObligacionExtraida]:
-    """Call LLM to extract obligations and persist them. Returns extracted list."""
+    """Call LLM to extract obligations and persist them. Returns extracted list.
+
+    Processes each obligation section independently to avoid missing obligations
+    in contracts with multiple scattered clauses. Results are merged and deduplicated.
+    Uses LLM_EXTRACTION_MODEL when set (e.g. ollama/qwen2.5:7b for local zero-cost runs).
+    """
     from app.adapters.llm import get_llm
     from app.agent.prompts.obligaciones import OBLIGACIONES_SYSTEM, OBLIGACIONES_USER
 
-    llm = get_llm()  # uses LLM_DEFAULT_MODEL (Gemini) with automatic fallback to OpenAI
-    texto_slice = _extract_relevant_slice(texto_contrato, _MAX_TEXTO_CHARS)
-    messages = [
-        LLMMessage(role="system", content=OBLIGACIONES_SYSTEM),
-        LLMMessage(role="user", content=OBLIGACIONES_USER.format(texto_contrato=texto_slice)),
-    ]
+    # Use dedicated extraction model if configured (e.g. local Ollama), else default
+    extraction_model = settings.LLM_EXTRACTION_MODEL or None
+    llm = get_llm(model=extraction_model)
 
-    try:
-        resp = await llm.complete(messages, temperature=0.0, max_tokens=3000)
-    except Exception as exc:
-        await logger.awarning("obligaciones_llm_failed", contrato_id=str(contrato_id), error=str(exc))
-        return []
+    chunks = _extract_obligation_sections(texto_contrato)
+    await logger.ainfo(
+        "obligaciones_chunks",
+        contrato_id=str(contrato_id),
+        total_chunks=len(chunks),
+        total_chars=len(texto_contrato),
+        model=extraction_model or settings.LLM_DEFAULT_MODEL,
+    )
 
-    extraidas = _parse_obligaciones_llm(resp.content)
+    all_raw: list[ObligacionExtraida] = []
+    seen_norm: set[str] = set()
+
+    for i, chunk in enumerate(chunks):
+        messages = [
+            LLMMessage(role="system", content=OBLIGACIONES_SYSTEM),
+            LLMMessage(role="user", content=OBLIGACIONES_USER.format(texto_contrato=chunk)),
+        ]
+        try:
+            resp = await llm.complete(messages, temperature=0.0, max_tokens=4096)
+        except Exception as exc:
+            await logger.awarning(
+                "obligaciones_llm_chunk_failed",
+                contrato_id=str(contrato_id),
+                chunk=i,
+                error=str(exc),
+            )
+            continue
+
+        chunk_obs = _parse_obligaciones_llm(resp.content)
+        for ob in chunk_obs:
+            norm = ob.descripcion.lower().strip()
+            if norm not in seen_norm:
+                seen_norm.add(norm)
+                all_raw.append(ob)
+
+        await logger.ainfo(
+            "obligaciones_chunk_done",
+            contrato_id=str(contrato_id),
+            chunk=i,
+            found=len(chunk_obs),
+            tokens=resp.total_tokens,
+        )
+
+    extraidas = all_raw
     if not extraidas:
         await logger.awarning(
             "obligaciones_llm_empty",
             contrato_id=str(contrato_id),
-            raw=resp.content[:300],
-            texto_chars=len(texto_slice),
+            chunks_processed=len(chunks),
         )
         return []
 
