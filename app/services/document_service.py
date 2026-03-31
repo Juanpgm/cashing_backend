@@ -87,7 +87,7 @@ async def _extraer_obligaciones(
     from app.adapters.llm import get_llm
     from app.agent.prompts.obligaciones import OBLIGACIONES_SYSTEM, OBLIGACIONES_USER
 
-    llm = get_llm(model=settings.LLM_FALLBACK_MODEL)  # prefer OpenAI for structured extraction
+    llm = get_llm()  # uses LLM_DEFAULT_MODEL (Gemini) with automatic fallback to OpenAI
     texto_slice = _extract_relevant_slice(texto_contrato, _MAX_TEXTO_CHARS)
     messages = [
         LLMMessage(role="system", content=OBLIGACIONES_SYSTEM),
