@@ -13,7 +13,7 @@ from sqlalchemy.orm import selectinload
 from app.adapters.storage.s3_adapter import S3StorageAdapter
 from app.agent.tools.document_parser import parse_document
 from app.core.config import settings
-from app.core.exceptions import AlreadyExistsError, NotFoundError
+from app.core.exceptions import NotFoundError
 from app.models.contrato import Contrato
 from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
 from app.models.obligacion import Obligacion, TipoObligacion
@@ -177,7 +177,7 @@ async def upload_document(
         if r.scalar_one_or_none() is None:
             raise NotFoundError("Contrato", str(contrato_id))
 
-    # Deduplicate: reject if same filename + tipo already exists for this contrato
+    # Deduplicate: if same filename+tipo+contrato already exists, reuse it
     dup_conditions = [
         DocumentoFuente.usuario_id == user_id,
         DocumentoFuente.nombre == filename,
@@ -186,8 +186,34 @@ async def upload_document(
     if contrato_id is not None:
         dup_conditions.append(DocumentoFuente.contrato_id == contrato_id)
     dup_result = await db.execute(select(DocumentoFuente).where(*dup_conditions).limit(1))
-    if dup_result.scalar_one_or_none() is not None:
-        raise AlreadyExistsError(f"Ya existe un documento '{filename}' de tipo '{tipo.value}' para este contrato")
+    existing_doc = dup_result.scalar_one_or_none()
+
+    obligaciones_extraidas: list[ObligacionExtraida] = []
+
+    if existing_doc is not None:
+        # Document already uploaded — skip S3, just try obligation extraction if still pending
+        await logger.ainfo(
+            "document_already_exists",
+            doc_id=str(existing_doc.id),
+            filename=filename,
+            contrato_id=str(contrato_id),
+        )
+        if tipo == TipoDocumentoFuente.CONTRATO and contrato_id is not None and existing_doc.texto_extraido:
+            ob_check = await db.execute(
+                select(Obligacion).where(Obligacion.contrato_id == contrato_id).limit(1)
+            )
+            if ob_check.scalar_one_or_none() is None:
+                obligaciones_extraidas = await _extraer_obligaciones(
+                    existing_doc.texto_extraido, contrato_id, db
+                )
+                await db.commit()
+        return DocumentUploadResponse(
+            id=existing_doc.id,
+            nombre=existing_doc.nombre,
+            tipo=existing_doc.tipo.value,
+            texto_extraido=existing_doc.texto_extraido,
+            obligaciones_extraidas=obligaciones_extraidas,
+        )
 
     storage = S3StorageAdapter(bucket=settings.S3_BUCKET_DOCUMENTOS)
     storage_key = f"usuarios/{user_id}/documentos/{uuid.uuid4()}/{filename}"
@@ -213,13 +239,11 @@ async def upload_document(
     await db.flush()
 
     # Auto-extract obligations when uploading a contract document
-    obligaciones_extraidas: list[ObligacionExtraida] = []
     if tipo == TipoDocumentoFuente.CONTRATO and contrato_id is not None and texto_extraido:
-        # Only extract if the contract has no obligations yet (don't overwrite manual ones)
-        existing = await db.execute(
+        ob_check = await db.execute(
             select(Obligacion).where(Obligacion.contrato_id == contrato_id).limit(1)
         )
-        if existing.scalar_one_or_none() is None:
+        if ob_check.scalar_one_or_none() is None:
             obligaciones_extraidas = await _extraer_obligaciones(texto_extraido, contrato_id, db)
 
     await db.commit()
