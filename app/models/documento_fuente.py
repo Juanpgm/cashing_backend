@@ -22,6 +22,9 @@ class DocumentoFuente(UUIDMixin, TimestampMixin, Base):
     usuario_id: Mapped[uuid.UUID] = mapped_column(
         Uuid, ForeignKey("usuarios.id"), nullable=False, index=True
     )
+    contrato_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("contratos.id"), nullable=True, index=True
+    )
     storage_key: Mapped[str] = mapped_column(String(500), nullable=False)
     nombre: Mapped[str] = mapped_column(String(255), nullable=False)
     tipo: Mapped[TipoDocumentoFuente] = mapped_column(

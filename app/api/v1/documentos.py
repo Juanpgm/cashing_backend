@@ -1,8 +1,10 @@
-"""Documentos API — upload and process source documents."""
+"""Documentos API — upload and process source documents per contract."""
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, UploadFile
+import uuid
+
+from fastapi import APIRouter, Depends, Query, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser
@@ -15,6 +17,7 @@ from app.core.file_validation import (
 )
 from app.models.documento_fuente import TipoDocumentoFuente
 from app.schemas.agent import DocumentProcessRequest, DocumentProcessResponse, DocumentUploadResponse
+from app.schemas.documento_fuente import DocumentoFuenteResponse
 from app.services import document_service
 
 router = APIRouter(prefix="/documentos", tags=["documentos"])
@@ -25,9 +28,21 @@ async def upload_document(
     file: UploadFile,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
-    tipo: TipoDocumentoFuente = TipoDocumentoFuente.CONTRATO,
+    tipo: TipoDocumentoFuente = Query(TipoDocumentoFuente.CONTRATO, description="Tipo de documento"),
+    contrato_id: uuid.UUID | None = Query(
+        None,
+        description=(
+            "ID del contrato al que pertenece este documento. "
+            "Requerido para que el agente use el documento como contexto del contrato."
+        ),
+    ),
 ) -> DocumentUploadResponse:
-    """Upload a source document (contract, instructions, template)."""
+    """Upload a source document (contract PDF/Word, instructions, template) linked to a contract.
+
+    - **tipo=contrato**: el texto del contrato que el agente usará como contexto normativo.
+    - **tipo=instrucciones**: directivas del usuario para guiar al agente en la redacción.
+    - **tipo=plantilla**: plantilla HTML personalizada para el PDF de cuenta de cobro.
+    """
     if not file.filename:
         raise ValidationError("Filename is required")
 
@@ -49,6 +64,7 @@ async def upload_document(
         content=content,
         content_type=file.content_type or "application/octet-stream",
         tipo=tipo,
+        contrato_id=contrato_id,
     )
 
 
@@ -64,3 +80,13 @@ async def process_document(
         user_id=user.id,
         document_id=body.document_id,
     )
+
+
+@router.get("/contrato/{contrato_id}", response_model=list[DocumentoFuenteResponse])
+async def listar_documentos_contrato(
+    contrato_id: uuid.UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> list[DocumentoFuenteResponse]:
+    """Lista todos los documentos cargados para un contrato específico."""
+    return await document_service.listar_documentos_contrato(db, user.id, contrato_id)
