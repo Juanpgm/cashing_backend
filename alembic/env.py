@@ -36,8 +36,8 @@ if config.config_file_name is not None:
 
 target_metadata = Base.metadata
 
-# Override sqlalchemy.url with the actual DATABASE_URL
-config.set_main_option("sqlalchemy.url", settings.DATABASE_URL.replace("+asyncpg", "+psycopg2"))
+# Override sqlalchemy.url with the actual DATABASE_URL (keep asyncpg — psycopg2 is not installed)
+config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
 
 
 def run_migrations_offline() -> None:
@@ -62,7 +62,7 @@ def do_run_migrations(connection) -> None:  # type: ignore[no-untyped-def]
 async def run_async_migrations() -> None:
     """Run migrations in 'online' mode using async engine."""
     connectable = async_engine_from_config(
-        config.get_section(config.config_ini_section, {}),
+        {"sqlalchemy.url": settings.DATABASE_URL},
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
     )
