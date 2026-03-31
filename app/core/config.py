@@ -58,6 +58,9 @@ class Settings(BaseSettings):
     # Encryption
     TOKEN_ENCRYPTION_KEY: str = "your-fernet-key-here"
 
+    # SECOP — datos.gov.co public contracting API
+    SECOP_APP_TOKEN: str = ""
+
     # Credits
     CREDITS_PER_CUENTA_COBRO: int = 10
     CREDITS_PER_CHAT_MESSAGE: int = 1
