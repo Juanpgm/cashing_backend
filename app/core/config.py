@@ -28,10 +28,10 @@ class Settings(BaseSettings):
 
     # Storage
     STORAGE_PROVIDER: str = "minio"
-    S3_ENDPOINT_URL: str = "http://localhost:9000"
+    S3_ENDPOINT_URL: str | None = None  # None → native AWS S3; set URL for MinIO/R2
     S3_ACCESS_KEY: str = "minioadmin"
     S3_SECRET_KEY: str = "minioadmin"
-    S3_REGION: str = "auto"
+    S3_REGION: str = "us-east-1"
     S3_BUCKET_EVIDENCIAS: str = "cashin-evidencias"
     S3_BUCKET_DOCUMENTOS: str = "cashin-documentos"
     S3_BUCKET_PDFS: str = "cashin-pdfs"
