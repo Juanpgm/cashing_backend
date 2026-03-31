@@ -4,6 +4,7 @@ import uuid
 from typing import Annotated
 
 from fastapi import Depends, Request
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,17 +17,19 @@ from app.core.security import decode_token
 from app.models.token_blacklist import TokenBlacklist
 from app.models.usuario import Usuario
 
+_bearer_scheme = HTTPBearer(auto_error=False)
+
 
 async def get_current_user(
     request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
     db: AsyncSession = Depends(get_db),
 ) -> Usuario:
     """Extract and validate JWT from Authorization header, return active user."""
-    auth_header = request.headers.get("Authorization")
-    if not auth_header or not auth_header.startswith("Bearer "):
+    if not credentials:
         raise UnauthorizedError("Missing or invalid authorization header")
 
-    token = auth_header.removeprefix("Bearer ")
+    token = credentials.credentials
     try:
         payload = decode_token(token)
     except JWTError:
