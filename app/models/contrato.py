@@ -25,6 +25,7 @@ class Contrato(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
     supervisor_nombre: Mapped[str | None] = mapped_column(String(255), nullable=True)
     entidad: Mapped[str | None] = mapped_column(String(255), nullable=True)
     dependencia: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    documento_proveedor: Mapped[str | None] = mapped_column(String(30), nullable=True, index=True)
     fuente_documento_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid, ForeignKey("documentos_fuente.id"), nullable=True
     )

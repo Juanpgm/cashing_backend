@@ -475,6 +475,7 @@ async def importar_contratos_secop(
             supervisor_nombre=data.supervisor_nombre,
             entidad=data.entidad,
             dependencia=data.dependencia,
+            documento_proveedor=documento_proveedor,
         )
         db.add(contrato)
         await db.flush()
