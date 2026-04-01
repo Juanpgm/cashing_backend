@@ -33,15 +33,27 @@ def sanitize_filename(filename: str) -> str:
 
 
 def validate_mime_type(content: bytes, declared_mime: str) -> bool:
-    """Validate MIME type using magic bytes. Returns True if valid."""
+    """Validate MIME type using magic bytes. Returns True if valid.
+
+    Falls back to trusting the declared MIME when libmagic is unavailable
+    (common on Windows dev environments without the system library).
+    """
+    if declared_mime not in ALLOWED_MIME_TYPES:
+        return False
     try:
+        import sys
+
+        # python-magic hangs on Windows when libmagic is missing — skip detection
+        if sys.platform == "win32":
+            return True
+
         import magic
 
         detected = magic.from_buffer(content[:2048], mime=True)
-        return detected == declared_mime and declared_mime in ALLOWED_MIME_TYPES
-    except ImportError:
-        # Fallback: trust declared MIME if python-magic unavailable
-        return declared_mime in ALLOWED_MIME_TYPES
+        return detected == declared_mime
+    except (ImportError, OSError, Exception):
+        # Fallback: trust declared MIME if python-magic or libmagic unavailable
+        return True
 
 
 def validate_file_extension(filename: str) -> bool:

@@ -23,9 +23,9 @@ class S3StorageAdapter:
             region_name=settings.S3_REGION,
             config=Config(
                 signature_version="s3v4",
-                connect_timeout=5,
-                read_timeout=30,
-                retries={"max_attempts": 2, "mode": "standard"},
+                connect_timeout=3,
+                read_timeout=10,
+                retries={"max_attempts": 1, "mode": "standard"},
             ),
         )
         self._bucket = bucket or settings.S3_BUCKET_EVIDENCIAS

@@ -51,6 +51,7 @@ class LiteLLMAdapter:
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
+            "timeout": 120,
         }
         # LiteLLM requires api_base when routing to a local Ollama instance
         if model.startswith("ollama/"):
@@ -117,6 +118,7 @@ class LiteLLMAdapter:
             "temperature": temperature,
             "max_tokens": max_tokens,
             "stream": True,
+            "timeout": 120,
         }
         if target_model.startswith("ollama/"):
             stream_kwargs["api_base"] = settings.OLLAMA_BASE_URL
