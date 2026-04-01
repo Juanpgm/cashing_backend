@@ -86,6 +86,10 @@ class DocumentUploadResponse(BaseModel):
         default_factory=list,
         description="Obligaciones detectadas automáticamente del contrato (solo cuando tipo=contrato)",
     )
+    avisos: list[str] = Field(
+        default_factory=list,
+        description="Advertencias o errores durante la extracción automática (LLM, parsing, etc.)",
+    )
 
     model_config = {"from_attributes": True}
 

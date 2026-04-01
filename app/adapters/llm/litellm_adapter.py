@@ -20,11 +20,19 @@ class LiteLLMAdapter:
         self._default_model = default_model or settings.LLM_DEFAULT_MODEL
 
     def _get_model_chain(self, model: str | None) -> list[str]:
-        """Return ordered list of models to try (primary → fallback)."""
+        """Return ordered list of models to try (primary → fallback → local).
+
+        Chain: requested model → LLM_FALLBACK_MODEL → LLM_LOCAL_MODEL (Ollama).
+        Duplicates are removed to avoid retrying the same model.
+        """
         primary = model or self._default_model
-        chain = [primary]
-        if primary != settings.LLM_FALLBACK_MODEL:
-            chain.append(settings.LLM_FALLBACK_MODEL)
+        candidates = [primary, settings.LLM_FALLBACK_MODEL, settings.LLM_LOCAL_MODEL]
+        seen: set[str] = set()
+        chain: list[str] = []
+        for c in candidates:
+            if c and c not in seen:
+                seen.add(c)
+                chain.append(c)
         return chain
 
     @staticmethod

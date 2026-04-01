@@ -51,7 +51,7 @@ Solo incluye campos que puedas extraer con certeza del texto.
 
 TEXTO DEL CONTRATO:
 \"\"\"
-{{texto_contrato}}
+{texto_contrato}
 \"\"\"
 
 Responde ÚNICAMENTE con las líneas CAMPO|nombre|valor. Sin introducción, sin conclusión, \
