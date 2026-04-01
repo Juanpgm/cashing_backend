@@ -190,21 +190,21 @@ async def _obtener_obligaciones_existentes(
 
 async def _extraer_obligaciones(
     texto_contrato: str,
-    contrato_id: uuid.UUID,
+    contrato_id: uuid.UUID | None,
     db: AsyncSession,
-) -> list[ObligacionExtraida]:
-    """Call LLM to extract obligations, persist new ones, and return ALL extracted.
+) -> tuple[list[ObligacionExtraida], list[str]]:
+    """Call LLM to extract obligations and return extracted list + warnings.
 
-    Processes each obligation section independently to avoid missing obligations
-    in contracts with multiple scattered clauses. Results are merged and deduplicated.
-    Uses LLM_EXTRACTION_MODEL when set (e.g. ollama/qwen2.5:7b for local zero-cost runs).
+    When ``contrato_id`` is provided, new obligations are persisted to DB.
+    When ``contrato_id`` is None (auto-create failed), obligations are extracted
+    for display only — no DB persistence.
 
-    Returns the full list of LLM-extracted obligations (not just newly inserted ones)
-    so the API response always shows what was found.
+    Returns ``(obligations, warnings)`` where warnings tracks LLM/parsing issues.
     """
     from app.adapters.llm import get_llm
     from app.agent.prompts.obligaciones import OBLIGACIONES_SYSTEM, OBLIGACIONES_USER
 
+    avisos: list[str] = []
     # Use dedicated extraction model if configured (e.g. local Ollama), else default
     extraction_model = settings.LLM_EXTRACTION_MODEL or None
     llm = get_llm(model=extraction_model)
@@ -221,6 +221,7 @@ async def _extraer_obligaciones(
 
     all_raw: list[ObligacionExtraida] = []
     seen_norm: set[str] = set()
+    llm_errors = 0
 
     for i, chunk in enumerate(chunks):
         messages = [
@@ -230,6 +231,7 @@ async def _extraer_obligaciones(
         try:
             resp = await llm.complete(messages, temperature=0.0, max_tokens=4096)
         except Exception as exc:
+            llm_errors += 1
             await logger.awarning(
                 "obligaciones_llm_chunk_failed",
                 contrato_id=str(contrato_id),
@@ -260,6 +262,12 @@ async def _extraer_obligaciones(
             tokens=resp.total_tokens,
         )
 
+    if llm_errors > 0:
+        avisos.append(
+            f"La extracción de obligaciones falló en {llm_errors}/{len(chunks)} fragmentos. "
+            "Verifica la configuración del modelo LLM (API key, cuota, conectividad)."
+        )
+
     extraidas = all_raw
     if not extraidas:
         await logger.awarning(
@@ -267,7 +275,17 @@ async def _extraer_obligaciones(
             contrato_id=str(contrato_id),
             chunks_processed=len(chunks),
         )
-        return []
+        if llm_errors == 0:
+            avisos.append(
+                "No se encontraron obligaciones específicas en el documento. "
+                "Verifica que el PDF contenga una sección de obligaciones del contratista."
+            )
+        return [], avisos
+
+    # When contrato_id is None (auto-create failed), return extracted obligations
+    # for display only — no DB persistence.
+    if contrato_id is None:
+        return extraidas, avisos
 
     # Load existing obligations to deduplicate by normalized description
     existing_result = await db.execute(
@@ -306,7 +324,7 @@ async def _extraer_obligaciones(
         ya_existentes=len(extraidas) - nuevas,
     )
     # Return ALL extracted obligations (not just newly inserted)
-    return extraidas
+    return extraidas, avisos
 
 
 def _parse_campos_llm(response: str) -> dict[str, str]:
@@ -486,6 +504,7 @@ async def upload_document(
 
     obligaciones_extraidas: list[ObligacionExtraida] = []
     contrato_creado: ContratoExtraido | None = None
+    avisos: list[str] = []
 
     if existing_doc is not None:
         # Document already uploaded — return existing record + obligations
@@ -504,9 +523,10 @@ async def upload_document(
             )
             # If none exist and we have text, try extraction now
             if not obligaciones_extraidas and existing_doc.texto_extraido:
-                obligaciones_extraidas = await _extraer_obligaciones(
+                obligaciones_extraidas, ob_avisos = await _extraer_obligaciones(
                     existing_doc.texto_extraido, effective_contrato_id, db
                 )
+                avisos.extend(ob_avisos)
                 if obligaciones_extraidas:
                     await db.commit()
         return DocumentUploadResponse(
@@ -516,6 +536,7 @@ async def upload_document(
             texto_extraido=existing_doc.texto_extraido,
             contrato_id=effective_contrato_id,
             obligaciones_extraidas=obligaciones_extraidas,
+            avisos=avisos,
         )
 
     # Extract text first (in-memory, no network) so obligations can be parsed
@@ -562,6 +583,12 @@ async def upload_document(
                 numero=contrato_creado.numero_contrato,
                 usuario_id=str(user_id),
             )
+        else:
+            avisos.append(
+                "No se pudo crear el contrato automáticamente desde el documento. "
+                "Verifica que el PDF contenga datos del contrato (número, objeto, fechas) "
+                "o crea el contrato manualmente con POST /contratos/ y vuelve a subir el documento."
+            )
 
     # Upload to S3-compatible storage — non-blocking on failure so text+obligations
     # are always persisted even when MinIO/R2 is unavailable (e.g. local dev).
@@ -588,9 +615,14 @@ async def upload_document(
     db.add(doc)
     await db.flush()
 
-    # Auto-extract obligations when uploading a contract document
-    if tipo == TipoDocumentoFuente.CONTRATO and contrato_id is not None and texto_extraido:
-        obligaciones_extraidas = await _extraer_obligaciones(texto_extraido, contrato_id, db)
+    # Auto-extract obligations when uploading a contract document.
+    # Runs even when contrato_id is None (auto-create failed) so obligations
+    # are still returned for display — they just won't be persisted to DB.
+    if tipo == TipoDocumentoFuente.CONTRATO and texto_extraido:
+        obligaciones_extraidas, ob_avisos = await _extraer_obligaciones(
+            texto_extraido, contrato_id, db
+        )
+        avisos.extend(ob_avisos)
 
     await db.commit()
     await db.refresh(doc)
@@ -605,6 +637,7 @@ async def upload_document(
         contrato_id=contrato_id,
         contrato_creado=contrato_creado,
         obligaciones_extraidas=obligaciones_extraidas,
+        avisos=avisos,
     )
 
 
