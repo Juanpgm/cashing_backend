@@ -48,7 +48,7 @@ class Settings(BaseSettings):
 
     # LLM
     LLM_DEFAULT_MODEL: str = "gemini/gemini-2.5-flash"
-    LLM_FALLBACK_MODEL: str = "openai/gpt-4o-mini"
+    LLM_FALLBACK_MODEL: str = "groq/llama-3.1-8b-instant"
     LLM_LOCAL_MODEL: str = "ollama/llama3.1"
     # LLM_EXTRACTION_MODEL: model used specifically for document/obligation extraction.
     # If empty, falls back to LLM_DEFAULT_MODEL.

@@ -41,13 +41,15 @@ async def upload_document(
         None,
         description=(
             "UUID del contrato al que pertenece este documento. "
-            "**Requerido** para que el agente use el documento como contexto del contrato. "
+            "**Opcional para tipo=contrato**: si no se proporciona, el sistema extrae "
+            "automáticamente los datos del contrato desde el PDF y crea el registro. "
+            "**Requerido** para `instrucciones` y `plantilla`. "
             "Obtenlo en `GET /contratos/`."
         ),
         example="00000000-0000-0000-0000-000000000000",
     ),
 ) -> DocumentUploadResponse:
-    """Sube un documento fuente vinculado a un contrato específico.
+    """Sube un documento fuente, opcionalmente vinculado a un contrato.
 
     ### Tipos de documento
     | tipo | Descripción | Uso por el agente |
@@ -56,10 +58,25 @@ async def upload_document(
     | `instrucciones` | Archivo .txt/.docx con directivas | Guía de redacción para actividades |
     | `plantilla` | HTML de la plantilla del PDF | Formato visual de la cuenta de cobro |
 
+    ### Auto-creación de contrato
+    Cuando `tipo=contrato` y **no** se proporciona `contrato_id`, el sistema:
+    1. Extrae el texto del documento PDF/Word
+    2. Usa IA para identificar los datos del contrato (número, objeto, valor, fechas, entidad, etc.)
+    3. Crea automáticamente el registro del contrato en la base de datos
+    4. Extrae las obligaciones contractuales del contratista
+    5. Devuelve el contrato creado (`contrato_creado`) y las obligaciones extraídas
+
     ### Flujo recomendado
-    1. Importar contrato: `POST /secop/importar`
+    **Opción A — Contrato ya existe:**
+    1. Importar contrato: `POST /secop/importar` o `POST /contratos/`
     2. Subir texto del contrato: `POST /documentos/upload?tipo=contrato&contrato_id=...`
     3. Subir instrucciones: `POST /documentos/upload?tipo=instrucciones&contrato_id=...`
+
+    **Opción B — Auto-crear contrato desde PDF:**
+    1. Subir PDF del contrato: `POST /documentos/upload?tipo=contrato` *(sin contrato_id)*
+    2. El contrato se crea automáticamente con datos extraídos por IA
+    3. Subir instrucciones: `POST /documentos/upload?tipo=instrucciones&contrato_id=...`
+
     4. Verificar: `GET /contratos/{id}/configuracion`
     """
     if not file.filename:

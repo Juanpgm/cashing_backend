@@ -1,6 +1,8 @@
 """Agent schemas — request/response models for chat and document processing."""
 
 import uuid
+from datetime import date
+from decimal import Decimal
 from enum import StrEnum
 
 from pydantic import BaseModel, Field
@@ -52,11 +54,34 @@ class ObligacionExtraida(BaseModel):
     orden: int
 
 
+class ContratoExtraido(BaseModel):
+    """Datos del contrato extraídos automáticamente por LLM desde el texto del documento."""
+
+    numero_contrato: str
+    objeto: str
+    valor_total: Decimal = Field(default=Decimal("0.00"))
+    valor_mensual: Decimal = Field(default=Decimal("0.00"))
+    fecha_inicio: date | None = None
+    fecha_fin: date | None = None
+    supervisor_nombre: str | None = None
+    entidad: str | None = None
+    dependencia: str | None = None
+    documento_proveedor: str | None = None
+
+
 class DocumentUploadResponse(BaseModel):
     id: uuid.UUID
     nombre: str
     tipo: str
     texto_extraido: str | None = None
+    contrato_id: uuid.UUID | None = Field(
+        default=None,
+        description="UUID del contrato asociado (existente o auto-creado)",
+    )
+    contrato_creado: ContratoExtraido | None = Field(
+        default=None,
+        description="Datos del contrato creado automáticamente (solo cuando tipo=contrato y no se pasó contrato_id)",
+    )
     obligaciones_extraidas: list[ObligacionExtraida] = Field(
         default_factory=list,
         description="Obligaciones detectadas automáticamente del contrato (solo cuando tipo=contrato)",

@@ -50,3 +50,4 @@ docker-compose.override.yml
 # Alembic
 alembic/versions/__pycache__/
 .claude/
+test_upload.pdf
