@@ -6,7 +6,8 @@ from contextlib import asynccontextmanager
 import structlog
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
@@ -108,3 +109,12 @@ app.include_router(api_v1_router)
 @app.get("/health", response_model=HealthResponse, tags=["health"])
 async def health() -> HealthResponse:
     return HealthResponse(environment=settings.ENVIRONMENT)
+
+
+# Developer Test UI (static file served at /test-ui)
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
+
+
+@app.get("/test-ui", include_in_schema=False)
+async def test_ui() -> RedirectResponse:
+    return RedirectResponse(url="/static/test_ui.html")

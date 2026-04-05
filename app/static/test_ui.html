@@ -1,0 +1,899 @@
+<!DOCTYPE html>
+<html lang="es" class="h-full">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CashIn — Dev UI</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    :root {
+      --bg: #0a0e1a; --bg2: #0f1420; --bg3: #151b2e;
+      --border: #1e2a42; --border2: #253047;
+      --text: #e2e8f0; --text2: #94a3b8; --text3: #4a5568;
+      --green: #10b981; --green2: #059669; --green-bg: #0d2e1e;
+      --blue: #3b82f6; --blue-bg: #0d1e3d;
+      --purple: #8b5cf6; --purple-bg: #1a0d3d;
+      --orange: #f59e0b; --orange-bg: #2d1e00;
+      --red: #ef4444; --red-bg: #2d0d0d;
+      --yellow: #eab308; --yellow-bg: #2d2500;
+    }
+    * { box-sizing: border-box; }
+    body { background: var(--bg); color: var(--text); font-family: -apple-system, 'Inter', system-ui, sans-serif; margin: 0; }
+    .input { background: var(--bg3); border: 1px solid var(--border2); border-radius: 8px; color: var(--text); padding: 8px 12px; width: 100%; font-size: 13px; outline: none; transition: border-color 0.15s; }
+    .input:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(59,130,246,.15); }
+    .label { display: block; font-size: 11px; color: var(--text3); margin-bottom: 5px; font-weight: 500; letter-spacing: .04em; text-transform: uppercase; }
+    .card { background: var(--bg2); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
+    .card-sm { background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+    .btn { border-radius: 8px; padding: 9px 16px; font-size: 13px; font-weight: 600; cursor: pointer; transition: all .15s; border: none; display: inline-flex; align-items: center; gap: 6px; }
+    .btn:hover { filter: brightness(1.1); }
+    .btn:disabled { opacity: .4; cursor: not-allowed; filter: none; }
+    .btn-primary { background: var(--green); color: #fff; }
+    .btn-secondary { background: var(--bg3); color: var(--text2); border: 1px solid var(--border2); }
+    .btn-danger { background: var(--red-bg); color: var(--red); border: 1px solid var(--red-bg); }
+    .btn-sm { padding: 4px 10px; font-size: 11px; border-radius: 6px; font-weight: 500; cursor: pointer; background: var(--bg3); color: var(--text2); border: 1px solid var(--border); }
+    .btn-sm:hover { background: var(--border2); color: var(--text); }
+    .badge { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 20px; font-size: 10px; font-weight: 700; letter-spacing: .03em; }
+    .badge-GET { background: var(--blue-bg); color: var(--blue); }
+    .badge-POST { background: var(--green-bg); color: var(--green); }
+    .badge-PATCH { background: var(--yellow-bg); color: var(--yellow); }
+    .badge-DELETE { background: var(--red-bg); color: var(--red); }
+    .badge-2xx { background: var(--green-bg); color: var(--green); }
+    .badge-4xx { background: var(--yellow-bg); color: var(--yellow); }
+    .badge-5xx { background: var(--red-bg); color: var(--red); }
+    .badge-0 { background: var(--bg3); color: var(--text3); }
+    pre { font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace; font-size: 12px; line-height: 1.65; }
+    pre::-webkit-scrollbar { width: 5px; height: 5px; }
+    pre::-webkit-scrollbar-track { background: transparent; }
+    pre::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
+    .sidebar-item { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; padding: 6px 14px; border-radius: 6px; font-size: 12px; color: var(--text2); cursor: pointer; background: transparent; border: none; transition: all .12s; }
+    .sidebar-item:hover { background: var(--bg3); color: var(--text); }
+    .sidebar-item.active { background: var(--blue-bg); color: #90cdf4; }
+    .sidebar-group-label { padding: 10px 14px 4px; font-size: 10px; font-weight: 700; color: var(--text3); text-transform: uppercase; letter-spacing: .08em; display: flex; align-items: center; justify-content: space-between; }
+    .tab-btn { padding: 8px 18px; font-size: 13px; font-weight: 500; border-radius: 8px 8px 0 0; border: none; cursor: pointer; transition: all .15s; }
+    .tab-btn.active { background: var(--bg2); color: var(--text); border-bottom: 2px solid var(--green); }
+    .tab-btn:not(.active) { background: transparent; color: var(--text2); }
+    .tab-btn:not(.active):hover { color: var(--text); }
+    .step-circle { width: 32px; height: 32px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 700; flex-shrink: 0; transition: all .2s; }
+    .step-circle.done { background: var(--green); color: #fff; }
+    .step-circle.active { background: var(--blue); color: #fff; box-shadow: 0 0 0 4px rgba(59,130,246,.2); }
+    .step-circle.pending { background: var(--bg3); color: var(--text3); border: 2px solid var(--border2); }
+    .step-line { flex: 1; height: 2px; background: var(--border); margin: 0 4px; transition: background .3s; }
+    .step-line.done { background: var(--green); }
+    .ob-chip { display: inline-flex; align-items: center; gap: 4px; padding: 3px 10px; border-radius: 20px; font-size: 11px; background: var(--green-bg); color: var(--green); border: 1px solid rgba(16,185,129,.2); max-width: 240px; }
+    .ob-chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid rgba(255,255,255,.2); border-top-color: #fff; border-radius: 50%; animation: spin .6s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .sse-blink { animation: blink 1s ease-in-out infinite; }
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.3} }
+    .copy-icon { cursor: pointer; color: var(--text3); font-size: 10px; margin-left: 2px; transition: color .1s; }
+    .copy-icon:hover { color: var(--blue); }
+    .res-ok pre { background: #0a1e14; }
+    .res-err pre { background: #1e0a0a; }
+    textarea { resize: vertical; }
+    .fade-in { animation: fadeIn .2s ease; }
+    @keyframes fadeIn { from{opacity:0;transform:translateY(4px)} to{opacity:1;transform:translateY(0)} }
+    details > summary { list-style: none; cursor: pointer; }
+    details > summary::-webkit-details-marker { display: none; }
+    .drag-zone { border: 2px dashed var(--border2); border-radius: 12px; padding: 32px; text-align: center; cursor: pointer; transition: all .2s; }
+    .drag-zone:hover, .drag-zone.drag-over { border-color: var(--green); background: var(--green-bg); }
+    .tooltip { position: relative; }
+    .tooltip:hover::after { content: attr(data-tip); position: absolute; bottom: calc(100% + 6px); left: 50%; transform: translateX(-50%); background: var(--bg3); color: var(--text); font-size: 11px; padding: 4px 8px; border-radius: 5px; white-space: nowrap; border: 1px solid var(--border2); pointer-events: none; z-index: 99; }
+  </style>
+</head>
+<body class="h-screen flex flex-col overflow-hidden" style="background:var(--bg)">
+
+<!-- ───── TOPBAR ───── -->
+<header style="background:var(--bg2);border-bottom:1px solid var(--border)" class="flex items-center gap-3 px-5 py-2.5 shrink-0 z-10">
+  <div class="flex items-center gap-2 mr-1">
+    <div style="width:26px;height:26px;background:var(--green);border-radius:7px" class="flex items-center justify-center text-white font-bold text-sm">₵</div>
+    <span class="font-semibold text-sm" style="color:var(--text)">CashIn</span>
+    <span class="text-xs px-1.5 py-0.5 rounded font-mono" style="background:var(--green-bg);color:var(--green)">dev</span>
+  </div>
+  <div class="flex items-center gap-2 ml-2">
+    <select id="base-url-select" class="input" style="width:auto;font-size:12px;padding:5px 8px">
+      <option value="http://localhost:8000">⚡ Local :8000</option>
+      <option value="custom">🌐 Custom…</option>
+    </select>
+    <input id="custom-url-input" type="text" placeholder="https://…" class="input hidden" style="width:200px;font-size:12px;padding:5px 10px">
+  </div>
+  <div class="ml-auto flex items-center gap-3">
+    <div id="token-badge" class="badge badge-0">Sin sesión</div>
+    <button id="btn-logout" class="btn btn-secondary hidden" style="padding:5px 12px;font-size:12px">Salir</button>
+  </div>
+</header>
+
+<!-- ───── CONTEXT PILLS ───── -->
+<div style="background:var(--bg2);border-bottom:1px solid var(--border)" class="flex items-center gap-2 px-5 py-2 shrink-0 overflow-x-auto">
+  <span class="text-xs shrink-0" style="color:var(--text3)">Contexto activo:</span>
+  <div id="pill-user" class="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs shrink-0" style="background:var(--bg3);color:var(--text2)">
+    <span style="color:var(--text3)">usuario</span>
+    <span id="ctx-email" class="font-medium">—</span>
+  </div>
+  <div id="pill-contrato" class="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs shrink-0" style="background:var(--bg3);color:var(--text2)">
+    <span style="color:var(--text3)">contrato</span>
+    <span id="ctx-contrato" class="font-mono font-medium">—</span>
+    <span id="copy-c" class="copy-icon hidden" onclick="copyCtx('contrato')" title="Copiar">⎘</span>
+    <span id="clear-c" class="hidden cursor-pointer hover:text-red-400 text-xs ml-0.5" onclick="clearCtx('contrato')" style="color:var(--text3)" title="Limpiar">×</span>
+  </div>
+  <div id="pill-cuenta" class="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs shrink-0" style="background:var(--bg3);color:var(--text2)">
+    <span style="color:var(--text3)">cuenta</span>
+    <span id="ctx-cuenta" class="font-mono font-medium">—</span>
+    <span id="copy-u" class="copy-icon hidden" onclick="copyCtx('cuenta')" title="Copiar">⎘</span>
+    <span id="clear-u" class="hidden cursor-pointer text-xs ml-0.5" onclick="clearCtx('cuenta')" style="color:var(--text3)" title="Limpiar">×</span>
+  </div>
+  <div id="pill-session" class="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs shrink-0" style="background:var(--bg3);color:var(--text2)">
+    <span style="color:var(--text3)">sesión</span>
+    <span id="ctx-session" class="font-mono font-medium">—</span>
+    <span id="copy-s" class="copy-icon hidden" onclick="copyCtx('session')" title="Copiar">⎘</span>
+  </div>
+  <button onclick="resetContext()" class="btn-sm ml-auto shrink-0" style="font-size:10px">Limpiar todo</button>
+</div>
+
+<!-- ───── MAIN ───── -->
+<main class="flex flex-1 overflow-hidden">
+
+  <!-- SIDEBAR -->
+  <nav id="sidebar" style="width:220px;min-width:220px;background:var(--bg2);border-right:1px solid var(--border)" class="overflow-y-auto shrink-0 py-2">
+    <!-- Tabs -->
+    <div class="flex px-3 gap-1 mb-3 pt-1">
+      <button onclick="switchView('workflow')" id="tab-wf" class="flex-1 btn-sm py-1.5 text-center" style="font-size:11px">🗂 Flujo</button>
+      <button onclick="switchView('endpoints')" id="tab-ep" class="flex-1 btn-sm py-1.5 text-center" style="font-size:11px">⚡ Endpoints</button>
+    </div>
+    <div id="sidebar-content"></div>
+  </nav>
+
+  <!-- CONTENT -->
+  <div class="flex-1 overflow-hidden flex flex-col">
+
+    <!-- WORKFLOW VIEW -->
+    <div id="view-workflow" class="flex-1 overflow-y-auto p-5 hidden">
+      <!-- Stepper -->
+      <div id="stepper" class="flex items-center mb-8 px-2"></div>
+      <!-- Step content -->
+      <div id="step-content" class="max-w-2xl mx-auto"></div>
+    </div>
+
+    <!-- ENDPOINTS VIEW -->
+    <div id="view-endpoints" class="flex-1 overflow-y-auto p-5 hidden">
+      <div id="panel">
+        <div class="text-center mt-16" style="color:var(--text3)">
+          <div class="text-4xl mb-3">⚡</div>
+          <p class="text-sm">Selecciona un endpoint del panel izquierdo</p>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</main>
+
+<!-- TOAST -->
+<div id="toast-area" class="fixed bottom-5 right-5 flex flex-col gap-2 z-50"></div>
+
+<script>
+// ─── STATE ───────────────────────────────────────────────────────────────────
+const S = {
+  baseUrl: ls('cui_base_url') || 'http://localhost:8000',
+  accessToken: ls('cui_access_token'),
+  refreshToken: ls('cui_refresh_token'),
+  activeEmail: ls('cui_email'),
+  activeContratoId: ls('cui_contrato_id'),
+  activeCuentaId: ls('cui_cuenta_id'),
+  activeSessionId: ls('cui_session_id'),
+  currentView: 'workflow',
+  currentStep: 0,
+  currentEndpointId: null,
+  workflowObligaciones: [],
+};
+function ls(k) { return localStorage.getItem(k) || null; }
+function ss(k, v) { if (v == null) localStorage.removeItem(k); else localStorage.setItem(k, v); }
+const PERSIST = { baseUrl:'cui_base_url', accessToken:'cui_access_token', refreshToken:'cui_refresh_token', activeEmail:'cui_email', activeContratoId:'cui_contrato_id', activeCuentaId:'cui_cuenta_id', activeSessionId:'cui_session_id' };
+function setState(p) {
+  Object.assign(S, p);
+  for (const [k,lk] of Object.entries(PERSIST)) if (k in p) ss(lk, p[k]);
+  updateCtx(); updateAuthBadge();
+}
+
+// ─── ENDPOINTS DATA ───────────────────────────────────────────────────────────
+const GROUPS = [
+  { id:'public',   icon:'🌐', label:'Público',          color:'#94a3b8' },
+  { id:'auth',     icon:'🔐', label:'Autenticación',    color:'#60a5fa' },
+  { id:'contratos',icon:'📄', label:'Contratos',        color:'#34d399' },
+  { id:'docs',     icon:'📁', label:'Documentos',       color:'#fbbf24' },
+  { id:'cuentas',  icon:'💰', label:'Cuentas de Cobro', color:'#a78bfa' },
+  { id:'chat',     icon:'💬', label:'Chat IA',          color:'#fb923c' },
+  { id:'secop',    icon:'🔍', label:'SECOP',            color:'#f472b6' },
+  { id:'health',   icon:'⚡', label:'Diagnóstico',      color:'#4ade80' },
+];
+const EP = [
+  { id:'health',group:'health',method:'GET',path:'/health',desc:'Health check',auth:false,pp:[],qp:[],body:null },
+  { id:'health-llm',group:'health',method:'GET',path:'/api/v1/health/llm',desc:'Probar conectividad LLM',auth:false,pp:[],qp:[],body:null },
+  { id:'auth-register',group:'auth',method:'POST',path:'/api/v1/auth/register',desc:'Registrar cuenta',auth:false,pp:[],qp:[],
+    body:{email:'dev@example.com',password:'Secret123!',nombre:'Dev User',cedula:'1016019452',telefono:'3001234567'} },
+  { id:'auth-login',group:'auth',method:'POST',path:'/api/v1/auth/login',desc:'Login — guarda JWT automáticamente',auth:false,pp:[],qp:[],
+    body:{email:'dev@example.com',password:'Secret123!'} },
+  { id:'auth-me',group:'auth',method:'GET',path:'/api/v1/auth/me',desc:'Usuario actual',auth:true,pp:[],qp:[],body:null },
+  { id:'auth-logout',group:'auth',method:'POST',path:'/api/v1/auth/logout',desc:'Cerrar sesión',auth:true,pp:[],qp:[],body:null },
+  { id:'auth-refresh',group:'auth',method:'POST',path:'/api/v1/auth/refresh',desc:'Renovar token',auth:false,pp:[],qp:[],body:{refresh_token:'<auto>'} },
+  { id:'contratos-create',group:'contratos',method:'POST',path:'/api/v1/contratos/',desc:'Crear contrato',auth:true,pp:[],qp:[],
+    body:{numero_contrato:'CD-045-2025',objeto:'Prestación de servicios como desarrollador de software',valor_total:'12000000.00',valor_mensual:'2000000.00',fecha_inicio:'2025-01-01',fecha_fin:'2025-06-30',supervisor_nombre:'María García López',entidad:'Ministerio de TIC',dependencia:'Dirección de Transformación Digital',documento_proveedor:'1016019452',obligaciones:[]} },
+  { id:'contratos-list',group:'contratos',method:'GET',path:'/api/v1/contratos/',desc:'Listar contratos',auth:true,pp:[],qp:[],body:null },
+  { id:'contratos-get',group:'contratos',method:'GET',path:'/api/v1/contratos/{contrato_id}',desc:'Ver contrato',auth:true,pp:['contrato_id'],qp:[],body:null },
+  { id:'contratos-patch',group:'contratos',method:'PATCH',path:'/api/v1/contratos/{contrato_id}',desc:'Editar contrato',auth:true,pp:['contrato_id'],qp:[],body:{supervisor_nombre:'Nuevo Supervisor'} },
+  { id:'contratos-delete',group:'contratos',method:'DELETE',path:'/api/v1/contratos/{contrato_id}',desc:'Eliminar contrato',auth:true,pp:['contrato_id'],qp:[],body:null },
+  { id:'contratos-config',group:'contratos',method:'GET',path:'/api/v1/contratos/{contrato_id}/configuracion',desc:'Verificar docs completos',auth:true,pp:['contrato_id'],qp:[],body:null },
+  { id:'contratos-contexto',group:'contratos',method:'GET',path:'/api/v1/contratos/{contrato_id}/contexto-agente',desc:'Contexto completo para agente',auth:true,pp:['contrato_id'],qp:[],body:null },
+  { id:'contratos-periodos',group:'contratos',method:'GET',path:'/api/v1/contratos/{contrato_id}/periodos-pendientes',desc:'Períodos sin facturar',auth:true,pp:['contrato_id'],qp:[],body:null },
+  { id:'contratos-ob-extraer',group:'contratos',method:'POST',path:'/api/v1/contratos/{contrato_id}/obligaciones/extraer',desc:'Extraer obligaciones del PDF con LLM',auth:true,pp:['contrato_id'],qp:[],body:null },
+  { id:'contratos-ob-add',group:'contratos',method:'POST',path:'/api/v1/contratos/{contrato_id}/obligaciones',desc:'Agregar obligación manual',auth:true,pp:['contrato_id'],qp:[],body:{descripcion:'Elaborar informes mensuales de avance técnico',tipo:'especifica',orden:1} },
+  { id:'contratos-ob-del',group:'contratos',method:'DELETE',path:'/api/v1/contratos/{contrato_id}/obligaciones/{obligacion_id}',desc:'Eliminar obligación',auth:true,pp:['contrato_id','obligacion_id'],qp:[],body:null },
+  { id:'docs-upload',group:'docs',method:'POST',path:'/api/v1/documentos/upload',desc:'Subir PDF/DOCX del contrato',auth:true,pp:[],qp:['tipo','contrato_id'],isFile:true,qDefaults:{tipo:'contrato',contrato_id:''} },
+  { id:'docs-process',group:'docs',method:'POST',path:'/api/v1/documentos/process',desc:'Re-extraer texto de documento',auth:true,pp:[],qp:[],body:{document_id:'00000000-0000-0000-0000-000000000000'} },
+  { id:'docs-list',group:'docs',method:'GET',path:'/api/v1/documentos/contrato/{contrato_id}',desc:'Listar docs del contrato',auth:true,pp:['contrato_id'],qp:[],body:null },
+  { id:'cuentas-create',group:'cuentas',method:'POST',path:'/api/v1/cuentas-cobro/',desc:'Crear cuenta de cobro',auth:true,pp:[],qp:[],body:{contrato_id:'00000000-0000-0000-0000-000000000000',mes:3,anio:2025,valor:'2000000.00'} },
+  { id:'cuentas-list',group:'cuentas',method:'GET',path:'/api/v1/cuentas-cobro/',desc:'Listar cuentas',auth:true,pp:[],qp:[],body:null },
+  { id:'cuentas-get',group:'cuentas',method:'GET',path:'/api/v1/cuentas-cobro/{cuenta_id}',desc:'Ver cuenta',auth:true,pp:['cuenta_id'],qp:[],body:null },
+  { id:'cuentas-delete',group:'cuentas',method:'DELETE',path:'/api/v1/cuentas-cobro/{cuenta_id}',desc:'Eliminar (borrador)',auth:true,pp:['cuenta_id'],qp:[],body:null },
+  { id:'cuentas-act-add',group:'cuentas',method:'POST',path:'/api/v1/cuentas-cobro/{cuenta_id}/actividades',desc:'Agregar actividad',auth:true,pp:['cuenta_id'],qp:[],body:{descripcion:'Desarrollo del módulo de autenticación OAuth 2.0',justificacion:'Cumplimiento de obligación técnica.',fecha_realizacion:'2025-03-15',obligacion_id:null} },
+  { id:'cuentas-act-bulk',group:'cuentas',method:'POST',path:'/api/v1/cuentas-cobro/{cuenta_id}/actividades/bulk',desc:'Agregar actividades (lote)',auth:true,pp:['cuenta_id'],qp:[],body:{actividades:[{descripcion:'Actividad 1',justificacion:'Justificación 1.',fecha_realizacion:'2025-03-10',obligacion_id:null}]} },
+  { id:'cuentas-act-texto',group:'cuentas',method:'POST',path:'/api/v1/cuentas-cobro/{cuenta_id}/actividades/desde-texto',desc:'Parsear lista numerada',auth:true,pp:['cuenta_id'],qp:[],body:{texto:'1. Desarrollé el módulo de autenticación\n2. Elaboré informe mensual\n3. Asistí a reunión de seguimiento',fecha_realizacion:'2025-03-31',vincular_obligaciones:true} },
+  { id:'cuentas-act-gen',group:'cuentas',method:'POST',path:'/api/v1/cuentas-cobro/{cuenta_id}/actividades/generar',desc:'IA genera actividades',auth:true,pp:['cuenta_id'],qp:[],body:null },
+  { id:'cuentas-estado',group:'cuentas',method:'PATCH',path:'/api/v1/cuentas-cobro/{cuenta_id}/estado',desc:'Cambiar estado',auth:true,pp:['cuenta_id'],qp:[],body:{estado:'enviada'} },
+  { id:'cuentas-pdf-gen',group:'cuentas',method:'POST',path:'/api/v1/cuentas-cobro/{cuenta_id}/generar-pdf',desc:'Generar PDF',auth:true,pp:['cuenta_id'],qp:[],body:null },
+  { id:'cuentas-pdf-get',group:'cuentas',method:'GET',path:'/api/v1/cuentas-cobro/{cuenta_id}/pdf',desc:'URL presignada del PDF',auth:true,pp:['cuenta_id'],qp:[],body:null },
+  { id:'chat-send',group:'chat',method:'POST',path:'/api/v1/chat/',desc:'Enviar mensaje al agente',auth:true,pp:[],qp:[],body:{message:'Hola, ayúdame con mi cuenta de cobro',session_id:null} },
+  { id:'chat-stream',group:'chat',method:'POST',path:'/api/v1/chat/stream',desc:'Streaming SSE del agente',auth:true,pp:[],qp:[],isSSE:true,body:{message:'Genera actividades para el mes de marzo',session_id:null} },
+  { id:'chat-history',group:'chat',method:'GET',path:'/api/v1/chat/{session_id}',desc:'Historial de conversación',auth:true,pp:['session_id'],qp:[],body:null },
+  { id:'secop-contratos',group:'secop',method:'GET',path:'/api/v1/secop/contratos',desc:'Buscar en SECOP por cédula',auth:true,pp:[],qp:['cedula','refresh'],body:null,qDefaults:{cedula:'1016019452',refresh:'false'} },
+  { id:'secop-importar',group:'secop',method:'POST',path:'/api/v1/secop/importar',desc:'Importar contratos SECOP',auth:true,pp:[],qp:['documento_proveedor','confirmar'],body:null,qDefaults:{documento_proveedor:'1016019452',confirmar:'false'} },
+];
+
+// ─── WORKFLOW STEPS ──────────────────────────────────────────────────────────
+const STEPS = [
+  { id:'s-auth',    icon:'🔐', label:'Acceso',       desc:'Iniciar sesión para comenzar' },
+  { id:'s-contrato',icon:'📄', label:'Contrato',     desc:'Crear o seleccionar contrato' },
+  { id:'s-doc',     icon:'📁', label:'Documento',    desc:'Subir PDF del contrato' },
+  { id:'s-ob',      icon:'🎯', label:'Obligaciones', desc:'Extraer obligaciones con IA' },
+  { id:'s-cuenta',  icon:'💰', label:'Cuenta',       desc:'Crear cuenta de cobro' },
+  { id:'s-pdf',     icon:'📑', label:'PDF',          desc:'Generar y descargar PDF' },
+];
+
+// ─── SIDEBAR ─────────────────────────────────────────────────────────────────
+function renderSidebar() {
+  const c = document.getElementById('sidebar-content');
+  const mc = { GET:'badge-GET', POST:'badge-POST', PATCH:'badge-PATCH', DELETE:'badge-DELETE' };
+  let h = '';
+  for (const g of GROUPS) {
+    const eps = EP.filter(e => e.group === g.id);
+    const isOpen = ['auth','contratos','docs'].includes(g.id);
+    h += `<details ${isOpen?'open':''}>
+      <summary class="sidebar-group-label" style="color:${g.color}">
+        <span>${g.icon} ${g.label}</span>
+        <span class="badge badge-0" style="font-size:9px">${eps.length}</span>
+      </summary>
+      <div class="pb-1">`;
+    for (const ep of eps) {
+      h += `<button class="sidebar-item" id="si-${ep.id}" onclick="selectEp('${ep.id}')">
+        <span class="badge ${mc[ep.method]||'badge-0'}" style="font-size:9px;padding:1px 5px;min-width:38px;justify-content:center">${ep.method}</span>
+        <span class="truncate" style="font-size:11px">${ep.path.replace('/api/v1','').replace(/{(\w+)}/g,'…')}</span>
+      </button>`;
+    }
+    h += `</div></details>`;
+  }
+  c.innerHTML = h;
+}
+
+// ─── VIEW SWITCHER ────────────────────────────────────────────────────────────
+function switchView(v) {
+  S.currentView = v;
+  document.getElementById('view-workflow').classList.toggle('hidden', v !== 'workflow');
+  document.getElementById('view-endpoints').classList.toggle('hidden', v !== 'endpoints');
+  const wfBtn = document.getElementById('tab-wf');
+  const epBtn = document.getElementById('tab-ep');
+  if (v === 'workflow') {
+    wfBtn.style.background = 'var(--blue-bg)'; wfBtn.style.color = '#90cdf4';
+    epBtn.style.background = ''; epBtn.style.color = 'var(--text2)';
+  } else {
+    epBtn.style.background = 'var(--blue-bg)'; epBtn.style.color = '#90cdf4';
+    wfBtn.style.background = ''; wfBtn.style.color = 'var(--text2)';
+  }
+}
+
+// ─── WORKFLOW ────────────────────────────────────────────────────────────────
+function renderStepper() {
+  const el = document.getElementById('stepper');
+  let h = '';
+  STEPS.forEach((step, i) => {
+    const done = i < S.currentStep;
+    const active = i === S.currentStep;
+    const cls = done ? 'done' : active ? 'active' : 'pending';
+    h += `<div class="flex flex-col items-center gap-1 cursor-pointer" onclick="goStep(${i})">
+      <div class="step-circle ${cls}">${done ? '✓' : i+1}</div>
+      <span style="font-size:10px;color:${active?'var(--text)':done?'var(--green)':'var(--text3)'};font-weight:${active?700:500}">${step.label}</span>
+    </div>`;
+    if (i < STEPS.length - 1) h += `<div class="step-line ${i < S.currentStep ? 'done' : ''}" style="margin-top:-12px"></div>`;
+  });
+  el.innerHTML = h;
+}
+
+function goStep(i) {
+  S.currentStep = i;
+  renderStepper();
+  renderStepContent(i);
+}
+
+function advanceStep() {
+  if (S.currentStep < STEPS.length - 1) { S.currentStep++; renderStepper(); renderStepContent(S.currentStep); }
+}
+
+function renderStepContent(i) {
+  const el = document.getElementById('step-content');
+  el.innerHTML = '';
+  const renderers = [renderStep0, renderStep1, renderStep2, renderStep3, renderStep4, renderStep5];
+  if (renderers[i]) { el.innerHTML = renderers[i](); wireStepEvents(i); }
+}
+
+// Step 0 — Auth
+function renderStep0() {
+  const logged = !!S.accessToken;
+  if (logged) return `<div class="card fade-in">
+    <div class="flex items-center gap-3 mb-4">
+      <div style="width:40px;height:40px;background:var(--green-bg);border-radius:10px" class="flex items-center justify-center text-xl">✅</div>
+      <div><p class="font-semibold text-sm">Sesión activa</p><p class="text-xs" style="color:var(--text2)">${S.activeEmail || 'Usuario autenticado'}</p></div>
+    </div>
+    <button onclick="advanceStep()" class="btn btn-primary w-full">Continuar → Contrato</button>
+  </div>`;
+  return `<div class="card fade-in">
+    <div class="flex items-center gap-3 mb-5">
+      <div style="width:40px;height:40px;background:var(--blue-bg);border-radius:10px" class="flex items-center justify-center text-xl">🔐</div>
+      <div><p class="font-semibold text-sm">Iniciar sesión</p><p class="text-xs" style="color:var(--text2)">Introduce tus credenciales de la app</p></div>
+    </div>
+    <div class="space-y-3">
+      <div><label class="label">Email</label><input id="wf-email" type="email" class="input" value="dev@example.com" placeholder="email@ejemplo.com"></div>
+      <div><label class="label">Contraseña</label><input id="wf-pass" type="password" class="input" value="Secret123!" placeholder="••••••••"></div>
+    </div>
+    <div class="flex gap-2 mt-4">
+      <button id="wf-btn-login" onclick="wfLogin()" class="btn btn-primary flex-1">Iniciar sesión</button>
+      <button id="wf-btn-register" onclick="wfRegister()" class="btn btn-secondary">Registrar</button>
+    </div>
+    <div id="wf-auth-res" class="mt-3 hidden"></div>
+  </div>`;
+}
+
+async function wfLogin() {
+  const email = q('#wf-email').value.trim();
+  const pass = q('#wf-pass').value.trim();
+  setBtnLoading('wf-btn-login', true);
+  const r = await apiFetch('POST','/api/v1/auth/login',{body:{email,password:pass}});
+  setBtnLoading('wf-btn-login', false);
+  processResponse('auth-login', r.data);
+  if (r.status === 200) { showToast('✅ Sesión iniciada'); setTimeout(advanceStep, 500); }
+  else showStepRes('wf-auth-res', r);
+}
+
+async function wfRegister() {
+  const email = q('#wf-email').value.trim();
+  const pass = q('#wf-pass').value.trim();
+  setBtnLoading('wf-btn-register', true);
+  const r = await apiFetch('POST','/api/v1/auth/register',{body:{email,password:pass,nombre:'Dev User',cedula:'1016019452',telefono:'3001234567'}});
+  setBtnLoading('wf-btn-register', false);
+  if (r.status === 201) { showToast('✅ Cuenta creada. Iniciando sesión…'); await wfLogin(); }
+  else showStepRes('wf-auth-res', r);
+}
+
+// Step 1 — Contrato
+function renderStep1() {
+  const c = S.activeContratoId;
+  const active = c ? `<div class="card-sm mb-4 flex items-center justify-between" style="border-color:var(--green);background:var(--green-bg)">
+    <div class="flex items-center gap-2"><span>📄</span><div><p class="text-xs font-semibold" style="color:var(--green)">Contrato activo</p><p class="font-mono text-xs" style="color:var(--green)">${c.slice(0,16)}…</p></div></div>
+    <button onclick="advanceStep()" class="btn btn-primary" style="padding:6px 14px;font-size:12px">Continuar →</button>
+  </div>` : '';
+  return `<div class="card fade-in">
+    <div class="flex items-center gap-3 mb-5">
+      <div style="width:40px;height:40px;background:var(--green-bg);border-radius:10px" class="flex items-center justify-center text-xl">📄</div>
+      <div><p class="font-semibold text-sm">Datos del contrato</p><p class="text-xs" style="color:var(--text2)">Crea un nuevo contrato o usa el activo</p></div>
+    </div>
+    ${active}
+    <div class="space-y-3">
+      <div class="grid grid-cols-2 gap-3">
+        <div><label class="label">Número contrato</label><input id="wf-num" class="input" value="CD-045-2025"></div>
+        <div><label class="label">Cédula contratista</label><input id="wf-ced" class="input" value="1016019452"></div>
+      </div>
+      <div><label class="label">Objeto contractual</label><input id="wf-obj" class="input" value="Prestación de servicios como desarrollador de software"></div>
+      <div class="grid grid-cols-2 gap-3">
+        <div><label class="label">Entidad</label><input id="wf-ent" class="input" value="Ministerio de TIC"></div>
+        <div><label class="label">Supervisor</label><input id="wf-sup" class="input" value="María García López"></div>
+      </div>
+      <div class="grid grid-cols-3 gap-3">
+        <div><label class="label">Valor mensual</label><input id="wf-vmes" class="input" value="2000000.00"></div>
+        <div><label class="label">Inicio</label><input id="wf-fi" type="date" class="input" value="2025-01-01"></div>
+        <div><label class="label">Fin</label><input id="wf-ff" type="date" class="input" value="2025-06-30"></div>
+      </div>
+    </div>
+    <button id="wf-btn-cont" onclick="wfCreateContrato()" class="btn btn-primary w-full mt-4">Crear contrato →</button>
+    <div id="wf-cont-res" class="mt-3 hidden"></div>
+  </div>`;
+}
+
+async function wfCreateContrato() {
+  setBtnLoading('wf-btn-cont', true);
+  const vmes = parseFloat(q('#wf-vmes').value)||2000000;
+  const body = { numero_contrato:q('#wf-num').value, objeto:q('#wf-obj').value, valor_total:(vmes*6).toFixed(2), valor_mensual:vmes.toFixed(2), fecha_inicio:q('#wf-fi').value, fecha_fin:q('#wf-ff').value, supervisor_nombre:q('#wf-sup').value, entidad:q('#wf-ent').value, dependencia:'Dirección de TI', documento_proveedor:q('#wf-ced').value, obligaciones:[] };
+  const r = await apiFetch('POST','/api/v1/contratos/',{body});
+  setBtnLoading('wf-btn-cont', false);
+  processResponse('contratos-create', r.data);
+  if (r.status === 201) { showToast('✅ Contrato creado'); setTimeout(advanceStep, 400); }
+  else showStepRes('wf-cont-res', r);
+}
+
+// Step 2 — Documento
+function renderStep2() {
+  return `<div class="card fade-in">
+    <div class="flex items-center gap-3 mb-5">
+      <div style="width:40px;height:40px;background:var(--orange-bg,#2d1e00);border-radius:10px" class="flex items-center justify-center text-xl">📁</div>
+      <div><p class="font-semibold text-sm">Documento del contrato</p><p class="text-xs" style="color:var(--text2)">Sube el PDF o Word del contrato firmado</p></div>
+    </div>
+    ${S.activeContratoId ? `<div class="text-xs mb-4 px-3 py-2 rounded-lg" style="background:var(--bg3);color:var(--text2)">Contrato activo: <span class="font-mono" style="color:var(--green)">${S.activeContratoId.slice(0,24)}…</span></div>` : '<div class="text-xs mb-4 px-3 py-2 rounded-lg" style="background:var(--red-bg);color:var(--red)">⚠ No hay contrato activo. Regresa al paso anterior.</div>'}
+    <div id="drop-zone" class="drag-zone mb-4" onclick="q('#wf-file').click()">
+      <div class="text-3xl mb-2">📂</div>
+      <p class="text-sm font-medium" style="color:var(--text2)">Arrastra el PDF aquí o <span style="color:var(--green)">haz clic</span></p>
+      <p class="text-xs mt-1" style="color:var(--text3)">PDF, DOCX, TXT — máx. 10MB</p>
+      <p id="file-name" class="text-xs mt-2 font-medium" style="color:var(--green)"></p>
+    </div>
+    <input id="wf-file" type="file" accept=".pdf,.docx,.doc,.txt,.html" class="hidden" onchange="updateFileName(this)">
+    <button id="wf-btn-upload" onclick="wfUpload()" class="btn btn-primary w-full">Subir documento →</button>
+    <div id="wf-doc-res" class="mt-3 hidden"></div>
+  </div>`;
+}
+
+function wireStepEvents(i) {
+  if (i === 2) {
+    const dz = document.getElementById('drop-zone');
+    if (!dz) return;
+    dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('drag-over'); });
+    dz.addEventListener('dragleave', () => dz.classList.remove('drag-over'));
+    dz.addEventListener('drop', e => { e.preventDefault(); dz.classList.remove('drag-over'); const f = e.dataTransfer.files[0]; if (f) { const fi = q('#wf-file'); const dt = new DataTransfer(); dt.items.add(f); fi.files = dt.files; updateFileName(fi); } });
+  }
+}
+
+function updateFileName(input) {
+  const el = document.getElementById('file-name');
+  if (el && input.files[0]) el.textContent = '📎 ' + input.files[0].name;
+}
+
+async function wfUpload() {
+  const fi = q('#wf-file');
+  if (!fi?.files[0]) { showToast('⚠ Selecciona un archivo primero', 'warn'); return; }
+  if (!S.activeContratoId) { showToast('⚠ No hay contrato activo', 'warn'); return; }
+  setBtnLoading('wf-btn-upload', true);
+  const fd = new FormData(); fd.append('file', fi.files[0]);
+  const r = await apiFetch('POST','/api/v1/documentos/upload',{body:fd,isFormData:true,qp:{tipo:'contrato',contrato_id:S.activeContratoId}});
+  setBtnLoading('wf-btn-upload', false);
+  processResponse('docs-upload', r.data);
+  if (r.status === 201) { showToast('✅ Documento subido'); setTimeout(advanceStep, 400); }
+  else showStepRes('wf-doc-res', r);
+}
+
+// Step 3 — Obligaciones
+function renderStep3() {
+  const obs = S.workflowObligaciones || [];
+  const avisos = S.workflowObAvisos || [];
+
+  const avisosHtml = avisos.length ? `
+    <div class="card-sm mb-4" style="border-color:rgba(245,158,11,.4);background:rgba(245,158,11,.06)">
+      ${avisos.map(a=>`<p class="text-xs" style="color:#d97706">⚠ ${a}</p>`).join('')}
+    </div>` : '';
+
+  const obsHtml = obs.length ? `
+    <div class="mb-4">
+      <p class="text-xs font-semibold mb-2" style="color:var(--text2)">${obs.length} obligación(es) encontrada(s):</p>
+      <ol style="list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:8px">
+        ${obs.map((o,i)=>`<li style="display:flex;gap:10px;align-items:flex-start;padding:8px 10px;background:var(--bg2);border-radius:8px;border:1px solid var(--border)">
+          <span style="min-width:22px;height:22px;background:var(--green-bg);color:var(--green);border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;flex-shrink:0">${i+1}</span>
+          <span class="text-sm" style="line-height:1.4">${o.descripcion}</span>
+        </li>`).join('')}
+      </ol>
+    </div>` : '';
+
+  return `<div class="card fade-in">
+    <div class="flex items-center gap-3 mb-5">
+      <div style="width:40px;height:40px;background:var(--green-bg);border-radius:10px" class="flex items-center justify-center text-xl">🎯</div>
+      <div><p class="font-semibold text-sm">Extracción de obligaciones</p><p class="text-xs" style="color:var(--text2)">El modelo de IA analiza el contrato y extrae las obligaciones específicas</p></div>
+    </div>
+    ${avisosHtml}
+    ${obsHtml}
+    <div class="card-sm mb-4" style="background:var(--green-bg);border-color:rgba(16,185,129,.2)">
+      <p class="text-xs" style="color:var(--green)">Modelo: <strong>gemini/gemini-2.0-flash</strong> — 1,000,000 tokens/día gratuitos</p>
+    </div>
+    <button id="wf-btn-extraer" onclick="wfExtraerOb()" class="btn btn-primary w-full mb-2">🤖 ${obs.length ? 'Re-extraer' : 'Extraer'} obligaciones con IA</button>
+    ${obs.length ? `<button onclick="advanceStep()" class="btn btn-secondary w-full">Continuar → Cuenta de Cobro</button>` : ''}
+    <div id="wf-ob-res" class="mt-3 hidden"></div>
+  </div>`;
+}
+
+async function wfExtraerOb() {
+  if (!S.activeContratoId) { showToast('⚠ No hay contrato activo', 'warn'); return; }
+  setBtnLoading('wf-btn-extraer', true);
+  const r = await apiFetch('POST',`/api/v1/contratos/${S.activeContratoId}/obligaciones/extraer`);
+  setBtnLoading('wf-btn-extraer', false);
+  if (r.status === 200 && r.data?.obligaciones) {
+    S.workflowObligaciones = r.data.obligaciones;
+    S.workflowObAvisos = r.data.avisos || [];
+    showToast(r.data.total ? `✅ ${r.data.total} obligaciones extraídas` : '⚠ No se encontraron obligaciones', r.data.total ? 'success' : 'warn');
+    renderStepContent(S.currentStep);
+  } else { showStepRes('wf-ob-res', r); }
+}
+
+// Step 4 — Cuenta de Cobro
+function renderStep4() {
+  const now = new Date();
+  const u = S.activeCuentaId;
+  const active = u ? `<div class="card-sm mb-4 flex items-center justify-between" style="border-color:var(--purple,#8b5cf6);background:var(--purple-bg)">
+    <div><p class="text-xs font-semibold" style="color:var(--purple)">Cuenta activa</p><p class="font-mono text-xs" style="color:var(--purple)">${u.slice(0,20)}…</p></div>
+    <button onclick="advanceStep()" class="btn" style="background:var(--purple);color:#fff;padding:6px 14px;font-size:12px">Continuar →</button>
+  </div>` : '';
+  return `<div class="card fade-in">
+    <div class="flex items-center gap-3 mb-5">
+      <div style="width:40px;height:40px;background:var(--purple-bg);border-radius:10px" class="flex items-center justify-center text-xl">💰</div>
+      <div><p class="font-semibold text-sm">Cuenta de cobro</p><p class="text-xs" style="color:var(--text2)">Crea la cuenta para el período de facturación</p></div>
+    </div>
+    ${active}
+    <div class="space-y-3">
+      <div class="grid grid-cols-2 gap-3">
+        <div><label class="label">Mes</label><input id="wf-mes" type="number" class="input" value="${now.getMonth()+1}" min="1" max="12"></div>
+        <div><label class="label">Año</label><input id="wf-anio" type="number" class="input" value="${now.getFullYear()}"></div>
+      </div>
+      <div><label class="label">Valor</label><input id="wf-valor" class="input" value="2000000.00"></div>
+    </div>
+    <button id="wf-btn-cuenta" onclick="wfCreateCuenta()" class="btn btn-primary w-full mt-4">Crear cuenta →</button>
+    <div id="wf-cu-res" class="mt-3 hidden"></div>
+  </div>`;
+}
+
+async function wfCreateCuenta() {
+  if (!S.activeContratoId) { showToast('⚠ No hay contrato activo', 'warn'); return; }
+  setBtnLoading('wf-btn-cuenta', true);
+  const body = { contrato_id:S.activeContratoId, mes:parseInt(q('#wf-mes').value), anio:parseInt(q('#wf-anio').value), valor:q('#wf-valor').value };
+  const r = await apiFetch('POST','/api/v1/cuentas-cobro/',{body});
+  setBtnLoading('wf-btn-cuenta', false);
+  processResponse('cuentas-create', r.data);
+  if (r.status === 201) { showToast('✅ Cuenta creada'); setTimeout(advanceStep, 400); }
+  else showStepRes('wf-cu-res', r);
+}
+
+// Step 5 — PDF
+function renderStep5() {
+  return `<div class="card fade-in">
+    <div class="flex items-center gap-3 mb-5">
+      <div style="width:40px;height:40px;background:#1a1040;border-radius:10px" class="flex items-center justify-center text-xl">📑</div>
+      <div><p class="font-semibold text-sm">Generar PDF</p><p class="text-xs" style="color:var(--text2)">Genera la cuenta de cobro en PDF lista para enviar</p></div>
+    </div>
+    ${S.activeCuentaId ? `<div class="text-xs mb-4 px-3 py-2 rounded-lg" style="background:var(--bg3);color:var(--text2)">Cuenta: <span class="font-mono" style="color:var(--purple)">${S.activeCuentaId.slice(0,24)}…</span></div>` : ''}
+    <button id="wf-btn-pdf" onclick="wfGenPDF()" class="btn btn-primary w-full mb-2">Generar PDF →</button>
+    <div id="wf-pdf-res" class="mt-3 hidden"></div>
+    <div id="wf-pdf-link" class="hidden mt-3"></div>
+  </div>`;
+}
+
+async function wfGenPDF() {
+  if (!S.activeCuentaId) { showToast('⚠ No hay cuenta activa', 'warn'); return; }
+  setBtnLoading('wf-btn-pdf', true);
+  const r = await apiFetch('POST',`/api/v1/cuentas-cobro/${S.activeCuentaId}/generar-pdf`);
+  setBtnLoading('wf-btn-pdf', false);
+  if (r.status === 200 && r.data?.pdf_url) {
+    showToast('✅ PDF generado');
+    const el = document.getElementById('wf-pdf-link');
+    el.innerHTML = `<a href="${r.data.pdf_url}" target="_blank" class="btn btn-primary w-full" style="text-decoration:none;justify-content:center">📥 Abrir PDF</a>`;
+    el.classList.remove('hidden');
+  } else { showStepRes('wf-pdf-res', r); }
+}
+
+function showStepRes(id, r) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.classList.remove('hidden');
+  const ok = r.status >= 200 && r.status < 300;
+  el.innerHTML = `<div class="rounded-lg p-3 text-xs ${ok?'res-ok':'res-err'}" style="border:1px solid ${ok?'var(--green-bg)':'var(--red-bg)'}">
+    <div class="flex items-center gap-2 mb-2">
+      <span class="badge ${ok?'badge-2xx':'badge-5xx'}">${r.status}</span>
+      <span style="color:var(--text3)">${r.elapsed}ms</span>
+    </div>
+    <pre class="overflow-auto max-h-40 rounded p-2" style="background:var(--bg3)">${r.data?JSON.stringify(r.data,null,2):''}</pre>
+  </div>`;
+}
+
+// ─── ENDPOINTS PANEL ─────────────────────────────────────────────────────────
+function selectEp(id) {
+  switchView('endpoints');
+  S.currentEndpointId = id;
+  document.querySelectorAll('.sidebar-item').forEach(b=>b.classList.remove('active'));
+  const btn = document.getElementById('si-'+id); if (btn) btn.classList.add('active');
+  renderPanel(id);
+}
+
+function renderPanel(epId) {
+  const ep = EP.find(e=>e.id===epId); if (!ep) return;
+  const mc = {GET:'var(--blue)',POST:'var(--green)',PATCH:'var(--yellow)',DELETE:'var(--red)',PUT:'var(--yellow)'};
+  const col = mc[ep.method]||'var(--text)';
+
+  let ppHtml = '';
+  if (ep.pp?.length) {
+    ppHtml = `<div class="mb-4"><label class="label">Path params</label><div class="space-y-2">`;
+    for (const p of ep.pp) {
+      const autoV = p.includes('contrato')?S.activeContratoId:p.includes('cuenta')?S.activeCuentaId:p.includes('session')?S.activeSessionId:'';
+      ppHtml += `<div class="flex items-center gap-2">
+        <code class="text-xs shrink-0 w-32" style="color:var(--text3)">{${p}}</code>
+        <input id="pp-${p}" class="input flex-1 font-mono text-xs" value="${autoV||''}" placeholder="${p}">
+        <button class="btn-sm shrink-0" onclick="useActive('${p}')">Activo</button>
+      </div>`;
+    }
+    ppHtml += `</div></div>`;
+  }
+
+  let qpHtml = '';
+  const qd = ep.qDefaults||{};
+  if (ep.qp?.length) {
+    qpHtml = `<div class="mb-4"><label class="label">Query params</label><div class="grid grid-cols-2 gap-2">`;
+    for (const q2 of ep.qp) qpHtml += `<div><label class="label">${q2}</label><input id="qp-${q2}" class="input font-mono text-xs" value="${qd[q2]||''}" placeholder="${q2}"></div>`;
+    qpHtml += `</div></div>`;
+  }
+
+  let bodyHtml = '';
+  if (ep.isFile) {
+    bodyHtml = `<div class="mb-4">
+      <label class="label">Archivo</label>
+      <input id="ep-file" type="file" accept=".pdf,.docx,.doc,.txt,.html,.xlsx" class="block w-full text-xs mb-3" style="color:var(--text2)">
+      <div class="grid grid-cols-2 gap-3">
+        <div><label class="label">tipo</label>
+          <select id="ep-qp-tipo" class="input text-xs"><option value="contrato">contrato</option><option value="instrucciones">instrucciones</option><option value="plantilla">plantilla</option></select>
+        </div>
+        <div><label class="label">contrato_id</label>
+          <div class="flex gap-1"><input id="ep-qp-contrato_id" class="input flex-1 font-mono text-xs" value="${S.activeContratoId||''}" placeholder="UUID">
+          <button class="btn-sm" onclick="document.getElementById('ep-qp-contrato_id').value=S.activeContratoId||''">Active</button></div>
+        </div>
+      </div>
+    </div>`;
+  } else if (['POST','PUT','PATCH'].includes(ep.method)) {
+    let bv = '';
+    if (ep.id==='auth-refresh') bv = JSON.stringify({refresh_token:S.refreshToken||''},null,2);
+    else if (ep.id==='cuentas-create') { const b={...ep.body}; if(S.activeContratoId)b.contrato_id=S.activeContratoId; bv=JSON.stringify(b,null,2); }
+    else if (ep.body) bv = JSON.stringify(ep.body,null,2);
+    bodyHtml = `<div class="mb-4">
+      <div class="flex items-center justify-between mb-1">
+        <label class="label" style="margin:0">Body JSON</label>
+        <button class="btn-sm" onclick="fmtBody()">Formatear</button>
+      </div>
+      <textarea id="ep-body" class="input font-mono text-xs" rows="9">${esc(bv)}</textarea>
+    </div>`;
+  }
+
+  const sseHtml = ep.isSSE ? `<div id="sse-wrap" class="hidden mb-4">
+    <label class="label flex items-center gap-2"><span id="sse-dot" class="inline-block w-2 h-2 rounded-full sse-blink" style="background:var(--green)"></span>Streaming</label>
+    <pre id="sse-out" class="rounded-lg p-3 text-xs overflow-auto max-h-56 whitespace-pre-wrap" style="background:var(--bg3);color:var(--green)"></pre>
+  </div>` : '';
+
+  document.getElementById('panel').innerHTML = `<div class="fade-in">
+    <div class="flex items-center gap-3 mb-1">
+      <span class="font-bold text-base" style="color:${col}">${ep.method}</span>
+      <code class="font-mono text-sm" style="color:var(--text)">${ep.path}</code>
+      ${ep.auth?'<span class="badge" style="background:#1a0d3d;color:var(--purple);font-size:9px">🔒 JWT</span>':'<span class="badge badge-2xx" style="font-size:9px">público</span>'}
+    </div>
+    <p class="text-xs mb-5" style="color:var(--text2)">${ep.desc}</p>
+    <div class="card mb-4">
+      ${ppHtml}${qpHtml}${bodyHtml}
+      <button id="ep-send" onclick="execEp('${ep.id}')" class="btn btn-primary w-full">
+        <span id="ep-send-label">▶ Enviar</span>
+      </button>
+    </div>
+    ${sseHtml}
+    <div id="ep-res" class="hidden card"></div>
+  </div>`;
+}
+
+function useActive(p) {
+  const v = p.includes('contrato')?S.activeContratoId:p.includes('cuenta')?S.activeCuentaId:p.includes('session')?S.activeSessionId:null;
+  const el = document.getElementById('pp-'+p); if(el&&v) el.value=v;
+}
+function fmtBody() { const t=q('#ep-body'); if(!t)return; try{t.value=JSON.stringify(JSON.parse(t.value),null,2);}catch{} }
+
+async function execEp(epId) {
+  const ep = EP.find(e=>e.id===epId); if(!ep) return;
+  setBtnLoading('ep-send', true, '▶ Enviar');
+
+  let path = ep.path;
+  for (const p of (ep.pp||[])) { const v=document.getElementById('pp-'+p)?.value?.trim()||''; path=path.replace('{'+p+'}',v); }
+
+  const qps = {};
+  for (const qk of (ep.qp||[])) { const el=document.getElementById('qp-'+qk); if(el) qps[qk]=el.value.trim(); }
+
+  if (ep.isSSE) {
+    let body=null; const t=q('#ep-body'); if(t?.value?.trim()){try{body=JSON.parse(t.value);}catch{}} await execSSE(path,body); setBtnLoading('ep-send',false,'▶ Enviar'); return;
+  }
+
+  if (ep.isFile) {
+    const fi = document.getElementById('ep-file');
+    if (!fi?.files[0]) { showToast('⚠ Selecciona un archivo','warn'); setBtnLoading('ep-send',false,'▶ Enviar'); return; }
+    const fd = new FormData(); fd.append('file',fi.files[0]);
+    const tipo = document.getElementById('ep-qp-tipo')?.value||'contrato';
+    const cid = document.getElementById('ep-qp-contrato_id')?.value?.trim();
+    const fqp={tipo}; if(cid) fqp.contrato_id=cid;
+    const r = await apiFetch('POST',path,{body:fd,isFormData:true,qp:fqp});
+    renderEpRes(r); processResponse(ep.id,r.data); setBtnLoading('ep-send',false,'▶ Enviar'); return;
+  }
+
+  let body=null;
+  if (['POST','PUT','PATCH'].includes(ep.method)) {
+    const t=q('#ep-body'); if(t?.value?.trim()){try{body=JSON.parse(t.value);}catch{showToast('JSON inválido','error');setBtnLoading('ep-send',false,'▶ Enviar');return;}}
+  }
+  const r = await apiFetch(ep.method,path,{body,qp:qps});
+  renderEpRes(r); processResponse(ep.id,r.data); setBtnLoading('ep-send',false,'▶ Enviar');
+}
+
+function renderEpRes({status,data,elapsed}) {
+  const el = document.getElementById('ep-res'); if(!el) return;
+  el.classList.remove('hidden','res-ok','res-err');
+  const ok = status>=200&&status<300;
+  el.classList.add(ok?'res-ok':'res-err');
+  const pdfUrl = typeof data==='object'&&data?(data.pdf_url||data.presigned_url||null):null;
+  el.innerHTML = `<div class="flex items-center gap-3 mb-3">
+    <span class="badge ${ok?'badge-2xx':status>=400&&status<500?'badge-4xx':'badge-5xx'}">${status||0}</span>
+    <span class="text-xs" style="color:var(--text3)">${elapsed}ms</span>
+    <button onclick="copyText(document.getElementById('ep-res-pre').innerText)" class="btn-sm ml-auto">⎘ Copiar</button>
+    ${pdfUrl?`<a href="${pdfUrl}" target="_blank" class="btn-sm" style="color:var(--green)">📥 Abrir PDF</a>`:''}
+  </div>
+  <pre id="ep-res-pre" class="overflow-auto max-h-80 rounded-lg p-3 text-xs" style="background:var(--bg3)">${hlJson(data)}</pre>`;
+}
+
+// ─── SSE ─────────────────────────────────────────────────────────────────────
+async function execSSE(path, body) {
+  const wrap=q('#sse-wrap'), out=q('#sse-out');
+  if(wrap) wrap.classList.remove('hidden'); if(out) out.textContent='';
+  const url=S.baseUrl+path, headers={'Content-Type':'application/json'};
+  if(S.accessToken) headers['Authorization']='Bearer '+S.accessToken;
+  let full='', t0=performance.now();
+  try {
+    const resp=await fetch(url,{method:'POST',headers,body:body?JSON.stringify(body):null});
+    if(!resp.ok){const e=await resp.json().catch(()=>({})); renderEpRes({status:resp.status,data:e,elapsed:Math.round(performance.now()-t0)}); return;}
+    const reader=resp.body.getReader(),dec=new TextDecoder(); let buf='';
+    while(true){
+      const{done,value}=await reader.read(); if(done)break;
+      buf+=dec.decode(value,{stream:true}); const lines=buf.split('\n'); buf=lines.pop()||'';
+      for(const line of lines){
+        if(!line.startsWith('data: '))continue;
+        const raw=line.slice(6).trim(); if(!raw)continue;
+        try{const p=JSON.parse(raw); if(p.token){full+=p.token;if(out)out.textContent=full;} if(p.done&&out)out.textContent=p.full_response||full; if(p.error&&out)out.textContent+='[ERROR] '+p.error;}catch{}
+      }
+    }
+    const dot=q('#sse-dot'); if(dot){dot.classList.remove('sse-blink');dot.style.background='var(--text3)';}
+    renderEpRes({status:resp.status,data:{streaming_complete:true,chars:full.length},elapsed:Math.round(performance.now()-t0)});
+  } catch(e){if(out)out.textContent='[Error] '+e.message;}
+}
+
+// ─── API FETCH ────────────────────────────────────────────────────────────────
+async function apiFetch(method, path, {body=null,isFormData=false,qp={}}={}) {
+  const url=new URL(S.baseUrl+path);
+  for(const[k,v]of Object.entries(qp))if(v!==''&&v!=null)url.searchParams.set(k,v);
+  const headers={};
+  if(S.accessToken)headers['Authorization']='Bearer '+S.accessToken;
+  if(!isFormData&&body!=null)headers['Content-Type']='application/json';
+  const opts={method,headers};
+  if(body!=null)opts.body=isFormData?body:JSON.stringify(body);
+  const t0=performance.now();
+  let resp=await fetch(url.toString(),opts);
+  if(resp.status===401&&S.refreshToken){const ok=await tryRefresh();if(ok){headers['Authorization']='Bearer '+S.accessToken;resp=await fetch(url.toString(),{...opts,headers});}}
+  const elapsed=Math.round(performance.now()-t0);
+  let data=null;
+  if(resp.status!==204){const ct=resp.headers.get('content-type')||'';if(ct.includes('application/json'))data=await resp.json().catch(()=>null);else data=await resp.text().catch(()=>null);}
+  return{status:resp.status,data,elapsed};
+}
+async function tryRefresh(){if(!S.refreshToken)return false;try{const r=await fetch(S.baseUrl+'/api/v1/auth/refresh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({refresh_token:S.refreshToken})});if(!r.ok){setState({accessToken:null,refreshToken:null});return false;}const t=await r.json();setState({accessToken:t.access_token,refreshToken:t.refresh_token});return true;}catch{return false;}}
+
+// ─── PROCESS RESPONSE ────────────────────────────────────────────────────────
+function processResponse(epId, data) {
+  if(!data||typeof data!=='object') return;
+  if(data.access_token) setState({accessToken:data.access_token,refreshToken:data.refresh_token||S.refreshToken});
+  if(data.email) setState({activeEmail:data.email});
+  if(epId==='auth-logout') setState({accessToken:null,refreshToken:null,activeEmail:null});
+  if((epId.startsWith('contratos')&&data.id&&!epId.includes('ob-'))&&epId!=='contratos-ob-extraer') setState({activeContratoId:data.id});
+  if(data.contrato_id) setState({activeContratoId:data.contrato_id});
+  if(epId.startsWith('cuentas')&&data.id) setState({activeCuentaId:data.id});
+  if(data.session_id) setState({activeSessionId:data.session_id});
+  if(Array.isArray(data)&&data[0]){if(epId==='contratos-list')setState({activeContratoId:data[0].id});if(epId==='cuentas-list')setState({activeCuentaId:data[0].id});}
+}
+
+// ─── JSON HIGHLIGHT ───────────────────────────────────────────────────────────
+const UUID_RE=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function hlJson(obj) {
+  if(typeof obj==='string')return esc(obj);
+  if(obj===null||obj===undefined)return '<span style="color:var(--text3)">null</span>';
+  return esc(JSON.stringify(obj,null,2)).replace(
+    /(&quot;((?:[^&]|&(?!quot;))*?)&quot;(\s*:)?|true|false|null|-?\d+(?:\.\d*)?)/g,
+    m=>{
+      if(m==='true'||m==='false')return `<span style="color:var(--purple)">${m}</span>`;
+      if(m==='null')return `<span style="color:var(--red)">${m}</span>`;
+      if(/^-?\d/.test(m))return `<span style="color:var(--yellow)">${m}</span>`;
+      if(/:$/.test(m.replace(/&quot;/g,'"')))return `<span style="color:var(--blue)">${m}</span>`;
+      const inner=m.replace(/^&quot;|&quot;(:|$)/g,'').replace(/&quot;$/,'');
+      if(UUID_RE.test(inner))return `<span style="color:var(--green)">${m}</span><span class="copy-icon" onclick="copyText('${inner}')" title="Copiar UUID">⎘</span>`;
+      return `<span style="color:#a5d6a7">${m}</span>`;
+    }
+  );
+}
+
+// ─── CONTEXT BAR ─────────────────────────────────────────────────────────────
+function updateCtx() {
+  setText('ctx-email', S.activeEmail||'—');
+  const c=S.activeContratoId; setText('ctx-contrato',c?c.slice(0,8)+'…':'—'); setV('copy-c',!!c); setV('clear-c',!!c);
+  if(c){const p=document.getElementById('pill-contrato');if(p){p.style.background='var(--green-bg)';p.style.color='var(--green)';}}
+  else{const p=document.getElementById('pill-contrato');if(p){p.style.background='var(--bg3)';p.style.color='var(--text2)';}}
+  const u=S.activeCuentaId; setText('ctx-cuenta',u?u.slice(0,8)+'…':'—'); setV('copy-u',!!u); setV('clear-u',!!u);
+  if(u){const p=document.getElementById('pill-cuenta');if(p){p.style.background='var(--purple-bg)';p.style.color='var(--purple)';}}
+  else{const p=document.getElementById('pill-cuenta');if(p){p.style.background='var(--bg3)';p.style.color='var(--text2)';}}
+  const ses=S.activeSessionId; setText('ctx-session',ses?ses.slice(0,8)+'…':'—'); setV('copy-s',!!ses);
+}
+function updateAuthBadge() {
+  const b=document.getElementById('token-badge'),btn=document.getElementById('btn-logout');
+  if(S.accessToken){b.textContent='🟢 '+(S.activeEmail||'Autenticado');b.className='badge badge-2xx';if(btn)btn.classList.remove('hidden');}
+  else{b.textContent='Sin sesión';b.className='badge badge-0';if(btn)btn.classList.add('hidden');}
+}
+function copyCtx(t){const v=t==='contrato'?S.activeContratoId:t==='cuenta'?S.activeCuentaId:S.activeSessionId;if(v)copyText(v);}
+function clearCtx(t){if(t==='contrato')setState({activeContratoId:null});else setState({activeCuentaId:null});}
+function resetContext(){setState({activeContratoId:null,activeCuentaId:null,activeSessionId:null,activeEmail:null,accessToken:null,refreshToken:null});showToast('Contexto limpiado');}
+
+// ─── UTILS ────────────────────────────────────────────────────────────────────
+function q(sel){return document.querySelector(sel);}
+function setText(id,v){const el=document.getElementById(id);if(el)el.textContent=v;}
+function setV(id,v){const el=document.getElementById(id);if(el)el.classList.toggle('hidden',!v);}
+function esc(s){if(typeof s!=='string')return s;return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function copyText(t){navigator.clipboard.writeText(t).then(()=>showToast('⎘ Copiado'));}
+function setBtnLoading(id, loading, label='') {
+  const btn=document.getElementById(id); if(!btn)return;
+  btn.disabled=loading;
+  const lbl=document.getElementById(id+'-label');
+  if(loading){btn.innerHTML=`<span class="spinner"></span> Cargando…`;}
+  else{btn.innerHTML=lbl?'':label||(btn._origLabel||'Enviar');}
+  if(!loading&&label)btn.innerHTML=`<span id="${id}-label">${label}</span>`;
+}
+function showToast(msg, type='ok') {
+  const t=document.createElement('div');
+  const colors={ok:'var(--green2)',warn:'var(--orange)',error:'var(--red)'};
+  t.className='fade-in rounded-lg shadow-lg text-sm font-medium px-4 py-3';
+  t.style.cssText=`background:${colors[type]||colors.ok};color:#fff;max-width:300px`;
+  t.textContent=msg;
+  document.getElementById('toast-area').appendChild(t);
+  setTimeout(()=>t.classList.add('opacity-0','transition-opacity'),2200);
+  setTimeout(()=>t.remove(),2500);
+}
+
+// ─── INIT ─────────────────────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded',()=>{
+  renderSidebar();
+  updateCtx();
+  updateAuthBadge();
+
+  const sel=document.getElementById('base-url-select');
+  const ci=document.getElementById('custom-url-input');
+  const stored=S.baseUrl;
+  const opt=[...sel.options].find(o=>o.value===stored);
+  if(opt)sel.value=stored; else{sel.value='custom';ci.classList.remove('hidden');ci.value=stored;}
+
+  sel.addEventListener('change',e=>{
+    if(e.target.value==='custom'){ci.classList.remove('hidden');}
+    else{ci.classList.add('hidden');setState({baseUrl:e.target.value});}
+  });
+  ci.addEventListener('input',e=>setState({baseUrl:e.target.value.trim().replace(/\/$/,'')}));
+
+  document.getElementById('btn-logout').addEventListener('click',async()=>{
+    try{await apiFetch('POST','/api/v1/auth/logout');}catch{}
+    setState({accessToken:null,refreshToken:null,activeEmail:null});
+    showToast('Sesión cerrada');
+    if(S.currentView==='workflow')renderStepContent(S.currentStep);
+  });
+
+  // Start workflow
+  switchView('workflow');
+  renderStepper();
+  renderStepContent(0);
+});
+</script>
+</body>
+</html>

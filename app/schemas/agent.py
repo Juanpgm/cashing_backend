@@ -94,6 +94,13 @@ class DocumentUploadResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class ObligacionesExtraerResponse(BaseModel):
+    contrato_id: uuid.UUID
+    obligaciones: list[ObligacionExtraida]
+    total: int
+    avisos: list[str] = Field(default_factory=list)
+
+
 class DocumentProcessRequest(BaseModel):
     document_id: uuid.UUID
 

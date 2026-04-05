@@ -20,13 +20,23 @@ class LiteLLMAdapter:
         self._default_model = default_model or settings.LLM_DEFAULT_MODEL
 
     def _get_model_chain(self, model: str | None) -> list[str]:
-        """Return ordered list of models to try (primary → fallback → local).
+        """Return ordered list of models to try (primary → fallback → local/production-fallback).
 
-        Chain: requested model → LLM_FALLBACK_MODEL → LLM_LOCAL_MODEL (Ollama).
+        In production (settings.is_production), LLM_LOCAL_MODEL (Ollama) is replaced by
+        LLM_PRODUCTION_FALLBACK_MODEL when set, or silently dropped when not set.
+        Prevents Railway containers from hanging on a connection to a non-existent Ollama instance.
+
+        Chain: requested model → LLM_FALLBACK_MODEL → LLM_LOCAL_MODEL (dev)
+                                                     → LLM_PRODUCTION_FALLBACK_MODEL (prod)
         Duplicates are removed to avoid retrying the same model.
         """
         primary = model or self._default_model
-        candidates = [primary, settings.LLM_FALLBACK_MODEL, settings.LLM_LOCAL_MODEL]
+        local_candidate = settings.LLM_LOCAL_MODEL
+
+        if settings.is_production:
+            local_candidate = settings.LLM_PRODUCTION_FALLBACK_MODEL  # may be ""
+
+        candidates = [primary, settings.LLM_FALLBACK_MODEL, local_candidate]
         seen: set[str] = set()
         chain: list[str] = []
         for c in candidates:
