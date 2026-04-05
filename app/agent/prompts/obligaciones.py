@@ -20,7 +20,10 @@ OBLIGACIONES ESPECÍFICAS del contratista — las actividades y tareas técnicas
 desarrollar según el objeto del contrato.
 
 REGLAS ESTRICTAS:
-1. Busca ÚNICAMENTE en secciones tituladas "OBLIGACIONES ESPECÍFICAS" o similar.
+1. Busca en secciones que contengan obligaciones del contratista. Pueden titularse \
+"OBLIGACIONES ESPECÍFICAS", "OBLIGACIONES DEL CONTRATISTA", "OBLIGACIONES PARTICULARES", \
+"OBLIGACIONES ESPECÍFICAS DEL CONTRATISTA", "CLÁUSULA DE OBLIGACIONES" u otras similares. \
+Las obligaciones suelen venir enumeradas con números (1, 2, 3...) o letras (A, B, C...).
 2. EXTRAE SOLO las actividades que el contratista debe ejecutar como parte de su trabajo.
 3. NO INCLUYAS ninguna de estas (son obligaciones generales):
    - Pago de seguridad social, ARL, pensión, salud

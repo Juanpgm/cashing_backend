@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser
 from app.core.database import get_db
+from app.schemas.agent import ObligacionesExtraerResponse
 from app.schemas.contrato import (
     ContratoContextoAgenteResponse,
     ContratoCreate,
@@ -125,6 +126,32 @@ async def listar_periodos_pendientes(
     aún no han sido facturados.
     """
     return await contrato_service.listar_periodos_pendientes(db, user.id, contrato_id)
+
+
+@router.post("/{contrato_id}/obligaciones/extraer", response_model=ObligacionesExtraerResponse)
+async def extraer_obligaciones(
+    contrato_id: uuid.UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ObligacionesExtraerResponse:
+    """Extrae obligaciones contractuales del documento PDF del contrato usando LLM.
+
+    Busca el documento tipo `contrato` vinculado al contrato, lee su texto extraído y
+    corre el pipeline de extracción (chunking + LLM + deduplicación).
+    Las nuevas obligaciones se persisten en DB; las ya existentes se omiten.
+
+    **Requisito:** El documento del contrato debe haberse subido previamente con
+    `POST /documentos/upload?tipo=contrato` y el texto debe haberse extraído correctamente.
+    """
+    obligaciones, avisos = await document_service.extraer_obligaciones_documento(
+        contrato_id, user.id, db
+    )
+    return ObligacionesExtraerResponse(
+        contrato_id=contrato_id,
+        obligaciones=obligaciones,
+        total=len(obligaciones),
+        avisos=avisos,
+    )
 
 
 @router.post(

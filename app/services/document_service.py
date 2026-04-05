@@ -55,6 +55,8 @@ _CHUNK_OVERLAP = 500
 _OBLIGACION_SECTION_KW_TIER1 = [
     "OBLIGACIONES ESPECIFICAS",
     "OBLIGACIONES ESPECÍFICAS",
+    "OBLIGACIONES ESPECIFICAS DEL CONTRATISTA",
+    "OBLIGACIONES ESPECÍFICAS DEL CONTRATISTA",
 ]
 # Broader fallback (tier 2) — used only when tier-1 finds nothing.
 _OBLIGACION_SECTION_KW_TIER2 = [
@@ -62,6 +64,9 @@ _OBLIGACION_SECTION_KW_TIER2 = [
     "CLAUSULA DE OBLIGACIONES",
     "CLÁUSULA DE OBLIGACIONES",
     "OBLIGACIONES Y RESPONSABILIDADES",
+    "OBLIGACIONES PARTICULARES",
+    "OBLIGACIONES ESPECIALES",
+    "OBLIGACIONES CONTRACTUALES",
     "OBJETO DEL CONTRATO",
     "ALCANCE DEL TRABAJO",
 ]
@@ -90,7 +95,7 @@ def _extract_obligation_sections(texto: str) -> list[str]:
                 if idx == -1:
                     break
                 start = max(0, idx - 300)
-                end = min(len(texto), idx + _MAX_CHUNK_CHARS)
+                end = min(len(texto), idx + _MAX_CHUNK_CHARS * 2)
                 ranges.append((start, end))
                 pos = idx + len(kw)
         return ranges
@@ -222,6 +227,7 @@ async def _extraer_obligaciones(
     all_raw: list[ObligacionExtraida] = []
     seen_norm: set[str] = set()
     llm_errors = 0
+    first_error_hint: str = ""
 
     for i, chunk in enumerate(chunks):
         messages = [
@@ -232,11 +238,14 @@ async def _extraer_obligaciones(
             resp = await llm.complete(messages, temperature=0.0, max_tokens=4096)
         except Exception as exc:
             llm_errors += 1
+            hint = str(exc)[:300]
+            if not first_error_hint:
+                first_error_hint = hint
             await logger.awarning(
                 "obligaciones_llm_chunk_failed",
                 contrato_id=str(contrato_id),
                 chunk=i,
-                error=str(exc),
+                error=hint,
             )
             continue
 
@@ -263,9 +272,9 @@ async def _extraer_obligaciones(
         )
 
     if llm_errors > 0:
+        cause = f" Causa: {first_error_hint}" if first_error_hint else " Verifica la configuración del modelo LLM (API key, cuota, conectividad)."
         avisos.append(
-            f"La extracción de obligaciones falló en {llm_errors}/{len(chunks)} fragmentos. "
-            "Verifica la configuración del modelo LLM (API key, cuota, conectividad)."
+            f"La extracción de obligaciones falló en {llm_errors}/{len(chunks)} fragmentos.{cause}"
         )
 
     extraidas = all_raw
@@ -516,19 +525,6 @@ async def upload_document(
             contrato_id=str(effective_contrato_id),
             has_text=bool(existing_doc.texto_extraido),
         )
-        if tipo == TipoDocumentoFuente.CONTRATO and effective_contrato_id is not None:
-            # First check DB for previously extracted obligations
-            obligaciones_extraidas = await _obtener_obligaciones_existentes(
-                effective_contrato_id, db
-            )
-            # If none exist and we have text, try extraction now
-            if not obligaciones_extraidas and existing_doc.texto_extraido:
-                obligaciones_extraidas, ob_avisos = await _extraer_obligaciones(
-                    existing_doc.texto_extraido, effective_contrato_id, db
-                )
-                avisos.extend(ob_avisos)
-                if obligaciones_extraidas:
-                    await db.commit()
         return DocumentUploadResponse(
             id=existing_doc.id,
             nombre=existing_doc.nombre,
@@ -614,15 +610,6 @@ async def upload_document(
     )
     db.add(doc)
     await db.flush()
-
-    # Auto-extract obligations when uploading a contract document.
-    # Runs even when contrato_id is None (auto-create failed) so obligations
-    # are still returned for display — they just won't be persisted to DB.
-    if tipo == TipoDocumentoFuente.CONTRATO and texto_extraido:
-        obligaciones_extraidas, ob_avisos = await _extraer_obligaciones(
-            texto_extraido, contrato_id, db
-        )
-        avisos.extend(ob_avisos)
 
     await db.commit()
     await db.refresh(doc)
@@ -819,3 +806,47 @@ async def verificar_configuracion_contrato(
         documentos=docs_response,
         system_prompt=system_prompt,
     )
+
+
+async def extraer_obligaciones_documento(
+    contrato_id: uuid.UUID,
+    user_id: uuid.UUID,
+    db: AsyncSession,
+) -> tuple[list[ObligacionExtraida], list[str]]:
+    """Extrae obligaciones del documento tipo CONTRATO vinculado al contrato.
+
+    Busca el primer DocumentoFuente con tipo=CONTRATO y texto_extraido disponible,
+    verifica que pertenezca al usuario, ejecuta el pipeline LLM de extracción y
+    persiste las obligaciones en DB.
+
+    Returns (obligaciones, avisos).
+    Raises NotFoundError si no hay documento de contrato con texto extraído.
+    """
+    result = await db.execute(
+        select(DocumentoFuente)
+        .join(Contrato, DocumentoFuente.contrato_id == Contrato.id)
+        .where(
+            DocumentoFuente.contrato_id == contrato_id,
+            DocumentoFuente.tipo == TipoDocumentoFuente.CONTRATO,
+            DocumentoFuente.texto_extraido.is_not(None),
+            Contrato.usuario_id == user_id,
+            Contrato.deleted_at.is_(None),
+        )
+        .limit(1)
+    )
+    doc = result.scalar_one_or_none()
+    if doc is None:
+        raise NotFoundError(
+            "DocumentoFuente",
+            f"No se encontró un documento tipo 'contrato' con texto extraído para el contrato {contrato_id}. "
+            "Primero sube el PDF del contrato con POST /documentos/upload?tipo=contrato.",
+        )
+
+    obligaciones, avisos = await _extraer_obligaciones(doc.texto_extraido, contrato_id, db)
+    await db.commit()
+    await logger.ainfo(
+        "obligaciones_extraidas_endpoint",
+        contrato_id=str(contrato_id),
+        total=len(obligaciones),
+    )
+    return obligaciones, avisos

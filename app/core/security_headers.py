@@ -13,6 +13,8 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
     # Swagger/ReDoc paths that need relaxed CSP to load CDN assets
     _DOCS_PATHS = {"/docs", "/redoc", "/openapi.json"}
+    # Developer Test UI paths — allow TailwindCSS CDN + inline scripts
+    _TEST_UI_PATHS = {"/test-ui", "/static/test_ui.html"}
 
     async def dispatch(self, request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
         response = await call_next(request)
@@ -28,6 +30,15 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
                 "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
                 "img-src 'self' data: https://fastapi.tiangolo.com; "
                 "font-src 'self' https://cdn.jsdelivr.net;"
+            )
+        elif request.url.path in self._TEST_UI_PATHS:
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self'; "
+                "script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; "
+                "style-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; "
+                "connect-src 'self'; "
+                "img-src 'self' data:; "
+                "font-src 'self' https://cdn.tailwindcss.com;"
             )
         else:
             response.headers["Content-Security-Policy"] = "default-src 'none'"

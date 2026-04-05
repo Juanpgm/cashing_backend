@@ -46,17 +46,22 @@ class Settings(BaseSettings):
     S3_BUCKET_DOCUMENTOS: str = "cashin-documentos"
     S3_BUCKET_PDFS: str = "cashin-pdfs"
 
-    # LLM — Groq (free tier) as primary, Ollama as local fallback
+    # LLM — Groq for fast chat/routing; Gemini 2.5 Flash for document extraction (generous free tier)
+    # Gemini free tier: 1,000,000 TPM/day vs Groq 8b: ~20,000 TPM/day
+    # Note: gemini-2.0-flash and gemini-1.5-flash are deprecated for new accounts — use gemini-2.5-flash
     LLM_DEFAULT_MODEL: str = "groq/llama-3.1-8b-instant"
-    LLM_FALLBACK_MODEL: str = "groq/llama3-8b-8192"
+    LLM_FALLBACK_MODEL: str = "groq/llama-3.1-8b-instant"
     LLM_LOCAL_MODEL: str = "ollama/qwen2.5:7b"
-    # LLM_EXTRACTION_MODEL: model used specifically for document/obligation extraction.
-    # If empty, falls back to LLM_DEFAULT_MODEL.
-    # Use a more capable model for better extraction accuracy.
-    LLM_EXTRACTION_MODEL: str = "groq/llama-3.3-70b-versatile"
+    # LLM_EXTRACTION_MODEL: dedicated model for document/obligation extraction.
+    # Gemini 2.5 Flash: 1M TPM/day free — ideal for large contract documents.
+    LLM_EXTRACTION_MODEL: str = "gemini/gemini-2.5-flash"
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     GROQ_API_KEY: str = ""
     GEMINI_API_KEY: str = ""
+    # LLM_PRODUCTION_FALLBACK_MODEL: used in production instead of LLM_LOCAL_MODEL (Ollama).
+    # Set to e.g. "gemini/gemini-2.0-flash" and configure GEMINI_API_KEY.
+    # When empty and is_production=True, the Ollama slot is silently dropped.
+    LLM_PRODUCTION_FALLBACK_MODEL: str = ""
     OPENAI_API_KEY: str = ""
 
     # Google OAuth

@@ -24,3 +24,17 @@ class HealthResponse(BaseModel):
     status: str = "ok"
     environment: str
     version: str = "0.1.0"
+
+
+class LLMModelStatus(BaseModel):
+    model: str
+    reachable: bool
+    error: str | None = None
+    latency_ms: float | None = None
+
+
+class LLMHealthResponse(BaseModel):
+    status: str  # "ok" | "degraded" | "error"
+    is_production: bool
+    model_chain: list[str]
+    results: list[LLMModelStatus]
