@@ -8,6 +8,7 @@ from app.core.audit import log_audit_event
 from app.core.database import get_db
 from app.core.rate_limit import limiter
 from app.schemas.auth import (
+    ChangePasswordRequest,
     LoginRequest,
     RefreshRequest,
     RegisterRequest,
@@ -74,6 +75,40 @@ async def update_me(
     db: AsyncSession = Depends(get_db),
 ) -> UserResponse:
     return await auth_service.update_user(db, user.id, data)
+
+
+@router.post("/me/change-password", status_code=204)
+@limiter.limit("5/minute")
+async def change_password(
+    request: Request,
+    data: ChangePasswordRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Change the authenticated user's password."""
+    await auth_service.change_password(db, user.id, data)
+    await log_audit_event(
+        action="change_password",
+        user_id=str(user.id),
+        ip=request.client.host if request.client else "",
+    )
+    return Response(status_code=204)
+
+
+@router.delete("/me", status_code=204)
+async def delete_me(
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Soft-delete the authenticated user's account."""
+    await auth_service.delete_user(db, user.id)
+    await log_audit_event(
+        action="delete_account",
+        user_id=str(user.id),
+        ip=request.client.host if request.client else "",
+    )
+    return Response(status_code=204)
 
 
 @router.post("/logout", status_code=204)

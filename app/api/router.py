@@ -9,9 +9,11 @@ from app.api.v1.cuentas_cobro import router as cuentas_cobro_router
 from app.api.v1.documentos import router as documentos_router
 from app.api.v1.health import router as health_router
 from app.api.v1.secop import router as secop_router
+from app.api.v1.users import router as users_router
 
 api_v1_router = APIRouter(prefix="/api/v1")
 api_v1_router.include_router(auth_router)
+api_v1_router.include_router(users_router)
 api_v1_router.include_router(chat_router)
 api_v1_router.include_router(documentos_router)
 api_v1_router.include_router(contratos_router)

@@ -20,6 +20,8 @@ from app.models.credito import Credito, TipoCredito
 from app.models.token_blacklist import TokenBlacklist
 from app.models.usuario import RolUsuario, Usuario
 from app.schemas.auth import (
+    AdminUpdateUserRequest,
+    ChangePasswordRequest,
     RegisterRequest,
     TokenResponse,
     UpdateUserRequest,
@@ -74,7 +76,9 @@ async def login(db: AsyncSession, email: str, password: str) -> TokenResponse:
 
     if not verify_password(password, user.password_hash):
         user.failed_login_attempts += 1
-        await db.flush()
+        # Commit immediately so the counter persists even though the caller
+        # (get_db) will roll back the outer transaction when we raise below.
+        await db.commit()
         raise UnauthorizedError("Invalid email or password")
 
     # Reset failed attempts on success
@@ -112,8 +116,8 @@ async def refresh_tokens(db: AsyncSession, refresh_token_str: str) -> TokenRespo
     await db.flush()
 
     user_id = payload.get("sub", "")
-    result = await db.execute(select(Usuario).where(Usuario.id == uuid.UUID(user_id)))
-    user = result.scalar_one_or_none()
+    user_result = await db.execute(select(Usuario).where(Usuario.id == uuid.UUID(user_id)))
+    user = user_result.scalar_one_or_none()
 
     if user is None or not user.activo:
         raise UnauthorizedError("User not found or inactive")
@@ -133,9 +137,7 @@ async def get_user_by_id(db: AsyncSession, user_id: uuid.UUID) -> UserResponse:
     return UserResponse.model_validate(user)
 
 
-async def update_user(
-    db: AsyncSession, user_id: uuid.UUID, data: UpdateUserRequest
-) -> UserResponse:
+async def update_user(db: AsyncSession, user_id: uuid.UUID, data: UpdateUserRequest) -> UserResponse:
     """Update user profile fields."""
     result = await db.execute(select(Usuario).where(Usuario.id == user_id))
     user = result.scalar_one_or_none()
@@ -171,3 +173,61 @@ async def logout(db: AsyncSession, token: str) -> None:
     blacklist_entry = TokenBlacklist(jti=jti, expires_at=expires_at)
     db.add(blacklist_entry)
     await db.flush()
+
+
+async def change_password(db: AsyncSession, user_id: uuid.UUID, data: ChangePasswordRequest) -> None:
+    """Change a user's password after verifying the current one."""
+    result = await db.execute(select(Usuario).where(Usuario.id == user_id))
+    user = result.scalar_one_or_none()
+    if user is None:
+        raise NotFoundError("Usuario", str(user_id))
+
+    if not verify_password(data.current_password, user.password_hash):
+        raise UnauthorizedError("Current password is incorrect")
+
+    user.password_hash = hash_password(data.new_password)
+    await db.flush()
+
+
+async def delete_user(db: AsyncSession, user_id: uuid.UUID) -> None:
+    """Soft-delete a user account."""
+    result = await db.execute(select(Usuario).where(Usuario.id == user_id))
+    user = result.scalar_one_or_none()
+    if user is None:
+        raise NotFoundError("Usuario", str(user_id))
+
+    user.soft_delete()
+    user.activo = False
+    await db.flush()
+
+
+async def list_users(db: AsyncSession) -> list[UserResponse]:
+    """Return all non-deleted users (admin only)."""
+    result = await db.execute(select(Usuario).where(Usuario.deleted_at.is_(None)).order_by(Usuario.created_at.desc()))
+    users = result.scalars().all()
+    return [UserResponse.model_validate(u) for u in users]
+
+
+async def admin_update_user(db: AsyncSession, target_id: uuid.UUID, data: AdminUpdateUserRequest) -> UserResponse:
+    """Admin: update a user's active status, role, or reset their lockout counter."""
+    result = await db.execute(select(Usuario).where(Usuario.id == target_id))
+    user = result.scalar_one_or_none()
+    if user is None:
+        raise NotFoundError("Usuario", str(target_id))
+
+    if data.activo is not None:
+        user.activo = data.activo
+
+    if data.rol is not None:
+        try:
+            user.rol = RolUsuario(data.rol)
+        except ValueError as exc:
+            from app.core.exceptions import ValidationError
+
+            raise ValidationError(f"Invalid role: {data.rol}") from exc
+
+    if data.reset_failed_attempts:
+        user.failed_login_attempts = 0
+
+    await db.flush()
+    return UserResponse.model_validate(user)
