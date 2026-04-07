@@ -45,3 +45,14 @@ class UpdateUserRequest(BaseModel):
     nombre: str | None = Field(default=None, max_length=255)
     cedula: str | None = Field(default=None, max_length=20)
     telefono: str | None = Field(default=None, max_length=20)
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=8, max_length=128)
+
+
+class AdminUpdateUserRequest(BaseModel):
+    activo: bool | None = None
+    rol: str | None = None
+    reset_failed_attempts: bool = False

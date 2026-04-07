@@ -44,7 +44,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Run Alembic migrations (handles ALTER TABLE for existing columns)
     try:
         proc = await asyncio.create_subprocess_exec(
-            "alembic", "upgrade", "head",
+            "alembic",
+            "upgrade",
+            "head",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -75,10 +77,17 @@ app = FastAPI(
 
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(AuditMiddleware)
+
+# Use explicit origins from settings so that allow_credentials=True can be set.
+# allow_credentials + allow_origins=["*"] is forbidden by the CORS spec; if the
+# operator leaves CORS_ORIGINS as the default single-element wildcard list the
+# code falls back to permissive-but-no-credentials mode so the server still starts.
+_cors_origins = settings.CORS_ORIGINS
+_allow_credentials = "*" not in _cors_origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=_cors_origins,
+    allow_credentials=_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -95,9 +104,13 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 async def domain_error_handler(request: Request, exc: DomainError) -> JSONResponse:
     http_exc = domain_to_http(exc)
     trace_id = getattr(request.state, "trace_id", None)
+    headers: dict[str, str] = {}
+    if http_exc.status_code == 401:
+        headers["WWW-Authenticate"] = "Bearer"
     return JSONResponse(
         status_code=http_exc.status_code,
         content={"detail": http_exc.detail, "trace_id": trace_id},
+        headers=headers,
     )
 
 

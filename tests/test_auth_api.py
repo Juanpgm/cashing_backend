@@ -240,3 +240,200 @@ async def test_logout_unauthorized(client: AsyncClient) -> None:
     """Logout without a token should fail."""
     response = await client.post("/api/v1/auth/logout")
     assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_change_password_success(client: AsyncClient) -> None:
+    """User can change their password and then login with the new one."""
+    reg_payload = {
+        "email": "changepw@example.com",
+        "password": "OldPass123!",
+        "nombre": "ChangePW User",
+    }
+    await client.post("/api/v1/auth/register", json=reg_payload)
+
+    login_resp = await client.post(
+        "/api/v1/auth/login",
+        json={"email": "changepw@example.com", "password": "OldPass123!"},
+    )
+    token = login_resp.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    change_resp = await client.post(
+        "/api/v1/auth/me/change-password",
+        headers=headers,
+        json={"current_password": "OldPass123!", "new_password": "NewPass456!"},
+    )
+    assert change_resp.status_code == 204
+
+    # Old password should now be rejected
+    old_resp = await client.post(
+        "/api/v1/auth/login",
+        json={"email": "changepw@example.com", "password": "OldPass123!"},
+    )
+    assert old_resp.status_code == 401
+
+    # New password should work
+    new_resp = await client.post(
+        "/api/v1/auth/login",
+        json={"email": "changepw@example.com", "password": "NewPass456!"},
+    )
+    assert new_resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_change_password_wrong_current(client: AsyncClient, test_user: dict) -> None:
+    """Providing the wrong current password should fail."""
+    response = await client.post(
+        "/api/v1/auth/me/change-password",
+        headers=test_user["headers"],
+        json={"current_password": "WrongCurrent!", "new_password": "NewPass456!"},
+    )
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_change_password_too_short(client: AsyncClient, test_user: dict) -> None:
+    """New password shorter than 8 chars should be rejected with 422."""
+    response = await client.post(
+        "/api/v1/auth/me/change-password",
+        headers=test_user["headers"],
+        json={"current_password": "TestPass123!", "new_password": "short"},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_delete_me(client: AsyncClient, test_user: dict) -> None:
+    """User can delete their own account and can no longer authenticate after."""
+    # Account works before deletion
+    me_resp = await client.get("/api/v1/auth/me", headers=test_user["headers"])
+    assert me_resp.status_code == 200
+
+    # Delete account
+    del_resp = await client.delete("/api/v1/auth/me", headers=test_user["headers"])
+    assert del_resp.status_code == 204
+
+    # Token should be rejected after deletion
+    me_resp2 = await client.get("/api/v1/auth/me", headers=test_user["headers"])
+    assert me_resp2.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_401_has_www_authenticate_header(client: AsyncClient) -> None:
+    """401 responses must include WWW-Authenticate: Bearer."""
+    response = await client.get("/api/v1/auth/me")
+    assert response.status_code == 401
+    assert response.headers.get("www-authenticate") == "Bearer"
+
+
+# ---------- Admin /users endpoints ----------
+
+
+async def _make_admin(client: AsyncClient) -> dict:
+    """Register a user, promote them to admin in the DB, return headers."""
+    from app.core.security import create_access_token
+    from app.models.usuario import RolUsuario, Usuario
+    from sqlalchemy import select
+
+    from tests.conftest import async_session_test
+
+    payload = {
+        "email": "admin@example.com",
+        "password": "AdminPass1!",
+        "nombre": "Admin User",
+    }
+    await client.post("/api/v1/auth/register", json=payload)
+
+    # Promote to admin directly in the test DB
+    async with async_session_test() as session:
+        result = await session.execute(select(Usuario).where(Usuario.email == "admin@example.com"))
+        user = result.scalar_one()
+        user.rol = RolUsuario.ADMIN
+        await session.commit()
+        user_id = str(user.id)
+
+    admin_token = create_access_token(user_id, RolUsuario.ADMIN.value)
+    return {"headers": {"Authorization": f"Bearer {admin_token}"}, "user_id": user_id}
+
+
+@pytest.mark.asyncio
+async def test_list_users_admin(client: AsyncClient, test_user: dict) -> None:
+    """Admin can list all users."""
+    admin = await _make_admin(client)
+    response = await client.get("/api/v1/users/", headers=admin["headers"])
+    assert response.status_code == 200
+    data = response.json()
+    assert isinstance(data, list)
+    assert len(data) >= 1
+
+
+@pytest.mark.asyncio
+async def test_list_users_non_admin_forbidden(client: AsyncClient, test_user: dict) -> None:
+    """Non-admin cannot list users."""
+    response = await client.get("/api/v1/users/", headers=test_user["headers"])
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_admin_deactivate_user(client: AsyncClient, test_user: dict) -> None:
+    """Admin can deactivate a user; deactivated user cannot login."""
+    admin = await _make_admin(client)
+    user_id = str(test_user["user"].id)
+
+    patch_resp = await client.patch(
+        f"/api/v1/users/{user_id}",
+        headers=admin["headers"],
+        json={"activo": False},
+    )
+    assert patch_resp.status_code == 200
+    assert patch_resp.json()["activo"] is False
+
+    # Deactivated user should not be able to use their token
+    me_resp = await client.get("/api/v1/auth/me", headers=test_user["headers"])
+    assert me_resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_admin_reset_lockout(client: AsyncClient, test_user: dict) -> None:
+    """Admin can reset the failed login attempts counter."""
+
+    admin = await _make_admin(client)
+    user_id = str(test_user["user"].id)
+
+    patch_resp = await client.patch(
+        f"/api/v1/users/{user_id}",
+        headers=admin["headers"],
+        json={"reset_failed_attempts": True},
+    )
+    assert patch_resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_failed_login_attempts_persist_via_api(client: AsyncClient) -> None:
+    """Failed login via the API must increment the counter in the DB (regression test)."""
+    from app.models.usuario import Usuario
+    from sqlalchemy import select
+
+    reg = {
+        "email": "failcount@example.com",
+        "password": "StrongPass1!",
+        "nombre": "Fail Count",
+    }
+    await client.post("/api/v1/auth/register", json=reg)
+
+    # Two bad-password attempts through the API
+    for _ in range(2):
+        resp = await client.post(
+            "/api/v1/auth/login",
+            json={"email": "failcount@example.com", "password": "Wrong!"},
+        )
+        assert resp.status_code == 401
+
+    # Verify counter in DB using test session
+    from tests.conftest import async_session_test
+
+    async with async_session_test() as session:
+        result = await session.execute(select(Usuario).where(Usuario.email == "failcount@example.com"))
+        user = result.scalar_one()
+        assert user.failed_login_attempts == 2
