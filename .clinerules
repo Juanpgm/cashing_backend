@@ -22,7 +22,7 @@ Leer estos archivos antes de sugerir código:
 ## Stack
 
 - Python 3.12, FastAPI 0.115+, SQLAlchemy 2.0 async (asyncpg)
-- PostgreSQL 16, LangGraph 0.4+, LiteLLM 1.60+
+- PostgreSQL 16, custom async graph engine (CompiledGraph, replaces LangGraph), LiteLLM 1.60+
 - Pydantic v2, structlog, slowapi, WeasyPrint, pdfplumber
 
 ## Reglas de Código

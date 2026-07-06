@@ -7,17 +7,20 @@
 
 ## 1. Visión del Producto
 
-**CashIn** es un backend AI Agent-first que automatiza la creación de cuentas de cobro para contratistas colombianos de prestación de servicios. Un agente IA (LangGraph) procesa contratos, extrae obligaciones, clasifica actividades, recolecta evidencia, genera justificaciones y ensambla documentos finales (PDF).
+**CashIn** es un backend AI Agent-first que automatiza la creación de cuentas de cobro para contratistas colombianos de prestación de servicios. Un agente IA (LangGraph) procesa contratos, extrae obligaciones, recolecta evidencia desde Gmail/Drive/Calendar vía MCP, genera justificaciones y ensambla documentos finales (DOCX/PDF).
 
 **Usuario objetivo:** Contratista colombiano que necesita generar su cuenta de cobro mensual con evidencias organizadas.
 
 **Flujo de valor:**
 
 ```
-Contrato (PDF/DOCX) → Agente IA → Extracción de obligaciones
-                                  → Clasificación de actividades (LABORAL/NO_LABORAL/PARCIAL)
-                                  → Generación de justificación formal en español colombiano
-                                  → Ensamble de PDF final con carpetas de evidencia
+Contrato (PDF/DOCX) → Agente IA → Extracción de obligaciones contractuales
+                                 → Búsqueda de evidencia en Gmail (MCP: gmail_server)
+                                 → Matching LLM: email ↔ obligación
+                                 → Clasificación de actividades (LABORAL/NO_LABORAL/PARCIAL)
+                                 → Generación de justificación formal en español colombiano
+                                 → Generación de documento (DOCX/PDF)
+                                 → Subida a Google Drive con estructura de carpetas
 ```
 
 ---
@@ -34,11 +37,22 @@ Contrato (PDF/DOCX) → Agente IA → Extracción de obligaciones
 | DB                  | PostgreSQL                        | 16                     | Base de datos relacional                |
 | Agente IA           | LangGraph                         | 0.4+                   | Grafos de workflow con state management |
 | LLM                 | LiteLLM                           | 1.60+                  | 100+ modelos, fallback chains           |
+| LLM local           | Ollama                            | —                      | Modelos locales sin costo (dev/privacidad) |
+| MCP                 | mcp[cli] (Anthropic SDK)          | —                      | Servidores MCP para herramientas del agente |
 | Storage             | S3-compatible                     | boto3                  | MinIO (dev), Cloudflare R2 (prod)       |
 | Auth                | python-jose + bcrypt              | JWT HS256              | Tokens access/refresh                   |
+| OAuth               | google-auth-oauthlib              | —                      | OAuth 2.0 Google Workspace              |
+| Google APIs         | google-api-python-client          | —                      | Gmail, Drive, Calendar                  |
+| Token encryption    | cryptography (Fernet)             | —                      | Tokens OAuth cifrados en reposo         |
 | Pagos               | Wompi                             | httpx                  | Pasarela colombiana                     |
 | PDF                 | WeasyPrint + Jinja2               | —                      | HTML → PDF rendering                    |
-| Parsing             | pdfplumber, python-docx, openpyxl | —                      | Extracción de texto                     |
+| DOCX                | python-docx                       | —                      | Generación/llenado de plantillas Word   |
+| Parsing             | pdfplumber, pytesseract, openpyxl | —                      | Extracción texto + OCR                  |
+| Subagentes          | CrewAI                            | ≥0.100                 | Agentes paralelos complejos (evidencia, ensamblado) |
+| Checkpointing       | langgraph-checkpoint-postgres     | ≥2.0                   | Persistencia de estado del agente en PostgreSQL |
+| Embeddings          | pgvector + text-embedding-004     | —                      | Búsqueda semántica de evidencias y obligaciones |
+| Observabilidad      | Langfuse                          | ≥3.0                   | Trazas de LLM calls, scores, latencias  |
+| SECOP Colombia      | Socrata API (data.gov.co)         | —                      | Contratos públicos + documentos SECOP II |
 | Logging             | structlog                         | JSON prod, consola dev | Logging estructurado                    |
 | Rate Limit          | slowapi                           | —                      | Throttling por IP                       |
 | Validación archivos | python-magic                      | —                      | MIME type detection                     |
@@ -46,39 +60,52 @@ Contrato (PDF/DOCX) → Agente IA → Extracción de obligaciones
 ### 2.2 Capas de la Aplicación
 
 ```
-┌─────────────────────────────────────────────────┐
-│  API Layer (app/api/)                           │
-│  FastAPI routes, deps, rate limits, auth guards │
-│  Archivos: deps.py, router.py, v1/*.py          │
-├─────────────────────────────────────────────────┤
-│  Service Layer (app/services/)                  │
-│  Orquestación, lógica de negocio, persistencia  │
-│  Archivos: agent_service, auth_service,         │
-│            document_service                      │
-├─────────────────────────────────────────────────┤
-│  Agent Layer (app/agent/)                       │
-│  LangGraph grafo, nodos, prompts, tools         │
-│  Archivos: graph.py, state.py, nodes/, prompts/,│
-│            tools/                                │
-├─────────────────────────────────────────────────┤
-│  Adapter Layer (app/adapters/)                  │
-│  Ports & Adapters: LLM, Storage                 │
-│  Archivos: llm/port.py + litellm_adapter.py,   │
-│            storage/port.py + s3_adapter.py       │
-├─────────────────────────────────────────────────┤
-│  Core Layer (app/core/)                         │
-│  Config, DB, Security, Exceptions, Middleware    │
-│  Archivos: config.py, database.py, security.py, │
-│    exceptions.py, audit.py, rate_limit.py,       │
-│    file_validation.py, security_headers.py       │
-├─────────────────────────────────────────────────┤
-│  Model Layer (app/models/)                      │
-│  SQLAlchemy ORM, mixins, 16 domain entities      │
-├─────────────────────────────────────────────────┤
-│  Schema Layer (app/schemas/)                    │
-│  Pydantic v2 request/response validation         │
-│  Archivos: agent.py, auth.py, common.py          │
-└─────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│  MCP Servers (mcp_servers/)                             │
+│  Procesos independientes. Exponen tools al agente.      │
+│  Archivos: gmail_server.py, drive_server.py,            │
+│            calendar_server.py                           │
+│  Registro en: .claude/settings.json                     │
+├─────────────────────────────────────────────────────────┤
+│  API Layer (app/api/)                                   │
+│  FastAPI routes, deps, rate limits, auth guards         │
+│  Archivos: deps.py, router.py, v1/*.py                  │
+│  Integraciones: v1/integraciones.py (OAuth + Gmail +    │
+│                 Drive endpoints)                         │
+├─────────────────────────────────────────────────────────┤
+│  Service Layer (app/services/)                          │
+│  Orquestación, lógica de negocio, persistencia          │
+│  Archivos: agent_service, auth_service,                 │
+│            document_service, google_workspace_service    │
+├─────────────────────────────────────────────────────────┤
+│  Agent Layer (app/agent/)                               │
+│  LangGraph grafo, nodos, prompts, tools                 │
+│  Modos: CHAT | PIPELINE | EVIDENCE | DRIVE | CONFIG     │
+│  Archivos: graph.py, state.py, nodes/, prompts/,        │
+│            tools/                                        │
+├─────────────────────────────────────────────────────────┤
+│  Adapter Layer (app/adapters/)                          │
+│  Ports & Adapters: LLM, Storage, Email, Drive, Calendar │
+│  llm/: port.py + litellm_adapter.py                     │
+│  storage/: port.py + s3_adapter.py                      │
+│  email/: port.py + gmail_adapter.py                     │
+│  drive/: port.py + drive_adapter.py                     │
+│  calendar/: port.py + gcal_adapter.py                   │
+├─────────────────────────────────────────────────────────┤
+│  Core Layer (app/core/)                                 │
+│  Config, DB, Security, Exceptions, Middleware           │
+│  Archivos: config.py, database.py, security.py,         │
+│    exceptions.py, audit.py, rate_limit.py,              │
+│    file_validation.py, security_headers.py              │
+├─────────────────────────────────────────────────────────┤
+│  Model Layer (app/models/)                              │
+│  SQLAlchemy ORM, mixins, 17 domain entities             │
+│  Incluye: GoogleToken (OAuth tokens cifrados)           │
+├─────────────────────────────────────────────────────────┤
+│  Schema Layer (app/schemas/)                            │
+│  Pydantic v2 request/response validation                │
+│  Archivos: agent.py, auth.py, google_workspace.py       │
+└─────────────────────────────────────────────────────────┘
 ```
 
 ### 2.3 Flujo de Request
@@ -100,9 +127,20 @@ HTTP Request
 
 ```
 [User Input] → [Router Node] (LLM clasifica intención)
-  ├── mode=CHAT     → [Chat Node] → respuesta conversacional → END
-  ├── mode=PIPELINE → [Doc Ingestion] → [Doc Understanding] → [Classification] → [Justification] → END
-  └── mode=CONFIG   → [Config Handler] → END
+  ├── mode=CHAT      → [Chat Node] → respuesta conversacional → END
+  ├── mode=PIPELINE  → [Doc Ingestion] → [Doc Understanding] → [Classification] → [Justification] → END
+  ├── mode=EVIDENCE  → [Email Fetch] → [Obligation Matching] → [Justification Summary] → END
+  ├── mode=DRIVE                  → [Drive Upload] → END
+  ├── mode=CONFIG                 → [Config Handler] → END
+  ├── mode=SECOP_DISCOVERY        → [SECOP Discovery] → END                              [Fase 1]
+  ├── mode=REQUIREMENTS_INGESTION → [Requirements Ingestion] → END                       [Fase 2]
+  ├── mode=TEMPLATE_RESOLVE       → [Template Resolver] → (HIL si falta) → END          [Fase 2]
+  ├── mode=QUALITY_GATE           → [Quality Gate] → END                                 [Fase 3]
+  └── mode=CUENTA_COBRO_FULL      → [Supervisor] →                                       [Fase 6]
+        [SECOP Discovery] → [Requirements Ingestion] → [Entity Profile]
+        → [Template Resolver] → [Obligations Extraction] → [Quality Gate]
+        → [Evidence Orchestrator(CrewAI)] → [Evidence Matcher] → [Evidence Dedup]
+        → [Doc Assembly(CrewAI)] → [Folder Organizer] → [Human Review HIL] → END
 ```
 
 **Temperaturas por nodo:**
@@ -112,15 +150,56 @@ HTTP Request
 - Understanding: 0.1 (extracción precisa)
 - Classification: 0.0 (estricta)
 - Justification: 0.3 (creativa pero consistente)
+- Email matching: 0.0 (clasificación binaria)
+- Evidence summary: 0.3 (narrativa natural)
+
+**Modelos por tarea (optimización de tokens):**
+
+- Routing/clasificación → `groq/llama-3.1-8b-instant` (rápido, barato)
+- Extracción de obligaciones → `gemini/gemini-2.5-flash` (largo contexto)
+- Email matching → `groq/llama-3.1-8b-instant` (determinista)
+- Justificación/narrativa → `gemini/gemini-2.5-flash` (mejor lenguaje)
+- Dev/testing → `ollama/qwen2.5:7b` (gratis, local)
 
 ### 2.5 Ports & Adapters
 
-| Puerto (Protocol)                                                       | Adaptador Implementado | Alternativas Cloud                       |
-| ----------------------------------------------------------------------- | ---------------------- | ---------------------------------------- |
-| `LLMPort` (`complete()`, `stream()`)                                    | `LiteLLMAdapter`       | Gemini Flash-Lite → GPT-4o-mini → Ollama |
-| `StoragePort` (`upload()`, `download()`, `presigned_url()`, `delete()`) | `S3Adapter`            | MinIO (dev), R2 (prod), AWS S3           |
+| Puerto (Protocol)                                                       | Adaptador Implementado    | Backends Soportados                        |
+| ----------------------------------------------------------------------- | ------------------------- | ------------------------------------------ |
+| `LLMPort` (`complete()`, `stream()`)                                    | `LiteLLMAdapter`          | Gemini → Groq → Ollama (fallback chain)    |
+| `StoragePort` (`upload()`, `download()`, `presigned_url()`, `delete()`) | `S3Adapter`               | MinIO (dev), Cloudflare R2 (prod), AWS S3  |
+| `EmailPort` (`search_messages()`, `send_message()`, `get_message()`)    | `GmailAdapter`            | Gmail API (OAuth 2.0 + Fernet tokens)      |
+| `DrivePort` (`upload_file()`, `get_or_create_folder()`, `list_files()`) | `DriveAdapter`            | Google Drive API (tokens compartidos)      |
+| `CalendarPort` (`list_events()`, `get_event()`)                         | `GoogleCalendarAdapter`   | Google Calendar API                        |
 
-**Regla:** Nunca importar `boto3` directamente en services. Siempre usar `StoragePort`.
+**Reglas:**
+- Nunca importar `boto3` en services → usar `StoragePort`
+- Nunca importar `googleapiclient` en services → usar `EmailPort`/`DrivePort`
+- Todas las llamadas a Google APIs son bloqueantes → siempre `run_in_executor`
+- Tokens OAuth cifrados con Fernet antes de persistir en `google_tokens`
+
+### 2.6 MCP Servers
+
+Los MCP servers son procesos standalone (no parte del FastAPI app). Exponen tools al agente vía el protocolo MCP (stdio o SSE). Toda autenticación está centralizada en el backend — los MCP servers llaman a la API con un token de servicio.
+
+```
+mcp_servers/
+├── gmail_server.py    # Tools: search_emails, get_email, send_email
+├── drive_server.py    # Tools: upload_file, list_files, create_folder, make_shareable
+└── calendar_server.py # Tools: list_events, get_event
+```
+
+Registro en `mcp_servers/mcp_config.json` (fuente de verdad, versionado en repo):
+```json
+{
+  "mcpServers": {
+    "gmail":      { "command": "uv", "args": ["run", "python", "mcp_servers/gmail_server.py"] },
+    "drive":      { "command": "uv", "args": ["run", "python", "mcp_servers/drive_server.py"] },
+    "calendar":   { "command": "uv", "args": ["run", "python", "mcp_servers/calendar_server.py"] },
+    "filesystem": { "command": "uv", "args": ["run", "python", "mcp_servers/filesystem_server.py"], "enabled": false }
+  }
+}
+```
+Ver especificación completa en `docs/AGENT_SPECS.md` sección 8.
 
 ---
 
@@ -224,6 +303,8 @@ def node(state: AgentState) -> dict:
 | `DocumentoFuente` | documentos_fuente | Docs subidos (contrato/instrucciones/plantilla) |
 | `Plantilla`       | plantillas        | Templates HTML/Jinja2 para PDF                  |
 | `Conversacion`    | conversaciones    | Historial de chat (mensajes_json)               |
+| `AgentRun`        | agent_runs        | Métricas de ejecución del agente (tokens, costo, duración, nodo) |
+| `BorradorCuentaCobro` | borradores_cuenta_cobro | Borradores versionados con diff (v1, v2...) |
 
 ### Entidades Monetización
 
@@ -311,16 +392,18 @@ def node(state: AgentState) -> dict:
 
 ## 7. Roadmap
 
-| Fase | Nombre                                                   | Estado         |
-| ---- | -------------------------------------------------------- | -------------- |
-| 1    | Cimientos (DB, Auth, Core, Storage)                      | ✅ Completada  |
-| 2    | Motor del Agente IA (LangGraph, LLM, Tools)              | ✅ Completada  |
-| 3    | Contratos, Cuentas de Cobro, Plantillas (CRUD + estados) | 🔄 En progreso |
-| 4    | Integración Google Workspace + Evidencias                | ⬚ Pendiente    |
-| 5    | Pagos y Monetización (Wompi + créditos)                  | ⬚ Pendiente    |
-| 6    | Hardening de Seguridad (transversal)                     | 🔄 Continuo    |
-| 7    | GCP CLI Setup + OAuth Configuration                      | ⬚ Pendiente    |
-| 8    | Production-Ready (optimización, caché, notificaciones)   | ⬚ Pendiente    |
+| Fase | Nombre                                                             | Estado         |
+| ---- | ------------------------------------------------------------------ | -------------- |
+| 1    | Cimientos (DB, Auth, Core, Storage)                                | ✅ Completada  |
+| 2    | Motor del Agente IA (LangGraph, LLM, Tools)                        | ✅ Completada  |
+| 3    | Contratos, Cuentas de Cobro, Plantillas (CRUD + estados)           | 🔄 En progreso |
+| 4    | Google Workspace + MCP Servers + Evidencias (Gmail, Drive, OAuth)  | 🔄 En progreso |
+| 5    | Pagos y Monetización (Wompi + créditos)                            | ⬚ Pendiente    |
+| 6    | Hardening de Seguridad (transversal)                               | 🔄 Continuo    |
+| 7    | Generación de Documentos (DOCX/PDF con plantillas + OCR)           | ⬚ Pendiente    |
+| 8    | Integraciones adicionales (Outlook, Calendar, almacenamiento extra)| ⬚ Pendiente    |
+| 9    | Multi-cloud (GCP Cloud Run / AWS Lambda options)                   | ⬚ Pendiente    |
+| 10   | Production-Ready (caché LLM, notificaciones, CI/CD completo)       | ⬚ Pendiente    |
 
 ---
 
@@ -485,9 +568,11 @@ Posibles paths:
 - **GCP:** Cloud Run, Cloud SQL, Cloud Storage, Pub/Sub, Firebase Auth
 - **Azure:** Container Apps, Azure DB for PostgreSQL, Blob Storage, Service Bus
 
-### Google Workspace (Fase 4, No MVP)
+### Google Workspace (Fase 4, En progreso)
 
-- OAuth 2.0 Authorization Code + PKCE
-- Scopes mínimos: gmail.readonly, calendar.readonly, drive.metadata.readonly
-- Tokens refresh cifrados con Fernet
-- Aislamiento estricto por usuario
+- OAuth 2.0 Authorization Code: `GET /integraciones/google/connect` → callback → tokens
+- Scopes implementados: `gmail.readonly`, `gmail.send`, `drive.file`, `calendar.readonly`
+- Tokens refresh cifrados con Fernet, almacenados en tabla `google_tokens` (1:1 por usuario)
+- Auto-refresh en cada llamada si `expires_at < now()`
+- Aislamiento estricto por `usuario_id` — ningún adapter accede a tokens de otro usuario
+- MCP servers exponen las mismas capacidades al agente vía protocolo MCP

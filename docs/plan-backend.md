@@ -2,11 +2,11 @@
 
 ## TL;DR
 
-Reemplazar el plan-backend.md existente (CRUD-first) por un sistema **AI Agent-first** que automatiza la creación de cuentas de cobro para contratistas colombianos. El agente procesa contratos, extrae actividades, recolecta evidencia de Google Workspace, filtra contenido no-laboral, genera justificaciones y ensambla los documentos finales (PDF) con carpetas de evidencias organizadas.
+Sistema **AI Agent-first + MCP** que automatiza la creación de cuentas de cobro para contratistas colombianos. El agente procesa contratos (PDF/DOCX con OCR), extrae obligaciones contractuales, recolecta evidencia de Gmail/Drive/Calendar vía MCP servers, aplica matching semántico email↔obligación, genera justificaciones en español colombiano profesional y produce documentos (DOCX/PDF) listos para presentar.
 
-**Stack principal**: FastAPI 3.12 + LangGraph + LiteLLM + PostgreSQL + Cloudflare R2 (storage)
-**Deploy MVP**: Railway (backend + DB) — con configs para Docker, GCP Cloud Run y AWS Lambda
-**Monetización**: Sistema de créditos (pago por cuenta vía Wompi + suscripción mensual + tokens IA)
+**Stack principal**: FastAPI 3.12 + LangGraph + LiteLLM + Ollama + MCP + PostgreSQL + Cloudflare R2
+**Deploy MVP**: Railway (backend + DB) — arquitectura portable a GCP Cloud Run o AWS sin cambiar el core
+**Monetización**: Sistema de créditos (pago por cuenta vía Wompi + suscripción mensual)
 
 ---
 
@@ -107,20 +107,33 @@ Reemplazar el plan-backend.md existente (CRUD-first) por un sistema **AI Agent-f
     └───────→ [Output / Response]
 ```
 
-### Tools del Agente
+### Tools del Agente (implementadas como nodos LangGraph + MCP tools)
 
-- `parse_docx`: Extraer texto y estructura de .docx
-- `parse_pdf`: Extraer texto de PDF
-- `parse_excel`: Leer datos de Excel
-- `search_gmail`: Buscar correos en rango de fechas
-- `search_calendar`: Buscar eventos en rango
-- `search_drive`: Buscar archivos en rango
-- `classify_content`: Clasificar como laboral/no-laboral
-- `generate_justification`: Generar texto de justificación
-- `fill_template`: Llenar plantilla con datos
-- `generate_pdf`: Crear PDF final
-- `organize_evidence`: Crear estructura de carpetas
-- `upload_file`: Subir archivo a storage
+**Document Processing:**
+- `parse_pdf`: pdfplumber → fallback OCR (pytesseract) para contratos escaneados
+- `parse_docx`: python-docx para extracción de texto estructurado
+- `parse_excel`: openpyxl para datos tabulares
+- `extract_obligations`: two-tier keyword detection + LLM chunking (8000 chars + 500 overlap)
+
+**Evidence Collection (modo EVIDENCE):**
+- `build_gmail_queries`: genera queries Gmail específicas por obligación (max 5/obligación)
+- `search_gmail`: GmailAdapter.search_messages() con dedup por message_id
+- `match_email_to_obligation`: LLM temp=0.0 → RELEVANTE|alta/media o NO_RELEVANTE
+- `summarize_evidence`: narrativa estructurada de evidencia encontrada
+
+**Document Generation:**
+- `fill_docx_template`: python-docx con placeholders `{{campo}}`
+- `generate_pdf`: WeasyPrint + Jinja2 desde HTML template
+- `upload_to_drive`: DriveAdapter con carpetas `CashIn/{Entidad}/Contrato-{N}/{año}-{mes}/`
+
+**Classification:**
+- `classify_activity`: LLM temp=0.0 → LABORAL / NO_LABORAL / PARCIAL
+- `generate_justification`: LLM temp=0.3 → texto formal español colombiano
+
+**MCP Tools (expuestas via mcp_servers/):**
+- Gmail: `search_emails`, `get_email`, `send_email`
+- Drive: `upload_file`, `list_files`, `create_folder`, `make_shareable`
+- Calendar: `list_events`, `get_event`
 
 ---
 
@@ -217,14 +230,18 @@ cashin-backend/
 - Motor de Cuentas de Cobro (máquina de estados)
 - Generación de documentos (PDF)
 
-### FASE 4: Integración Google Workspace + Evidencias
+### FASE 4: Google Workspace + MCP Servers + Evidencias
 
-> Prioridad: MEDIA | Diferenciador del producto
+> Prioridad: ALTA | Diferenciador del producto | 🔄 En progreso
 
-- Google OAuth (gmail.readonly, calendar.readonly, drive.metadata.readonly)
-- Adapters Google (gmail, calendar, drive)
-- Clasificación inteligente (laboral vs personal)
-- Gestión de evidencias (upload, auto-collect, carpetas)
+- OAuth 2.0 flow completo: `GET /integraciones/google/connect` → callback → tokens Fernet-cifrados
+- Adapters implementados: `GmailAdapter`, `DriveAdapter` (tokens compartidos)
+- Nodos LangGraph: `email_fetch` (Gmail query building + dedup), `drive_upload` (carpetas automáticas)
+- MCP servers: `gmail_server.py`, `drive_server.py`, `calendar_server.py`
+- Matching semántico LLM: email ↔ obligación (temp=0.0, modelo barato)
+- Generación de justificaciones de actividades para cuentas de cobro
+- Esquema carpetas Drive: `CashIn/{Entidad}/Contrato-{N}/{año}-{mes}/`
+- Gestión de evidencias (upload S3, link a Evidencia model, presigned URLs)
 
 ### FASE 5: Pagos y Monetización
 
@@ -250,23 +267,50 @@ cashin-backend/
 - Dependency security (bandit, pip-audit, safety)
 - Security tests completos
 
-### FASE 7: Google Cloud CLI Setup
+### FASE 4.1: Google Cloud CLI Setup
 
-> Prioridad: ALTA | Necesario para Fase 4
+> Prerrequisito para Fase 4 — Configurar proyecto GCP y credenciales OAuth
 
-- Crear proyecto GCP + habilitar APIs
+- Crear proyecto GCP + habilitar APIs (Gmail, Drive, Calendar)
 - Configurar OAuth consent screen + credenciales
 - Scripts automatizados (setup_gcloud.ps1, load_secrets.py)
 - Pre-commit hooks de seguridad
 
-### FASE 8: Pulido y Production-Ready
+### FASE 7: Generación de Documentos (DOCX/PDF + OCR)
+
+> Prioridad: ALTA | Necesario para entregable final
+
+- DOCX desde plantillas Word con `python-docx` + llenado `{{campo}}`
+- PDF desde HTML con WeasyPrint + Jinja2 (encabezados, firma digital placeholder)
+- OCR para contratos escaneados: pdfplumber → fallback pytesseract (lang=spa)
+- Subida automática del documento generado a Google Drive
+
+### FASE 8: Integraciones adicionales
+
+> Prioridad: MEDIA | Amplía alcance
+
+- Outlook/Microsoft 365 via Microsoft Graph API (nuevo adapter `OutlookAdapter`)
+- Google Calendar para cruce de reuniones con obligaciones
+- Slack/Teams para notificaciones de cuenta de cobro lista
+- Almacenamiento extra: OneDrive, Dropbox (nuevos adapters)
+
+### FASE 9: Multi-cloud (post-MVP)
+
+> Prioridad: BAJA | Solo si escala lo requiere
+
+- GCP Cloud Run (Dockerfile ya compatible, `gcloud run deploy`)
+- AWS Lambda + API Gateway (agregar `Mangum` wrapper)
+- Secret Manager (reemplaza `.env` en producción)
+
+### FASE 10: Production-Ready
 
 > Prioridad: BAJA | Post-MVP
 
-- Procesamiento de instrucciones de cobro
-- Importación masiva (CSV/Excel)
-- Notificaciones (email)
-- Optimización de costos (caché LLM)
+- Caché LLM (redis para responses repetidas)
+- Notificaciones push (email/webhook cuando cuenta de cobro está lista)
+- Importación masiva de contratos (CSV/Excel)
+- CI/CD completo con GitHub Actions + Railway auto-deploy
+- Optimización de costos: routing inteligente de modelos por tarea
 
 ---
 

@@ -40,6 +40,9 @@ uv pip install -r requirements-dev.txt
 | `make format`              | `ruff check --fix + ruff format`             | Auto-fix estilo            |
 | `make security`            | `bandit + pip-audit`                         | Scan vulnerabilidades      |
 | `make clean`               | Eliminar `__pycache__`, `.pyc`, caches       | Limpiar proyecto           |
+| `make e2e`                 | `playwright test`                            | Tests Playwright (Fase 8)  |
+| `make load-test`           | `locust -f tests/locustfile.py`              | Load testing (Fase 7)      |
+| `make contract-test`       | `schemathesis run openapi.json`              | Contract testing           |
 
 ---
 
@@ -58,6 +61,10 @@ mypy app/             # Type check strict + Pydantic plugin
 - `pytest` + `pytest-asyncio` — Tests async automáticos
 - `httpx` — AsyncClient para tests HTTP sin servidor
 - `moto[s3]` — Mock de S3-compatible storage
+- `testcontainers[postgres]` — PostgreSQL real en Docker para tests de integración
+- `playwright` — E2E tests del frontend (Fase 8)
+- `locust` — Load testing y benchmarks (Fase 7)
+- `schemathesis` — Contract testing automático desde OpenAPI schema
 - `factory-boy` — Factories para generación de datos
 - `coverage[toml]` — Cobertura con config en pyproject.toml
 - `ruff` — Linter/formatter ultra-rápido
@@ -335,28 +342,51 @@ LLM_LOCAL_MODEL=ollama/llama3.1                    # Local ($0, para dev/test)
 
 ---
 
-## 9. Google Workspace (Fase 4, No MVP)
+## 9. Google Workspace (Fase 4, En progreso)
 
-> Preparado pero NO implementado en MVP.
+### Librerías instaladas
 
-### Librerías (ya en requirements.txt)
-
-- `google-api-python-client`
-- `google-auth`, `google-auth-oauthlib`, `google-auth-httplib2`
-
-### Variables de Entorno (setear cuando se implemente)
-
-```env
-GOOGLE_OAUTH_CLIENT_ID=
-GOOGLE_OAUTH_CLIENT_SECRET=
-GOOGLE_OAUTH_REDIRECT_URI=http://localhost:8000/api/v1/integraciones/google/callback
+```bash
+uv add google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2 cryptography "mcp[cli]"
 ```
 
-### Scopes mínimos (readonly)
+### Variables de Entorno
 
-- `gmail.readonly` — Lectura de correos por rango de fechas
-- `calendar.readonly` — Eventos por rango temporal
-- `drive.metadata.readonly` — Metadata de archivos
+```env
+GOOGLE_OAUTH_CLIENT_ID=xxx.apps.googleusercontent.com
+GOOGLE_OAUTH_CLIENT_SECRET=GOCSPX-xxx
+GOOGLE_OAUTH_REDIRECT_URI=http://localhost:8000/api/v1/integraciones/google/callback
+TOKEN_ENCRYPTION_KEY=<fernet-key>   # python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+### Setup OAuth (Google Cloud Console)
+
+1. APIs & Services → Credentials → Create OAuth 2.0 Client ID (Web app)
+2. Authorized redirect URIs: `http://localhost:8000/api/v1/integraciones/google/callback`
+3. APIs habilitadas: Gmail API, Drive API, Google Calendar API
+4. Modo de prueba: agregar test users en OAuth consent screen
+
+### Scopes implementados
+
+- `gmail.readonly` + `gmail.send` — Lectura y envío de correos
+- `drive.file` — Archivos creados por la app (no Drive completo)
+- `calendar.readonly` — Eventos del calendario
+- `openid`, `email`, `profile` — Identidad del usuario
+
+### MCP Servers (ejecutar en dev)
+
+```bash
+# En terminales separadas o como background processes:
+uv run python mcp_servers/gmail_server.py    # puerto stdio
+uv run python mcp_servers/drive_server.py
+uv run python mcp_servers/calendar_server.py
+```
+
+### Variable de entorno solo para dev
+
+```env
+OAUTHLIB_INSECURE_TRANSPORT=1   # Permite HTTP en localhost. NUNCA en producción.
+```
 
 ---
 
@@ -373,7 +403,8 @@ python scripts/load_secrets.py      # Carga secrets/.env.local en .env
 - Genera Fernet key para encriptar tokens OAuth
 - Escribe a `secrets/.env.local`
 
-### setup_gcloud.ps1 (solo si migra a GCP)
+### setup_gcloud.ps1 (si se usa GCP)
 
-- Crea proyecto GCP + habilita APIs
+- Crea proyecto GCP + habilita APIs (Gmail, Drive, Calendar)
 - Configura OAuth consent screen
+- Genera credenciales OAuth para download

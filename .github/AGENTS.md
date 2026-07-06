@@ -217,14 +217,26 @@ Asegurar calidad con pipeline reproducible en local y CI.
 
 ### Objetivo
 
-Implementar y mantener el workflow de agente LangGraph para procesamiento de documentos y chat.
+Implementar y mantener el workflow de agente LangGraph para procesamiento de documentos, chat, recolección de evidencia y generación de documentos.
 
 ### Arquitectura del workflow
 
 ```
 Input → [router] → chat mode     → [chat node] → END
                  → pipeline mode  → [doc_ingestion] → [doc_understanding] → [classification] → [justification] → END
+                 → evidence mode  → [email_fetch] → [obligation_matching] → [justification_summary] → END
+                 → drive mode     → [drive_upload] → END
 ```
+
+### Modos del router
+
+| Modo       | Palabra clave (LLM) | Trigger típico                                    |
+| ---------- | ------------------- | ------------------------------------------------- |
+| `chat`     | "chat"              | Preguntas conversacionales, consultas generales   |
+| `pipeline` | "pipeline"          | "procesa este documento", "analiza este contrato" |
+| `evidence` | "evidence"          | "busca evidencias", "revisa mis correos"          |
+| `drive`    | "drive"             | "sube a Drive", "guarda en Drive"                 |
+| `config`   | "config"            | Configuración de preferencias                     |
 
 ### Reglas de ejecución
 
@@ -232,14 +244,198 @@ Input → [router] → chat mode     → [chat node] → END
 2. Nodos retornan state parcial: `{**state, "key": value}` (spread pattern)
 3. Prompts versionados en `app/agent/prompts/` — nunca inline
 4. LLM vía `LLMPort` protocol — nunca importar litellm/openai directamente
-5. Tools en `app/agent/tools/` — funciones puras que operan sobre datos
-6. Registrar token usage para sistema de créditos
+5. Email/Drive vía `EmailPort`/`DrivePort` protocol — nunca importar googleapiclient directamente
+6. Tools en `app/agent/tools/` — funciones puras que operan sobre datos
+7. Registrar token usage para sistema de créditos
+8. Temperatura 0.0 para nodos de clasificación/routing, ≤0.3 para generación
 
 ### Criterios de salida
 
 - Workflow determinístico y reproducible
 - Tests para cada nodo individualmente
 - Manejo de errores LLM (fallback chain, reintentos)
+- `state["error"]` poblado en vez de excepción no capturada
+
+---
+
+## Agente: Evidence Collection
+
+### Objetivo
+
+Recolectar evidencia de cumplimiento contractual desde Gmail, mapearla a obligaciones específicas y generar justificaciones de actividades para la cuenta de cobro.
+
+### Entradas esperadas
+
+- `contrato_contexto`: `{fecha_inicio, fecha_fin, entidad, supervisor_email, numero}`
+- `obligaciones_contexto`: lista de `{id, descripcion, orden}`
+- `usuario_id`: para cargar tokens OAuth de Gmail
+
+### Reglas de ejecución
+
+1. Construir queries Gmail específicos por obligación (máx 5 queries por obligación)
+2. Buscar emails con `EmailPort.search_messages()`, deduplicar por `message_id`
+3. Matching LLM con temperatura 0.0: cada email contra cada obligación → `RELEVANTE|alta/media|razón` o `NO_RELEVANTE`
+4. Truncar cuerpo del email a 800 chars antes del LLM (el subject + primer párrafo contiene el 90% de la señal)
+5. Para evidencia encontrada → generar justificación con temperatura ≤0.3
+6. Si no hay evidencia → indicar explícitamente, no inventar actividades
+7. Usar modelo barato para matching (`groq/llama-3.1-8b-instant`), mejor para justificación (`gemini/gemini-2.5-flash`)
+8. Limitar a 5-7 obligaciones por ejecución para respetar rate limits Gmail
+
+### Criterios de salida
+
+- `email_evidence`: lista estructurada `[{obligacion_id, emails: [{message_id, subject, relevance}]}]`
+- `actividades_generadas`: lista `[{descripcion, obligacion_id, evidencia_ids}]`
+- `response`: resumen narrativo para mostrar al usuario
+
+---
+
+## Agente: MCP Integration
+
+### Objetivo
+
+Construir e integrar MCP servers Python que expongan capacidades de Google Workspace al agente y a Claude Code como herramientas reutilizables.
+
+### Entradas esperadas
+
+- Servicio objetivo: Gmail | Drive | Calendar | (futuro: Outlook, Slack, Notion)
+- Scopes OAuth requeridos
+- Endpoints de la API backend a usar
+
+### Reglas de ejecución
+
+1. Crear el MCP server en `mcp_servers/{servicio}_server.py` usando `mcp[cli]`
+2. El server llama a la API FastAPI (nunca directamente a Google) — auth centralizada
+3. Definir tools con `@app.list_tools()` y `@app.call_tool()` con schemas JSON claros
+4. Registrar en `.claude/settings.json` bajo `mcpServers`
+5. Para nuevo servicio Google: crear `adapters/{servicio}/port.py` + `{servicio}_adapter.py`
+6. OAuth: usar `OAUTHLIB_INSECURE_TRANSPORT=1` solo en dev, nunca en prod
+7. Scope mínimo requerido: `drive.file` (no `drive`), `gmail.readonly` + `gmail.send`
+8. Tokens: siempre encriptar con Fernet antes de guardar, desencriptar en memoria solo para llamadas API
+9. Credenciales Google: nunca en código ni en git — siempre `.env`
+
+### Criterios de salida
+
+- MCP server ejecutable: `uv run python mcp_servers/gmail_server.py`
+- Tools visibles en Claude Code vía `/mcp`
+- OAuth flow completo: connect → callback → status → revoke
+- Tests con credenciales mock o sandbox de Google
+
+---
+
+---
+
+## Agente: SECOP Discovery & Onboarding
+
+### Objetivo
+
+Detectar contratos activos en SECOP II por cédula y descargar documentos asociados para poblar automáticamente el contexto del contratista.
+
+### Entradas esperadas
+
+- `cedula`: número de identificación del contratista
+- O: formulario manual / PDF del contrato privado
+
+### Reglas de ejecución
+
+1. Usar `tools/secop_client.py` — cliente Socrata para dataset `jbjy-vk9h` (contratos) y `p6dx-8zbt` (documentos)
+2. Filtrar por `estado=vigente` y `tipo_contrato=prestacion_de_servicios`
+3. Descargar documentos referenciados a `documentos_fuente` via `StoragePort`
+4. Si SECOP no responde → `state.error` descriptivo, no excepción cruda
+5. Contrato privado: si el usuario sube PDF → procesar igual que SECOP (extracción completa); si llena formulario → persistir campos clave directamente
+6. Mock Socrata en tests con fixture `tests/fixtures/secop_contratos.json`
+
+### Criterios de salida
+
+- `secop_contratos`: lista con metadatos del contrato (referencia, objeto, valor, vigencia, entidad)
+- `secop_documentos`: lista de URLs de documentos disponibles
+- `documentos_fuente` persistidos en DB con metadata correcta
+- Tests: unit con mock, integración con cédula de prueba pública
+
+---
+
+## Agente: Template & Requirements Intelligence
+
+### Objetivo
+
+Comprender los requisitos de cuentas de cobro de cada entidad, construir su perfil y resolver qué plantillas usar, solicitando al usuario las que falten de forma ordenada.
+
+### Reglas de ejecución
+
+1. `requirements_ingestion_node`: usar `gemini/gemini-2.5-flash` con structured output → schema `EntityRequirements`
+2. `entity_profile_node`: re-usar perfil existente si la entidad ya fue procesada; actualizar si llegan nuevos docs
+3. `template_resolver_node`: buscar en tabla `plantillas` por `entidad_tipo + documento_tipo`
+4. Si falta plantilla → `interrupt()` con mensaje HIL que incluye: nombre del documento, campos requeridos, ejemplo de nombre de archivo, cómo subir
+5. Soportar logos (PNG/JPG), plantillas DOCX, PDF de ejemplo y archivos de instrucciones en texto
+6. Detección automática: analizar membrete, logo, nombre de entidad del contrato para clasificar tipo de entidad
+
+### Criterios de salida
+
+- `entity_requirements`: schema normalizado con documentos requeridos, plazos, formato de evidencias
+- `entity_profile_id`: UUID del perfil creado/actualizado en DB
+- `template_id`: UUID de la plantilla resuelta o `None` (con HIL activo)
+
+---
+
+## Agente: Evidence Orchestrator (CrewAI)
+
+### Objetivo
+
+Coordinar la recolección paralela de evidencia desde múltiples fuentes usando CrewAI, maximizando recall con mínimo tiempo de ejecución.
+
+### Crew: `EvidenceGatheringCrew`
+
+| Agente | Herramientas | Responsabilidad |
+|--------|-------------|----------------|
+| `GmailSearchAgent` | MCP gmail_server | Búsqueda de emails por obligación + período |
+| `DriveSearchAgent` | MCP drive_server | Búsqueda de archivos en Drive |
+| `CalendarSearchAgent` | MCP calendar_server | Eventos del período como evidencia de reuniones |
+
+### Reglas de ejecución
+
+1. Lanzar `EvidenceGatheringCrew.kickoff_async()` desde `evidence_orchestrator_node`
+2. Pasar contexto: `{obligaciones, periodo_inicio, periodo_fin, entidad_keywords}`
+3. Timeout: 120 segundos por crew; si se supera → usar evidencia parcial recolectada
+4. `evidence_matcher_node`: primero pgvector cosine (umbral ≥ 0.75), luego LLM refinement top-5
+5. `evidence_dedup_node`: SHA-256 del contenido + cosine ≥ 0.95 para duplicados
+6. Archivo `app/agent/crews/evidence_crew.py` — aislado, tests propios
+7. Compatibilidad: pinning estricto de `langchain-core` compartida con LangGraph
+
+### Criterios de salida
+
+- `matched_evidence`: dict `obligacion_id → [evidencias rankeadas por relevancia]`
+- `deduplicated_evidence`: sin duplicados por grupo
+- Recall ≥ 85% sobre dataset benchmark (Fase 4)
+
+---
+
+## Agente: Document Assembly (CrewAI)
+
+### Objetivo
+
+Generar en paralelo todos los documentos de la cuenta de cobro usando plantillas resueltas, obligaciones y evidencias consolidadas.
+
+### Crew: `DocAssemblyCrew`
+
+| Agente | Responsabilidad |
+|--------|----------------|
+| `CuentaCobroAgent` | Genera el cuerpo principal de la cuenta de cobro |
+| `InformeActividadesAgent` | Genera el informe de actividades con evidencias |
+| `AnexosAgent` | Prepara los anexos y organiza documentos de soporte |
+
+### Reglas de ejecución
+
+1. **Vista previa obligatoria**: siempre generar HTML preview antes de PDF/DOCX
+2. `GET /api/v1/cuentas-cobro/{id}/preview` → HTML renderizado con Jinja2
+3. PDF/DOCX solo se genera tras aprobación explícita (endpoint o botón UI)
+4. Usar plantilla resuelta por `template_resolver_node` — nunca improvisar formato
+5. Incluir logo de la entidad si está en `plantillas.logo_url`
+6. `folder_organizer_node`: estructura `{entidad_slug}/{referencia_contrato}/{YYYY-MM}/{tipo_doc}/`
+
+### Criterios de salida
+
+- `document_drafts`: lista con HTML de cada documento para preview
+- `folder_manifest`: mapa `tipo_doc → path/URL` en S3/Drive/local
+- Set completo para 5 entidades distintas pasa checklist 20 items (Fase 5)
 
 ---
 

@@ -1,4 +1,4 @@
-.PHONY: setup run dev up down migrate test lint security clean
+.PHONY: setup run dev up down migrate test lint security clean start-local kill-local
 
 # Setup
 setup:
@@ -13,12 +13,19 @@ run:
 dev:
 	uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
-# Docker
+# Docker (infra only — db, minio, redis; use start-local to run the backend without Docker)
 up:
-	docker compose -f deploy/docker/docker-compose.yml up -d
+	docker compose up -d db minio redis
 
 down:
-	docker compose -f deploy/docker/docker-compose.yml down
+	docker compose down
+
+# Local dev without Docker (PowerShell only — opens backend + frontend in new windows)
+start-local:
+	powershell -File scripts/start-local.ps1
+
+kill-local:
+	powershell -File scripts/kill-local.ps1
 
 # Database
 migrate:

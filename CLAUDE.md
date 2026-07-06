@@ -27,39 +27,68 @@ uv run pytest tests/path/to/test_file.py::test_name -v
 
 ## Architecture
 
-**Stack:** FastAPI + SQLAlchemy 2.0 async (asyncpg) + PostgreSQL 16 + LangGraph + LiteLLM
+**Stack:** FastAPI + SQLAlchemy 2.0 async (asyncpg) + PostgreSQL 16 + custom async graph engine (`CompiledGraph`) + LiteLLM + MCP
 
-The application is an AI-powered backend for automating Colombian contractor billing ("cuentas de cobro") via agent-driven workflows.
+> **Note:** The agent engine is a custom async graph runner at `app/agent/engine.py` (`CompiledGraph`, `END`, `HumanInterrupt`). It mirrors LangGraph's `StateGraph` builder API (`add_node`, `add_edge`, `add_conditional_edges`, `set_entry_point`, `compile`, `ainvoke`) but does NOT depend on LangGraph — `langgraph` is not imported anywhere and is absent from `requirements.txt`. Older planning docs that mention LangGraph are historical.
+
+The application is an AI-powered backend for automating Colombian contractor billing ("cuentas de cobro") via agent-driven workflows and MCP-based integrations.
 
 ### Request Flow
 
 ```
-HTTP Request → FastAPI (api/v1/) → Service Layer → LangGraph Agent → LLM (via LiteLLM) + DB + Storage
+HTTP Request → FastAPI (api/v1/) → Service Layer → Agent Engine (CompiledGraph) → LLM (via LiteLLM) + DB + Storage
+MCP Client   → MCP Servers (mcp_servers/) → Adapters (email/drive/calendar) → Google APIs
 ```
 
 For chat/document endpoints, the core execution path is:
 
 1. `api/v1/chat.py` or `api/v1/documentos.py` receives the request
-2. `services/agent_service.py` loads/creates conversation state and invokes LangGraph
-3. The **router node** (`agent/nodes/router.py`) classifies intent (chat / pipeline / config)
-4. Either the **chat node** (conversational) or **pipeline nodes** (document processing) execute
+2. `services/agent_service.py` loads/creates conversation state and invokes the compiled agent graph (custom engine, `agent/engine.py`)
+3. The **router node** (`agent/nodes/router.py`) classifies intent (chat / pipeline / config / evidence)
+4. Either the **chat node**, **pipeline nodes**, or **evidence node** execute
 5. Responses stream back or return as JSON with token usage
 
-### LangGraph Workflow
+### Agent Graph Workflow
 
 ```
-Input → [router] → chat mode  → [chat node] → END
-                → pipeline mode → [doc_ingestion] → [doc_understanding] → [classification] → [justification] → END
+Input → [router] → chat mode     → [chat node] → END
+                 → pipeline mode  → [doc_ingestion] → [doc_understanding] → [classification] → [justification] → END
+                 → evidence mode  → [email_fetch] → [obligation_matching] → [justification] → END
+                 → drive mode     → [drive_upload] → END
 ```
 
 State is typed via `AgentState` (`agent/state.py`) — a TypedDict with `total=False`. Nodes return partial state updates (spread pattern: `{**state, "key": value}`).
 
 ### Key Abstractions (Ports & Adapters)
 
-- **`adapters/llm/port.py`** — `LLMPort` Protocol with `complete()` and `stream()` methods. Implementation: `LiteLLMAdapter` (supports Gemini, OpenAI, Ollama with fallback chains).
-- **`adapters/storage/port.py`** — `StoragePort` Protocol for file operations. Implementation: `S3Adapter` (MinIO in dev, Cloudflare R2 in prod). Cloud-agnostic: works with any S3-compatible service.
+- **`adapters/llm/port.py`** — `LLMPort` with `complete()` and `stream()`. Implementation: `LiteLLMAdapter` (Gemini → Groq → Ollama fallback chain).
+- **`adapters/storage/port.py`** — `StoragePort` for file operations. Implementation: `S3Adapter` (MinIO dev, Cloudflare R2 prod).
+- **`adapters/email/port.py`** — `EmailPort` with `search_messages()`, `send_message()`. Implementation: `GmailAdapter` (Google API + Fernet-encrypted tokens).
+- **`adapters/drive/port.py`** — `DrivePort` with `upload_file()`, `get_or_create_folder()`, `make_shareable()`. Implementation: `DriveAdapter`.
+- **`adapters/calendar/port.py`** — `CalendarPort` with `list_events()`. Implementation: `GoogleCalendarAdapter`.
 
-Both are injected via FastAPI's dependency system (`api/deps.py`).
+All injected via FastAPI's dependency system (`api/deps.py`).
+
+### MCP Servers
+
+Standalone Python processes in `mcp_servers/` expose agent tools to Claude Code and other MCP clients. They proxy requests to the FastAPI backend (auth-centralized):
+
+```
+mcp_servers/
+├── gmail_server.py    # Tools: search_emails, get_email, send_email
+├── drive_server.py    # Tools: upload_file, list_files, create_folder
+└── calendar_server.py # Tools: list_events, get_event
+```
+
+Register in `.claude/settings.json`:
+```json
+{
+  "mcpServers": {
+    "gmail": { "command": "uv", "args": ["run", "python", "mcp_servers/gmail_server.py"] },
+    "drive": { "command": "uv", "args": ["run", "python", "mcp_servers/drive_server.py"] }
+  }
+}
+```
 
 ### Database Models
 
@@ -118,6 +147,10 @@ For every new feature, follow this sequence: `model → schema → service → a
 # ❌ Sync database calls → always AsyncSession
 # ❌ Import boto3 in services → use StoragePort
 # ❌ Import litellm/openai in agent nodes → use LLMPort
+# ❌ Call Google APIs directly in services → use EmailPort/DrivePort/CalendarPort
+# ❌ Call Google APIs synchronously → wrap with run_in_executor
+# ❌ Store OAuth tokens in plaintext → encrypt with Fernet before DB storage
+# ❌ MCP servers connecting to Google directly → proxy through FastAPI backend
 # ❌ print() → use structlog
 # ❌ Hardcoded secrets → use Settings via .env
 # ❌ shell=True in subprocess
@@ -151,13 +184,30 @@ docs: descripcion
 | Phase | Name | Status |
 |-------|------|--------|
 | 1 | Foundations (DB, Auth, Core, Storage) | ✅ Done |
-| 2 | AI Agent Engine (LangGraph, LLM, Tools) | ✅ Done |
+| 2 | AI Agent Engine (custom CompiledGraph, LLM, Tools) | ✅ Done |
 | 3 | Contracts, Cuentas de Cobro, Templates | 🔄 In progress |
-| 4 | Google Workspace + Evidence collection | ⬚ Pending |
+| 4 | Google Workspace + MCP Servers + Evidence | 🔄 In progress |
 | 5 | Payments & Monetization (Wompi + credits) | ⬚ Pending |
 | 6 | Security Hardening (continuous) | 🔄 Ongoing |
-| 7 | GCP CLI Setup + OAuth | ⬚ Pending |
-| 8 | Production-Ready (cache, notifications) | ⬚ Pending |
+| 7 | Document Generation (DOCX/PDF templates) | ⬚ Pending |
+| 8 | Additional Integrations (Outlook, Calendar, OCR) | ⬚ Pending |
+| 9 | Multi-cloud deployment (GCP/AWS options) | ⬚ Pending |
+| 10 | Production-Ready (cache, notifications, CI/CD) | ⬚ Pending |
+
+## MCP Development
+
+New capabilities follow this sequence: `adapter port → adapter impl → service → api endpoint → mcp_server tool → test`
+
+For Google Workspace tools:
+1. OAuth flow: `GET /integraciones/google/connect` → user grants scopes → `GET /integraciones/google/callback`
+2. Tokens encrypted with Fernet and stored in `google_tokens` table
+3. Adapters load tokens per `usuario_id`, auto-refresh on expiry
+4. MCP servers proxy tool calls to the backend API (never to Google directly)
+
+**Token encryption key generation:**
+```bash
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
 
 ## Code Style
 
