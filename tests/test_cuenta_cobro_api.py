@@ -154,6 +154,48 @@ async def test_listar_cuentas_cobro_con_datos(
     assert data[0]["id"] == str(cuenta_borrador.id)
 
 
+@pytest.mark.asyncio
+async def test_listar_cuentas_cobro_filtra_por_contrato(
+    client: AsyncClient,
+    test_user: dict[str, Any],
+    db: AsyncSession,
+    contrato: Contrato,
+    cuenta_borrador: CuentaCobro,
+) -> None:
+    """Each contrato must only expose its own cuentas: filtering by contrato_id
+    never leaks cuentas from a sibling contrato of the same user."""
+    user = test_user["user"]
+    otro_contrato = Contrato(
+        usuario_id=user.id,
+        numero_contrato="CTR-002-2024",
+        objeto="Otro contrato de prestación de servicios",
+        valor_total=24_000_000,
+        valor_mensual=2_000_000,
+        fecha_inicio=date(2024, 1, 1),
+        fecha_fin=date(2024, 12, 31),
+    )
+    db.add(otro_contrato)
+    await db.flush()
+    cuenta_otro = CuentaCobro(
+        contrato_id=otro_contrato.id,
+        mes=3,
+        anio=2024,
+        valor=2_000_000,
+        estado=EstadoCuentaCobro.BORRADOR,
+    )
+    db.add(cuenta_otro)
+    await db.commit()
+
+    resp = await client.get(
+        f"/api/v1/cuentas-cobro/?contrato_id={contrato.id}", headers=test_user["headers"]
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    ids = {item["id"] for item in data}
+    assert ids == {str(cuenta_borrador.id)}
+    assert str(cuenta_otro.id) not in ids
+
+
 # ---------------------------------------------------------------------------
 # GET /cuentas-cobro/{id}
 # ---------------------------------------------------------------------------

@@ -6,15 +6,22 @@ from typing import Any
 
 import app.models  # noqa: F401 — register all models for Base.metadata
 import pytest
+from app.core.config import settings
 from app.core.database import Base, get_db
 from app.core.rate_limit import limiter
 from app.core.security import create_access_token, hash_password
 from app.main import app as fastapi_app
+from cryptography.fernet import Fernet
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 # Disable rate limiting in tests
 limiter.enabled = False
+
+# Ensure a valid Fernet key for adapters that encrypt OAuth tokens (Gmail/Drive/Calendar).
+# The default placeholder in Settings is not a valid 32-byte base64 key.
+if len(settings.TOKEN_ENCRYPTION_KEY) != 44:
+    settings.TOKEN_ENCRYPTION_KEY = Fernet.generate_key().decode()
 
 # In-memory SQLite for tests
 TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"

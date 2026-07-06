@@ -14,7 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 # Patch path for get_llm — lazily imported inside service functions
 _PATCH_GET_LLM = "app.adapters.llm.get_llm"
 _PATCH_PARSE_PDF = "app.agent.tools.document_parser.parse_pdf"
-_PATCH_S3 = "app.services.document_service.S3StorageAdapter"
+_PATCH_S3 = "app.services.document_service._get_storage"
+_PATCH_GET_GRAPH = "app.services.agent_service.get_graph"
 
 
 # ── _parse_campos_llm unit tests ────────────────────────────────────
@@ -22,7 +23,7 @@ _PATCH_S3 = "app.services.document_service.S3StorageAdapter"
 
 class TestParseCamposLLM:
     def test_parse_valid_output(self) -> None:
-        from app.services.document_service import _parse_campos_llm
+        from app.agent.tools.contract_parser import parse_campos_llm as _parse_campos_llm
 
         llm_output = (
             "CAMPO|numero_contrato|CD-045-2025\n"
@@ -46,40 +47,50 @@ class TestParseCamposLLM:
         assert len(result) == 10
 
     def test_parse_partial_output(self) -> None:
-        from app.services.document_service import _parse_campos_llm
+        from app.agent.tools.contract_parser import parse_campos_llm as _parse_campos_llm
 
-        llm_output = (
-            "CAMPO|numero_contrato|CPS-123-2024\n"
-            "CAMPO|objeto|Consultoría técnica\n"
-        )
+        llm_output = "CAMPO|numero_contrato|CPS-123-2024\nCAMPO|objeto|Consultoría técnica\n"
         result = _parse_campos_llm(llm_output)
         assert len(result) == 2
         assert result["numero_contrato"] == "CPS-123-2024"
 
     def test_parse_ignores_invalid_fields(self) -> None:
-        from app.services.document_service import _parse_campos_llm
+        from app.agent.tools.contract_parser import parse_campos_llm as _parse_campos_llm
 
-        llm_output = (
-            "CAMPO|numero_contrato|CD-001\n"
-            "CAMPO|campo_invalido|algo\n"
-            "texto extra que no es campo\n"
-        )
+        llm_output = "CAMPO|numero_contrato|CD-001\nCAMPO|campo_invalido|algo\ntexto extra que no es campo\n"
         result = _parse_campos_llm(llm_output)
         assert len(result) == 1
         assert "campo_invalido" not in result
 
     def test_parse_empty_output(self) -> None:
-        from app.services.document_service import _parse_campos_llm
+        from app.agent.tools.contract_parser import parse_campos_llm as _parse_campos_llm
 
         result = _parse_campos_llm("")
         assert result == {}
 
     def test_parse_markdown_bold_campo(self) -> None:
-        from app.services.document_service import _parse_campos_llm
+        from app.agent.tools.contract_parser import parse_campos_llm as _parse_campos_llm
 
         llm_output = "**CAMPO**|numero_contrato|CD-045-2025\n"
         result = _parse_campos_llm(llm_output)
         assert result["numero_contrato"] == "CD-045-2025"
+
+    def test_parse_new_location_and_supervisor_fields(self) -> None:
+        from app.agent.tools.contract_parser import parse_campos_llm as _parse_campos_llm
+
+        llm_output = (
+            "CAMPO|pais|Colombia\n"
+            "CAMPO|departamento|Antioquia\n"
+            "CAMPO|ciudad|Medellín\n"
+            "CAMPO|direccion_ejecucion|Calle 44 # 52-165, Alpujarra\n"
+            "CAMPO|cargo_supervisor|Director de TIC\n"
+        )
+        result = _parse_campos_llm(llm_output)
+        assert result["pais"] == "Colombia"
+        assert result["departamento"] == "Antioquia"
+        assert result["ciudad"] == "Medellín"
+        assert result["direccion_ejecucion"] == "Calle 44 # 52-165, Alpujarra"
+        assert result["cargo_supervisor"] == "Director de TIC"
 
 
 # ── _parse_obligaciones_llm unit tests ──────────────────────────────
@@ -87,7 +98,7 @@ class TestParseCamposLLM:
 
 class TestParseObligacionesLLM:
     def test_parse_standard_format(self) -> None:
-        from app.services.document_service import _parse_obligaciones_llm
+        from app.agent.tools.contract_parser import parse_obligaciones_llm as _parse_obligaciones_llm
 
         output = (
             "OBLIGACION|especifica|Diseñar los módulos del sistema\n"
@@ -100,7 +111,7 @@ class TestParseObligacionesLLM:
         assert result[0].descripcion == "Diseñar los módulos del sistema"
 
     def test_parse_accented_obligacion(self) -> None:
-        from app.services.document_service import _parse_obligaciones_llm
+        from app.agent.tools.contract_parser import parse_obligaciones_llm as _parse_obligaciones_llm
 
         output = (
             "OBLIGACIÓN|específica|Diseñar los módulos del sistema\n"
@@ -113,7 +124,7 @@ class TestParseObligacionesLLM:
         assert result[0].descripcion == "Diseñar los módulos del sistema"
 
     def test_parse_accented_especifica_normalized(self) -> None:
-        from app.services.document_service import _parse_obligaciones_llm
+        from app.agent.tools.contract_parser import parse_obligaciones_llm as _parse_obligaciones_llm
 
         output = "OBLIGACION|específica|Presentar informes mensuales\n"
         result = _parse_obligaciones_llm(output)
@@ -121,55 +132,44 @@ class TestParseObligacionesLLM:
         assert result[0].tipo == "especifica"
 
     def test_parse_numbered_lines(self) -> None:
-        from app.services.document_service import _parse_obligaciones_llm
+        from app.agent.tools.contract_parser import parse_obligaciones_llm as _parse_obligaciones_llm
 
-        output = (
-            "1. OBLIGACION|especifica|Diseñar módulos\n"
-            "2. OBLIGACION|general|Pagar seguridad social\n"
-        )
+        output = "1. OBLIGACION|especifica|Diseñar módulos\n2. OBLIGACION|general|Pagar seguridad social\n"
         result = _parse_obligaciones_llm(output)
         assert len(result) == 1
         assert result[0].tipo == "especifica"
 
     def test_parse_bulleted_lines(self) -> None:
-        from app.services.document_service import _parse_obligaciones_llm
+        from app.agent.tools.contract_parser import parse_obligaciones_llm as _parse_obligaciones_llm
 
-        output = (
-            "- OBLIGACION|especifica|Diseñar módulos\n"
-            "* OBLIGACION|general|Pagar seguridad social\n"
-        )
+        output = "- OBLIGACION|especifica|Diseñar módulos\n* OBLIGACION|general|Pagar seguridad social\n"
         result = _parse_obligaciones_llm(output)
         assert len(result) == 1
         assert result[0].tipo == "especifica"
 
     def test_parse_markdown_bold(self) -> None:
-        from app.services.document_service import _parse_obligaciones_llm
+        from app.agent.tools.contract_parser import parse_obligaciones_llm as _parse_obligaciones_llm
 
         output = "**OBLIGACION**|especifica|Diseñar módulos del sistema\n"
         result = _parse_obligaciones_llm(output)
         assert len(result) == 1
 
     def test_parse_code_fenced_response(self) -> None:
-        from app.services.document_service import _parse_obligaciones_llm
+        from app.agent.tools.contract_parser import parse_obligaciones_llm as _parse_obligaciones_llm
 
-        output = (
-            "```\n"
-            "OBLIGACION|especifica|Diseñar módulos\n"
-            "OBLIGACION|general|Pagar seguridad social\n"
-            "```\n"
-        )
+        output = "```\nOBLIGACION|especifica|Diseñar módulos\nOBLIGACION|general|Pagar seguridad social\n```\n"
         result = _parse_obligaciones_llm(output)
         assert len(result) == 1
         assert result[0].tipo == "especifica"
 
     def test_parse_empty_returns_empty(self) -> None:
-        from app.services.document_service import _parse_obligaciones_llm
+        from app.agent.tools.contract_parser import parse_obligaciones_llm as _parse_obligaciones_llm
 
         assert _parse_obligaciones_llm("") == []
         assert _parse_obligaciones_llm("No se encontraron obligaciones.") == []
 
     def test_parse_mixed_accented_and_numbered(self) -> None:
-        from app.services.document_service import _parse_obligaciones_llm
+        from app.agent.tools.contract_parser import parse_obligaciones_llm as _parse_obligaciones_llm
 
         output = (
             "1. OBLIGACIÓN|específica|Diseñar e implementar los módulos del sistema\n"
@@ -190,27 +190,24 @@ class TestExtraerDatosContrato:
     async def test_extraction_success(self) -> None:
         from app.services.document_service import _extraer_datos_contrato
 
-        mock_response = LLMResponse(
-            content=(
-                "CAMPO|numero_contrato|CD-045-2025\n"
-                "CAMPO|objeto|Prestación de servicios profesionales\n"
-                "CAMPO|valor_total|12000000.00\n"
-                "CAMPO|valor_mensual|2000000.00\n"
-                "CAMPO|fecha_inicio|2025-01-15\n"
-                "CAMPO|fecha_fin|2025-07-14\n"
-                "CAMPO|supervisor_nombre|María García\n"
-                "CAMPO|entidad|MinTIC\n"
-            ),
-            model="test",
-            total_tokens=100,
+        mock_graph = AsyncMock()
+        mock_graph.ainvoke = AsyncMock(
+            return_value={
+                "contrato_extraido": {
+                    "numero_contrato": "CD-045-2025",
+                    "objeto": "Prestación de servicios profesionales",
+                    "valor_total": "12000000.00",
+                    "valor_mensual": "2000000.00",
+                    "fecha_inicio": "2025-01-15",
+                    "fecha_fin": "2025-07-14",
+                    "supervisor_nombre": "María García",
+                    "entidad": "MinTIC",
+                }
+            }
         )
 
-        with patch(_PATCH_GET_LLM) as mock_get_llm:
-            mock_llm = AsyncMock()
-            mock_llm.complete = AsyncMock(return_value=mock_response)
-            mock_get_llm.return_value = mock_llm
-
-            result = await _extraer_datos_contrato("Texto del contrato de prueba...")
+        with patch(_PATCH_GET_GRAPH, return_value=mock_graph):
+            result, _avisos = await _extraer_datos_contrato("Texto del contrato de prueba...")
             assert result is not None
             assert result.numero_contrato == "CD-045-2025"
             assert result.objeto == "Prestación de servicios profesionales"
@@ -225,53 +222,42 @@ class TestExtraerDatosContrato:
     async def test_extraction_llm_failure(self) -> None:
         from app.services.document_service import _extraer_datos_contrato
 
-        with patch(_PATCH_GET_LLM) as mock_get_llm:
-            mock_llm = AsyncMock()
-            mock_llm.complete = AsyncMock(side_effect=RuntimeError("LLM error"))
-            mock_get_llm.return_value = mock_llm
+        mock_graph = AsyncMock()
+        mock_graph.ainvoke = AsyncMock(side_effect=RuntimeError("LLM error"))
 
-            result = await _extraer_datos_contrato("Texto del contrato...")
+        with patch(_PATCH_GET_GRAPH, return_value=mock_graph):
+            result, _avisos = await _extraer_datos_contrato("Texto del contrato...")
             assert result is None
 
     @pytest.mark.asyncio
     async def test_extraction_insufficient_data(self) -> None:
         from app.services.document_service import _extraer_datos_contrato
 
-        mock_response = LLMResponse(
-            content="CAMPO|supervisor_nombre|María García\n",
-            model="test",
-            total_tokens=50,
-        )
+        mock_graph = AsyncMock()
+        mock_graph.ainvoke = AsyncMock(return_value={"contrato_extraido": {"supervisor_nombre": "María García"}})
 
-        with patch(_PATCH_GET_LLM) as mock_get_llm:
-            mock_llm = AsyncMock()
-            mock_llm.complete = AsyncMock(return_value=mock_response)
-            mock_get_llm.return_value = mock_llm
-
-            result = await _extraer_datos_contrato("Texto sin datos útiles...")
+        with patch(_PATCH_GET_GRAPH, return_value=mock_graph):
+            result, _avisos = await _extraer_datos_contrato("Texto sin datos útiles...")
             assert result is None
 
     @pytest.mark.asyncio
     async def test_extraction_colombian_number_format(self) -> None:
         from app.services.document_service import _extraer_datos_contrato
 
-        mock_response = LLMResponse(
-            content=(
-                "CAMPO|numero_contrato|CD-001\n"
-                "CAMPO|objeto|Consultoría\n"
-                "CAMPO|valor_total|12.000.000,50\n"
-                "CAMPO|valor_mensual|2.000.000,00\n"
-            ),
-            model="test",
-            total_tokens=80,
+        mock_graph = AsyncMock()
+        mock_graph.ainvoke = AsyncMock(
+            return_value={
+                "contrato_extraido": {
+                    "numero_contrato": "CD-001",
+                    "objeto": "Consultoría",
+                    "valor_total": "12.000.000,50",
+                    "valor_mensual": "2.000.000,00",
+                }
+            }
         )
 
-        with patch(_PATCH_GET_LLM) as mock_get_llm:
-            mock_llm = AsyncMock()
-            mock_llm.complete = AsyncMock(return_value=mock_response)
-            mock_get_llm.return_value = mock_llm
-
-            result = await _extraer_datos_contrato("Texto del contrato...")
+        with patch(_PATCH_GET_GRAPH, return_value=mock_graph):
+            result, _avisos = await _extraer_datos_contrato("Texto del contrato...")
             assert result is not None
             assert result.valor_total == Decimal("12000000.50")
             assert result.valor_mensual == Decimal("2000000.00")
@@ -293,19 +279,21 @@ class TestUploadDocumentAutoCreate:
 
         user = test_user["user"]
 
-        llm_extraction_response = LLMResponse(
-            content=(
-                "CAMPO|numero_contrato|CD-099-2025\n"
-                "CAMPO|objeto|Prestación de servicios profesionales de desarrollo\n"
-                "CAMPO|valor_total|18000000.00\n"
-                "CAMPO|valor_mensual|3000000.00\n"
-                "CAMPO|fecha_inicio|2025-02-01\n"
-                "CAMPO|fecha_fin|2025-07-31\n"
-                "CAMPO|entidad|MinTIC\n"
-            ),
-            model="test",
-            total_tokens=100,
+        mock_graph = AsyncMock()
+        mock_graph.ainvoke = AsyncMock(
+            return_value={
+                "contrato_extraido": {
+                    "numero_contrato": "CD-099-2025",
+                    "objeto": "Prestación de servicios profesionales de desarrollo",
+                    "valor_total": "18000000.00",
+                    "valor_mensual": "3000000.00",
+                    "fecha_inicio": "2025-02-01",
+                    "fecha_fin": "2025-07-31",
+                    "entidad": "MinTIC",
+                }
+            }
         )
+
         llm_obligaciones_response = LLMResponse(
             content=(
                 "OBLIGACION|especifica|Desarrollar módulos del sistema de información\n"
@@ -315,22 +303,23 @@ class TestUploadDocumentAutoCreate:
             total_tokens=80,
         )
 
-        call_count = 0
-
-        async def mock_complete(messages: Any, **kwargs: Any) -> LLMResponse:
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                return llm_extraction_response
-            return llm_obligaciones_response
-
         with (
+            patch(_PATCH_GET_GRAPH, return_value=mock_graph),
             patch(_PATCH_GET_LLM) as mock_get_llm,
-            patch(_PATCH_PARSE_PDF, return_value="Texto completo del contrato..."),
+            patch(
+                _PATCH_PARSE_PDF,
+                return_value=(
+                    "CONTRATO DE PRESTACIÓN DE SERVICIOS PROFESIONALES No. CD-099-2025 "
+                    "celebrado entre el Ministerio de TIC y el contratista para el desarrollo "
+                    "de módulos de software. OBJETO: prestación de servicios profesionales de "
+                    "desarrollo. VALOR TOTAL: dieciocho millones de pesos. PLAZO: del 1 de "
+                    "febrero al 31 de julio de 2025. OBLIGACIONES ESPECÍFICAS del contratista."
+                ),
+            ),
             patch(_PATCH_S3) as mock_storage_cls,
         ):
             mock_llm = AsyncMock()
-            mock_llm.complete = AsyncMock(side_effect=mock_complete)
+            mock_llm.complete = AsyncMock(return_value=llm_obligaciones_response)
             mock_get_llm.return_value = mock_llm
 
             mock_storage = AsyncMock()
@@ -353,6 +342,158 @@ class TestUploadDocumentAutoCreate:
         assert result.contrato_creado.entidad == "MinTIC"
         assert len(result.obligaciones_extraidas) == 2
         assert all(o.tipo == "especifica" for o in result.obligaciones_extraidas)
+
+    @pytest.mark.asyncio
+    async def test_upload_contract_auto_creates_with_location_fields(
+        self,
+        db: AsyncSession,
+        test_user: dict[str, Any],
+    ) -> None:
+        """Auto-created contract should persist location and cargo_supervisor fields."""
+        from app.services.document_service import upload_document
+
+        user = test_user["user"]
+
+        mock_graph = AsyncMock()
+        mock_graph.ainvoke = AsyncMock(
+            return_value={
+                "contrato_extraido": {
+                    "numero_contrato": "LOC-001-2025",
+                    "objeto": "Consultoría técnica especializada",
+                    "valor_total": "6000000.00",
+                    "valor_mensual": "1000000.00",
+                    "fecha_inicio": "2025-01-01",
+                    "fecha_fin": "2025-06-30",
+                    "supervisor_nombre": "Juan Pérez",
+                    "cargo_supervisor": "Director de TIC",
+                    "entidad": "Alcaldía Municipal",
+                    "pais": "Colombia",
+                    "departamento": "Antioquia",
+                    "ciudad": "Medellín",
+                    "direccion_ejecucion": "Calle 44 # 52-165, Alpujarra",
+                }
+            }
+        )
+
+        llm_obligaciones_response = LLMResponse(
+            content="OBLIGACION|especifica|Prestar consultoría técnica especializada\n",
+            model="test",
+            total_tokens=40,
+        )
+
+        with (
+            patch(_PATCH_GET_GRAPH, return_value=mock_graph),
+            patch(_PATCH_GET_LLM) as mock_get_llm,
+            patch(
+                _PATCH_PARSE_PDF,
+                return_value=(
+                    "CONTRATO DE CONSULTORÍA No. LOC-001-2025 celebrado entre la Alcaldía "
+                    "Municipal de Medellín, Antioquia, y el contratista Juan Pérez. OBJETO: "
+                    "consultoría técnica especializada. VALOR TOTAL: seis millones de pesos. "
+                    "LUGAR DE EJECUCIÓN: Calle 44 # 52-165, Alpujarra, Medellín. PLAZO: del 1 "
+                    "de enero al 30 de junio de 2025. SUPERVISOR: Director de TIC."
+                ),
+            ),
+            patch(_PATCH_S3) as mock_storage_cls,
+        ):
+            mock_llm = AsyncMock()
+            mock_llm.complete = AsyncMock(return_value=llm_obligaciones_response)
+            mock_get_llm.return_value = mock_llm
+
+            mock_storage = AsyncMock()
+            mock_storage.upload = AsyncMock()
+            mock_storage_cls.return_value = mock_storage
+
+            result = await upload_document(
+                db=db,
+                user_id=user.id,
+                filename="contrato_medellin.pdf",
+                content=b"fake pdf content",
+                content_type="application/pdf",
+                tipo="contrato",
+                contrato_id=None,
+            )
+
+        assert result.contrato_creado is not None
+        assert result.contrato_creado.cargo_supervisor == "Director de TIC"
+        assert result.contrato_creado.pais == "Colombia"
+        assert result.contrato_creado.departamento == "Antioquia"
+        assert result.contrato_creado.ciudad == "Medellín"
+        assert result.contrato_creado.direccion_ejecucion == "Calle 44 # 52-165, Alpujarra"
+
+    @pytest.mark.asyncio
+    async def test_upload_contract_defaults_documento_proveedor_from_cedula(
+        self,
+        db: AsyncSession,
+        test_user: dict[str, Any],
+    ) -> None:
+        """When LLM doesn't extract documento_proveedor, it defaults to user cedula."""
+        from app.models.contrato import Contrato
+        from app.services.document_service import upload_document
+        from sqlalchemy import select
+
+        user = test_user["user"]
+        user.cedula = "5555555555"
+        await db.flush()
+
+        mock_graph = AsyncMock()
+        mock_graph.ainvoke = AsyncMock(
+            return_value={
+                "contrato_extraido": {
+                    "numero_contrato": "CED-001-2025",
+                    "objeto": "Prestación de servicios técnicos especializados",
+                    "valor_total": "3000000.00",
+                    "valor_mensual": "3000000.00",
+                    "fecha_inicio": "2025-01-01",
+                    "fecha_fin": "2025-01-31",
+                    # No documento_proveedor — should default to user.cedula
+                }
+            }
+        )
+
+        llm_obligaciones_response = LLMResponse(
+            content="",
+            model="test",
+            total_tokens=10,
+        )
+
+        with (
+            patch(_PATCH_GET_GRAPH, return_value=mock_graph),
+            patch(_PATCH_GET_LLM) as mock_get_llm,
+            patch(
+                _PATCH_PARSE_PDF,
+                return_value=(
+                    "CONTRATO DE PRESTACIÓN DE SERVICIOS No. CED-001-2025. OBJETO: prestación "
+                    "de servicios técnicos especializados para la entidad contratante. VALOR "
+                    "TOTAL: tres millones de pesos pagaderos en una sola cuota. PLAZO: del 1 al "
+                    "31 de enero de 2025. El presente documento no registra el número de cédula "
+                    "del contratista, por lo que deberá tomarse del perfil del usuario."
+                ),
+            ),
+            patch(_PATCH_S3) as mock_storage_cls,
+        ):
+            mock_llm = AsyncMock()
+            mock_llm.complete = AsyncMock(return_value=llm_obligaciones_response)
+            mock_get_llm.return_value = mock_llm
+
+            mock_storage = AsyncMock()
+            mock_storage.upload = AsyncMock()
+            mock_storage_cls.return_value = mock_storage
+
+            result = await upload_document(
+                db=db,
+                user_id=user.id,
+                filename="contrato_sin_cedula.pdf",
+                content=b"fake pdf content",
+                content_type="application/pdf",
+                tipo="contrato",
+                contrato_id=None,
+            )
+
+        assert result.contrato_id is not None
+        contrato_db_result = await db.execute(select(Contrato).where(Contrato.id == result.contrato_id))
+        contrato_db = contrato_db_result.scalar_one()
+        assert contrato_db.documento_proveedor == "5555555555"
 
     @pytest.mark.asyncio
     async def test_upload_contract_with_contrato_id_skips_auto_create(

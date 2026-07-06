@@ -289,3 +289,131 @@ async def test_eliminar_obligacion_bloqueada_por_actividad(db: AsyncSession, tes
 
     with pytest.raises(ValidationError):
         await contrato_service.eliminar_obligacion(db, test_user["user"].id, created.id, ob_id)
+
+
+# ---------------------------------------------------------------------------
+# Nuevos campos: ubicación, cargo_supervisor, derivación valor_total, cédula
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_crear_contrato_con_campos_ubicacion(db: AsyncSession, test_user: dict[str, Any]) -> None:
+    data = _make_contrato_create(
+        pais="Colombia",
+        departamento="Cundinamarca",
+        ciudad="Bogotá",
+        direccion_ejecucion="Carrera 8 # 12-70",
+        cargo_supervisor="Director de Área",
+    )
+    result = await contrato_service.crear_contrato(db, test_user["user"].id, data)
+
+    assert result.pais == "Colombia"
+    assert result.departamento == "Cundinamarca"
+    assert result.ciudad == "Bogotá"
+    assert result.direccion_ejecucion == "Carrera 8 # 12-70"
+    assert result.cargo_supervisor == "Director de Área"
+
+
+@pytest.mark.asyncio
+async def test_crear_contrato_sin_valor_total_deriva_correctamente(
+    db: AsyncSession, test_user: dict[str, Any]
+) -> None:
+    """valor_total should be derived as valor_mensual × months when not provided."""
+    from decimal import Decimal
+
+    data = _make_contrato_create(
+        valor_total=None,
+        valor_mensual="2000000.00",
+        fecha_inicio=date(2025, 1, 1),
+        fecha_fin=date(2025, 6, 30),
+    )
+    result = await contrato_service.crear_contrato(db, test_user["user"].id, data)
+
+    # 6 months (Jan–Jun, inclusive: Jan 1 → Jun 30 spans Jan, Feb, Mar, Apr, May, Jun)
+    assert result.valor_total == Decimal("12000000.00")
+
+
+@pytest.mark.asyncio
+async def test_crear_contrato_sin_valor_total_un_mes(
+    db: AsyncSession, test_user: dict[str, Any]
+) -> None:
+    """Duration within same month defaults to minimum 1 month."""
+    from decimal import Decimal
+
+    data = _make_contrato_create(
+        valor_total=None,
+        valor_mensual="3000000.00",
+        fecha_inicio=date(2025, 3, 1),
+        fecha_fin=date(2025, 3, 31),
+    )
+    result = await contrato_service.crear_contrato(db, test_user["user"].id, data)
+
+    assert result.valor_total == Decimal("3000000.00")
+
+
+@pytest.mark.asyncio
+async def test_crear_contrato_precarga_cedula_usuario(
+    db: AsyncSession, test_user: dict[str, Any]
+) -> None:
+    """documento_proveedor should default to authenticated user's cedula."""
+    # Ensure the test user has a cedula set
+    user = test_user["user"]
+    user.cedula = "9876543210"
+    await db.flush()
+
+    data = _make_contrato_create(documento_proveedor=None)
+    result = await contrato_service.crear_contrato(db, user.id, data)
+
+    assert result.documento_proveedor == "9876543210"
+
+
+@pytest.mark.asyncio
+async def test_crear_contrato_documento_proveedor_explicito_no_se_sobreescribe(
+    db: AsyncSession, test_user: dict[str, Any]
+) -> None:
+    """Explicit documento_proveedor is preserved even if user has cedula."""
+    user = test_user["user"]
+    user.cedula = "1111111111"
+    await db.flush()
+
+    data = _make_contrato_create(documento_proveedor="9999999999")
+    result = await contrato_service.crear_contrato(db, user.id, data)
+
+    assert result.documento_proveedor == "9999999999"
+
+
+@pytest.mark.asyncio
+async def test_actualizar_contrato_campos_ubicacion(
+    db: AsyncSession, test_user: dict[str, Any]
+) -> None:
+    created = await contrato_service.crear_contrato(db, test_user["user"].id, _make_contrato_create())
+    update = ContratoUpdate(ciudad="Medellín", cargo_supervisor="Jefe de Oficina")
+    result = await contrato_service.actualizar_contrato(db, test_user["user"].id, created.id, update)
+
+    assert result.ciudad == "Medellín"
+    assert result.cargo_supervisor == "Jefe de Oficina"
+    assert result.numero_contrato == created.numero_contrato
+
+
+# ---------------------------------------------------------------------------
+# _derivar_valor_total unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_derivar_valor_total_meses_normales() -> None:
+    from decimal import Decimal
+
+    from app.services.contrato_service import _derivar_valor_total
+
+    # Jan 1 → Jun 30: 6 calendar months (Jan, Feb, Mar, Apr, May, Jun) × 2,000,000 = 12,000,000
+    result = _derivar_valor_total(Decimal("2000000"), date(2025, 1, 1), date(2025, 6, 30))
+    assert result == Decimal("12000000.00")
+
+
+def test_derivar_valor_total_minimo_un_mes() -> None:
+    from decimal import Decimal
+
+    from app.services.contrato_service import _derivar_valor_total
+
+    result = _derivar_valor_total(Decimal("5000000"), date(2025, 3, 5), date(2025, 3, 25))
+    assert result == Decimal("5000000.00")

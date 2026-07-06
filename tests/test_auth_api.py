@@ -1,6 +1,7 @@
 """Auth API endpoint tests."""
 
 import pytest
+from unittest.mock import AsyncMock, MagicMock, patch
 from httpx import AsyncClient
 
 
@@ -167,6 +168,7 @@ async def test_refresh_token_reuse_blocked(client: AsyncClient) -> None:
         "email": "reuse@example.com",
         "password": "StrongPass1!",
         "nombre": "Reuse User",
+        "cedula": "20000001",
     }
     await client.post("/api/v1/auth/register", json=payload)
     login_resp = await client.post(
@@ -240,3 +242,71 @@ async def test_logout_unauthorized(client: AsyncClient) -> None:
     """Logout without a token should fail."""
     response = await client.post("/api/v1/auth/logout")
     assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_update_me_new_cedula_triggers_secop_import(client: AsyncClient, db) -> None:
+    """Setting cedula for the first time triggers SECOP contract import."""
+    from app.core.security import create_access_token, hash_password
+    from app.models.usuario import Usuario
+
+    user = Usuario(
+        email="nocedula@example.com",
+        nombre="No Cedula User",
+        cedula=None,
+        password_hash=hash_password("TestPass123!"),
+        rol="contratista",
+        activo=True,
+        creditos_disponibles=10,
+    )
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+
+    token = create_access_token(subject=str(user.id), role=user.rol)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    mock_result = MagicMock(importados=3, actualizados=0, omitidos_duplicados=0)
+    mock_import = AsyncMock(return_value=mock_result)
+
+    with patch("app.services.secop_service.importar_contratos_secop", mock_import):
+        response = await client.put(
+            "/api/v1/auth/me",
+            headers=headers,
+            json={"cedula": "1016019452"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["cedula"] == "1016019452"
+    mock_import.assert_called_once()
+    call_kwargs = mock_import.call_args.kwargs
+    assert call_kwargs["documento_proveedor"] == "1016019452"
+    assert call_kwargs["confirmar"] is True
+
+
+@pytest.mark.asyncio
+async def test_update_me_existing_cedula_no_reimport(client: AsyncClient, test_user: dict) -> None:
+    """Updating a field other than cedula should NOT trigger SECOP import."""
+    mock_import = AsyncMock()
+
+    with patch("app.services.secop_service.importar_contratos_secop", mock_import):
+        response = await client.put(
+            "/api/v1/auth/me",
+            headers=test_user["headers"],
+            json={"nombre": "Updated Name"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["nombre"] == "Updated Name"
+    mock_import.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_me_invalid_cedula_format(client: AsyncClient, test_user: dict) -> None:
+    """Cedula with non-numeric or out-of-range characters should return 422."""
+    response = await client.put(
+        "/api/v1/auth/me",
+        headers=test_user["headers"],
+        json={"cedula": "abc123"},
+    )
+    assert response.status_code == 422

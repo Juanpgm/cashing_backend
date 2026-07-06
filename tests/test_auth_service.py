@@ -81,6 +81,7 @@ async def test_login_increments_failed_attempts(db: AsyncSession) -> None:
         email="fail_svc@example.com",
         password="StrongPass1!",
         nombre="Fail Svc",
+        cedula="10000001",
     )
     await auth_service.register(db, data)
 
@@ -102,6 +103,7 @@ async def test_login_resets_failed_attempts_on_success(db: AsyncSession) -> None
         email="reset_svc@example.com",
         password="StrongPass1!",
         nombre="Reset Svc",
+        cedula="10000002",
     )
     await auth_service.register(db, data)
 
@@ -127,6 +129,7 @@ async def test_account_locked_after_10_failed_attempts(db: AsyncSession) -> None
         email="locked_svc@example.com",
         password="StrongPass1!",
         nombre="Locked Svc",
+        cedula="10000003",
     )
     await auth_service.register(db, data)
 
@@ -151,6 +154,7 @@ async def test_login_inactive_user(db: AsyncSession) -> None:
         email="inactive_svc@example.com",
         password="StrongPass1!",
         nombre="Inactive Svc",
+        cedula="10000004",
     )
     await auth_service.register(db, data)
 
@@ -169,6 +173,7 @@ async def test_get_user_by_id(db: AsyncSession) -> None:
         email="getuser@example.com",
         password="StrongPass1!",
         nombre="Get User",
+        cedula="10000005",
     )
     user_resp = await auth_service.register(db, data)
     fetched = await auth_service.get_user_by_id(db, user_resp.id)
@@ -188,6 +193,7 @@ async def test_update_user(db: AsyncSession) -> None:
         email="update_svc@example.com",
         password="StrongPass1!",
         nombre="Original Name",
+        cedula="10000006",
     )
     user_resp = await auth_service.register(db, data)
     updated = await auth_service.update_user(
@@ -213,6 +219,7 @@ async def test_refresh_tokens(db: AsyncSession) -> None:
         email="refresh_svc@example.com",
         password="StrongPass1!",
         nombre="Refresh Svc",
+        cedula="10000007",
     )
     await auth_service.register(db, data)
     tokens = await auth_service.login(db, email="refresh_svc@example.com", password="StrongPass1!")
@@ -238,6 +245,7 @@ async def test_refresh_with_access_token_fails(db: AsyncSession) -> None:
         email="wrongtype@example.com",
         password="StrongPass1!",
         nombre="Wrong Type",
+        cedula="10000008",
     )
     user_resp = await auth_service.register(db, data)
     access_token = create_access_token(str(user_resp.id), "contratista")
@@ -255,6 +263,7 @@ async def test_logout(db: AsyncSession) -> None:
         email="logout_svc@example.com",
         password="StrongPass1!",
         nombre="Logout Svc",
+        cedula="10000009",
     )
     user_resp = await auth_service.register(db, data)
     token = create_access_token(str(user_resp.id), "contratista")
