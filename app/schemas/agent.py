@@ -4,6 +4,7 @@ import uuid
 from datetime import date
 from decimal import Decimal
 from enum import StrEnum
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -12,7 +13,9 @@ from pydantic import BaseModel, Field
 
 class LLMMessage(BaseModel):
     role: str = Field(description="Role: system, user, or assistant")
-    content: str
+    # Plain text for normal completions, or a list of multimodal content parts
+    # (e.g. {"type": "text", ...} + {"type": "image_url"/"file", ...}) for vision input.
+    content: str | list[dict[str, Any]]
 
 
 class LLMResponse(BaseModel):
@@ -52,6 +55,7 @@ class ObligacionExtraida(BaseModel):
     descripcion: str
     tipo: str  # "general" | "especifica"
     orden: int
+    etiqueta: str = ""  # original marker from the contract (e.g. "A", "1", "a", "iii")
 
 
 class ContratoExtraido(BaseModel):
@@ -64,9 +68,70 @@ class ContratoExtraido(BaseModel):
     fecha_inicio: date | None = None
     fecha_fin: date | None = None
     supervisor_nombre: str | None = None
+    cargo_supervisor: str | None = None
     entidad: str | None = None
     dependencia: str | None = None
     documento_proveedor: str | None = None
+    pais: str | None = None
+    departamento: str | None = None
+    ciudad: str | None = None
+    direccion_ejecucion: str | None = None
+
+
+# --- Structured LLM extraction schemas (response_format / JSON) ---
+
+
+class ContratoCamposLLM(BaseModel):
+    """Raw structured contract metadata returned by the LLM (response_format).
+
+    All fields are strings so the JSON schema stays simple for the model.
+    Numeric/date conversion happens downstream via the document_service safe
+    parsers (``_safe_decimal`` / ``_safe_date``). An empty string means
+    "not found in the document".
+    """
+
+    numero_contrato: str = ""
+    objeto: str = ""
+    valor_total: str = ""
+    valor_mensual: str = ""
+    fecha_inicio: str = ""
+    fecha_fin: str = ""
+    supervisor_nombre: str = ""
+    cargo_supervisor: str = ""
+    entidad: str = ""
+    dependencia: str = ""
+    documento_proveedor: str = ""
+    pais: str = ""
+    departamento: str = ""
+    ciudad: str = ""
+    direccion_ejecucion: str = ""
+
+
+class ObligacionItemLLM(BaseModel):
+    """A single obligation item in a structured LLM response."""
+
+    descripcion: str
+    tipo: str = "especifica"
+    etiqueta: str = ""  # original marker from the contract (e.g. "A", "1", "a")
+
+
+class ObligacionesLLMList(BaseModel):
+    """Top-level wrapper for a structured list of obligations (response_format)."""
+
+    obligaciones: list[ObligacionItemLLM] = Field(default_factory=list)
+
+
+class ContratoExtractionResult(BaseModel):
+    """Combined structured result from the multimodal (vision) extraction path.
+
+    Carries the contract metadata, its specific obligations, and a plain-text
+    transcription of the document so ``texto_extraido`` can be populated for a
+    scanned PDF or image (the vision model acts as the OCR).
+    """
+
+    contrato: ContratoCamposLLM = Field(default_factory=ContratoCamposLLM)
+    obligaciones: list[ObligacionItemLLM] = Field(default_factory=list)
+    transcripcion: str = ""
 
 
 class DocumentUploadResponse(BaseModel):
@@ -118,3 +183,13 @@ class AgentMode(StrEnum):
     CHAT = "chat"
     PIPELINE = "pipeline"
     CONFIG = "config"
+    EVIDENCE = "evidence"
+    DRIVE = "drive"
+    EXTRACT_OBLIGATIONS = "extract_obligations"
+    GENERATE_ACTIVITIES = "generate_activities"
+    # Phases 1-6 (implemented incrementally per plan)
+    SECOP_DISCOVERY = "secop_discovery"
+    REQUIREMENTS_INGESTION = "requirements_ingestion"
+    TEMPLATE_RESOLVE = "template_resolve"
+    QUALITY_GATE = "quality_gate"
+    CUENTA_COBRO_FULL = "cuenta_cobro_full"

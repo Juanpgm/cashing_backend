@@ -9,6 +9,9 @@ from jose import JWTError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.adapters.drive.drive_adapter import DriveAdapter
+from app.adapters.email.gmail_adapter import GmailAdapter
+from app.adapters.storage import get_storage as _get_storage
 from app.adapters.storage.s3_adapter import S3StorageAdapter
 from app.core.config import settings
 from app.core.database import get_db
@@ -85,6 +88,21 @@ async def require_credits(
     return user
 
 
-def get_pdf_storage() -> S3StorageAdapter:
+def get_pdf_storage() -> object:
     """Storage adapter scoped to the PDFs bucket."""
-    return S3StorageAdapter(bucket=settings.S3_BUCKET_PDFS)
+    return _get_storage(settings.S3_BUCKET_PDFS)
+
+
+def get_avatar_storage() -> object:
+    """Storage adapter scoped to the avatars bucket."""
+    return _get_storage(settings.S3_BUCKET_AVATARS)
+
+
+async def get_email_adapter(db: AsyncSession = Depends(get_db)) -> GmailAdapter:
+    """Gmail adapter — requires user to have connected their Google account."""
+    return GmailAdapter(db=db)
+
+
+async def get_drive_adapter(db: AsyncSession = Depends(get_db)) -> DriveAdapter:
+    """Drive adapter — requires user to have connected their Google account."""
+    return DriveAdapter(db=db)

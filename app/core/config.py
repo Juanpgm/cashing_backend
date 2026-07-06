@@ -37,7 +37,10 @@ class Settings(BaseSettings):
     JWT_REFRESH_TOKEN_EXPIRE_DAYS: int = 7
 
     # Storage
-    STORAGE_PROVIDER: str = "minio"
+    # STORAGE_PROVIDER: "local" (default dev, no MinIO needed) | "minio" | "s3"
+    STORAGE_PROVIDER: str = "local"
+    # Filesystem root for STORAGE_PROVIDER=local (relative to cwd or absolute)
+    LOCAL_STORAGE_PATH: str = "local_storage"
     S3_ENDPOINT_URL: str | None = None  # None → native AWS S3; set URL for MinIO/R2
     S3_ACCESS_KEY: str = "minioadmin"
     S3_SECRET_KEY: str = "minioadmin"
@@ -45,29 +48,98 @@ class Settings(BaseSettings):
     S3_BUCKET_EVIDENCIAS: str = "cashin-evidencias"
     S3_BUCKET_DOCUMENTOS: str = "cashin-documentos"
     S3_BUCKET_PDFS: str = "cashin-pdfs"
+    S3_BUCKET_AVATARS: str = "cashin-avatars"
 
     # LLM — Groq for fast chat/routing; Gemini 2.5 Flash for document extraction (generous free tier)
     # Gemini free tier: 1,000,000 TPM/day vs Groq 8b: ~20,000 TPM/day
     # Note: gemini-2.0-flash and gemini-1.5-flash are deprecated for new accounts — use gemini-2.5-flash
-    LLM_DEFAULT_MODEL: str = "groq/llama-3.1-8b-instant"
-    LLM_FALLBACK_MODEL: str = "groq/llama-3.1-8b-instant"
-    LLM_LOCAL_MODEL: str = "ollama/qwen2.5:7b"
+    LLM_DEFAULT_MODEL: str = "ollama/llama3.1:8b"
+    LLM_FALLBACK_MODEL: str = "ollama/llama3.1:8b"
+    LLM_LOCAL_MODEL: str = "ollama/llama3.1:8b"
     # LLM_EXTRACTION_MODEL: dedicated model for document/obligation extraction.
-    # Gemini 2.5 Flash: 1M TPM/day free — ideal for large contract documents.
-    LLM_EXTRACTION_MODEL: str = "gemini/gemini-2.5-flash"
+    # Gemini 2.5 Flash-Lite: 1M TPM/day, 1,500 RPD free — cheapest option for text extraction.
+    # Switch to "gemini/gemini-2.5-flash" for heavier reasoning on complex contracts.
+    LLM_EXTRACTION_MODEL: str = "gemini/gemini-2.5-flash-lite"
+    # Multimodal (vision) fallback for scanned PDFs and images — the model reads
+    # the file directly and acts as the OCR. Used only when text extraction yields
+    # fewer than EXTRACTION_MIN_TEXT_CHARS characters.
+    #   Free tier options (no billing required):
+    #     "gemini/gemini-2.5-flash-lite"                        — 30 RPM/1,500 RPD free; reads PDF natively
+    #     "gemini/gemini-2.5-flash"                             — 15 RPM/1,500 RPD free; reads PDF natively
+    #     "mistral/pixtral-12b-2409"                            — 1B tokens/month free; rasterizes PDF (no page limit)
+    #     "groq/meta-llama/llama-4-scout-17b-16e-instruct"      — free RPM limits; rasterizes PDF; MAX 5 pages
+    #   Local (offline, free):
+    #     "ollama/llama3.2-vision" — rasterizes PDF to images (Ollama doesn't read PDF natively)
+    # Resilience: the service tries this model first, then curated current fallbacks
+    # (see _VISION_FALLBACK_MODELS in document_service). A decommissioned or
+    # quota-exhausted model falls through instead of breaking extraction entirely.
+    LLM_MULTIMODAL_MODEL: str = "gemini/gemini-2.5-flash-lite"
+    EXTRACTION_MULTIMODAL_FALLBACK_ENABLED: bool = True
+    EXTRACTION_MIN_TEXT_CHARS: int = 200
+    # When a PDF is rasterized (for a local vision model or the OCR tier), cap
+    # pages and resolution to keep payloads and latency reasonable on a dev machine.
+    MULTIMODAL_MAX_PDF_PAGES: int = 8
+    MULTIMODAL_RASTER_DPI: int = 150
+    # OCR tier — runs BEFORE the vision model for scanned PDFs/images: rasterizes
+    # the document and reads it with a local OCR engine (free, fast, no LLM); the
+    # deterministic extractor then runs on the recovered text. The vision model is
+    # used only if OCR text is insufficient. Set EXTRACTION_OCR_ENABLED=false to
+    # skip OCR and go straight to vision.
+    EXTRACTION_OCR_ENABLED: bool = True
+    # OCR engine: "rapidocr" (default, pip-only, no system binary) or "tesseract" (needs binary + tessdata).
+    # rapidocr deps: rapidocr-onnxruntime + opencv-python-headless + onnxruntime + pyclipper + shapely
+    # tesseract deps: Tesseract binary (apt install tesseract-ocr tesseract-ocr-spa) + pytesseract pip wrapper
+    EXTRACTION_OCR_ENGINE: str = "rapidocr"
+    EXTRACTION_OCR_LANG: str = "spa"  # Tesseract only — ignored for rapidocr (auto-detects language)
+    # Absolute path to the Tesseract binary. Leave empty when it is on PATH; set it
+    # on Windows if the installer did not add it, e.g.
+    # "C:/Program Files/Tesseract-OCR/tesseract.exe".
+    TESSERACT_CMD: str = ""
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     GROQ_API_KEY: str = ""
     GEMINI_API_KEY: str = ""
+    MISTRAL_API_KEY: str = ""
     # LLM_PRODUCTION_FALLBACK_MODEL: used in production instead of LLM_LOCAL_MODEL (Ollama).
     # Set to e.g. "gemini/gemini-2.0-flash" and configure GEMINI_API_KEY.
     # When empty and is_production=True, the Ollama slot is silently dropped.
     LLM_PRODUCTION_FALLBACK_MODEL: str = ""
     OPENAI_API_KEY: str = ""
 
-    # Google OAuth
+    # Firebase Admin SDK
+    # Local dev: set FIREBASE_SERVICE_ACCOUNT_PATH to the JSON file path (e.g. secrets/firebase-service-account.json)
+    # Production: set FIREBASE_SERVICE_ACCOUNT_JSON to the minified JSON string in the platform dashboard
+    FIREBASE_SERVICE_ACCOUNT_PATH: str = ""
+    FIREBASE_SERVICE_ACCOUNT_JSON: str = ""
+
+    # Google OAuth + Workspace
     GOOGLE_OAUTH_CLIENT_ID: str = ""
     GOOGLE_OAUTH_CLIENT_SECRET: str = ""
     GOOGLE_OAUTH_REDIRECT_URI: str = "http://localhost:8000/api/v1/integraciones/google/callback"
+    # Scopes "explorer": lectura amplia para descubrir evidencias en Gmail, Drive y Calendar.
+    # - gmail.readonly: leer correos como evidencia; gmail.send/compose: enviar la cuenta de cobro.
+    # - drive.readonly: explorar TODO el Drive del usuario (no solo archivos creados por la app).
+    # - calendar.readonly: leer eventos (reuniones, entregas) como evidencia.
+    # Nota: drive.readonly y gmail.readonly son scopes "restringidos" y requieren verificación
+    # de Google para producción; en local funcionan con usuarios de prueba (modo Testing).
+    GOOGLE_OAUTH_SCOPES: list[str] = [
+        "https://www.googleapis.com/auth/gmail.readonly",
+        "https://www.googleapis.com/auth/gmail.send",
+        "https://www.googleapis.com/auth/gmail.compose",
+        "https://www.googleapis.com/auth/drive.readonly",
+        "https://www.googleapis.com/auth/calendar.readonly",
+        "openid",
+        "https://www.googleapis.com/auth/userinfo.email",
+        "https://www.googleapis.com/auth/userinfo.profile",
+    ]
+
+    # Local dev: skip OAuth client setup and use `gcloud auth application-default login` instead.
+    # Never set this in production.
+    GOOGLE_USE_ADC: bool = False
+
+    # Frontend base URL — used to redirect the browser back after the OAuth callback.
+    FRONTEND_URL: str = "http://localhost:3000"
+    # Signed OAuth state token TTL — covers the Google round-trip window.
+    GOOGLE_OAUTH_STATE_TTL_SECONDS: int = 600
 
     # Wompi
     WOMPI_PUBLIC_KEY: str = "pub_test_xxx"
@@ -80,6 +152,19 @@ class Settings(BaseSettings):
 
     # SECOP — datos.gov.co public contracting API
     SECOP_APP_TOKEN: str = ""
+
+    # SECOP II scraper microservice (Playwright-based). Used by "agentic" mode
+    # to fetch contract-phase documents not available in datos.gov.co.
+    SECOP_SCRAPER_URL: str = ""
+    SECOP_SCRAPER_INTERNAL_TOKEN: str = ""
+    # Sliding-window quota for the manual "Exploración Agéntica" trigger.
+    SECOP_AGENTIC_HOURLY_LIMIT: int = 20
+
+    # Langfuse — LLM observability (Phase 7)
+    # Set LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY to enable tracing.
+    LANGFUSE_PUBLIC_KEY: str = ""
+    LANGFUSE_SECRET_KEY: str = ""
+    LANGFUSE_HOST: str = "https://cloud.langfuse.com"
 
     # Credits
     CREDITS_PER_CUENTA_COBRO: int = 10

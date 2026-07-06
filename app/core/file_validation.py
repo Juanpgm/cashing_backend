@@ -10,6 +10,7 @@ ALLOWED_MIME_TYPES: dict[str, list[str]] = {
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [".xlsx"],
     "application/vnd.openxmlformats-officedocument.presentationml.presentation": [".pptx"],
     "application/vnd.ms-excel": [".xls"],
+    "text/plain": [".txt"],
 }
 
 MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10MB
@@ -32,28 +33,71 @@ def sanitize_filename(filename: str) -> str:
     return name
 
 
-def validate_mime_type(content: bytes, declared_mime: str) -> bool:
-    """Validate MIME type using magic bytes. Returns True if valid.
+_MAGIC_SIGNATURES: dict[str, list[bytes]] = {
+    "application/pdf": [b"%PDF"],
+    "image/jpeg": [b"\xff\xd8\xff"],
+    "image/png": [b"\x89PNG"],
+    "application/zip": [b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"],
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": [b"PK\x03\x04"],
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [b"PK\x03\x04"],
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": [b"PK\x03\x04"],
+    "application/msword": [b"\xd0\xcf\x11\xe0"],
+    "text/plain": [],  # No magic bytes for plain text — accept any content
+    "text/html": [],
+    "text/csv": [],
+}
 
-    Falls back to trusting the declared MIME when libmagic is unavailable
-    (common on Windows dev environments without the system library).
+
+def validate_mime_type(content: bytes, declared_content_type: str) -> bool:
+    """Validate file content matches declared MIME type using magic bytes.
+
+    Uses libmagic when available. Falls back to manual magic-byte signatures
+    for common types so validation still runs on platforms without libmagic.
     """
-    if declared_mime not in ALLOWED_MIME_TYPES:
+    # Normalize declared type (strip parameters like charset)
+    base_type = declared_content_type.split(";")[0].strip().lower()
+
+    if base_type not in ALLOWED_MIME_TYPES:
         return False
+
+    signatures = _MAGIC_SIGNATURES.get(base_type)
+    if signatures is None:
+        # Unknown type not in our signatures map — try libmagic, permissive fallback
+        try:
+            import magic
+
+            detected = magic.from_buffer(content[:2048], mime=True)
+            return detected == base_type
+        except (ImportError, OSError, Exception):
+            return True  # Can't validate — allow through
+
+    # Empty signature list means we accept any content for this type (e.g. text/plain)
+    if not signatures:
+        return True
+
+    # Try libmagic first for precise detection; fall back to manual magic bytes
     try:
-        import sys
-
-        # python-magic hangs on Windows when libmagic is missing — skip detection
-        if sys.platform == "win32":
-            return True
-
         import magic
 
         detected = magic.from_buffer(content[:2048], mime=True)
-        return detected == declared_mime
+        return detected == base_type
     except (ImportError, OSError, Exception):
-        # Fallback: trust declared MIME if python-magic or libmagic unavailable
-        return True
+        return any(content[: len(sig)] == sig for sig in signatures)
+
+
+def get_safe_filename(filename: str) -> str:
+    """Return a storage-safe version of the filename (ASCII, no spaces).
+
+    Replaces spaces and special characters with underscores, preserving the
+    original extension. Used to build storage keys that are safe across all
+    object-storage providers.
+    """
+    name, _, ext = filename.rpartition(".")
+    if not name:
+        name, ext = ext, ""
+    safe_name = re.sub(r"[^\w\-]", "_", name)
+    safe_name = re.sub(r"_+", "_", safe_name).strip("_") or "documento"
+    return f"{safe_name}.{ext}" if ext else safe_name
 
 
 def validate_file_extension(filename: str) -> bool:

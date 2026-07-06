@@ -8,6 +8,7 @@ from datetime import UTC, date, datetime
 
 import structlog
 from jinja2 import BaseLoader, Environment
+from sqlalchemy import delete as sa_delete
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -35,6 +36,7 @@ from app.schemas.cuenta_cobro import (
     CuentaCobroCreate,
     CuentaCobroListItem,
     CuentaCobroResponse,
+    CuentaCobroUpdate,
     GenerarPDFResponse,
     PDFUrlResponse,
 )
@@ -202,7 +204,7 @@ async def crear_cuenta_cobro(
     if usuario.creditos_disponibles < costo:
         raise InsufficientCreditsError(required=costo, available=usuario.creditos_disponibles)
 
-    # Check uniqueness (contrato_id, mes, anio)
+    # Check uniqueness (contrato_id, mes, anio) — active records only
     existing = await db.execute(
         select(CuentaCobro).where(
             CuentaCobro.contrato_id == data.contrato_id,
@@ -213,6 +215,17 @@ async def crear_cuenta_cobro(
     )
     if existing.scalar_one_or_none() is not None:
         raise AlreadyExistsError("CuentaCobro", f"contrato={data.contrato_id} mes={data.mes}/{data.anio}")
+
+    # The DB unique index covers ALL rows including soft-deleted ones.
+    # Hard-delete any tombstone that would block the INSERT.
+    await db.execute(
+        sa_delete(CuentaCobro).where(
+            CuentaCobro.contrato_id == data.contrato_id,
+            CuentaCobro.mes == data.mes,
+            CuentaCobro.anio == data.anio,
+            CuentaCobro.deleted_at.is_not(None),
+        )
+    )
 
     # Deduct credits
     usuario.creditos_disponibles -= costo
@@ -235,6 +248,12 @@ async def crear_cuenta_cobro(
     db.add(cuenta)
     await db.flush()
 
+    # The checklist is NOT materialised here: the cuenta nace con requisitos_modo
+    # = NULL so the post-creation gate can ask the user how to build the checklist
+    # (standard / inferred from a document / inferred from pasted text). Once the
+    # user confirms a mode via POST /cuentas-cobro/{id}/requisitos, the checklist
+    # is materialised (and SECOP detection runs from /refresh-secop on demand).
+
     await logger.ainfo(
         "cuenta_cobro_creada",
         cuenta_id=str(cuenta.id),
@@ -245,9 +264,19 @@ async def crear_cuenta_cobro(
     return await _reload_cuenta_response(db, cuenta.id)
 
 
-async def listar_cuentas_cobro(db: AsyncSession, usuario_id: uuid.UUID) -> list[CuentaCobroListItem]:
-    """List all CuentasCobro belonging to a user (via their contratos)."""
-    result = await db.execute(
+async def listar_cuentas_cobro(
+    db: AsyncSession,
+    usuario_id: uuid.UUID,
+    contrato_id: uuid.UUID | None = None,
+) -> list[CuentaCobroListItem]:
+    """List CuentasCobro belonging to a user (via their contratos).
+
+    When ``contrato_id`` is provided, the result is restricted to that contract,
+    so a contract only ever sees its own cuentas — never those of a sibling
+    contract of the same user. Ownership is still enforced via the join on
+    ``Contrato.usuario_id``.
+    """
+    stmt = (
         select(CuentaCobro)
         .join(Contrato, CuentaCobro.contrato_id == Contrato.id)
         .where(
@@ -257,6 +286,9 @@ async def listar_cuentas_cobro(db: AsyncSession, usuario_id: uuid.UUID) -> list[
         )
         .order_by(CuentaCobro.anio.desc(), CuentaCobro.mes.desc())
     )
+    if contrato_id is not None:
+        stmt = stmt.where(CuentaCobro.contrato_id == contrato_id)
+    result = await db.execute(stmt)
     cuentas = result.scalars().all()
     return [CuentaCobroListItem.model_validate(c) for c in cuentas]
 
@@ -414,19 +446,13 @@ async def agregar_actividades_desde_texto(
     if vincular_obligaciones:
         from app.models.obligacion import Obligacion as Ob
 
-        ob_result = await db.execute(
-            select(Ob)
-            .where(Ob.contrato_id == cuenta.contrato_id)
-            .order_by(Ob.orden)
-        )
+        ob_result = await db.execute(select(Ob).where(Ob.contrato_id == cuenta.contrato_id).order_by(Ob.orden))
         obligaciones = ob_result.scalars().all()
 
     created: list[ActividadResponse] = []
     for i, desc in enumerate(descripciones):
         if len(desc) < 10:
-            raise ValidationError(
-                f"La actividad {i + 1} es demasiado corta (mínimo 10 caracteres): '{desc}'"
-            )
+            raise ValidationError(f"La actividad {i + 1} es demasiado corta (mínimo 10 caracteres): '{desc}'")
 
         ob_id = obligaciones[i].id if (vincular_obligaciones and i < len(obligaciones)) else None
 
@@ -471,16 +497,13 @@ async def generar_actividades_agente(
 
     if cuenta.estado not in (EstadoCuentaCobro.BORRADOR, EstadoCuentaCobro.RECHAZADA):
         raise ValidationError(
-            f"No se pueden generar actividades en estado '{cuenta.estado}'. "
-            "Solo se permite en borrador o rechazada."
+            f"No se pueden generar actividades en estado '{cuenta.estado}'. Solo se permite en borrador o rechazada."
         )
 
     contrato = cuenta.contrato
 
     # Load obligations sorted by order
-    ob_result = await db.execute(
-        select(Ob).where(Ob.contrato_id == contrato.id).order_by(Ob.orden)
-    )
+    ob_result = await db.execute(select(Ob).where(Ob.contrato_id == contrato.id).order_by(Ob.orden))
     obligaciones = ob_result.scalars().all()
 
     # Load contract document text if available
@@ -503,10 +526,10 @@ async def generar_actividades_agente(
         )
 
     # Build context for the LLM
-    obligaciones_str = "\n".join(
-        f"{i + 1}. [{ob.tipo.value.upper()}] {ob.descripcion}"
-        for i, ob in enumerate(obligaciones)
-    ) or "(no registradas — inferir del objeto del contrato)"
+    obligaciones_str = (
+        "\n".join(f"{i + 1}. [{ob.tipo.value.upper()}] {ob.descripcion}" for i, ob in enumerate(obligaciones))
+        or "(no registradas — inferir del objeto del contrato)"
+    )
 
     user_content = (
         f"Contrato N° {contrato.numero_contrato}\n"
@@ -558,6 +581,58 @@ async def generar_actividades_agente(
         usuario_id=str(usuario_id),
         cantidad=len(created),
         tokens=resp.total_tokens,
+    )
+    return ActividadesBulkResponse(creadas=len(created), actividades=created)
+
+
+async def crear_actividades_desde_obligaciones(
+    db: AsyncSession,
+    usuario_id: uuid.UUID,
+    cuenta_id: uuid.UUID,
+) -> ActividadesBulkResponse:
+    """Seed one activity per contract obligation (deterministic, NO LLM).
+
+    Bridges the obligaciones→actividades gap without any model call: each obligation
+    becomes a baseline activity (descripcion = the obligation text, linked by
+    obligacion_id) that the user then edits. Lets the informe be generated when only
+    obligaciones were loaded.
+    """
+    from app.models.obligacion import Obligacion as Ob
+
+    cuenta = await _get_cuenta_con_ownership(db, usuario_id, cuenta_id)
+
+    if cuenta.estado not in (EstadoCuentaCobro.BORRADOR, EstadoCuentaCobro.RECHAZADA):
+        raise ValidationError(
+            f"No se pueden crear actividades en estado '{cuenta.estado}'. Solo se permite en borrador o rechazada."
+        )
+
+    ob_result = await db.execute(select(Ob).where(Ob.contrato_id == cuenta.contrato_id).order_by(Ob.orden))
+    obligaciones = list(ob_result.scalars().all())
+    if not obligaciones:
+        raise ValidationError(
+            "El contrato no tiene obligaciones registradas. Regístrelas en "
+            "POST /contratos/{id}/obligaciones o ingrese actividades manualmente."
+        )
+
+    created: list[ActividadResponse] = []
+    for ob in obligaciones:
+        act = Actividad(
+            cuenta_cobro_id=cuenta_id,
+            obligacion_id=ob.id,
+            descripcion=ob.descripcion,
+            justificacion="",
+            fecha_realizacion=None,
+        )
+        db.add(act)
+        await db.flush()
+        await db.refresh(act)
+        created.append(ActividadResponse.model_validate(act))
+
+    await logger.ainfo(
+        "actividades_desde_obligaciones",
+        cuenta_id=str(cuenta_id),
+        usuario_id=str(usuario_id),
+        cantidad=len(created),
     )
     return ActividadesBulkResponse(creadas=len(created), actividades=created)
 
@@ -707,3 +782,47 @@ async def eliminar_cuenta_cobro(db: AsyncSession, usuario_id: uuid.UUID, cuenta_
     cuenta.deleted_at = datetime.now(UTC)
     await db.flush()
     await logger.ainfo("cuenta_cobro_eliminada", cuenta_id=str(cuenta_id), usuario_id=str(usuario_id))
+
+
+async def actualizar_cuenta_cobro(
+    db: AsyncSession,
+    usuario_id: uuid.UUID,
+    cuenta_id: uuid.UUID,
+    data: CuentaCobroUpdate,
+) -> CuentaCobroResponse:
+    """Partially update a CuentaCobro (mes/anio/valor). Only allowed in BORRADOR."""
+    cuenta = await _get_cuenta_con_ownership(db, usuario_id, cuenta_id)
+
+    if cuenta.estado != EstadoCuentaCobro.BORRADOR:
+        raise ValidationError(f"Solo se pueden editar cuentas en estado 'borrador'. Estado actual: '{cuenta.estado}'.")
+
+    nuevo_mes = data.mes if data.mes is not None else cuenta.mes
+    nuevo_anio = data.anio if data.anio is not None else cuenta.anio
+
+    if nuevo_mes != cuenta.mes or nuevo_anio != cuenta.anio:
+        existing = await db.execute(
+            select(CuentaCobro).where(
+                CuentaCobro.contrato_id == cuenta.contrato_id,
+                CuentaCobro.mes == nuevo_mes,
+                CuentaCobro.anio == nuevo_anio,
+                CuentaCobro.id != cuenta.id,
+                CuentaCobro.deleted_at.is_(None),
+            )
+        )
+        if existing.scalar_one_or_none() is not None:
+            raise AlreadyExistsError("CuentaCobro", f"contrato={cuenta.contrato_id} mes={nuevo_mes}/{nuevo_anio}")
+        cuenta.mes = nuevo_mes
+        cuenta.anio = nuevo_anio
+
+    if data.valor is not None:
+        cuenta.valor = float(data.valor)
+
+    await db.flush()
+    await logger.ainfo(
+        "cuenta_cobro_actualizada",
+        cuenta_id=str(cuenta_id),
+        usuario_id=str(usuario_id),
+        mes=cuenta.mes,
+        anio=cuenta.anio,
+    )
+    return await _reload_cuenta_response(db, cuenta.id)

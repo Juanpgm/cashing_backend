@@ -5,8 +5,11 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
+from decimal import Decimal
+
 from pydantic import BaseModel
 
+from app.models.categoria_documento import CategoriaDocumento
 from app.models.documento_fuente import TipoDocumentoFuente
 
 
@@ -17,6 +20,9 @@ class DocumentoFuenteResponse(BaseModel):
     contrato_id: uuid.UUID | None
     tiene_texto: bool
     created_at: datetime
+    categoria: CategoriaDocumento = CategoriaDocumento.OTROS
+    categoria_confianza: Decimal | None = None
+    categoria_override: bool = False
 
     model_config = {"from_attributes": True}
 

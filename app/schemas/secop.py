@@ -4,11 +4,22 @@ from __future__ import annotations
 
 import uuid
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
+from typing import Any
+from pydantic import BaseModel, Field, model_validator
 
-from pydantic import BaseModel
-
+from app.models.categoria_documento import CategoriaDocumento
 from app.schemas.contrato import ContratoResponse
+
+
+def _to_decimal(v: Any) -> Decimal | None:
+    """Safely convert a value from datos_raw (str or number) to Decimal."""
+    if v is None:
+        return None
+    try:
+        return Decimal(str(v))
+    except (InvalidOperation, ValueError):
+        return None
 
 
 class SecopContratoResponse(BaseModel):
@@ -35,6 +46,49 @@ class SecopContratoResponse(BaseModel):
     valor_del_contrato: Decimal | None
     valor_pagado: Decimal | None
     updated_at: datetime
+
+    # Extra fields extracted from datos_raw (not dedicated DB columns)
+    objeto_del_contrato: str | None = None
+    valor_facturado: Decimal | None = None
+    valor_pendiente_de_pago: Decimal | None = None
+    valor_amortizado: Decimal | None = None
+    valor_pendiente_de_ejecucion: Decimal | None = None
+    nombre_supervisor: str | None = None
+    urlproceso: str | None = None
+    justificacion_modalidad_de: str | None = None
+    dias_adicionados: int | None = None
+
+    # Internal: read from ORM but NOT included in JSON response
+    datos_raw: dict | None = Field(None, exclude=True)
+
+    @model_validator(mode="after")
+    def _populate_from_raw(self) -> "SecopContratoResponse":
+        raw = self.datos_raw or {}
+        if not raw:
+            return self
+        if self.objeto_del_contrato is None:
+            self.objeto_del_contrato = raw.get("objeto_del_contrato")
+        if self.valor_facturado is None:
+            self.valor_facturado = _to_decimal(raw.get("valor_facturado"))
+        if self.valor_pendiente_de_pago is None:
+            self.valor_pendiente_de_pago = _to_decimal(raw.get("valor_pendiente_de_pago"))
+        if self.valor_amortizado is None:
+            self.valor_amortizado = _to_decimal(raw.get("valor_amortizado"))
+        if self.valor_pendiente_de_ejecucion is None:
+            self.valor_pendiente_de_ejecucion = _to_decimal(raw.get("valor_pendiente_de_ejecucion"))
+        if self.nombre_supervisor is None:
+            self.nombre_supervisor = raw.get("nombre_supervisor")
+        if self.urlproceso is None:
+            url_val = raw.get("urlproceso")
+            if isinstance(url_val, dict):
+                url_val = url_val.get("url")
+            self.urlproceso = str(url_val) if url_val and str(url_val).startswith("http") else None
+        if self.justificacion_modalidad_de is None:
+            self.justificacion_modalidad_de = raw.get("justificacion_modalidad_de")
+        if self.dias_adicionados is None:
+            v = raw.get("dias_adicionados")
+            self.dias_adicionados = int(v) if v is not None else None
+        return self
 
     model_config = {"from_attributes": True}
 
@@ -76,7 +130,13 @@ class SecopDocumentoResponse(BaseModel):
     entidad: str | None
     nit_entidad: str | None
     url_descarga: str | None
+    url_proceso: str | None = None
+    tipo_origen: str | None = None  # derived at runtime; not a DB column
+    archivo_identificador: str | None = None  # Marketplace ID when no HTTP URL available
     updated_at: datetime
+    categoria: CategoriaDocumento = CategoriaDocumento.OTROS
+    categoria_confianza: Decimal | None = None
+    categoria_override: bool = False
 
     model_config = {"from_attributes": True}
 
@@ -109,12 +169,31 @@ class SecopConsultaCompletaResponse(BaseModel):
     contratos: list[SecopContratoDetalleResponse]
 
 
+class ArchivoInternoItem(BaseModel):
+    """Un archivo dentro de un comprimido (zip/rar)."""
+
+    nombre: str
+    tamanio_bytes: int | None = None
+    es_directorio: bool = False
+
+
+class ArchivoComprimidoResponse(BaseModel):
+    """Lista de archivos internos de un documento comprimido."""
+
+    doc_id: str
+    nombre_archivo: str | None
+    extension: str | None
+    archivos: list[ArchivoInternoItem]
+    error: str | None = None
+
+
 class SecopImportResult(BaseModel):
     """Resultado de importar contratos SECOP a la base de datos del usuario."""
 
     documento_proveedor: str
     encontrados_en_secop: int
     importados: int
+    actualizados: int = 0
     omitidos_duplicados: int
     omitidos_invalidos: int
     contratos: list[ContratoResponse]

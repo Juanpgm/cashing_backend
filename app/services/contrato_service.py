@@ -6,13 +6,14 @@ import uuid
 from datetime import UTC, date, datetime
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.exceptions import NotFoundError, ValidationError
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
+from app.models.secop import SecopContrato
 from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
 from app.models.obligacion import Obligacion
 from app.models.usuario import Usuario
@@ -60,7 +61,33 @@ async def _reload_contrato_response(db: AsyncSession, contrato_id: uuid.UUID) ->
         .options(selectinload(Contrato.obligaciones))
         .where(Contrato.id == contrato_id)
     )
-    return ContratoResponse.model_validate(result.scalar_one())
+    contrato = result.scalar_one()
+    response = ContratoResponse.model_validate(contrato)
+
+    # Enrich with SECOP portal URL if available
+    secop_result = await db.execute(
+        select(SecopContrato).where(SecopContrato.numero_contrato == contrato.numero_contrato)
+    )
+    secop_contrato = secop_result.scalar_one_or_none()
+    if secop_contrato:
+        raw = secop_contrato.datos_raw or {}
+        url_val = raw.get("urlproceso")
+        if isinstance(url_val, dict):
+            url_val = url_val.get("url")
+        if url_val and str(url_val).startswith("http"):
+            response.url_proceso = str(url_val)
+
+    return response
+
+
+def _derivar_valor_total(valor_mensual: "Decimal", fecha_inicio: date, fecha_fin: date) -> "Decimal":
+    """Derive valor_total as valor_mensual × calendar months spanned (both endpoints inclusive)."""
+    from decimal import Decimal as _Decimal
+    meses = (fecha_fin.year - fecha_inicio.year) * 12 + (fecha_fin.month - fecha_inicio.month)
+    if fecha_fin.day >= fecha_inicio.day:
+        meses += 1
+    meses = max(meses, 1)
+    return (_Decimal(str(valor_mensual)) * meses).quantize(_Decimal("0.01"))
 
 
 async def crear_contrato(
@@ -68,21 +95,43 @@ async def crear_contrato(
     usuario_id: uuid.UUID,
     data: ContratoCreate,
 ) -> ContratoResponse:
-    """Create a contract with optional obligaciones."""
+    """Create a contract with optional obligaciones.
+
+    If valor_total is omitted, it is derived as valor_mensual × duration in months.
+    If documento_proveedor is omitted, it defaults to the authenticated user's cedula.
+    """
     if data.fecha_fin <= data.fecha_inicio:
         raise ValidationError("La fecha de fin debe ser posterior a la fecha de inicio.")
+
+    from decimal import Decimal
+    valor_total = data.valor_total
+    if valor_total is None:
+        valor_total = _derivar_valor_total(data.valor_mensual, data.fecha_inicio, data.fecha_fin)
+
+    documento_proveedor = data.documento_proveedor
+    if not documento_proveedor:
+        usuario = await db.get(Usuario, usuario_id)
+        if usuario and usuario.cedula:
+            documento_proveedor = usuario.cedula
 
     contrato = Contrato(
         usuario_id=usuario_id,
         numero_contrato=data.numero_contrato,
         objeto=data.objeto,
-        valor_total=float(data.valor_total),
+        valor_total=float(valor_total),
+        valor_adicion=float(data.valor_adicion) if data.valor_adicion else None,
         valor_mensual=float(data.valor_mensual),
         fecha_inicio=data.fecha_inicio,
         fecha_fin=data.fecha_fin,
         supervisor_nombre=data.supervisor_nombre,
+        cargo_supervisor=data.cargo_supervisor,
         entidad=data.entidad,
         dependencia=data.dependencia,
+        documento_proveedor=documento_proveedor,
+        pais=data.pais,
+        departamento=data.departamento,
+        ciudad=data.ciudad,
+        direccion_ejecucion=data.direccion_ejecucion,
     )
     db.add(contrato)
     await db.flush()
@@ -99,6 +148,14 @@ async def crear_contrato(
     await db.flush()
 
     await logger.ainfo("contrato_creado", contrato_id=str(contrato.id), usuario_id=str(usuario_id))
+
+    # Generate pgvector embeddings for all new obligations (best-effort)
+    try:
+        from app.services.embedding_service import generate_embeddings_for_contrato
+        await generate_embeddings_for_contrato(db, contrato.id)
+    except Exception as _emb_exc:  # noqa: BLE001
+        await logger.awarning("embedding_generation_skipped", exc=str(_emb_exc))
+
     return await _reload_contrato_response(db, contrato.id)
 
 
@@ -109,7 +166,22 @@ async def listar_contratos(db: AsyncSession, usuario_id: uuid.UUID) -> list[Cont
         .where(Contrato.usuario_id == usuario_id, Contrato.deleted_at.is_(None))
         .order_by(Contrato.created_at.desc())
     )
-    return [ContratoListItem.model_validate(c) for c in result.scalars().all()]
+    contratos = result.scalars().all()
+    if not contratos:
+        return []
+
+    numeros = [c.numero_contrato for c in contratos]
+    secop_result = await db.execute(
+        select(SecopContrato.numero_contrato).where(SecopContrato.numero_contrato.in_(numeros))
+    )
+    secop_numeros = {row[0] for row in secop_result.all()}
+
+    items: list[ContratoListItem] = []
+    for c in contratos:
+        item = ContratoListItem.model_validate(c)
+        item.fuente = "secop" if c.numero_contrato in secop_numeros else "usuario"
+        items.append(item)
+    return items
 
 
 async def obtener_contrato(
@@ -137,7 +209,7 @@ async def actualizar_contrato(
         raise ValidationError("La fecha de fin debe ser posterior a la fecha de inicio.")
 
     for field, value in updates.items():
-        if field in ("valor_total", "valor_mensual") and value is not None:
+        if field in ("valor_total", "valor_adicion", "valor_mensual") and value is not None:
             value = float(value)
         setattr(contrato, field, value)
 
@@ -185,10 +257,19 @@ async def agregar_obligacion(
         descripcion=data.descripcion,
         tipo=data.tipo,
         orden=data.orden,
+        etiqueta=data.etiqueta,
     )
     db.add(ob)
     await db.flush()
     await db.refresh(ob)
+
+    # Generate embedding for this single new obligation (best-effort)
+    try:
+        from app.services.embedding_service import generate_embeddings_for_contrato
+        await generate_embeddings_for_contrato(db, contrato_id)
+    except Exception as _emb_exc:  # noqa: BLE001
+        await logger.awarning("embedding_generation_skipped", exc=str(_emb_exc))
+
     return ObligacionResponse.model_validate(ob)
 
 
@@ -222,6 +303,39 @@ async def eliminar_obligacion(
 
     await db.delete(ob)
     await db.flush()
+
+
+async def limpiar_obligaciones(
+    db: AsyncSession,
+    usuario_id: uuid.UUID,
+    contrato_id: uuid.UUID,
+) -> int:
+    """Bulk-delete all obligations for a contract (dev/test utility).
+
+    Nullifies FK references in actividades before deleting so no constraint
+    violation occurs. Returns the number of deleted rows.
+    """
+    from app.models.actividad import Actividad
+
+    await _get_contrato_con_ownership(db, usuario_id, contrato_id)
+
+    ob_ids_result = await db.execute(
+        select(Obligacion.id).where(Obligacion.contrato_id == contrato_id)
+    )
+    ob_ids = [row[0] for row in ob_ids_result.all()]
+    if not ob_ids:
+        return 0
+
+    await db.execute(
+        update(Actividad)
+        .where(Actividad.obligacion_id.in_(ob_ids))
+        .values(obligacion_id=None)
+    )
+    result = await db.execute(
+        delete(Obligacion).where(Obligacion.contrato_id == contrato_id)
+    )
+    await db.flush()
+    return result.rowcount or 0
 
 
 _MESES_ES = [

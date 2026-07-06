@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import uuid
+
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser
 from app.core.database import get_db
+from app.schemas.checklist import CategoriaUpdateBody
 from app.schemas.secop import (
+    ArchivoComprimidoResponse,
     SecopConsultaCompletaResponse,
     SecopContratoResponse,
     SecopDocumentoResponse,
@@ -52,6 +56,11 @@ async def obtener_proceso(
     return await secop_service.obtener_proceso(db, id_proceso, refresh=refresh)
 
 
+# Route compatibility note (Fix C1):
+# GET /documentos/{numero_contrato}       — 3-segment path, param is a string
+# GET /documentos/{doc_id}/archivos       — 4-segment path with literal suffix "/archivos"
+# FastAPI resolves these by path depth: the literal "/archivos" suffix makes the 4-segment
+# route unambiguous. No collision exists; no reordering or rename is required.
 @router.get("/documentos/{numero_contrato}", response_model=list[SecopDocumentoResponse])
 async def buscar_documentos(
     numero_contrato: str,
@@ -65,6 +74,20 @@ async def buscar_documentos(
     (visible en la respuesta de GET /secop/contratos como `numero_contrato`).
     """
     return await secop_service.buscar_documentos_contrato(db, numero_contrato, refresh=refresh)
+
+
+@router.get("/documentos/{doc_id}/archivos", response_model=ArchivoComprimidoResponse)
+async def listar_archivos_comprimido(
+    doc_id: uuid.UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ArchivoComprimidoResponse:
+    """Lista los archivos internos de un documento comprimido (.zip).
+
+    Descarga el archivo desde `url_descarga` y devuelve el listado de archivos contenidos.
+    Para archivos .rar informa que no es posible listar el contenido sin herramientas adicionales.
+    """
+    return await secop_service.listar_archivos_comprimido(db, doc_id)
 
 
 @router.post("/importar", response_model=SecopImportResult, status_code=201)
@@ -129,3 +152,21 @@ async def consulta_completa(
 ) -> SecopConsultaCompletaResponse:
     """Consulta completa: contratos + proceso + documentos por cédula en una sola llamada."""
     return await secop_service.consulta_completa(db, cedula, refresh=refresh)
+
+
+@router.patch("/documentos/{doc_id}/categoria", response_model=SecopDocumentoResponse)
+async def actualizar_categoria_documento(
+    doc_id: uuid.UUID,
+    body: CategoriaUpdateBody,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> SecopDocumentoResponse:
+    """Sobreescribe manualmente la categoría de un documento SECOP.
+
+    Marca `categoria_override=true` para que reclasificaciones automáticas no
+    lo sobreescriban en el futuro.
+    """
+    doc = await secop_service.actualizar_categoria_documento(db, doc_id, body.categoria, usuario_id=user.id)
+    await db.commit()
+    await db.refresh(doc)
+    return SecopDocumentoResponse.model_validate(doc)

@@ -154,6 +154,20 @@ async def extraer_obligaciones(
     )
 
 
+@router.delete(
+    "/{contrato_id}/obligaciones",
+    status_code=status.HTTP_200_OK,
+)
+async def limpiar_obligaciones(
+    contrato_id: uuid.UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, int]:
+    """[DEV] Bulk-delete all obligations for a contract and return the count."""
+    count = await contrato_service.limpiar_obligaciones(db, user.id, contrato_id)
+    return {"deleted": count}
+
+
 @router.post(
     "/{contrato_id}/obligaciones",
     response_model=ObligacionResponse,

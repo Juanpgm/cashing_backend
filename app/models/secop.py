@@ -6,12 +6,13 @@ import uuid
 from datetime import date
 from typing import Any
 
-from sqlalchemy import Date, ForeignKey, Index, Numeric, String, Text, Uuid
+from sqlalchemy import Boolean, Date, Enum, ForeignKey, Index, Numeric, String, Text, Uuid
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
 
 from app.core.database import Base
 from app.models.base import TimestampMixin, UUIDMixin
+from app.models.categoria_documento import CategoriaDocumento
 
 
 class SecopContrato(UUIDMixin, TimestampMixin, Base):
@@ -113,3 +114,13 @@ class SecopDocumento(UUIDMixin, TimestampMixin, Base):
     nit_entidad: Mapped[str | None] = mapped_column(String(50))
     url_descarga: Mapped[str | None] = mapped_column(String(1000))
     datos_raw: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+
+    # Document classification (global axis — independent from checklist per-cuenta state)
+    categoria: Mapped[CategoriaDocumento] = mapped_column(
+        Enum(CategoriaDocumento, name="categoria_documento", values_callable=lambda x: [e.value for e in x]),
+        nullable=False,
+        default=CategoriaDocumento.OTROS,
+        server_default=CategoriaDocumento.OTROS.value,
+    )
+    categoria_confianza: Mapped[float | None] = mapped_column(Numeric(4, 3), nullable=True)
+    categoria_override: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")

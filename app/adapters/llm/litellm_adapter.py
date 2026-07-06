@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from typing import Any
 
 import structlog
+from pydantic import BaseModel
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from app.core.config import settings
@@ -46,8 +48,32 @@ class LiteLLMAdapter:
         return chain
 
     @staticmethod
-    def _to_litellm_messages(messages: list[LLMMessage]) -> list[dict[str, str]]:
+    def _to_litellm_messages(messages: list[LLMMessage]) -> list[dict[str, Any]]:
         return [{"role": m.role, "content": m.content} for m in messages]
+
+    @staticmethod
+    def _api_key_for(model: str) -> str | None:
+        """Resolve the provider API key from settings.
+
+        LiteLLM otherwise only reads keys from ``os.environ``; ours live in
+        Settings (loaded from .env files), so we must pass them explicitly.
+        """
+        if model.startswith("gemini/"):
+            return settings.GEMINI_API_KEY or None
+        if model.startswith("groq/"):
+            return settings.GROQ_API_KEY or None
+        if model.startswith(("openai/", "gpt-")):
+            return settings.OPENAI_API_KEY or None
+        if model.startswith("mistral/"):
+            return settings.MISTRAL_API_KEY or None
+        return None
+
+    @staticmethod
+    def _api_base_for(model: str) -> str | None:
+        """Resolve provider-specific api_base overrides."""
+        if model.startswith("ollama/"):
+            return settings.OLLAMA_BASE_URL
+        return None
 
     @retry(
         stop=stop_after_attempt(2),
@@ -58,9 +84,10 @@ class LiteLLMAdapter:
     async def _call_model(
         self,
         model: str,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         temperature: float,
         max_tokens: int,
+        response_format: type[BaseModel] | dict[str, Any] | None = None,
     ) -> LLMResponse:
         import litellm
 
@@ -71,9 +98,14 @@ class LiteLLMAdapter:
             "max_tokens": max_tokens,
             "timeout": 120,
         }
-        # LiteLLM requires api_base when routing to a local Ollama instance
-        if model.startswith("ollama/"):
-            kwargs["api_base"] = settings.OLLAMA_BASE_URL
+        if response_format is not None:
+            kwargs["response_format"] = response_format
+        api_base = self._api_base_for(model)
+        if api_base:
+            kwargs["api_base"] = api_base
+        api_key = self._api_key_for(model)
+        if api_key:
+            kwargs["api_key"] = api_key
 
         response = await litellm.acompletion(**kwargs)
         choice = response.choices[0]  # type: ignore[union-attr]
@@ -93,16 +125,27 @@ class LiteLLMAdapter:
         model: str | None = None,
         temperature: float = 0.3,
         max_tokens: int = 2048,
+        response_format: type[BaseModel] | dict[str, Any] | None = None,
+        fallback: bool = True,
     ) -> LLMResponse:
-        """Complete with automatic fallback through model chain."""
+        """Complete with automatic fallback through model chain.
+
+        When ``response_format`` is a Pydantic model class (or a json_schema
+        dict), LiteLLM requests structured output; the response ``content`` is
+        then a JSON string the caller can validate with ``model_validate_json``.
+
+        Set ``fallback=False`` to try only the requested model — used for vision
+        calls, where the text-only fallback models cannot read image parts and
+        would just produce a misleading error.
+        """
         litellm_msgs = self._to_litellm_messages(messages)
-        models = self._get_model_chain(model)
+        models = self._get_model_chain(model) if fallback else [model or self._default_model]
         last_error: Exception | None = None
 
         for m in models:
             try:
                 await logger.ainfo("llm_request", model=m, msg_count=len(messages))
-                result = await self._call_model(m, litellm_msgs, temperature, max_tokens)
+                result = await self._call_model(m, litellm_msgs, temperature, max_tokens, response_format)
                 await logger.ainfo(
                     "llm_response",
                     model=m,
@@ -140,6 +183,9 @@ class LiteLLMAdapter:
         }
         if target_model.startswith("ollama/"):
             stream_kwargs["api_base"] = settings.OLLAMA_BASE_URL
+        api_key = self._api_key_for(target_model)
+        if api_key:
+            stream_kwargs["api_key"] = api_key
 
         response = await litellm.acompletion(**stream_kwargs)
         async for chunk in response:  # type: ignore[union-attr]

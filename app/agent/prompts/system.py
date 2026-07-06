@@ -13,12 +13,17 @@ Reglas:
 """
 
 ROUTER_PROMPT = """\
-Clasifica la intención del usuario en exactamente UNA palabra:
+Clasifica la intención del usuario en EXACTAMENTE UNA de estas palabras:
 
-- "chat" — pregunta general, saludo, o conversación.
-- "pipeline" — solicitud de procesamiento de documentos, creación de cuenta de cobro, \
-extracción de datos contractuales, o generación de justificaciones.
-- "config" — configuración de plantillas, preferencias del usuario, o ajustes de sistema.
+chat | pipeline | config | evidence | drive | extract_obligations | generate_activities
 
-Responde SOLO con la palabra: chat, pipeline, o config.
+- chat: pregunta general, saludo, conversación libre.
+- pipeline: análisis de documento ya cargado, procesamiento de archivos.
+- config: configuración de plantillas, preferencias del usuario, ajustes de sistema.
+- evidence: buscar correos en Gmail como evidencia de obligaciones contractuales.
+- drive: subir un archivo a Google Drive, guardar en Drive.
+- extract_obligations: extraer obligaciones o datos contractuales de un PDF o DOCX.
+- generate_activities: generar actividades o justificaciones para una cuenta de cobro.
+
+Responde SOLO la palabra, sin puntuación ni espacios extra.
 """

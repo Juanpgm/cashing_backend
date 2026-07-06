@@ -15,8 +15,23 @@ from app.schemas.agent import AgentMode, ChatMessageResponse, LLMMessage
 
 logger = structlog.get_logger("services.agent")
 
-# Compile graph once at module level
+# Graph is built at startup via initialise_graph(); until then it starts
+# without a checkpointer so that the module can be imported during tests.
 _graph = build_graph()
+
+
+def initialise_graph() -> None:
+    """Replace the module-level graph with a fresh compiled instance.
+
+    Call this once inside the FastAPI lifespan after startup is complete.
+    """
+    global _graph
+    _graph = build_graph()
+
+
+def get_graph() -> object:
+    """Return the compiled LangGraph graph (singleton)."""
+    return _graph
 
 
 async def chat(
@@ -55,6 +70,7 @@ async def chat(
         "messages": history,
         "user_input": message,
         "response": "",
+        "_db": db,  # allows obligation/extraction nodes to persist results
     }
 
     # Run agent graph
@@ -91,3 +107,55 @@ async def get_conversation_history(
     if convo is None:
         return []
     return convo.mensajes_json  # type: ignore[return-value]
+
+
+async def run_full(
+    db: AsyncSession,
+    session_id: uuid.UUID,
+    state: AgentState,
+    *,
+    start_node: str | None = None,
+) -> "RunResult":  # type: ignore[name-defined]  # noqa: F821
+    """Execute graph. Persist checkpoint on HIL pause; update AgentRun on completion."""
+    from app.agent.checkpoint import save_checkpoint
+    from app.agent.engine import RunResult
+    from app.models.agent_run import AgentRun
+
+    graph = get_graph()
+    result: RunResult = await graph.run(state, start_node=start_node)  # type: ignore[attr-defined]
+
+    agent_run_id = state.get("agent_run_id")
+
+    if result.status == "paused":
+        await save_checkpoint(
+            db, session_id, result.state, result.paused_node, estado="pausado_hil"
+        )
+        if agent_run_id:
+            run_q = await db.execute(select(AgentRun).where(AgentRun.id == agent_run_id))
+            agent_run = run_q.scalar_one_or_none()
+            if agent_run:
+                agent_run.estado = "pausado_hil"
+                agent_run.nodo_actual = result.paused_node
+                await db.flush()
+    else:
+        if agent_run_id:
+            run_q = await db.execute(select(AgentRun).where(AgentRun.id == agent_run_id))
+            agent_run = run_q.scalar_one_or_none()
+            if agent_run:
+                agent_run.estado = "completado"
+                await db.flush()
+
+    return result
+
+
+async def resume(
+    db: AsyncSession,
+    session_id: uuid.UUID,
+    feedback: str,
+) -> "RunResult":  # type: ignore[name-defined]  # noqa: F821
+    """Load checkpoint, inject hil_feedback, and resume graph execution."""
+    from app.agent.checkpoint import load_checkpoint
+
+    state, paused_node = await load_checkpoint(db, session_id)
+    state = {**state, "_db": db, "hil_feedback": feedback}  # type: ignore[misc]
+    return await run_full(db, session_id, state, start_node=paused_node)

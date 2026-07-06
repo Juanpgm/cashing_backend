@@ -56,6 +56,20 @@ class CuentaCobroCreate(BaseModel):
     }
 
 
+class CuentaCobroUpdate(BaseModel):
+    """Partial update for a CuentaCobro. Only allowed when in BORRADOR state."""
+
+    mes: int | None = Field(default=None, ge=1, le=12)
+    anio: int | None = Field(default=None, ge=2020, le=2099)
+    valor: Decimal | None = Field(default=None, gt=0, decimal_places=2)
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {"mes": 4, "anio": 2026, "valor": "2500000.00"}
+        }
+    }
+
+
 class CuentaCobroResponse(BaseModel):
     id: uuid.UUID
     contrato_id: uuid.UUID

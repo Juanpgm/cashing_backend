@@ -1,59 +1,100 @@
-"""Prompt for extracting contract metadata from a Colombian government contract — v1."""
+"""Prompt for extracting contract metadata from a Colombian government contract — v2.
+
+Uses response_format=ContratoCamposLLM (structured JSON output).
+The prompt instructs WHAT to extract; the schema enforces the JSON shape.
+"""
 
 CONTRATO_EXTRACTION_SYSTEM = """\
 Eres un abogado especializado en contratos de prestación de servicios del Estado colombiano. \
-Tu tarea es leer el texto de un contrato y extraer con precisión los datos principales del mismo \
-en un formato estructurado exacto.
+Tu tarea es leer el texto de un contrato y extraer con precisión los datos principales. \
+Los contratos colombianos tienen estructuras variables según la entidad, \
+pero siempre contienen número de contrato, objeto, valor, fechas y datos del supervisor. \
+Debes buscar estos datos aunque estén dispersos a lo largo del documento o en cláusulas con nombres distintos.
 """
 
 CONTRATO_EXTRACTION_USER = """\
-Lee el siguiente texto de un contrato de prestación de servicios y extrae los datos principales.
+Lee el siguiente texto de un contrato de prestación de servicios colombiano y extrae los datos indicados.
 
-INSTRUCCIONES:
-1. Busca el número del contrato (ej: CD-045-2025, CPS-123-2024, etc.).
-2. Extrae el objeto del contrato: la descripción del servicio a prestar.
-3. Extrae el valor total del contrato (solo cifra numérica, sin signos ni puntos de miles, \
-con punto decimal si aplica).
-4. Extrae el valor mensual o de cada pago periódico (solo cifra numérica). Si no se menciona \
-explícitamente, divide el valor total entre el número de meses de duración.
-5. Extrae las fechas de inicio y fin del contrato en formato YYYY-MM-DD.
-6. Extrae el nombre del supervisor del contrato.
-7. Extrae el nombre de la entidad contratante.
-8. Extrae la dependencia o área de la entidad.
-9. Extrae el número de documento (cédula) del contratista/proveedor.
+CAMPOS A EXTRAER:
 
-FORMATO DE RESPUESTA — una línea por campo, sin texto adicional antes ni después:
+1. **numero_contrato**: El identificador único del contrato. Puede aparecer como:
+   - "Contrato N° CPS-2024-001", "CD-045-2025", "Contrato de Prestación de Servicios No. 123 de 2024"
+   - También puede llamarse: No. de contrato, Número de contrato, Referencia del contrato
+   - Extrae solo el código/número (ej: "CPS-2024-001", "CD-045-2025", "123-2024")
+
+2. **objeto**: La descripción del servicio a prestar. Busca la cláusula u artículo llamado \
+"OBJETO" o "CLÁUSULA PRIMERA" o "ALCANCE". Es el párrafo que describe qué debe hacer el contratista.
+
+3. **valor_total**: El valor total del contrato en cifra numérica (sin puntos de miles, \
+con punto decimal si aplica). Busca: "VALOR DEL CONTRATO", "CLÁUSULA … VALOR", "por la suma de $…".
+
+4. **valor_mensual**: El valor de cada pago mensual o período. Si no se menciona explícitamente, \
+divide el valor_total entre el número de meses de duración del contrato.
+
+5. **fecha_inicio**: Fecha de inicio en formato YYYY-MM-DD. Busca: "fecha de inicio", \
+"inicio de ejecución", "a partir del día…", en la cláusula de PLAZO o VIGENCIA.
+
+6. **fecha_fin**: Fecha de terminación en formato YYYY-MM-DD. Busca: "fecha de terminación", \
+"hasta el día…", plazo de N meses contados desde la fecha de inicio.
+
+7. **supervisor_nombre**: Nombre completo del supervisor del contrato. Busca la cláusula \
+de SUPERVISIÓN o INTERVENTORÍA. Puede llamarse supervisor, interventor, o coordinador.
+
+8. **cargo_supervisor**: Cargo o título del supervisor (ej: "Jefe de Oficina Asesora", \
+"Director de Área", "Coordinador de Proyectos").
+
+9. **entidad**: Nombre de la entidad pública contratante (ej: "Ministerio de Tecnologías de \
+la Información y las Comunicaciones", "Departamento Nacional de Planeación").
+
+10. **dependencia**: La dependencia, dirección, oficina o área de la entidad que supervisa \
+el contrato. No confundir con el departamento geográfico.
+
+11. **documento_proveedor**: Número de cédula o NIT del contratista/proveedor (persona natural o empresa).
+
+12. **pais**: País de ejecución (generalmente "Colombia").
+
+13. **departamento**: Departamento geográfico de ejecución (ej: "Bogotá D.C.", "Cundinamarca", \
+"Antioquia").
+
+14. **ciudad**: Ciudad o municipio de ejecución del contrato.
+
+15. **direccion_ejecucion**: Dirección física del lugar de ejecución si aparece explícitamente.
+
+REGLAS:
+- Deja en cadena vacía ("") cualquier campo que no encuentres en el texto.
+- NO inventes datos. Si el número de contrato no aparece claramente, deja número vacío.
+- Para los valores monetarios: extrae solo la cifra (ej: "12000000" no "$12.000.000").
+- Para las fechas: convierte siempre a formato YYYY-MM-DD.
+- Si el plazo está expresado en meses (ej: "por el término de 6 meses"), calcula la fecha de fin \
+sumando los meses a la fecha de inicio.
+- Si el objeto es largo, inclúyelo completo — es el campo más importante.
+
+FORMATO DE RESPUESTA (elige uno):
+Opción A — JSON (preferido):
+{{"numero_contrato": "...", "objeto": "...", "valor_total": "...", "valor_mensual": "...", \
+"fecha_inicio": "...", "fecha_fin": "...", "supervisor_nombre": "...", "cargo_supervisor": "...", \
+"entidad": "...", "dependencia": "...", "documento_proveedor": "...", \
+"pais": "...", "departamento": "...", "ciudad": "...", "direccion_ejecucion": "..."}}
+
+Opción B — una línea por campo (si no podés responder en JSON):
 CAMPO|numero_contrato|<valor>
 CAMPO|objeto|<valor>
-CAMPO|valor_total|<valor numerico>
-CAMPO|valor_mensual|<valor numerico>
-CAMPO|fecha_inicio|<YYYY-MM-DD>
-CAMPO|fecha_fin|<YYYY-MM-DD>
+CAMPO|valor_total|<valor>
+CAMPO|valor_mensual|<valor>
+CAMPO|fecha_inicio|<valor>
+CAMPO|fecha_fin|<valor>
 CAMPO|supervisor_nombre|<valor>
+CAMPO|cargo_supervisor|<valor>
 CAMPO|entidad|<valor>
 CAMPO|dependencia|<valor>
 CAMPO|documento_proveedor|<valor>
-
-Ejemplo válido:
-CAMPO|numero_contrato|CD-045-2025
-CAMPO|objeto|Prestación de servicios profesionales como desarrollador de software
-CAMPO|valor_total|12000000.00
-CAMPO|valor_mensual|2000000.00
-CAMPO|fecha_inicio|2025-01-15
-CAMPO|fecha_fin|2025-07-14
-CAMPO|supervisor_nombre|María García López
-CAMPO|entidad|Ministerio de Tecnologías de la Información
-CAMPO|dependencia|Dirección de Transformación Digital
-CAMPO|documento_proveedor|1016019452
-
-Si un campo NO se encuentra en el texto, omite esa línea (no escribas "No especificado"). \
-Solo incluye campos que puedas extraer con certeza del texto.
+CAMPO|pais|<valor>
+CAMPO|departamento|<valor>
+CAMPO|ciudad|<valor>
+CAMPO|direccion_ejecucion|<valor>
 
 TEXTO DEL CONTRATO:
 \"\"\"
 {texto_contrato}
 \"\"\"
-
-Responde ÚNICAMENTE con las líneas CAMPO|nombre|valor. Sin introducción, sin conclusión, \
-sin explicaciones.
 """

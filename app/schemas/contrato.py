@@ -3,7 +3,7 @@
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -14,6 +14,7 @@ class ObligacionCreate(BaseModel):
     descripcion: str = Field(min_length=5, max_length=1000)
     tipo: TipoObligacion
     orden: int = Field(default=0, ge=0)
+    etiqueta: str = Field(default="", max_length=8)
 
     model_config = {
         "json_schema_extra": {
@@ -32,6 +33,7 @@ class ObligacionResponse(BaseModel):
     descripcion: str
     tipo: TipoObligacion
     orden: int
+    etiqueta: str = ""
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -40,14 +42,20 @@ class ObligacionResponse(BaseModel):
 class ContratoCreate(BaseModel):
     numero_contrato: str = Field(min_length=1, max_length=100)
     objeto: str = Field(min_length=10, max_length=2000)
-    valor_total: Decimal = Field(gt=0, decimal_places=2)
+    valor_total: Decimal | None = Field(default=None, gt=0, decimal_places=2)
+    valor_adicion: Decimal | None = Field(default=None, ge=0, decimal_places=2)
     valor_mensual: Decimal = Field(gt=0, decimal_places=2)
     fecha_inicio: date
     fecha_fin: date
     supervisor_nombre: str | None = Field(default=None, max_length=255)
+    cargo_supervisor: str | None = Field(default=None, max_length=255)
     entidad: str | None = Field(default=None, max_length=255)
     dependencia: str | None = Field(default=None, max_length=255)
     documento_proveedor: str | None = Field(default=None, max_length=30)
+    pais: str | None = Field(default=None, max_length=100)
+    departamento: str | None = Field(default=None, max_length=100)
+    ciudad: str | None = Field(default=None, max_length=100)
+    direccion_ejecucion: str | None = Field(default=None, max_length=255)
     obligaciones: list[ObligacionCreate] = Field(default_factory=list)
 
     model_config = {
@@ -84,13 +92,19 @@ class ContratoUpdate(BaseModel):
     numero_contrato: str | None = Field(default=None, min_length=1, max_length=100)
     objeto: str | None = Field(default=None, min_length=10, max_length=2000)
     valor_total: Decimal | None = Field(default=None, gt=0, decimal_places=2)
+    valor_adicion: Decimal | None = Field(default=None, ge=0, decimal_places=2)
     valor_mensual: Decimal | None = Field(default=None, gt=0, decimal_places=2)
     fecha_inicio: date | None = None
     fecha_fin: date | None = None
     supervisor_nombre: str | None = Field(default=None, max_length=255)
+    cargo_supervisor: str | None = Field(default=None, max_length=255)
     entidad: str | None = Field(default=None, max_length=255)
     dependencia: str | None = Field(default=None, max_length=255)
     documento_proveedor: str | None = Field(default=None, max_length=30)
+    pais: str | None = Field(default=None, max_length=100)
+    departamento: str | None = Field(default=None, max_length=100)
+    ciudad: str | None = Field(default=None, max_length=100)
+    direccion_ejecucion: str | None = Field(default=None, max_length=255)
 
     model_config = {
         "json_schema_extra": {
@@ -108,14 +122,21 @@ class ContratoResponse(BaseModel):
     numero_contrato: str
     objeto: str
     valor_total: Decimal
+    valor_adicion: Decimal | None = None
     valor_mensual: Decimal
     fecha_inicio: date
     fecha_fin: date
     supervisor_nombre: str | None
+    cargo_supervisor: str | None = None
     entidad: str | None
     dependencia: str | None
     documento_proveedor: str | None
+    pais: str | None = None
+    departamento: str | None = None
+    ciudad: str | None = None
+    direccion_ejecucion: str | None = None
     obligaciones: list[ObligacionResponse]
+    url_proceso: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -127,10 +148,12 @@ class ContratoListItem(BaseModel):
     numero_contrato: str
     objeto: str
     valor_total: Decimal
+    valor_adicion: Decimal | None = None
     valor_mensual: Decimal
     fecha_inicio: date
     fecha_fin: date
     entidad: str | None
+    fuente: Literal["secop", "usuario"] = "usuario"
     created_at: datetime
     updated_at: datetime
 
@@ -154,6 +177,7 @@ class ContratoContextoAgenteResponse(BaseModel):
     fecha_inicio: date
     fecha_fin: date
     valor_total: Decimal
+    valor_adicion: Decimal | None = None
     valor_mensual: Decimal
     documento_proveedor: str | None
     contratista_nombre: str

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import io
 import re
 import uuid
+import zipfile
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -14,11 +17,14 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.exceptions import ExternalServiceError, ValidationError
+from app.core.exceptions import ExternalServiceError, NotFoundError, ValidationError
+from app.models.categoria_documento import CategoriaDocumento
 from app.models.contrato import Contrato
 from app.models.secop import SecopContrato, SecopDocumento, SecopProceso
 from app.schemas.contrato import ContratoCreate, ContratoResponse
 from app.schemas.secop import (
+    ArchivoComprimidoResponse,
+    ArchivoInternoItem,
     SecopConsultaCompletaResponse,
     SecopContratoDetalleResponse,
     SecopContratoResponse,
@@ -33,8 +39,16 @@ log = structlog.get_logger("service.secop")
 _SECOP_BASE = "https://www.datos.gov.co/resource"
 _DS_CONTRATOS = "jbjy-vk9h"
 _DS_PROCESOS = "p6dx-8zbt"
-_DS_DOCUMENTOS = "dmgg-8hin"
+# Archive document datasets (one per year-range)
+_DS_DOCS_HIST = "f8va-cf4m"  # hasta 31/12/2021 (cubre 2018-2021)
+_DS_DOCS_2022 = "kgcd-kt7i"
+_DS_DOCS_2023 = "3skv-9na7"
+_DS_DOCS_2025 = "dmgg-8hin"  # desde 01/01/2025 (2024 gap: no public dataset exists)
+_DS_DOCUMENTOS = _DS_DOCS_2025  # backward-compat alias used by sincronizar_documentos
+_DS_MODIFICACIONES = "u8cx-r425"  # SECOP II Modificaciones a contratos
+_ALL_DOCS_DATASETS = (_DS_DOCS_HIST, _DS_DOCS_2022, _DS_DOCS_2023, _DS_DOCS_2025)
 _CACHE_TTL = timedelta(hours=24)
+_CACHE_TTL_DOCS = timedelta(hours=2)  # Documents refresh more frequently
 _PRESTACION = "prestaci"  # substring present in all "Prestación de Servicios" variants
 
 
@@ -65,11 +79,11 @@ def _is_prestacion_servicios(tipo: str | None) -> bool:
     return bool(tipo and _PRESTACION in tipo.lower())
 
 
-def _is_fresh(updated_at: datetime) -> bool:
+def _is_fresh(updated_at: datetime, ttl: timedelta = _CACHE_TTL) -> bool:
     now = datetime.now(tz=UTC)
     if updated_at.tzinfo is None:
         updated_at = updated_at.replace(tzinfo=UTC)
-    return (now - updated_at) < _CACHE_TTL
+    return (now - updated_at) < ttl
 
 
 async def _query_socrata(dataset_id: str, where_clause: str, limit: int = 500) -> list[dict[str, Any]]:
@@ -94,6 +108,87 @@ async def _query_socrata(dataset_id: str, where_clause: str, limit: int = 500) -
         return data
     results: list[dict[str, Any]] = data.get("results", [])
     return results
+
+
+async def _query_docs_datasets(where_clause: str) -> list[dict[str, Any]]:
+    """Fan-out: query all archive document datasets in parallel.
+
+    Each row is annotated with ``_secop_dataset`` so callers can derive ``tipo_origen``.
+    Errors from individual datasets are logged and skipped (partial results are fine).
+    """
+    raw_results = await asyncio.gather(
+        *[_query_socrata(ds, where_clause, limit=1000) for ds in _ALL_DOCS_DATASETS],
+        return_exceptions=True,
+    )
+    rows: list[dict[str, Any]] = []
+    for ds_id, result in zip(_ALL_DOCS_DATASETS, raw_results, strict=False):
+        if isinstance(result, Exception):
+            log.warning("secop_docs_dataset_error", dataset=ds_id, error=str(result))
+            continue
+        for raw in result:
+            annotated = dict(raw)
+            annotated["_secop_dataset"] = ds_id
+            rows.append(annotated)
+    return rows
+
+
+async def _query_modificaciones_docs(
+    id_contratos_secop: list[str],
+    referencia_contrato: str | None,
+) -> list[dict[str, Any]]:
+    """Query u8cx-r425 for modification PDFs and return synthetic document rows.
+
+    Only rows that have a valid ``archivo_version_anterior`` URL and a unique
+    ``identificador`` are included.  The returned dicts are shaped to match the
+    fields expected by ``_upsert_documento``.
+    """
+    if not id_contratos_secop:
+        return []
+
+    safe_ids = " OR ".join(f"id_contrato = '{idc.replace(chr(39), chr(39) + chr(39))}'" for idc in id_contratos_secop)
+    try:
+        rows = await _query_socrata(_DS_MODIFICACIONES, where_clause=safe_ids, limit=200)
+    except ExternalServiceError as exc:
+        log.warning("secop_modificaciones_error", error=str(exc))
+        return []
+
+    synthetic: list[dict[str, Any]] = []
+    seen_mods: set[str] = set()
+    for row in rows:
+        # Use identificador_modificacion (modification-level) as dedup key so each unique
+        # modification produces one doc.  Fall back to identificador (contract-level) when
+        # identificador_modificacion is absent (older dataset rows).
+        dedup_key = str(row.get("identificador_modificacion") or row.get("identificador") or "").strip()
+        if not dedup_key or dedup_key in seen_mods:
+            continue
+        seen_mods.add(dedup_key)
+
+        raw_av = str(row.get("archivo_version_anterior") or "").strip()
+        # Accept HTTP URLs directly; Marketplace IDs ("MarketplaceCO1...") are stored
+        # as-is but url_descarga is set to None (no direct download link available).
+        url_descarga: str | None = raw_av if raw_av.startswith("http") else None
+
+        nombre = f"Modificación: {row.get('proposito_modificacion') or row.get('descripcion') or 'sin descripción'}"
+        synth: dict[str, Any] = {
+            **row,
+            # Override with synthetic fields compatible with _upsert_documento
+            "id_documento": f"MOD-{dedup_key}",
+            "n_mero_de_contrato": referencia_contrato,
+            "proceso": None,
+            "nombre_archivo": nombre,
+            "extensi_n": "pdf",
+            "descripci_n": row.get("descripcion") or row.get("proposito_modificacion"),
+            "fecha_carga": row.get("fecha_de_aprobacion"),
+            "entidad": None,
+            "nit_entidad": None,
+            "url_descarga_documento": url_descarga,
+            "tamanno_archivo": None,
+            "_secop_dataset": _DS_MODIFICACIONES,
+            # Preserve the raw identifier for frontend reference
+            "_archivo_identificador": raw_av if not raw_av.startswith("http") else None,
+        }
+        synthetic.append(synth)
+    return synthetic
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +321,11 @@ async def _upsert_documento(
         for k, v in fields.items():
             setattr(obj, k, v)
 
+    # Classify after setting fields; respects categoria_override on existing rows
+    from app.services.document_classifier import aplicar_clasificacion
+
+    aplicar_clasificacion(obj)
+
     await db.flush()
     return obj
 
@@ -296,76 +396,315 @@ async def buscar_documentos_contrato(
 ) -> list[SecopDocumentoResponse]:
     """Fetch ALL documents for a contract by both numero_contrato and proceso_de_compra.
 
+    Supports contracts with multiple SECOP rows (original + addenda / modifications).
     SECOP documents are linked to contracts via two different keys:
-    - n_mero_de_contrato (CO1.PCCNTR.xxx) — direct contract docs
+    - n_mero_de_contrato — direct contract ref (often the internal reference)
     - proceso (CO1.BDOS.xxx) — process docs, often contain the contract minute / obligations
     Both sets are merged and deduplicated to return the full document set.
-    """
-    # Resolve SecopContrato → get proceso_de_compra and FK id
-    contrato_result = await db.execute(
-        select(SecopContrato).where(SecopContrato.numero_contrato == numero_contrato)
-    )
-    secop_contrato = contrato_result.scalar_one_or_none()
-    contrato_id = secop_contrato.id if secop_contrato else None
-    proceso_de_compra = secop_contrato.proceso_de_compra if secop_contrato else None
 
-    # Resolve SecopProceso FK if we have proceso_de_compra
+    When the contract is not yet cached in the local DB, it is fetched from the
+    SECOP II contratos dataset (jbjy-vk9h) so that proceso_de_compra is populated
+    before running the document queries. Without this step, the document fan-out
+    would have no proceso keys and would return zero results.
+    """
+    # Resolve ALL SecopContrato rows for this numero_contrato.
+    # A contract can have multiple rows (original + adiciones/modificaciones),
+    # each potentially with a different proceso_de_compra that hosts its own documents.
+    # Using scalars().all() instead of scalar_one_or_none() prevents MultipleResultsFound.
+    contrato_result = await db.execute(
+        select(SecopContrato).where(
+            or_(
+                SecopContrato.numero_contrato == numero_contrato,
+                SecopContrato.referencia_del_contrato == numero_contrato,
+                SecopContrato.proceso_de_compra == numero_contrato,
+            )
+        )
+    )
+    secop_contratos = contrato_result.scalars().all()
+
+    # ── Pre-fetch from Socrata when contract not yet cached ───────────────────
+    # Without this, procesos_de_compra stays empty and document queries return nothing.
+    # Real fields in jbjy-vk9h: referencia_del_contrato, proceso_de_compra, id_contrato.
+    # NOTE: 'numero_contrato' does NOT exist in that dataset — only referencia_del_contrato.
+    if not secop_contratos:
+        safe_num = numero_contrato.replace("'", "''")
+        try:
+            api_rows = await _query_socrata(
+                _DS_CONTRATOS,
+                (
+                    f"referencia_del_contrato = '{safe_num}'"
+                    f" OR proceso_de_compra = '{safe_num}'"
+                    f" OR id_contrato = '{safe_num}'"
+                ),
+                limit=10,
+            )
+        except Exception:
+            api_rows = []
+        for row in api_rows:
+            await _upsert_contrato(db, row)
+        if api_rows:
+            await db.commit()
+            contrato_result2 = await db.execute(
+                select(SecopContrato).where(
+                    or_(
+                        SecopContrato.numero_contrato == numero_contrato,
+                        SecopContrato.referencia_del_contrato == numero_contrato,
+                        SecopContrato.proceso_de_compra == numero_contrato,
+                    )
+                )
+            )
+            secop_contratos = contrato_result2.scalars().all()
+            log.info(
+                "secop_contract_prefetched",
+                numero_contrato=numero_contrato,
+                found=len(secop_contratos),
+            )
+
+    # Use the first match as the primary FK anchor
+    secop_contrato = secop_contratos[0] if secop_contratos else None
+    contrato_id = secop_contrato.id if secop_contrato else None
+
+    # Collect ALL unique proceso_de_compra values (one per addendum)
+    procesos_de_compra: list[str] = list(
+        dict.fromkeys(c.proceso_de_compra for c in secop_contratos if c.proceso_de_compra)
+    )
+
+    # Collect all linking keys to use as n_mero_de_contrato values in doc queries.
+    # Some entities store referencia_del_contrato, others id_contrato (CO1.PCCNTR.xxx).
+    referencias: list[str] = list(
+        dict.fromkeys(
+            ref
+            for c in secop_contratos
+            for ref in [c.referencia_del_contrato, c.numero_contrato, c.id_contrato_secop]
+            if ref and ref != numero_contrato
+        )
+    )
+
+    # Resolve SecopProceso FK for the primary proceso
     proceso_id: uuid.UUID | None = None
-    if proceso_de_compra:
+    if procesos_de_compra:
         proceso_result = await db.execute(
-            select(SecopProceso).where(SecopProceso.id_proceso_secop == proceso_de_compra)
+            select(SecopProceso).where(SecopProceso.id_proceso_secop == procesos_de_compra[0])
         )
         secop_proceso = proceso_result.scalar_one_or_none()
         proceso_id = secop_proceso.id if secop_proceso else None
 
-    # Check cache: docs linked by either key
-    cache_conditions = [SecopDocumento.numero_contrato == numero_contrato]
-    if proceso_de_compra:
-        cache_conditions.append(SecopDocumento.proceso == proceso_de_compra)
+    # Build cache condition: match any referencia OR any proceso
+    all_num_keys = [numero_contrato] + referencias
+    cache_conditions: list[Any] = [SecopDocumento.numero_contrato.in_(all_num_keys)]
+    if procesos_de_compra:
+        cache_conditions.append(SecopDocumento.proceso.in_(procesos_de_compra))
     cached_result = await db.execute(select(SecopDocumento).where(or_(*cache_conditions)))
     cached = cached_result.scalars().all()
 
-    needs_refresh = refresh or not cached or (cached and not _is_fresh(cached[0].updated_at))
+    needs_refresh = refresh or not cached or (cached and not _is_fresh(cached[0].updated_at, _CACHE_TTL_DOCS))
 
     if needs_refresh:
-        safe_num = numero_contrato.replace("'", "''")
-
-        # Query 1: docs linked directly by numero_contrato (CO1.PCCNTR.xxx)
-        rows_by_num = await _query_socrata(
-            _DS_DOCUMENTOS,
-            where_clause=f"n_mero_de_contrato = '{safe_num}'",
-            limit=200,
-        )
-
-        # Query 2: docs linked by proceso_de_compra (CO1.BDOS.xxx) — includes contract minute
-        rows_by_proceso: list[dict[str, Any]] = []
-        if proceso_de_compra:
-            safe_proceso = proceso_de_compra.replace("'", "''")
-            rows_by_proceso = await _query_socrata(
-                _DS_DOCUMENTOS,
-                where_clause=f"proceso = '{safe_proceso}'",
-                limit=200,
-            )
-
-        # Merge and deduplicate by id_documento
+        # Non-destructive refresh: upsert docs from SECOP without deleting cached ones.
+        # This preserves references held by DocumentoCuentaCobro (ondelete=SET NULL) and
+        # avoids data loss when SECOP returns 0 results due to a transient error.
         seen: set[str] = set()
-        for row in rows_by_num:
+
+        # ── Combined OR query — single fan-out to 4 datasets ─────────────────
+        # Build one WHERE clause covering all contract refs and all proceso IDs.
+        # Datasets index primarily by `proceso` (CO1.BDOS.xxx); `n_mero_de_contrato`
+        # is also queried for completeness but is typically empty in practice.
+        where_parts: list[str] = []
+        for ref in all_num_keys:
+            safe = ref.replace("'", "''")
+            where_parts.append(f"n_mero_de_contrato = '{safe}'")
+        for proc in procesos_de_compra:
+            safe = proc.replace("'", "''")
+            where_parts.append(f"proceso = '{safe}'")
+
+        # Modifications dataset
+        id_contratos_secop = [c.id_contrato_secop for c in secop_contratos if c.id_contrato_secop]
+        referencia_contrato = (secop_contrato.referencia_del_contrato if secop_contrato else None) or numero_contrato
+        mod_coro = _query_modificaciones_docs(id_contratos_secop, referencia_contrato)
+
+        if where_parts:
+            combined_where = " OR ".join(where_parts)
+            docs_coro = _query_docs_datasets(combined_where)
+            gather_results = await asyncio.gather(docs_coro, mod_coro, return_exceptions=True)
+            docs_rows: list[dict[str, Any]] = [] if isinstance(gather_results[0], Exception) else gather_results[0]
+            mod_rows: list[dict[str, Any]] = [] if isinstance(gather_results[1], Exception) else gather_results[1]
+            if isinstance(gather_results[0], Exception):
+                log.warning("secop_docs_query_error", error=str(gather_results[0]))
+            if isinstance(gather_results[1], Exception):
+                log.warning("secop_mods_query_error", error=str(gather_results[1]))
+        else:
+            mod_result = await mod_coro
+            docs_rows = []
+            mod_rows = mod_result if not isinstance(mod_result, Exception) else []
+
+        # Gap detection: SECOP has no public dataset for 2024 documents.
+        # Log a warning when the contract's start date falls in 2024 and no documents
+        # were found — avoids silently returning empty results without explanation.
+        if not docs_rows and not mod_rows and secop_contrato is not None:
+            contrato_year = secop_contrato.fecha_inicio.year if secop_contrato.fecha_inicio else None
+            if contrato_year == 2024:
+                log.warning(
+                    "secop_docs_gap_2024",
+                    numero_contrato=numero_contrato,
+                    note="gap_2024_no_dataset",
+                    detail=(
+                        "No SECOP document dataset exists for 2024. "
+                        "Documents for contracts starting in 2024 may not be available via the public API."
+                    ),
+                )
+
+        for row in docs_rows:
             id_doc = str(row.get("id_documento") or "").strip()
             if id_doc and id_doc not in seen:
                 seen.add(id_doc)
+                row["_tipo_origen"] = "proceso" if row.get("proceso") else "contrato"
                 await _upsert_documento(db, row, secop_contrato_id=contrato_id, secop_proceso_id=proceso_id)
-        for row in rows_by_proceso:
+        for row in mod_rows:
             id_doc = str(row.get("id_documento") or "").strip()
             if id_doc and id_doc not in seen:
                 seen.add(id_doc)
+                row["_tipo_origen"] = "modificacion"
                 await _upsert_documento(db, row, secop_contrato_id=contrato_id, secop_proceso_id=proceso_id)
 
         if seen:
             await db.commit()
-            cached_result = await db.execute(select(SecopDocumento).where(or_(*cache_conditions)))
-            cached = cached_result.scalars().all()
+        # Always re-read from DB after a refresh attempt (even if SECOP returned nothing new)
+        cached_result = await db.execute(select(SecopDocumento).where(or_(*cache_conditions)))
+        cached = cached_result.scalars().all()
 
-    return [SecopDocumentoResponse.model_validate(d) for d in cached]
+    responses: list[SecopDocumentoResponse] = []
+    for d in cached:
+        r = SecopDocumentoResponse.model_validate(d)
+        r.tipo_origen = _compute_tipo_origen(d)
+        r.archivo_identificador = (d.datos_raw or {}).get("_archivo_identificador")
+        responses.append(r)
+    return _inject_url_proceso(responses, secop_contrato)
+
+
+def _compute_tipo_origen(doc: SecopDocumento) -> str:
+    """Derive tipo_origen at runtime from datos_raw metadata (no DB column needed)."""
+    raw = doc.datos_raw or {}
+    dataset = raw.get("_secop_dataset", "")
+    if dataset == _DS_MODIFICACIONES:
+        return "modificacion"
+    # _tipo_origen is tagged on each row before upsert to record how it was found:
+    # "contrato" → found via n_mero_de_contrato (referencia_del_contrato is the key)
+    # "proceso"  → found via proceso_de_compra
+    tipo = raw.get("_tipo_origen")
+    if tipo in ("contrato", "proceso", "modificacion"):
+        return tipo
+    # Fallback for rows cached before this field was introduced
+    if doc.numero_contrato:
+        return "contrato"
+    return "proceso"
+
+
+def _inject_url_proceso(
+    docs: list[SecopDocumentoResponse],
+    secop_contrato: SecopContrato | None,
+) -> list[SecopDocumentoResponse]:
+    """Inject url_proceso from SecopContrato.datos_raw['urlproceso'] into each document."""
+    if not secop_contrato:
+        return docs
+    raw = secop_contrato.datos_raw or {}
+    url_val = raw.get("urlproceso")
+    if isinstance(url_val, dict):
+        url_val = url_val.get("url")
+    if not url_val or not str(url_val).startswith("http"):
+        return docs
+    for doc in docs:
+        doc.url_proceso = str(url_val)
+    return docs
+
+
+async def listar_archivos_comprimido(
+    db: AsyncSession,
+    doc_id: uuid.UUID,
+) -> ArchivoComprimidoResponse:
+    """Descarga un documento comprimido (.zip) y lista sus archivos internos.
+
+    Para archivos .rar devuelve un error informativo (requiere dependencia externa).
+    Para otros formatos devuelve una lista vacía con un mensaje.
+    """
+    result = await db.execute(select(SecopDocumento).where(SecopDocumento.id == doc_id))
+    doc = result.scalar_one_or_none()
+
+    if doc is None:
+        return ArchivoComprimidoResponse(
+            doc_id=str(doc_id),
+            nombre_archivo=None,
+            extension=None,
+            archivos=[],
+            error="Documento no encontrado",
+        )
+
+    ext = (doc.extension or "").lower().strip(".")
+    if not doc.url_descarga:
+        return ArchivoComprimidoResponse(
+            doc_id=str(doc_id),
+            nombre_archivo=doc.nombre_archivo,
+            extension=doc.extension,
+            archivos=[],
+            error="El documento no tiene URL de descarga",
+        )
+
+    if ext == "rar":
+        return ArchivoComprimidoResponse(
+            doc_id=str(doc_id),
+            nombre_archivo=doc.nombre_archivo,
+            extension=doc.extension,
+            archivos=[],
+            error="Formato RAR: no es posible listar el contenido sin herramientas adicionales",
+        )
+
+    if ext != "zip":
+        return ArchivoComprimidoResponse(
+            doc_id=str(doc_id),
+            nombre_archivo=doc.nombre_archivo,
+            extension=doc.extension,
+            archivos=[],
+            error=f"El archivo no es un comprimido soportado (extensión: {doc.extension or 'desconocida'})",
+        )
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            response = await client.get(doc.url_descarga)
+            response.raise_for_status()
+        content = response.content
+    except httpx.HTTPError as exc:
+        return ArchivoComprimidoResponse(
+            doc_id=str(doc_id),
+            nombre_archivo=doc.nombre_archivo,
+            extension=doc.extension,
+            archivos=[],
+            error=f"No se pudo descargar el archivo: {exc}",
+        )
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as zf:
+            archivos = [
+                ArchivoInternoItem(
+                    nombre=info.filename,
+                    tamanio_bytes=info.file_size if info.file_size > 0 else None,
+                    es_directorio=info.filename.endswith("/"),
+                )
+                for info in zf.infolist()
+            ]
+    except zipfile.BadZipFile:
+        return ArchivoComprimidoResponse(
+            doc_id=str(doc_id),
+            nombre_archivo=doc.nombre_archivo,
+            extension=doc.extension,
+            archivos=[],
+            error="El archivo no es un ZIP válido",
+        )
+
+    return ArchivoComprimidoResponse(
+        doc_id=str(doc_id),
+        nombre_archivo=doc.nombre_archivo,
+        extension=doc.extension,
+        archivos=archivos,
+    )
 
 
 async def consulta_completa(
@@ -395,10 +734,7 @@ async def consulta_completa(
         docs = await docs_coro
         return SecopContratoDetalleResponse(contrato=contrato, proceso=proceso, documentos=docs or [])
 
-    detalles = []
-    for c in contratos:
-        detalle = await _enriquecer(c)
-        detalles.append(detalle)
+    detalles = list(await asyncio.gather(*[_enriquecer(c) for c in contratos]))
 
     return SecopConsultaCompletaResponse(
         cedula=cedula,
@@ -412,9 +748,21 @@ async def consulta_completa(
 # ---------------------------------------------------------------------------
 
 
+def _meses_calendario(fecha_inicio: date, fecha_fin: date) -> int:
+    """Count calendar months the contract spans (both endpoints inclusive).
+
+    Counts distinct calendar months touched: Jan 19 – Jun 30 → 6 months.
+    The +1 applies when fecha_fin.day >= fecha_inicio.day, meaning the
+    end month is reached at least as far as the start month, so it counts.
+    """
+    meses = (fecha_fin.year - fecha_inicio.year) * 12 + (fecha_fin.month - fecha_inicio.month)
+    if fecha_fin.day >= fecha_inicio.day:
+        meses += 1
+    return max(1, meses)
+
+
 def _calcular_valor_mensual(valor_total: Decimal, fecha_inicio: date, fecha_fin: date) -> Decimal:
-    dias = (fecha_fin - fecha_inicio).days
-    meses = max(1, round(dias / 30))
+    meses = _meses_calendario(fecha_inicio, fecha_fin)
     try:
         return (valor_total / Decimal(meses)).quantize(Decimal("0.01"))
     except (InvalidOperation, ZeroDivisionError):
@@ -434,19 +782,27 @@ def _mapear_a_contrato_create(row: dict[str, Any]) -> ContratoCreate | None:
 
     # --- objeto ---
     objeto = (
-        str(row.get("objeto_del_contrato") or "").strip()
-        or str(row.get("descripcion_del_proceso") or "").strip()
+        str(row.get("objeto_del_contrato") or "").strip() or str(row.get("descripcion_del_proceso") or "").strip()
     )[:2000]
     if len(objeto) < 10:
         return None
 
-    # --- valor_total ---
+    # --- valor_total (base + adición acumulada) ---
     try:
-        valor_total = Decimal(str(row.get("valor_del_contrato") or 0)).quantize(Decimal("0.01"))
+        valor_base = Decimal(str(row.get("valor_del_contrato") or 0)).quantize(Decimal("0.01"))
     except InvalidOperation:
         return None
-    if valor_total <= 0:
+    if valor_base <= 0:
         return None
+
+    try:
+        valor_adicion = Decimal(str(row.get("valor_adicion") or 0)).quantize(Decimal("0.01"))
+        if valor_adicion < 0:
+            valor_adicion = Decimal("0.00")
+    except InvalidOperation:
+        valor_adicion = Decimal("0.00")
+
+    valor_total = valor_base + valor_adicion
 
     # --- fechas ---
     fecha_inicio = _parse_date(row.get("fecha_de_inicio_del_contrato"))
@@ -454,15 +810,15 @@ def _mapear_a_contrato_create(row: dict[str, Any]) -> ContratoCreate | None:
     if not fecha_inicio or not fecha_fin or fecha_fin <= fecha_inicio:
         return None
 
-    # --- valor_mensual (calculado) ---
+    # --- valor_mensual: valor_total / meses calendario ---
     valor_mensual = _calcular_valor_mensual(valor_total, fecha_inicio, fecha_fin)
 
     # --- campos opcionales ---
-    supervisor = (str(row.get("nombre_supervisor") or "").strip() or None)
+    supervisor = str(row.get("nombre_supervisor") or "").strip() or None
     if supervisor:
         supervisor = supervisor[:255]
 
-    entidad = (str(row.get("nombre_entidad") or "").strip() or None)
+    entidad = str(row.get("nombre_entidad") or "").strip() or None
     if entidad:
         entidad = entidad[:255]
 
@@ -470,6 +826,7 @@ def _mapear_a_contrato_create(row: dict[str, Any]) -> ContratoCreate | None:
         numero_contrato=numero,
         objeto=objeto,
         valor_total=valor_total,
+        valor_adicion=valor_adicion if valor_adicion > 0 else None,
         valor_mensual=valor_mensual,
         fecha_inicio=fecha_inicio,
         fecha_fin=fecha_fin,
@@ -514,6 +871,7 @@ async def importar_contratos_secop(
     importados: list[ContratoResponse] = []
     omitidos_duplicados = 0
     omitidos_invalidos = 0
+    actualizados = 0
 
     from sqlalchemy.orm import selectinload
 
@@ -523,30 +881,63 @@ async def importar_contratos_secop(
             omitidos_invalidos += 1
             continue
 
-        if data.numero_contrato in existing_numeros:
-            omitidos_duplicados += 1
-            continue
+        es_duplicado = data.numero_contrato in existing_numeros
 
         if not confirmar:
             # Preview mode: build response without persisting
-            importados.append(ContratoResponse(
-                id=uuid.uuid4(),
-                usuario_id=usuario_id,
-                numero_contrato=data.numero_contrato,
-                objeto=data.objeto,
-                valor_total=data.valor_total,
-                valor_mensual=data.valor_mensual,
-                fecha_inicio=data.fecha_inicio,
-                fecha_fin=data.fecha_fin,
-                supervisor_nombre=data.supervisor_nombre,
-                entidad=data.entidad,
-                dependencia=data.dependencia,
-                documento_proveedor=documento_proveedor,
-                obligaciones=[],
-                created_at=datetime.now(tz=UTC),
-                updated_at=datetime.now(tz=UTC),
-            ))
+            importados.append(
+                ContratoResponse(
+                    id=uuid.uuid4(),
+                    usuario_id=usuario_id,
+                    numero_contrato=data.numero_contrato,
+                    objeto=data.objeto,
+                    valor_total=data.valor_total,
+                    valor_adicion=data.valor_adicion,
+                    valor_mensual=data.valor_mensual,
+                    fecha_inicio=data.fecha_inicio,
+                    fecha_fin=data.fecha_fin,
+                    supervisor_nombre=data.supervisor_nombre,
+                    entidad=data.entidad,
+                    dependencia=data.dependencia,
+                    documento_proveedor=documento_proveedor,
+                    obligaciones=[],
+                    created_at=datetime.now(tz=UTC),
+                    updated_at=datetime.now(tz=UTC),
+                )
+            )
             existing_numeros.add(data.numero_contrato)
+            continue
+
+        if es_duplicado:
+            # UPSERT: update valor fields on existing record
+            upd_result = await db.execute(
+                select(Contrato).where(
+                    Contrato.usuario_id == usuario_id,
+                    Contrato.numero_contrato == data.numero_contrato,
+                    Contrato.deleted_at.is_(None),
+                )
+            )
+            existing_contrato = upd_result.scalar_one_or_none()
+            if existing_contrato is not None:
+                existing_contrato.valor_total = float(data.valor_total)
+                existing_contrato.valor_adicion = float(data.valor_adicion) if data.valor_adicion else None
+                existing_contrato.valor_mensual = float(data.valor_mensual)
+                existing_contrato.fecha_inicio = data.fecha_inicio
+                existing_contrato.fecha_fin = data.fecha_fin
+                if data.supervisor_nombre:
+                    existing_contrato.supervisor_nombre = data.supervisor_nombre
+                if data.entidad:
+                    existing_contrato.entidad = data.entidad
+                await db.flush()
+                result = await db.execute(
+                    select(Contrato)
+                    .options(selectinload(Contrato.obligaciones))
+                    .where(Contrato.id == existing_contrato.id)
+                )
+                importados.append(ContratoResponse.model_validate(result.scalar_one()))
+                actualizados += 1
+            else:
+                omitidos_duplicados += 1
             continue
 
         contrato = Contrato(
@@ -554,6 +945,7 @@ async def importar_contratos_secop(
             numero_contrato=data.numero_contrato,
             objeto=data.objeto,
             valor_total=data.valor_total,
+            valor_adicion=data.valor_adicion,
             valor_mensual=data.valor_mensual,
             fecha_inicio=data.fecha_inicio,
             fecha_fin=data.fecha_fin,
@@ -567,9 +959,7 @@ async def importar_contratos_secop(
         existing_numeros.add(data.numero_contrato)
 
         result = await db.execute(
-            select(Contrato)
-            .options(selectinload(Contrato.obligaciones))
-            .where(Contrato.id == contrato.id)
+            select(Contrato).options(selectinload(Contrato.obligaciones)).where(Contrato.id == contrato.id)
         )
         importados.append(ContratoResponse.model_validate(result.scalar_one()))
 
@@ -578,7 +968,8 @@ async def importar_contratos_secop(
     log.info(
         "secop_importar_done",
         documento_proveedor=documento_proveedor,
-        importados=len(importados),
+        importados=len(importados) - actualizados,
+        actualizados=actualizados,
         omitidos_duplicados=omitidos_duplicados,
         omitidos_invalidos=omitidos_invalidos,
     )
@@ -586,7 +977,8 @@ async def importar_contratos_secop(
     return SecopImportResult(
         documento_proveedor=documento_proveedor,
         encontrados_en_secop=len(rows),
-        importados=len(importados),
+        importados=len(importados) - actualizados,
+        actualizados=actualizados,
         omitidos_duplicados=omitidos_duplicados,
         omitidos_invalidos=omitidos_invalidos,
         contratos=importados,
@@ -612,9 +1004,7 @@ async def sincronizar_documentos_secop(
         raise ValidationError("La cédula debe contener entre 5 y 15 dígitos")
 
     # Load all cached contratos for this cedula
-    contratos_result = await db.execute(
-        select(SecopContrato).where(SecopContrato.cedula_contratista == cedula)
-    )
+    contratos_result = await db.execute(select(SecopContrato).where(SecopContrato.cedula_contratista == cedula))
     contratos = contratos_result.scalars().all()
 
     # Load all cached procesos via proceso_de_compra links
@@ -634,23 +1024,54 @@ async def sincronizar_documentos_secop(
     docs_guardados = 0
     docs_omitidos = 0
 
-    # Fetch documents for each contrato
-    for contrato in contratos:
+    async def _fetch_docs_for_contrato(contrato: SecopContrato) -> tuple[list[dict[str, Any]], SecopContrato]:
         if not contrato.numero_contrato:
-            continue
+            return [], contrato
         safe_num = contrato.numero_contrato.replace("'", "''")
         rows = await _query_socrata(
             _DS_DOCUMENTOS,
             where_clause=f"n_mero_de_contrato = '{safe_num}'",
             limit=100,
         )
+        return rows, contrato
+
+    async def _fetch_docs_for_proceso(proceso: SecopProceso) -> tuple[list[dict[str, Any]], SecopProceso]:
+        safe_proc = proceso.id_proceso_secop.replace("'", "''")
+        rows = await _query_socrata(
+            _DS_DOCUMENTOS,
+            where_clause=f"proceso = '{safe_proc}'",
+            limit=100,
+        )
+        return rows, proceso
+
+    # Fetch documents for all contratos and procesos in parallel
+    gather_results = await asyncio.gather(
+        *[_fetch_docs_for_contrato(c) for c in contratos],
+        *[_fetch_docs_for_proceso(p) for p in procesos],
+        return_exceptions=True,
+    )
+
+    contrato_results = gather_results[: len(contratos)]
+    proceso_results = gather_results[len(contratos) :]
+
+    def _url_from_row(row: dict[str, Any]) -> str | None:
+        raw = row.get("url_descarga_documento")
+        if isinstance(raw, dict):
+            return raw.get("url")
+        return raw
+
+    # Process contrato results
+    for result in contrato_results:
+        if isinstance(result, Exception):
+            log.warning("secop_sync_contrato_failed", error=str(result))
+            continue
+        rows, contrato = result
         for row in rows:
             id_doc = str(row.get("id_documento") or "").strip()
             if not id_doc:
                 continue
             if id_doc in existing_ids:
                 docs_omitidos += 1
-                # Build a temp response for preview
                 tmp = SecopDocumento(
                     id_documento_secop=id_doc,
                     numero_contrato=row.get("n_mero_de_contrato"),
@@ -659,10 +1080,8 @@ async def sincronizar_documentos_secop(
                     nombre_archivo=row.get("nombre_archivo"),
                     extension=row.get("extensi_n"),
                     descripcion=row.get("descripci_n"),
-                    url_descarga=(row.get("url_descarga_documento") or {}).get("url")
-                    if isinstance(row.get("url_descarga_documento"), dict)
-                    else row.get("url_descarga_documento"),
-                    dados_raw=row,
+                    url_descarga=_url_from_row(row),
+                    datos_raw=row,
                 )
                 all_docs.append(tmp)
                 continue
@@ -673,30 +1092,27 @@ async def sincronizar_documentos_secop(
                     existing_ids.add(id_doc)
                     docs_guardados += 1
             else:
-                # Preview: build in-memory object
-                all_docs.append(SecopDocumento(
-                    id_documento_secop=id_doc,
-                    numero_contrato=row.get("n_mero_de_contrato"),
-                    proceso=row.get("proceso"),
-                    secop_contrato_id=contrato.id,
-                    nombre_archivo=row.get("nombre_archivo"),
-                    extension=row.get("extensi_n"),
-                    descripcion=row.get("descripci_n"),
-                    url_descarga=(row.get("url_descarga_documento") or {}).get("url")
-                    if isinstance(row.get("url_descarga_documento"), dict)
-                    else row.get("url_descarga_documento"),
-                ))
+                all_docs.append(
+                    SecopDocumento(
+                        id_documento_secop=id_doc,
+                        numero_contrato=row.get("n_mero_de_contrato"),
+                        proceso=row.get("proceso"),
+                        secop_contrato_id=contrato.id,
+                        nombre_archivo=row.get("nombre_archivo"),
+                        extension=row.get("extensi_n"),
+                        descripcion=row.get("descripci_n"),
+                        url_descarga=_url_from_row(row),
+                    )
+                )
                 existing_ids.add(id_doc)
                 docs_guardados += 1
 
-    # Fetch documents for each proceso
-    for proceso in procesos:
-        safe_proc = proceso.id_proceso_secop.replace("'", "''")
-        rows = await _query_socrata(
-            _DS_DOCUMENTOS,
-            where_clause=f"proceso = '{safe_proc}'",
-            limit=100,
-        )
+    # Process proceso results
+    for result in proceso_results:
+        if isinstance(result, Exception):
+            log.warning("secop_sync_proceso_failed", error=str(result))
+            continue
+        rows, proceso = result
         for row in rows:
             id_doc = str(row.get("id_documento") or "").strip()
             if not id_doc or id_doc in existing_ids:
@@ -709,18 +1125,18 @@ async def sincronizar_documentos_secop(
                     existing_ids.add(id_doc)
                     docs_guardados += 1
             else:
-                all_docs.append(SecopDocumento(
-                    id_documento_secop=id_doc,
-                    numero_contrato=row.get("n_mero_de_contrato"),
-                    proceso=row.get("proceso"),
-                    secop_proceso_id=proceso.id,
-                    nombre_archivo=row.get("nombre_archivo"),
-                    extension=row.get("extensi_n"),
-                    descripcion=row.get("descripci_n"),
-                    url_descarga=(row.get("url_descarga_documento") or {}).get("url")
-                    if isinstance(row.get("url_descarga_documento"), dict)
-                    else row.get("url_descarga_documento"),
-                ))
+                all_docs.append(
+                    SecopDocumento(
+                        id_documento_secop=id_doc,
+                        numero_contrato=row.get("n_mero_de_contrato"),
+                        proceso=row.get("proceso"),
+                        secop_proceso_id=proceso.id,
+                        nombre_archivo=row.get("nombre_archivo"),
+                        extension=row.get("extensi_n"),
+                        descripcion=row.get("descripci_n"),
+                        url_descarga=_url_from_row(row),
+                    )
+                )
                 existing_ids.add(id_doc)
                 docs_guardados += 1
 
@@ -740,22 +1156,24 @@ async def sincronizar_documentos_secop(
     # Build response — in-memory objects don't have .id, so use placeholder UUID
     docs_response: list[SecopDocumentoResponse] = []
     for d in all_docs:
-        docs_response.append(SecopDocumentoResponse(
-            id=getattr(d, "id", None) or uuid.uuid4(),
-            id_documento_secop=d.id_documento_secop,
-            numero_contrato=d.numero_contrato,
-            proceso=d.proceso,
-            secop_contrato_id=d.secop_contrato_id,
-            secop_proceso_id=d.secop_proceso_id,
-            nombre_archivo=d.nombre_archivo,
-            extension=d.extension,
-            descripcion=d.descripcion,
-            fecha_carga=d.fecha_carga if hasattr(d, "fecha_carga") else None,
-            entidad=d.entidad if hasattr(d, "entidad") else None,
-            nit_entidad=d.nit_entidad if hasattr(d, "nit_entidad") else None,
-            url_descarga=d.url_descarga,
-            updated_at=d.updated_at if hasattr(d, "updated_at") and d.updated_at else datetime.now(tz=UTC),
-        ))
+        docs_response.append(
+            SecopDocumentoResponse(
+                id=getattr(d, "id", None) or uuid.uuid4(),
+                id_documento_secop=d.id_documento_secop,
+                numero_contrato=d.numero_contrato,
+                proceso=d.proceso,
+                secop_contrato_id=d.secop_contrato_id,
+                secop_proceso_id=d.secop_proceso_id,
+                nombre_archivo=d.nombre_archivo,
+                extension=d.extension,
+                descripcion=d.descripcion,
+                fecha_carga=d.fecha_carga if hasattr(d, "fecha_carga") else None,
+                entidad=d.entidad if hasattr(d, "entidad") else None,
+                nit_entidad=d.nit_entidad if hasattr(d, "nit_entidad") else None,
+                url_descarga=d.url_descarga,
+                updated_at=d.updated_at if hasattr(d, "updated_at") and d.updated_at else datetime.now(tz=UTC),
+            )
+        )
 
     return SecopSincronizarDocumentosResult(
         contratos_procesados=len(contratos),
@@ -766,3 +1184,50 @@ async def sincronizar_documentos_secop(
         confirmar=confirmar,
         documentos=docs_response,
     )
+
+
+async def actualizar_categoria_documento(
+    db: AsyncSession,
+    doc_id: uuid.UUID,
+    categoria: CategoriaDocumento,
+    usuario_id: uuid.UUID | None = None,
+) -> SecopDocumento:
+    """Override the category of a SECOP document and mark it as manually set.
+
+    When ``usuario_id`` is provided, verifies that the document belongs to a
+    SecopContrato imported by that user (via cedula_contratista match on
+    Contrato.documento_proveedor). Docs not linked to any user-owned contrato
+    raise NotFoundError to prevent cross-user category overrides.
+    """
+    # Fetch the SECOP document, optionally scoped to a user-imported contrato.
+    if usuario_id is not None:
+        # Join SecopDocumento → SecopContrato and verify the cedula is used by this user.
+        res = await db.execute(
+            select(SecopDocumento)
+            .join(SecopContrato, SecopDocumento.secop_contrato_id == SecopContrato.id, isouter=True)
+            .join(
+                Contrato,
+                (Contrato.documento_proveedor == SecopContrato.cedula_contratista)
+                & (Contrato.usuario_id == usuario_id)
+                & (Contrato.deleted_at.is_(None)),
+                isouter=True,
+            )
+            .where(
+                SecopDocumento.id == doc_id,
+                # Accept docs linked to a contrato the user owns, or unlinked docs
+                # (secop_contrato_id IS NULL) which are global and always accessible.
+                (SecopDocumento.secop_contrato_id.is_(None)) | (Contrato.id.is_not(None)),
+            )
+        )
+    else:
+        res = await db.execute(select(SecopDocumento).where(SecopDocumento.id == doc_id))
+
+    doc = res.scalar_one_or_none()
+    if doc is None:
+        raise NotFoundError("SecopDocumento", str(doc_id))
+
+    doc.categoria = categoria
+    doc.categoria_confianza = None
+    doc.categoria_override = True
+    await db.flush()
+    return doc

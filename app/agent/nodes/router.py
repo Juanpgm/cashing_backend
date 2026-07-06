@@ -12,11 +12,18 @@ from app.schemas.agent import AgentMode, LLMMessage
 logger = structlog.get_logger("agent.router")
 
 
+_VALID_MODES: dict[str, AgentMode] = {m.value: m for m in AgentMode}
+
+
 async def router_node(state: AgentState) -> AgentState:
-    """Determine if input is chat, pipeline or config request."""
+    """Determine execution mode from user intent."""
     user_input = state.get("user_input", "")
     if not user_input:
         return {**state, "mode": AgentMode.CHAT, "error": "Empty input"}
+
+    # Programmatic calls (from services) signal mode via __ prefix; skip LLM overhead.
+    if user_input.startswith("__"):
+        return state
 
     llm = get_llm()
     messages = [
@@ -26,15 +33,8 @@ async def router_node(state: AgentState) -> AgentState:
 
     try:
         resp = await llm.complete(messages, temperature=0.0, max_tokens=20)
-        text = resp.content.strip().lower()
-
-        if "pipeline" in text:
-            mode = AgentMode.PIPELINE
-        elif "config" in text:
-            mode = AgentMode.CONFIG
-        else:
-            mode = AgentMode.CHAT
-
+        text = resp.content.strip().lower().split()[0] if resp.content.strip() else "chat"
+        mode = _VALID_MODES.get(text, AgentMode.CHAT)
         await logger.ainfo("router_decision", mode=mode, input_preview=user_input[:80])
         return {**state, "mode": mode}
     except Exception as exc:

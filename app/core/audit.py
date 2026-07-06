@@ -22,7 +22,14 @@ class AuditMiddleware(BaseHTTPMiddleware):
         if hasattr(request.state, "user_id"):
             user_id = request.state.user_id
 
-        response = await call_next(request)
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            from fastapi.responses import JSONResponse
+            response = JSONResponse(
+                status_code=500,
+                content={"detail": f"{type(exc).__name__}: {exc}"},
+            )
 
         await logger.ainfo(
             "request",

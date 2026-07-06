@@ -15,8 +15,22 @@ logger = structlog.get_logger("agent.pipeline")
 
 
 async def doc_ingestion_node(state: AgentState) -> AgentState:
-    """Parse and store document text — actual parsing delegated to agent tools."""
+    """Parse and store document text."""
     doc_text = state.get("document_text")
+
+    if not doc_text and state.get("document_bytes"):
+        from app.agent.tools.document_parser import parse_document
+        try:
+            doc_text = parse_document(
+                state["document_bytes"],  # type: ignore[index]
+                state.get("document_filename", "document.pdf"),
+            )
+            await logger.ainfo("doc_ingestion_parsed_bytes", chars=len(doc_text))
+            return {**state, "document_text": doc_text, "error": None}
+        except Exception as exc:
+            await logger.aerror("doc_ingestion_parse_failed", error=str(exc))
+            return {**state, "error": f"Error parsing document: {exc}"}
+
     if not doc_text:
         return {**state, "error": "No document text provided for ingestion"}
     await logger.ainfo("doc_ingestion", chars=len(doc_text))

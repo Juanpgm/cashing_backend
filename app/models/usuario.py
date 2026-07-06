@@ -2,7 +2,7 @@
 
 import enum
 
-from sqlalchemy import Boolean, Enum, Integer, String
+from sqlalchemy import Boolean, Enum, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -21,7 +21,10 @@ class Usuario(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
     nombre: Mapped[str] = mapped_column(String(255), nullable=False)
     cedula: Mapped[str | None] = mapped_column(String(20), nullable=True)
     telefono: Mapped[str | None] = mapped_column(String(20), nullable=True)
-    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    password_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    google_id: Mapped[str | None] = mapped_column(String(128), unique=True, nullable=True, index=True)
+    photo_url: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    provider: Mapped[str] = mapped_column(String(20), nullable=False, default="email", server_default="email")
     rol: Mapped[RolUsuario] = mapped_column(
         Enum(RolUsuario, name="rol_usuario"),
         nullable=False,
@@ -34,3 +37,5 @@ class Usuario(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
     # Relationships
     contratos: Mapped[list["Contrato"]] = relationship(back_populates="usuario", lazy="selectin")  # type: ignore[name-defined]  # noqa: F821
     suscripciones: Mapped[list["Suscripcion"]] = relationship(back_populates="usuario", lazy="selectin")  # type: ignore[name-defined]  # noqa: F821
+    agent_runs: Mapped[list["AgentRun"]] = relationship(back_populates="usuario", lazy="dynamic")  # type: ignore[name-defined]  # noqa: F821
+    preferencias: Mapped[list["PreferenciaUsuario"]] = relationship(back_populates="usuario", lazy="selectin")  # type: ignore[name-defined]  # noqa: F821

@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: Arial, Helvetica, sans-serif;
+      font-size: 10.5pt;
+      color: #1a1a1a;
+      padding: 2cm 2.5cm;
+    }
+    .header {
+      text-align: center;
+      margin-bottom: 1.5em;
+      border-bottom: 2px solid #2d3a8c;
+      padding-bottom: 1em;
+    }
+    .header h1 {
+      font-size: 14pt;
+      font-weight: bold;
+      color: #2d3a8c;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .header h2 { font-size: 11pt; color: #444; margin-top: 0.4em; }
+    section { margin-top: 1.4em; }
+    section h3 {
+      font-size: 10.5pt;
+      font-weight: bold;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+      color: #2d3a8c;
+      border-bottom: 1px solid #c8cfe8;
+      padding-bottom: 3px;
+      margin-bottom: 0.7em;
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 9.5pt; }
+    table.kv td { padding: 3px 6px; }
+    table.kv td:first-child { font-weight: bold; width: 35%; color: #333; }
+    table.bordered th,
+    table.bordered td { border: 1px solid #bbb; padding: 4px 7px; vertical-align: top; }
+    table.bordered th { background: #eef0f8; font-weight: bold; text-align: left; }
+    table.bordered tr:nth-child(even) { background: #f8f9fc; }
+    .badge {
+      display: inline-block;
+      border-radius: 3px;
+      padding: 1px 6px;
+      font-size: 8.5pt;
+      font-weight: bold;
+    }
+    .badge-ok { background: #dcfce7; color: #166534; }
+    .badge-warn { background: #fef9c3; color: #854d0e; }
+    .badge-neutral { background: #f3f4f6; color: #374151; font-weight: normal; font-style: italic; }
+    .firmas {
+      margin-top: 3em;
+      display: flex;
+      gap: 3cm;
+    }
+    .firma-bloque { flex: 1; text-align: center; }
+    .firma-espacio { height: 1.8cm; }
+    .firma-linea { border-top: 1px solid #555; padding-top: 4px; }
+    .firma-bloque p { font-size: 9pt; line-height: 1.5; }
+    .footer {
+      margin-top: 2em;
+      font-size: 8pt;
+      color: #888;
+      text-align: center;
+      border-top: 1px solid #ddd;
+      padding-top: 0.6em;
+    }
+  </style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Constancia de cumplimiento de obligaciones contractuales</h1>
+  <h2>Contrato N.° {{ contrato_numero }} &mdash; {{ periodo }}</h2>
+</div>
+
+<section>
+  <h3>Datos del contrato</h3>
+  <table class="kv">
+    <tr><td>Entidad contratante</td><td>{{ entidad }}</td></tr>
+    <tr><td>Dependencia</td><td>{{ dependencia }}</td></tr>
+    <tr><td>N.° de contrato</td><td>{{ contrato_numero }}</td></tr>
+    <tr><td>Objeto</td><td>{{ objeto }}</td></tr>
+    <tr><td>Contratista</td><td>{{ contratista_nombre }}</td></tr>
+    <tr><td>C.C. contratista</td><td>{{ contratista_cedula }}</td></tr>
+    <tr><td>Supervisor</td><td>{{ supervisor_nombre }}</td></tr>
+    <tr><td>Período reportado</td><td>{{ periodo }}</td></tr>
+    <tr><td>Valor del período</td><td>{{ valor_periodo }}</td></tr>
+    <tr><td>Fecha de generación</td><td>{{ fecha_generacion }}</td></tr>
+  </table>
+</section>
+
+{% if checklist_items %}
+<section>
+  <h3>Requisitos documentales</h3>
+  <table class="bordered">
+    <thead>
+      <tr>
+        <th>Requisito</th>
+        <th style="width: 24%">Estado</th>
+        <th>Observaciones</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for item in checklist_items %}
+      <tr>
+        <td>{{ item.etiqueta }}</td>
+        <td>
+          {% if item.cumplido %}
+            <span class="badge badge-ok">{{ item.estado_label }}</span>
+          {% elif item.no_aplica %}
+            <span class="badge badge-neutral">{{ item.estado_label }}</span>
+          {% else %}
+            <span class="badge badge-warn">{{ item.estado_label }}</span>
+          {% endif %}
+        </td>
+        <td>{{ item.observaciones or "" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+
+{% if actividades %}
+<section>
+  <h3>Actividades realizadas en el período</h3>
+  <table class="bordered">
+    <thead>
+      <tr>
+        <th style="width: 4%">#</th>
+        <th style="width: 32%">Obligación</th>
+        <th>Actividad realizada</th>
+        <th style="width: 14%">Fecha</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for act in actividades %}
+      <tr>
+        <td>{{ loop.index }}</td>
+        <td>{{ act.obligacion_descripcion or "—" }}</td>
+        <td>{{ act.descripcion }}</td>
+        <td>{{ act.fecha_realizacion or "—" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+
+<div class="firmas">
+  <div class="firma-bloque">
+    <div class="firma-espacio"></div>
+    <div class="firma-linea">
+      <p><strong>{{ contratista_nombre }}</strong></p>
+      <p>C.C. {{ contratista_cedula }}</p>
+      <p>Contratista</p>
+    </div>
+  </div>
+  <div class="firma-bloque">
+    <div class="firma-espacio"></div>
+    <div class="firma-linea">
+      <p><strong>{{ supervisor_nombre }}</strong></p>
+      <p>Supervisor del contrato</p>
+    </div>
+  </div>
+</div>
+
+<div class="footer">
+  Generado por CashIn &middot; {{ fecha_generacion }} &middot;
+  Los datos personales son tratados conforme a la Ley 1581 de 2012 de protección de datos personales.
+</div>
+
+</body>
+</html>
