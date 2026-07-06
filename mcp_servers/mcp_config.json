@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json.schemastore.org/mcp-config.json",
+  "version": "1.0",
+  "description": "CashIn MCP server configuration — defines available workspace tools for the AI agent.",
+  "servers": {
+    "gmail": {
+      "module": "app.mcp_servers.gmail_server",
+      "description": "Gmail integration — search emails, read threads, extract evidence.",
+      "enabled": true,
+      "scopes": [
+        "https://www.googleapis.com/auth/gmail.readonly",
+        "https://www.googleapis.com/auth/gmail.send",
+        "https://www.googleapis.com/auth/gmail.compose"
+      ],
+      "settings": {
+        "max_results_per_query": 50,
+        "search_window_days": 90
+      }
+    },
+    "drive": {
+      "module": "app.mcp_servers.drive_server",
+      "description": "Google Drive integration — search files, read documents, upload evidence.",
+      "enabled": true,
+      "scopes": [
+        "https://www.googleapis.com/auth/drive.file",
+        "https://www.googleapis.com/auth/drive.readonly"
+      ],
+      "settings": {
+        "max_results_per_query": 20,
+        "allowed_mime_types": [
+          "application/pdf",
+          "application/vnd.google-apps.document",
+          "application/vnd.google-apps.spreadsheet",
+          "text/plain",
+          "image/png",
+          "image/jpeg"
+        ]
+      }
+    },
+    "calendar": {
+      "module": "app.mcp_servers.calendar_server",
+      "description": "Google Calendar integration — list events, find meetings as evidence.",
+      "enabled": true,
+      "scopes": [
+        "https://www.googleapis.com/auth/calendar.readonly"
+      ],
+      "settings": {
+        "max_events_per_query": 100,
+        "look_back_months": 3
+      }
+    },
+    "filesystem": {
+      "module": "mcp_servers.filesystem_server",
+      "description": "Local filesystem integration — index and read files from the user's computer.",
+      "enabled": true,
+      "settings": {
+        "max_files_per_index": 200,
+        "max_file_bytes": 51200,
+        "allowed_extensions": [
+          ".pdf", ".docx", ".doc", ".txt", ".xlsx", ".xls",
+          ".jpg", ".jpeg", ".png", ".eml", ".msg"
+        ]
+      }
+    }
+  },
+  "agent_defaults": {
+    "enabled_servers": ["gmail", "drive", "calendar", "filesystem"],
+    "evidence_mode_servers": ["gmail", "drive", "calendar", "filesystem"],
+    "onboarding_mode_servers": ["filesystem"],
+    "chat_mode_servers": ["gmail", "drive", "filesystem"]
+  }
+}

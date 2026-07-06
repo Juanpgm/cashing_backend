@@ -1,0 +1,297 @@
+"""
+Create Google OAuth2 Web Client for CashIn and write credentials to .env.
+
+Uses the clientauthconfig.googleapis.com internal API (same as GCP Console).
+Run: uv run python scripts/setup_google_oauth.py
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import requests
+
+PROJECT_ID = "cashing-9b4f6"
+SUPPORT_EMAIL = "juanp.gzmz@gmail.com"
+APP_TITLE = "CashIn"
+CLIENT_DISPLAY_NAME = "CashIn Web"
+REDIRECT_URI = "http://localhost:8000/api/v1/integraciones/google/callback"
+
+BASE = "https://clientauthconfig.googleapis.com/v1"
+ENV_PATH = Path(__file__).parent.parent / ".env"
+
+
+def gcloud_cmd() -> str:
+    """Return the correct gcloud executable for this OS."""
+    import shutil
+    # On Windows gcloud is a .cmd wrapper
+    for name in ("gcloud.cmd", "gcloud"):
+        path = shutil.which(name)
+        if path:
+            return path
+    # Fallback to common install location on Windows
+    fallback = r"C:\Users\User\AppData\Local\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd"
+    if os.path.exists(fallback):
+        return fallback
+    print("ERROR: gcloud not found. Install Google Cloud SDK first.")
+    sys.exit(1)
+
+
+def get_token() -> str:
+    result = subprocess.run(
+        [gcloud_cmd(), "auth", "print-access-token"],
+        capture_output=True, text=True, check=True,
+        shell=False,
+    )
+    return result.stdout.strip()
+
+
+def headers(token: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+
+def get_or_create_brand(token: str) -> str:
+    """Return brand name; create if not found."""
+    h = headers(token)
+
+    # List existing brands
+    r = requests.get(f"{BASE}/projects/{PROJECT_ID}/brands", headers=h)
+    if r.status_code == 200:
+        brands = r.json().get("brands", [])
+        if brands:
+            brand_name = brands[0]["name"]
+            print(f"  Found existing brand: {brand_name}")
+            return brand_name
+
+    # Create brand
+    print("  Creating OAuth consent screen brand…")
+    payload = {"applicationTitle": APP_TITLE, "supportEmail": SUPPORT_EMAIL}
+    r = requests.post(f"{BASE}/projects/{PROJECT_ID}/brands", headers=h, json=payload)
+    if r.status_code not in (200, 201):
+        print(f"  ERROR creating brand: {r.status_code} {r.text}")
+        sys.exit(1)
+    brand_name = r.json()["name"]
+    print(f"  Brand created: {brand_name}")
+    return brand_name
+
+
+def find_existing_client(token: str, brand_name: str) -> tuple[str, str] | None:
+    """Return (client_id, client_secret) if a web client already exists."""
+    h = headers(token)
+    r = requests.get(f"{BASE}/{brand_name}/oauthClients", headers=h)
+    if r.status_code != 200:
+        return None
+    for client in r.json().get("clients", []):
+        if client.get("clientType") == "WEB":
+            # Secret is only visible at creation time; skip if already exists
+            print(f"  Found existing web client: {client['name']}")
+            print("  NOTE: client_secret is not retrievable after creation.")
+            return None
+    return None
+
+
+def create_web_client(token: str, brand_name: str) -> tuple[str, str]:
+    """Create a new Web Application OAuth client; return (client_id, client_secret)."""
+    h = headers(token)
+    payload = {
+        "displayName": CLIENT_DISPLAY_NAME,
+        "clientType": "WEB",
+        "redirectUris": [REDIRECT_URI],
+    }
+    r = requests.post(f"{BASE}/{brand_name}/oauthClients", headers=h, json=payload)
+    if r.status_code not in (200, 201):
+        print(f"  ERROR creating client: {r.status_code} {r.text}")
+        sys.exit(1)
+    data = r.json()
+    client_id = data["clientId"]
+    client_secret = data["secret"]
+    print(f"  OAuth client created: {data['name']}")
+    return client_id, client_secret
+
+
+def generate_fernet_key() -> str:
+    from cryptography.fernet import Fernet
+    return Fernet.generate_key().decode()
+
+
+def update_env(client_id: str, client_secret: str, fernet_key: str) -> None:
+    """Append/update Google OAuth vars in .env without touching existing lines."""
+    env_text = ENV_PATH.read_text(encoding="utf-8") if ENV_PATH.exists() else ""
+
+    new_vars = {
+        "GOOGLE_OAUTH_CLIENT_ID": client_id,
+        "GOOGLE_OAUTH_CLIENT_SECRET": client_secret,
+        "GOOGLE_OAUTH_REDIRECT_URI": REDIRECT_URI,
+        "TOKEN_ENCRYPTION_KEY": fernet_key,
+    }
+
+    lines = env_text.splitlines()
+    updated_keys: set[str] = set()
+
+    # Update existing lines in-place
+    for i, line in enumerate(lines):
+        for key in new_vars:
+            if line.startswith(f"{key}=") or line.startswith(f"{key} ="):
+                lines[i] = f"{key}={new_vars[key]}"
+                updated_keys.add(key)
+                break
+
+    # Append missing keys
+    missing = [k for k in new_vars if k not in updated_keys]
+    if missing:
+        lines.append("")
+        lines.append("# Google OAuth2 — generated by scripts/setup_google_oauth.py")
+        for key in missing:
+            lines.append(f"{key}={new_vars[key]}")
+
+    ENV_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"\n  .env updated at {ENV_PATH}")
+    for key in new_vars:
+        masked = new_vars[key][:8] + "…" if len(new_vars[key]) > 8 else new_vars[key]
+        print(f"    {key}={masked}")
+
+
+def enable_apis(token: str) -> None:
+    """Ensure required Google APIs are enabled in the project."""
+    import subprocess
+    cmd = gcloud_cmd()
+    apis = [
+        "gmail.googleapis.com",
+        "drive.googleapis.com",
+        "calendar-json.googleapis.com",
+    ]
+    for api in apis:
+        r = subprocess.run(
+            [cmd, "services", "enable", api, f"--project={PROJECT_ID}"],
+            capture_output=True, text=True,
+        )
+        status = "OK" if r.returncode == 0 else f"WARNING: {r.stderr.strip()[:80]}"
+        print(f"  {api}: {status}")
+
+
+def write_partial_env(fernet_key: str) -> None:
+    """Write the parts we CAN generate automatically to .env."""
+    env_text = ENV_PATH.read_text(encoding="utf-8") if ENV_PATH.exists() else ""
+
+    auto_vars = {
+        "TOKEN_ENCRYPTION_KEY": fernet_key,
+        "GOOGLE_OAUTH_REDIRECT_URI": REDIRECT_URI,
+    }
+    placeholder_vars = {
+        "GOOGLE_OAUTH_CLIENT_ID": "PASTE_YOUR_CLIENT_ID_HERE",
+        "GOOGLE_OAUTH_CLIENT_SECRET": "PASTE_YOUR_CLIENT_SECRET_HERE",
+    }
+
+    lines = env_text.splitlines()
+    updated: set[str] = set()
+    all_vars = {**auto_vars, **placeholder_vars}
+
+    for i, line in enumerate(lines):
+        for key in all_vars:
+            if line.startswith(f"{key}=") or line.startswith(f"{key} ="):
+                # Only overwrite placeholders/auto vars, skip real secrets already set
+                current_val = line.split("=", 1)[1].strip()
+                is_placeholder = "PASTE_YOUR" in current_val or current_val in ("", '""')
+                if key in auto_vars or is_placeholder:
+                    lines[i] = f"{key}={all_vars[key]}"
+                updated.add(key)
+                break
+
+    missing = [k for k in all_vars if k not in updated]
+    if missing:
+        lines.append("")
+        lines.append("# Google OAuth2 — add your credentials below")
+        for key in missing:
+            lines.append(f"{key}={all_vars[key]}")
+
+    ENV_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def main() -> None:
+    print(f"\n=== CashIn — Google OAuth Setup (project: {PROJECT_ID}) ===\n")
+
+    print("1. Getting access token…")
+    token = get_token()
+    print("   OK")
+
+    print("\n2. Enabling Google APIs…")
+    enable_apis(token)
+
+    print("\n3. Generating TOKEN_ENCRYPTION_KEY…")
+    fernet_key = generate_fernet_key()
+    print("   OK")
+
+    print("\n4. Writing auto-generated vars to .env…")
+    write_partial_env(fernet_key)
+    print(f"   Written to {ENV_PATH}")
+
+    print("""
+=== ACTION REQUIRED - 5 clicks in Google Cloud Console ===
+
+Google removed all CLI APIs for creating OAuth clients in early 2026.
+You need to do this part manually (takes ~2 minutes):
+
+1. Open: https://console.cloud.google.com/apis/credentials?project=cashing-9b4f6
+
+2. Click  [+ CREATE CREDENTIALS]  >  OAuth client ID
+
+3. Application type: Web application
+   Name: CashIn Web
+
+4. Authorized redirect URIs → Add URI:
+   http://localhost:8000/api/v1/integraciones/google/callback
+
+5. Click [CREATE] — copy the Client ID and Client Secret that appear.
+
+6. Run this to inject them:
+   cd cashing-backend
+   uv run python scripts/setup_google_oauth.py --inject CLIENT_ID CLIENT_SECRET
+
+Note: You also need an OAuth consent screen configured:
+  https://console.cloud.google.com/apis/credentials/consent?project=cashing-9b4f6
+  - User type: External
+  - Add scopes: gmail.readonly, drive.readonly, calendar.readonly
+  - Add your email as test user
+
+==========================================================
+""")
+
+
+def inject_credentials(client_id: str, client_secret: str) -> None:
+    """Inject real credentials into .env after manual Console steps."""
+    env_text = ENV_PATH.read_text(encoding="utf-8") if ENV_PATH.exists() else ""
+    lines = env_text.splitlines()
+    updated: set[str] = set()
+    targets = {
+        "GOOGLE_OAUTH_CLIENT_ID": client_id,
+        "GOOGLE_OAUTH_CLIENT_SECRET": client_secret,
+    }
+    for i, line in enumerate(lines):
+        for key, val in targets.items():
+            if line.startswith(f"{key}="):
+                lines[i] = f"{key}={val}"
+                updated.add(key)
+                break
+
+    missing = [k for k in targets if k not in updated]
+    for key in missing:
+        lines.append(f"{key}={targets[key]}")
+
+    ENV_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"\nCredentials written to {ENV_PATH}")
+    print("Restart the backend server to pick them up.")
+    print("Then go to http://localhost:3000/integraciones and click 'Conectar'.\n")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) == 4 and sys.argv[1] == "--inject":
+        inject_credentials(sys.argv[2], sys.argv[3])
+    else:
+        main()
