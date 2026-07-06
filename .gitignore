@@ -51,3 +51,18 @@ docker-compose.override.yml
 alembic/versions/__pycache__/
 .claude/
 test_upload.pdf
+
+# Local databases (dev SQLite)
+*.db
+*.db-journal
+*.db.bak
+
+# Local runtime storage (uploaded documents)
+local_storage/
+
+# Engram local state
+.engram/
+
+# Temp / scratch files
+tmp*.txt
+_tmp*.py
