@@ -49,11 +49,20 @@ class TestAgentSchemas:
 
 
 class TestDocumentParser:
-    def test_parse_document_unsupported_format(self) -> None:
+    def test_parse_document_plain_text_is_decoded(self) -> None:
         from app.agent.tools.document_parser import parse_document
 
-        with pytest.raises(ValueError, match="Unsupported file format"):
-            parse_document(b"data", "file.txt")
+        # Unknown/plain-text extensions are now decoded best-effort (agent chat lets
+        # users drop arbitrary files), not rejected.
+        assert parse_document(b"hola mundo", "file.txt") == "hola mundo"
+        assert parse_document(b'{"a": 1}', "data.json") == '{"a": 1}'
+
+    def test_parse_document_rejects_binary(self) -> None:
+        from app.agent.tools.document_parser import parse_document
+
+        # Executables/images are still refused (no useful text to extract).
+        with pytest.raises(ValueError):
+            parse_document(b"MZ\x00\x00binary", "malware.exe")
 
     @patch("app.agent.tools.document_parser.parse_pdf", return_value="PDF text")
     def test_parse_document_pdf(self, mock_pdf: MagicMock) -> None:

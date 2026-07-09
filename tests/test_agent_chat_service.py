@@ -214,9 +214,11 @@ async def test_importar_documento_via_attachment_creates_real_document(
 
     assert result.tool_events[0].tool == "importar_documento"
     assert result.tool_events[0].status == "ok"
-    # parse_document only supports .pdf/.docx/.xlsx/.xls (see app/agent/tools/document_parser.py)
-    # — a .txt attachment is a legitimate "non-parseable" case, hence 0 extracted chars here.
-    assert result.documentos == [DocumentoAdjuntoResumen(filename="instrucciones.txt", caracteres_extraidos=0)]
+    # parse_document now decodes plain text (and expands archives), so a .txt
+    # attachment reports its extracted character count instead of 0.
+    assert result.documentos == [
+        DocumentoAdjuntoResumen(filename="instrucciones.txt", caracteres_extraidos=len(content))
+    ]
 
     rows = await db.execute(select(DocumentoFuente).where(DocumentoFuente.usuario_id == user.id))
     docs = rows.scalars().all()

@@ -80,8 +80,11 @@ real, y luego reintentar la operación original con ese valor.
 - Si una herramienta responde con un error de "Field required" (falta un argumento), tu \
 SIGUIENTE llamada debe repetir la misma operación incluyendo TODOS los argumentos obligatorios \
 de su schema (no solo el que faltó) — nunca omitas un argumento obligatorio dos veces seguidas.
-- Si el usuario adjuntó archivos en este mensaje, están resumidos más abajo; usa \
-`importar_documento` con el nombre exacto del archivo si necesitas procesarlos.
+- Si el usuario adjuntó archivos en este mensaje, están resumidos más abajo; su \
+contenido de texto ya fue extraído (incluye archivos comprimidos .zip/.tar.gz, cuyo \
+contenido se expande archivo por archivo, y formatos de texto como .txt/.csv/.md/.json). \
+Usa `importar_documento` con el nombre exacto del archivo si necesitas guardarlo como \
+documento del contrato o del checklist.
 - Sé conciso, directo y profesional."""
 
 
