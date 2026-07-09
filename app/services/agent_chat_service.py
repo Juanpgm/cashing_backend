@@ -28,6 +28,7 @@ from app.agent.tools.document_parser import parse_document
 from app.models.conversacion import Conversacion
 from app.models.usuario import Usuario
 from app.schemas.agent import AgentChatResult, DocumentoAdjuntoResumen, LLMMessage, ToolEvent
+import app.tools.catalog  # noqa: F401 — import-for-side-effect: populates TOOL_REGISTRY
 from app.tools.context import ToolAttachment, ToolContext
 from app.tools.invoke import invoke_tool
 from app.tools.llm_schema import to_openai_tools
