@@ -15,8 +15,11 @@ here would duplicate that logic and risk drifting out of sync with it.
 from __future__ import annotations
 
 import json
+import mimetypes
+import re
 import uuid
 from datetime import date
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -24,10 +27,15 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.llm import get_llm
-from app.agent.tools.document_parser import parse_document
+from app.agent.tools.document_parser import (
+    _NON_TEXT_EXTENSIONS,
+    is_archive_filename,
+    iter_archive_members,
+    parse_document,
+)
 from app.models.conversacion import Conversacion
 from app.models.usuario import Usuario
-from app.schemas.agent import AgentChatResult, DocumentoAdjuntoResumen, LLMMessage, ToolEvent
+from app.schemas.agent import AgentChatResult, DocumentoAdjuntoResumen, LLMMessage, LLMToolCall, ToolEvent
 import app.tools.catalog  # noqa: F401 — import-for-side-effect: populates TOOL_REGISTRY
 from app.tools.context import ToolAttachment, ToolContext
 from app.tools.invoke import invoke_tool
@@ -46,6 +54,16 @@ _MAX_TOOL_RESULT_CHARS = 3000
 _MAX_ATTACHMENT_CHARS = 4000
 
 _BINARY_NOTICE = "(contenido binario no extraíble)"
+
+# Total archive members exposed as importable attachments across ALL archive
+# attachments in one turn (in addition to `iter_archive_members`'s own per-archive
+# cap) — bounds the tool context a single message can inject.
+_MAX_EXPANDED_ATTACHMENTS = 50
+
+# Matches ```json ... ``` or bare ``` ... ``` fenced code blocks (case-insensitive
+# language tag), used to recover a tool call a weak local model "drew" as prose
+# instead of a real function call.
+_FENCED_BLOCK_RE = re.compile(r"```(?:json)?\s*\n?(.*?)```", re.DOTALL | re.IGNORECASE)
 
 SYSTEM_PROMPT_TEMPLATE = """\
 Eres CashIn AI, el asistente de IA de CashIn que ayuda a contratistas colombianos a \
@@ -85,13 +103,23 @@ contenido de texto ya fue extraído (incluye archivos comprimidos .zip/.tar.gz, 
 contenido se expande archivo por archivo, y formatos de texto como .txt/.csv/.md/.json). \
 Usa `importar_documento` con el nombre exacto del archivo si necesitas guardarlo como \
 documento del contrato o del checklist.
+- Si el usuario adjuntó un archivo comprimido (.zip/.tar.gz/.tgz), sus archivos internos \
+también son importables de forma individual por su nombre exacto — revisa la lista de \
+"Archivos que puedes importar por nombre exacto" para saber cuáles.
+- SIEMPRE invoca las herramientas a través del mecanismo de function-calling del modelo. \
+NUNCA escribas el nombre de una herramienta ni sus argumentos en formato JSON como texto \
+plano en tu respuesta — eso no ejecuta nada; si necesitas llamar a una herramienta, hazlo \
+mediante una llamada de función real, nunca describiéndola en el contenido del mensaje.
 - Sé conciso, directo y profesional."""
 
 
-def _build_system_prompt(attachment_blocks: list[str]) -> str:
+def _build_system_prompt(attachment_blocks: list[str], importable_filenames: list[str] | None = None) -> str:
     prompt = SYSTEM_PROMPT_TEMPLATE.format(today=date.today().isoformat())
     if attachment_blocks:
         prompt += "\n\n## Archivos adjuntados en este mensaje\n\n" + "\n\n".join(attachment_blocks)
+    if importable_filenames:
+        nombres = ", ".join(f"`{name}`" for name in importable_filenames)
+        prompt += f"\n\nArchivos que puedes importar por nombre exacto: {nombres}."
     return prompt
 
 
@@ -103,6 +131,233 @@ def _extract_attachment_text(attachment: ToolAttachment) -> str:
         logger.warning("agent_chat_attachment_parse_failed", filename=attachment.filename, error=str(exc))
         return ""
     return text or ""
+
+
+def _expand_attachments_for_tools(attachments: dict[str, ToolAttachment]) -> dict[str, ToolAttachment]:
+    """Return a NEW dict = `attachments` plus, for every archive attachment, one
+    entry per importable member — so `importar_documento` can resolve a file that
+    lives INSIDE a dropped `.zip`/`.tar`/`.tar.gz`/`.tgz`, not just the archive
+    itself.
+
+    Executable/image/media members (`document_parser._NON_TEXT_EXTENSIONS`) are
+    never exposed — everything else (rich docs like .pdf/.docx/.xlsx/.xls, and
+    text-like formats) is. Members are keyed by their basename; on a key collision
+    (with an original attachment or another archive's member), the key falls back
+    to `f"{archive_name}:{member_path}"`. Bounded by `_MAX_EXPANDED_ATTACHMENTS`
+    total expanded members across all archives in this turn, on top of
+    `iter_archive_members`'s own per-archive member cap.
+    """
+    expanded: dict[str, ToolAttachment] = dict(attachments)
+    added = 0
+
+    for archive_name, attachment in attachments.items():
+        if added >= _MAX_EXPANDED_ATTACHMENTS:
+            break
+        if not is_archive_filename(archive_name):
+            continue
+        try:
+            for member_path, member_data in iter_archive_members(attachment.data, archive_name):
+                if added >= _MAX_EXPANDED_ATTACHMENTS:
+                    break
+                ext = Path(member_path).suffix.lower()
+                if ext in _NON_TEXT_EXTENSIONS:
+                    continue
+
+                key = Path(member_path).name
+                if key in expanded:
+                    key = f"{archive_name}:{member_path}"
+
+                content_type, _ = mimetypes.guess_type(member_path)
+                expanded[key] = ToolAttachment(
+                    filename=key,
+                    content_type=content_type or "application/octet-stream",
+                    data=member_data,
+                )
+                added += 1
+        except Exception as exc:
+            logger.warning("agent_chat_archive_expand_failed", filename=archive_name, error=str(exc))
+            continue
+
+    return expanded
+
+
+def _try_parse_json_object(text: str) -> dict[str, Any] | None:
+    """Parse `text` as JSON, returning it only if the top-level value is an object."""
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _extract_json_candidates(content: str) -> list[dict[str, Any]]:
+    """Best-effort extraction of candidate JSON objects from raw model `content`.
+
+    Tries, in order, until one strategy yields at least one object: (a) the whole
+    trimmed content as a single JSON object, (b) every ```json/``` fenced code
+    block, (c) the first balanced `{...}` substring found anywhere in the text.
+    Never raises — a strategy that finds nothing just falls through to the next.
+    """
+    stripped = content.strip()
+    if not stripped:
+        return []
+
+    whole = _try_parse_json_object(stripped)
+    if whole is not None:
+        return [whole]
+
+    fenced_candidates = [
+        parsed
+        for block in _FENCED_BLOCK_RE.findall(content)
+        if (parsed := _try_parse_json_object(block.strip())) is not None
+    ]
+    if fenced_candidates:
+        return fenced_candidates
+
+    for brace_block in _iter_balanced_braces(content):
+        parsed = _try_parse_json_object(brace_block)
+        if parsed is not None:
+            return [parsed]
+
+    return []
+
+
+def _iter_balanced_braces(text: str) -> list[str]:
+    """Yield top-level `{...}` substrings of `text`, honoring quoted strings so a
+    `}` inside a string value doesn't prematurely close the object.
+    """
+    blocks: list[str] = []
+    n = len(text)
+    i = 0
+    while i < n:
+        if text[i] != "{":
+            i += 1
+            continue
+        depth = 0
+        in_string = False
+        escape = False
+        j = i
+        while j < n:
+            ch = text[j]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+            elif ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    blocks.append(text[i : j + 1])
+                    break
+            j += 1
+        i = j + 1
+    return blocks
+
+
+def _coerce_args_dict(value: Any) -> dict[str, Any] | None:
+    """Best-effort coercion of a tool-call "arguments" value into a dict.
+
+    Accepts either an already-parsed dict, or a JSON-encoded string (some models —
+    and litellm's own OpenAI-shaped tool_calls — represent `arguments` as a raw
+    JSON string rather than a nested object).
+    """
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def _match_named_shape(candidate: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    """Match `{"name"/"tool"/"function": <tool name>, "arguments"/"parameters"/"args": {...}}`.
+
+    Also accepts the OpenAI nested shape `{"function": {"name": ..., "arguments": ...}}`.
+    Returns None (never raises) when no known tool name is present.
+    """
+    function_field = candidate.get("function")
+    if isinstance(function_field, dict):
+        nested_name = function_field.get("name")
+        if isinstance(nested_name, str) and nested_name in TOOL_REGISTRY:
+            args = _coerce_args_dict(function_field.get("arguments"))
+            return nested_name, args if args is not None else {}
+
+    name: str | None = None
+    for key in ("name", "tool", "function"):
+        value = candidate.get(key)
+        if isinstance(value, str) and value in TOOL_REGISTRY:
+            name = value
+            break
+    if name is None:
+        return None
+
+    for args_key in ("arguments", "parameters", "args"):
+        args = _coerce_args_dict(candidate.get(args_key))
+        if args is not None:
+            return name, args
+    return name, {}
+
+
+def _match_bare_args_shape(candidate: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    """Match a dict that IS the arguments themselves (no name/tool key) to exactly
+    one registered tool by field names: a tool qualifies if every key in `candidate`
+    is a field of its `input_model` AND every required field of that model is
+    present in `candidate`. Ambiguous (zero or 2+ qualifying tools) → None; this
+    never guesses.
+    """
+    keys = set(candidate.keys())
+    matches: list[str] = []
+    for name, spec in TOOL_REGISTRY.items():
+        fields = spec.input_model.model_fields
+        if not keys <= set(fields.keys()):
+            continue
+        required = {field_name for field_name, info in fields.items() if info.is_required()}
+        if not required <= keys:
+            continue
+        matches.append(name)
+
+    if len(matches) == 1:
+        return matches[0], candidate
+    return None
+
+
+def _recover_tool_calls_from_content(content: str) -> list[LLMToolCall]:
+    """Recover tool call(s) a weak local model "drew" as plain text `content`
+    instead of emitting a real function call (a known llama3.1:8b weakness — the
+    model replies with e.g. `{"filename": "contrato.docx", ...}` as the message
+    body and leaves `tool_calls` empty).
+
+    Returns `[]` when nothing can be confidently recovered. Never raises.
+    """
+    if not content or not content.strip():
+        return []
+
+    try:
+        candidates = _extract_json_candidates(content)
+    except Exception:
+        return []
+
+    recovered: list[LLMToolCall] = []
+    for candidate in candidates:
+        try:
+            match = _match_named_shape(candidate) or _match_bare_args_shape(candidate)
+        except Exception:
+            match = None
+        if match is None:
+            continue
+        name, arguments = match
+        recovered.append(LLMToolCall(id=f"recovered_{len(recovered)}", name=name, arguments=arguments))
+
+    return recovered
 
 
 def _summarize_tool_result(dumped: Any) -> str:
@@ -177,7 +432,13 @@ async def chat_with_tools(
         preview = text[:_MAX_ATTACHMENT_CHARS] if text else _BINARY_NOTICE
         attachment_blocks.append(f"### {filename}\n{preview}")
 
-    system_prompt = _build_system_prompt(attachment_blocks)
+    # Attachments passed to tools (unlike the preview blocks above, which always
+    # describe the ORIGINAL uploads) are expanded so an archive's members are each
+    # individually resolvable by `importar_documento` via `ctx.attachments[filename]`.
+    expanded_attachments = _expand_attachments_for_tools(attachments)
+    importable_filenames = list(expanded_attachments.keys()) if attachments else []
+
+    system_prompt = _build_system_prompt(attachment_blocks, importable_filenames)
     messages: list[LLMMessage] = [
         LLMMessage(role="system", content=system_prompt),
         *history,
@@ -186,7 +447,7 @@ async def chat_with_tools(
 
     llm = get_llm()
     tools = to_openai_tools()
-    tool_ctx = ToolContext(db=db, usuario=usuario, attachments=attachments)
+    tool_ctx = ToolContext(db=db, usuario=usuario, attachments=expanded_attachments)
 
     tool_events: list[ToolEvent] = []
     tokens_used = 0
@@ -196,7 +457,19 @@ async def chat_with_tools(
         response = await llm.complete(messages, tools=tools, temperature=0.2, max_tokens=1024)
         tokens_used += response.total_tokens
 
-        if not response.tool_calls:
+        calls = response.tool_calls
+        recovered_from_content = False
+        if not calls:
+            # Weak local models (llama3.1:8b) sometimes "draw" the tool call as
+            # plain text instead of a real function call — recover it here so the
+            # loop still executes the tool instead of returning useless raw JSON.
+            recovered = _recover_tool_calls_from_content(response.content or "")
+            if recovered:
+                calls = recovered
+                recovered_from_content = True
+                await logger.ainfo("agent_chat_recovered_tool_calls", count=len(recovered))
+
+        if not calls:
             final_content = response.content
             messages.append(LLMMessage(role="assistant", content=final_content))
             break
@@ -204,19 +477,22 @@ async def chat_with_tools(
         messages.append(
             LLMMessage(
                 role="assistant",
-                content=response.content or "",
+                # When recovered, the original content WAS the tool call drawn as
+                # text — echoing it back alongside the now-real tool_calls would
+                # just confuse the model in the next turn, so it's dropped.
+                content="" if recovered_from_content else (response.content or ""),
                 tool_calls=[
                     {
                         "id": call.id,
                         "type": "function",
                         "function": {"name": call.name, "arguments": json.dumps(call.arguments)},
                     }
-                    for call in response.tool_calls
+                    for call in calls
                 ],
             )
         )
 
-        for call in response.tool_calls:
+        for call in calls:
             spec = TOOL_REGISTRY.get(call.name)
             if spec is None:
                 error_detail = f"Unknown tool: {call.name}"

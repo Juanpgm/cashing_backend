@@ -20,6 +20,7 @@ from __future__ import annotations
 import io
 import tarfile
 import zipfile
+from collections.abc import Iterator
 from pathlib import Path
 
 import structlog
@@ -152,6 +153,38 @@ def _iter_tar_members(content: bytes):
             yield member.name, extracted.read()
 
 
+def is_archive_filename(filename: str) -> bool:
+    """True if `filename`'s extension marks it as a supported archive (zip/tar/gz/tgz).
+
+    Shared by `parse_document` (text-preview expansion) and
+    `agent_chat_service._expand_attachments_for_tools` (making archive members
+    individually importable), so both agree on exactly which uploads are archives.
+    """
+    ext = Path(filename).suffix.lower()
+    return ext in _ARCHIVE_EXTENSIONS or filename.lower().endswith(".tar.gz")
+
+
+def iter_archive_members(content: bytes, filename: str) -> Iterator[tuple[str, bytes]]:
+    """Yield `(member_path, member_bytes)` for each member of a zip/tar/gz archive.
+
+    Reuses `_iter_zip_members`/`_iter_tar_members` — directories and members over
+    `_ARCHIVE_MAX_MEMBER_BYTES` are skipped there already. Bounded here by
+    `_ARCHIVE_MAX_MEMBERS` total members, same cap `parse_archive` uses, so a caller
+    (e.g. the agent chat's attachment expansion) can't be flooded by a zip-bomb-style
+    archive with a huge member count.
+    """
+    ext = Path(filename).suffix.lower()
+    is_tar = ext in (".tar", ".gz", ".tgz") or filename.lower().endswith(".tar.gz")
+    member_iter = _iter_tar_members(content) if is_tar else _iter_zip_members(content)
+
+    count = 0
+    for name, data in member_iter:
+        if count >= _ARCHIVE_MAX_MEMBERS:
+            break
+        count += 1
+        yield name, data
+
+
 def parse_archive(content: bytes, filename: str) -> str:
     """Expand a zip/tar/gz archive and concatenate the text of its members.
 
@@ -198,7 +231,7 @@ def parse_document(content: bytes, filename: str) -> str:
         return parse_docx(content)
     if ext in (".xlsx", ".xls"):
         return parse_xlsx(content)
-    if ext in _ARCHIVE_EXTENSIONS or filename.lower().endswith(".tar.gz"):
+    if is_archive_filename(filename):
         return parse_archive(content, filename)
     if ext in _NON_TEXT_EXTENSIONS:
         msg = f"Unsupported binary file format: {ext}"

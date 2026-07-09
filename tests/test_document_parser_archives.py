@@ -12,7 +12,7 @@ import tarfile
 import zipfile
 
 import pytest
-from app.agent.tools.document_parser import parse_archive, parse_document, parse_text
+from app.agent.tools.document_parser import iter_archive_members, parse_archive, parse_document, parse_text
 
 
 def _make_zip(files: dict[str, bytes]) -> bytes:
@@ -95,3 +95,25 @@ class TestDispatch:
     def test_binary_extension_raises(self) -> None:
         with pytest.raises(ValueError):
             parse_document(b"\x89PNG\r\n\x1a\n", "foto.png")
+
+
+class TestIterArchiveMembers:
+    def test_yields_zip_members(self) -> None:
+        content = _make_zip(
+            {
+                "contrato.docx": b"docx-bytes",
+                "nota.txt": b"nota interna",
+            }
+        )
+        members = dict(iter_archive_members(content, "soportes.zip"))
+        assert members == {"contrato.docx": b"docx-bytes", "nota.txt": b"nota interna"}
+
+    def test_yields_targz_members(self) -> None:
+        content = _make_targz({"informe.txt": b"resumen ejecutivo"})
+        members = dict(iter_archive_members(content, "backup.tar.gz"))
+        assert members == {"informe.txt": b"resumen ejecutivo"}
+
+    def test_skips_directories_and_respects_member_cap(self) -> None:
+        files = {f"f{i}.txt": f"contenido {i}".encode() for i in range(80)}
+        members = list(iter_archive_members(_make_zip(files), "muchos.zip"))
+        assert len(members) == 50  # _ARCHIVE_MAX_MEMBERS cap
