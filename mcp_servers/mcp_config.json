@@ -4,7 +4,7 @@
   "description": "CashIn MCP server configuration — defines available workspace tools for the AI agent.",
   "servers": {
     "gmail": {
-      "module": "app.mcp_servers.gmail_server",
+      "module": "mcp_servers.gmail_server",
       "description": "Gmail integration — search emails, read threads, extract evidence.",
       "enabled": true,
       "scopes": [
@@ -18,7 +18,7 @@
       }
     },
     "drive": {
-      "module": "app.mcp_servers.drive_server",
+      "module": "mcp_servers.drive_server",
       "description": "Google Drive integration — search files, read documents, upload evidence.",
       "enabled": true,
       "scopes": [
@@ -38,7 +38,7 @@
       }
     },
     "calendar": {
-      "module": "app.mcp_servers.calendar_server",
+      "module": "mcp_servers.calendar_server",
       "description": "Google Calendar integration — list events, find meetings as evidence.",
       "enabled": true,
       "scopes": [
@@ -61,11 +61,19 @@
           ".jpg", ".jpeg", ".png", ".eml", ".msg"
         ]
       }
+    },
+    "evidence": {
+      "module": "mcp_servers.evidence_server",
+      "description": "Evidence discovery — Gmail+Drive+Calendar → per-obligation justification with links.",
+      "enabled": true,
+      "settings": {
+        "default_window_days": 90
+      }
     }
   },
   "agent_defaults": {
-    "enabled_servers": ["gmail", "drive", "calendar", "filesystem"],
-    "evidence_mode_servers": ["gmail", "drive", "calendar", "filesystem"],
+    "enabled_servers": ["gmail", "drive", "calendar", "filesystem", "evidence"],
+    "evidence_mode_servers": ["gmail", "drive", "calendar", "filesystem", "evidence"],
     "onboarding_mode_servers": ["filesystem"],
     "chat_mode_servers": ["gmail", "drive", "filesystem"]
   }

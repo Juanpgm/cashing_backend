@@ -15,13 +15,15 @@ Or mount via mcp_config.json.
 from __future__ import annotations
 
 import glob
-import json
 import os
 from pathlib import Path
 
 import structlog
+from mcp.server.fastmcp import FastMCP
 
 logger = structlog.get_logger("mcp.filesystem")
+
+mcp = FastMCP("cashin-filesystem")
 
 # Security: restrict to user-configured allowed roots
 _DEFAULT_ALLOWED_ROOTS: list[str] = [
@@ -150,7 +152,70 @@ def index_folder(path: str, allowed_roots: list[str] | None = None, max_files: i
     return {"path": path, "files": files, "truncated": truncated, "count": len(files)}
 
 
-# ── MCP tool registry ────────────────────────────────────────────────────────
+# ── FastMCP tools (thin wrappers over the pure functions above) ──────────────
+
+
+@mcp.tool()
+async def filesystem_list_folder(path: str) -> dict:  # type: ignore[type-arg]
+    """List the direct contents of a local folder (must be within allowed roots).
+
+    Args:
+        path: Absolute path to the folder to list. Must resolve under one of the
+            allowed roots (~/Documents, ~/Downloads, ~/Desktop) or it is rejected.
+
+    Returns:
+        Dict with 'path' and 'entries' (list of {name, type, size_bytes}), or
+        {'error': ...} if the path is disallowed or not a directory.
+    """
+    return list_folder(path)
+
+
+@mcp.tool()
+async def filesystem_read_file(path: str) -> dict:  # type: ignore[type-arg]
+    """Read the text content of a local file (UTF-8, max 50 KB).
+
+    Args:
+        path: Absolute path to the file. Must resolve under an allowed root and be
+            no larger than 50 KB.
+
+    Returns:
+        Dict with 'path', 'content' (str) and 'size_bytes', or {'error': ...} if the
+        path is disallowed, missing, or too large.
+    """
+    return read_file(path)
+
+
+@mcp.tool()
+async def filesystem_search_files(folder: str, pattern: str) -> dict:  # type: ignore[type-arg]
+    """Search recursively for files matching a glob pattern under a folder.
+
+    Args:
+        folder: Absolute path to the root folder to search (must be under an allowed root).
+        pattern: Glob pattern to match filenames, e.g. "*.pdf" or "informe_*.docx".
+
+    Returns:
+        Dict with 'folder', 'pattern' and 'matches' (list of absolute file paths), or
+        {'error': ...} if the folder is disallowed or not a directory.
+    """
+    return search_files(folder, pattern)
+
+
+@mcp.tool()
+async def filesystem_index_folder(path: str) -> dict:  # type: ignore[type-arg]
+    """Walk a folder tree and return file metadata (never file content).
+
+    Args:
+        path: Absolute path to the root folder to index (must be under an allowed root).
+            Indexing stops after 200 files to prevent runaway walks.
+
+    Returns:
+        Dict with 'path', 'files' (list of {path, name, ext, size_bytes}), 'count' and
+        'truncated' (True if the 200-file cap was hit), or {'error': ...} if disallowed.
+    """
+    return index_folder(path)
+
+
+# ── Legacy in-process tool registry (kept for non-MCP callers) ───────────────
 
 TOOLS: dict[str, dict] = {
     "filesystem_list_folder": {
@@ -213,5 +278,4 @@ def call_tool(name: str, arguments: dict) -> dict:
 
 
 if __name__ == "__main__":
-    # Simple smoke test
-    print(json.dumps(list_folder(os.path.expanduser("~")), indent=2, ensure_ascii=False))
+    mcp.run()
