@@ -233,13 +233,16 @@ async def test_cruzar_creates_actividades_for_relevant_docs(db: AsyncSession) ->
     )
     await db.commit()
 
-    # Mock both LLM calls: relevance → batch array [1], justification → a short sentence
+    # Mock the THREE LLM calls in order: relevance batch, actividad, justification
     mock_relevance_resp = _make_llm_response("[1]")
+    mock_actividad_resp = _make_llm_response(
+        "Elaboré el informe técnico mensual de consultoría y asesoría del período de marzo."
+    )
     mock_justification_resp = _make_llm_response(
         "El informe técnico mensual de consultoría fue elaborado según se evidencia en informe_marzo.pdf."
     )
     mock_llm = AsyncMock()
-    mock_llm.complete = AsyncMock(side_effect=[mock_relevance_resp, mock_justification_resp])
+    mock_llm.complete = AsyncMock(side_effect=[mock_relevance_resp, mock_actividad_resp, mock_justification_resp])
 
     with patch("app.services.cruzar_service.get_llm", return_value=mock_llm):
         with patch("app.services.cruzar_service.quality_gate_node", new_callable=AsyncMock) as mock_gate:
@@ -253,9 +256,56 @@ async def test_cruzar_creates_actividades_for_relevant_docs(db: AsyncSession) ->
     assert actividades[0].obligacion_id == ob.id
     assert actividades[0].justificacion is not None
     assert len(actividades[0].justificacion) > 0
+    # descripcion (actividad realizada) must be the grounded LLM text, never the
+    # generic "Evidencia documental: {source}" placeholder nor the justificación.
+    assert actividades[0].descripcion == mock_actividad_resp.content
+    assert not actividades[0].descripcion.startswith("Evidencia documental:")
+    assert actividades[0].descripcion != actividades[0].justificacion
 
     # CoberturaResponse must reflect the new actividades (DEBIL because no Evidencia files attached)
     assert result.resumen.total == 1
+
+
+@pytest.mark.asyncio
+async def test_cruzar_actividad_falls_back_deterministically_on_llm_error(db: AsyncSession) -> None:
+    """When the actividad-generation LLM call fails, descripcion must be a
+    deterministic sentence naming the source document — never the obligación text,
+    never the raw "Evidencia documental: {source}" placeholder."""
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+    ob = await _make_obligacion(
+        db,
+        contrato.id,
+        1,
+        descripcion="Elaborar informes técnicos mensuales de consultoría y asesoría",
+    )
+    cuenta = await _make_cuenta(db, contrato.id)
+    await _make_documento(
+        db,
+        user.id,
+        contrato.id,
+        texto_extraido=(
+            "Informe técnico mensual de consultoría y asesoría para el período de marzo 2024. "
+            "Se elaboraron los documentos requeridos según las obligaciones contractuales."
+        ),
+    )
+    await db.commit()
+
+    mock_relevance_resp = _make_llm_response("[1]")
+    mock_llm = AsyncMock()
+    mock_llm.complete = AsyncMock(side_effect=[mock_relevance_resp, RuntimeError("llm down"), RuntimeError("llm down")])
+
+    with patch("app.services.cruzar_service.get_llm", return_value=mock_llm):
+        with patch("app.services.cruzar_service.quality_gate_node", new_callable=AsyncMock) as mock_gate:
+            mock_gate.return_value = {"quality_gate_passed": True, "quality_issues": []}
+            await cruzar_service.cruzar_documentos(db, user.id, cuenta.id)
+
+    acts_result = await db.execute(select(Actividad).where(Actividad.cuenta_cobro_id == cuenta.id))
+    actividades = list(acts_result.scalars().all())
+    assert len(actividades) == 1
+    assert actividades[0].descripcion == "Elaboración y entrega de informe_marzo.pdf."
+    assert actividades[0].descripcion != ob.descripcion
+    assert not actividades[0].descripcion.startswith("Evidencia documental:")
 
 
 @pytest.mark.asyncio

@@ -23,7 +23,10 @@ from sqlalchemy.orm import selectinload
 
 from app.adapters.llm import get_llm
 from app.agent.nodes.quality_gate import quality_gate_node
+from app.agent.prompts.actividad_generation import is_near_identical
 from app.agent.prompts.cruzar import (
+    CRUZAR_ACTIVIDAD_SYSTEM,
+    CRUZAR_ACTIVIDAD_USER,
     CRUZAR_JUSTIFICATION_SYSTEM,
     CRUZAR_JUSTIFICATION_USER,
     CRUZAR_RELEVANCE_BATCH_SYSTEM,
@@ -125,6 +128,35 @@ async def _llm_justification(obligation_text: str, candidate: dict, llm) -> str:
     except Exception as exc:
         await logger.awarning("cruzar.justification_llm_error", error=str(exc))
         return f"Evidencia documental referenciada en {candidate['source']}."
+
+
+async def _llm_actividad(obligation_text: str, candidate: dict, llm) -> str:
+    """Generate a grounded one-sentence ACTIVIDAD (what was done) from the matched
+    document — distinct from `_llm_justification` (why it satisfies the obligación).
+
+    Degraded fallback on LLM error: a deterministic sentence naming the source
+    document — NEVER the raw "Evidencia documental: {source}" placeholder text,
+    and never the obligación text.
+    """
+    user_content = CRUZAR_ACTIVIDAD_USER.format(
+        obligacion=obligation_text[:600],
+        documento_fuente=candidate["source"],
+        evidencias_texto=candidate["content"][:1500],
+    )
+    try:
+        resp = await llm.complete(
+            [
+                LLMMessage(role="system", content=CRUZAR_ACTIVIDAD_SYSTEM),
+                LLMMessage(role="user", content=user_content),
+            ],
+            temperature=0.0,
+            max_tokens=256,
+        )
+        actividad = resp.content.strip()
+        return actividad or f"Elaboración y entrega de {candidate['source']}."
+    except Exception as exc:
+        await logger.awarning("cruzar.actividad_llm_error", error=str(exc))
+        return f"Elaboración y entrega de {candidate['source']}."
 
 
 # ---------------------------------------------------------------------------
@@ -259,14 +291,20 @@ async def cruzar_documentos(
                 )
                 continue
 
-            # Step 4d: generate grounded justification
+            # Step 4d: generate grounded actividad (what was done) + justificación (why it counts)
+            actividad_texto = await _llm_actividad(ob_text, candidate, llm_justification)
             justificacion = await _llm_justification(ob_text, candidate, llm_justification)
+
+            if is_near_identical(actividad_texto, justificacion):
+                # Both texts collapsed to the same content — fall back to the
+                # deterministic actividad text so the two fields stay distinct.
+                actividad_texto = f"Elaboración y entrega de {candidate['source']}."
 
             # Step 4e: create Actividad record
             actividad = Actividad(
                 cuenta_cobro_id=cuenta_id,
                 obligacion_id=ob.id,
-                descripcion=f"Evidencia documental: {candidate['source']}",
+                descripcion=actividad_texto[:1000],
                 justificacion=justificacion[:1000],
                 fecha_realizacion=fecha_realizacion,
             )

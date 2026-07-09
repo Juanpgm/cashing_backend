@@ -407,13 +407,23 @@ _ACTIVIDAD_PARSED = re.compile(r"^ACTIVIDAD\|(.+?)\|(.+?)\|(\d+)\s*$", re.MULTIL
 
 
 def _parse_actividades_llm(response: str, obligaciones: list) -> list[ActividadCreate]:
-    """Parse pipe-delimited ACTIVIDAD lines produced by the LLM."""
+    """Parse pipe-delimited ACTIVIDAD lines produced by the LLM.
+
+    Post-parse guard: if descripcion and justificacion are near-identical (the model
+    ignored the FORBID rules in ACTIVIDADES_GENERATION_PROMPT), the justificacion is
+    reset to "" rather than persisting two copies of the same text — the user fills
+    it in manually instead of getting a duplicated, low-quality pair.
+    """
+    from app.agent.prompts.actividad_generation import is_near_identical
+
     result: list[ActividadCreate] = []
     for descripcion, justificacion, ob_num_str in _ACTIVIDAD_PARSED.findall(response):
         ob_idx = int(ob_num_str) - 1
         ob_id = obligaciones[ob_idx].id if obligaciones and 0 <= ob_idx < len(obligaciones) else None
         desc = descripcion.strip()[:2000]
         just = justificacion.strip()[:3000]
+        if is_near_identical(desc, just):
+            just = ""
         if len(desc) >= 10:
             result.append(ActividadCreate(descripcion=desc, justificacion=just, obligacion_id=ob_id))
     return result
@@ -541,12 +551,35 @@ async def generar_actividades_agente(
         or "(no registradas — inferir del objeto del contrato)"
     )
 
+    # Actividades de meses anteriores del mismo contrato — grounding para que el LLM
+    # no repita literalmente la redacción de períodos pasados (hasta 20, más recientes).
+    actividades_previas_result = await db.execute(
+        select(Actividad.descripcion, CuentaCobro.mes, CuentaCobro.anio)
+        .join(CuentaCobro, Actividad.cuenta_cobro_id == CuentaCobro.id)
+        .where(
+            CuentaCobro.contrato_id == contrato.id,
+            CuentaCobro.id != cuenta_id,
+            Actividad.descripcion.is_not(None),
+            Actividad.descripcion != "",
+        )
+        .order_by(CuentaCobro.anio.desc(), CuentaCobro.mes.desc())
+        .limit(20)
+    )
+    actividades_previas_str = "\n".join(
+        f"- {_MESES[mes - 1]} {anio}: {descripcion}" for descripcion, mes, anio in actividades_previas_result.all()
+    )
+
     user_content = (
         f"Contrato N° {contrato.numero_contrato}\n"
         f"Entidad: {contrato.entidad or '—'}\n"
         f"Objeto: {contrato.objeto}\n"
         f"Período a facturar: {_MESES[cuenta.mes - 1]} {cuenta.anio}\n\n"
         f"OBLIGACIONES CONTRACTUALES:\n{obligaciones_str}\n"
+        + (
+            f"\nACTIVIDADES DE MESES ANTERIORES (NO repitas su redacción literal):\n{actividades_previas_str}\n"
+            if actividades_previas_str
+            else ""
+        )
     )
     if texto_contrato:
         user_content += f"\nTEXTO DEL CONTRATO (fragmento):\n{texto_contrato[:3000]}"

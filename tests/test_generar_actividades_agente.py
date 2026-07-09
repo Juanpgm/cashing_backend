@@ -256,6 +256,57 @@ async def test_falla_si_llm_devuelve_formato_invalido(
         )
 
 
+async def test_actividad_near_identica_a_justificacion_se_resetea_a_vacio(
+    db: AsyncSession,
+    test_user: dict[str, Any],
+    contrato_con_obligaciones: tuple[Contrato, list[Obligacion]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regresión de calidad: si el LLM ignora las reglas FORBID y produce una
+    justificacion casi idéntica a la descripcion, el post-parse guard debe
+    resetear la justificacion a "" en vez de persistir un duplicado."""
+    contrato, _obs = contrato_con_obligaciones
+    cuenta = await _make_cuenta(db, contrato)
+    user = test_user["user"]
+
+    texto_repetido = "Elaboré informe mensual completo y detallado de avance"
+    llm_response = (
+        f"ACTIVIDAD|{texto_repetido}|{texto_repetido}|1\n"
+        "ACTIVIDAD|Participé activamente en reuniones de coordinación semanal|"
+        "Cumplimiento de la obligación de asistencia a reuniones periódicas|2\n"
+        "ACTIVIDAD|Desarrollé y entregué los entregables técnicos solicitados|"
+        "Cumplimiento de la obligación 3 de entrega de productos|3\n"
+    )
+    _patch_llm(monkeypatch, llm_response)
+
+    resp = await cuenta_cobro_service.generar_actividades_agente(db, user.id, cuenta.id)
+
+    assert resp.creadas == 3
+    primera = resp.actividades[0]
+    assert primera.descripcion == texto_repetido
+    assert primera.justificacion == ""
+    # The other two, genuinely distinct, keep their justificacion.
+    assert resp.actividades[1].justificacion != ""
+    assert resp.actividades[2].justificacion != ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# is_near_identical: accent folding (`_normalize` must fold "REALIZACIÓN" ~ "realizacion")
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_is_near_identical_folds_accents() -> None:
+    """Near-identical detection must not be evaded by accent differences alone —
+    'REALIZACIÓN' and 'realizacion' are the same text once accents are folded."""
+    from app.agent.prompts.actividad_generation import is_near_identical
+
+    assert is_near_identical("REALIZACIÓN de informes mensuales", "realizacion de informes mensuales")
+    assert is_near_identical(
+        "Elaboración y presentación de informes técnicos",
+        "elaboracion y presentacion de informes tecnicos",
+    )
+
+
 async def test_falla_si_estado_no_permite_edicion(
     db: AsyncSession,
     test_user: dict[str, Any],

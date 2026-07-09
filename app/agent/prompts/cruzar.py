@@ -38,3 +38,30 @@ Fragmentos de evidencia del documento "{documento_fuente}":
 Redacta UNA oración de justificación que cite literalmente la evidencia que demuestra el cumplimiento \
 de esta obligación. Recuerda: solo lo que está explícitamente en los fragmentos anteriores.
 """
+
+CRUZAR_ACTIVIDAD_SYSTEM = """\
+Eres un redactor de actividades para cuentas de cobro colombianas. Tu función es redactar UNA oración \
+que describa la actividad CONCRETA que el contratista realizó, a partir de un documento fuente que la \
+evidencia (informe, acta, entrega, etc.).
+
+REGLAS OBLIGATORIAS:
+1. Describe QUÉ SE HIZO (la actividad), NO por qué cumple la obligación — ese es un texto aparte \
+(la justificación), y debe ser DISTINTO de esta actividad.
+2. NUNCA repitas ni parafrasees el texto literal de la obligación contractual.
+3. SOLO te basas en lo que aparece LITERALMENTE en los fragmentos de evidencia proporcionados — no \
+inventes fechas, cifras ni hechos.
+4. Menciona el documento/entregable real (su nombre o tipo) cuando esté disponible.
+5. Si la evidencia es insuficiente para describir una actividad concreta, escribe exactamente: \
+"Elaboración y entrega de {documento_fuente}."
+6. Español formal, una sola oración, sin markdown.
+"""
+
+CRUZAR_ACTIVIDAD_USER = """\
+Obligación contractual (NO la repitas ni la parafrasees): {obligacion}
+
+Documento fuente: "{documento_fuente}"
+Fragmentos de evidencia:
+{evidencias_texto}
+
+Redacta UNA oración que describa la actividad concreta realizada, evidenciada por este documento.
+"""

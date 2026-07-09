@@ -180,8 +180,25 @@ class EvidenceDiscoveryRequest(BaseModel):
         default=None,
         description="Si se provee, carga las obligaciones del contrato desde la base de datos.",
     )
-    fecha_inicio: str = Field(description="YYYY-MM-DD — inicio del período a explorar")
-    fecha_fin: str = Field(description="YYYY-MM-DD — fin del período")
+    cuenta_id: uuid.UUID | None = Field(
+        default=None,
+        description=(
+            "Cuenta de cobro en curso. Si se provee (con o sin contrato_id), habilita "
+            "el default de fechas desde el contrato y la carga de actividades de meses "
+            "anteriores del mismo contrato como contexto para la justificación."
+        ),
+    )
+    fecha_inicio: str = Field(
+        default="",
+        description=(
+            "YYYY-MM-DD — inicio del período a explorar. Si se omite y hay contrato_id/"
+            "cuenta_id, se usa la fecha de inicio del contrato."
+        ),
+    )
+    fecha_fin: str = Field(
+        default="",
+        description="YYYY-MM-DD — fin del período. Si se omite y hay contrato_id/cuenta_id, se usa hoy.",
+    )
     supervisor_email: str | None = Field(
         default=None, description="Correo del supervisor (mejora la búsqueda en Gmail)"
     )
@@ -217,6 +234,10 @@ class EvidenceLink(BaseModel):
 class ObligacionJustificada(BaseModel):
     obligacion_id: str
     descripcion: str
+    actividad: str = Field(
+        default="",
+        description="Qué se hizo concretamente en el período (distinto de 'justificacion').",
+    )
     justificacion: str
     evidencias: list[EvidenceLink] = Field(default_factory=list)
 

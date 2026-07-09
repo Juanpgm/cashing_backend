@@ -86,13 +86,37 @@ async def _obligacion_ids_del_contrato(db: AsyncSession, contrato_id: uuid.UUID)
 async def _find_actividad(
     db: AsyncSession, cuenta_id: uuid.UUID, obligacion_id: uuid.UUID
 ) -> Actividad | None:
+    """Find the Actividad to attach evidence to for this cuenta + obligación.
+
+    An obligación can legitimately have MORE THAN ONE Actividad on the same cuenta
+    (e.g. `/cruzar` creates one Actividad per matched document candidate) — using
+    `scalar_one_or_none()` here raised `MultipleResultsFound` in that case (a latent
+    500). Deterministic tie-break instead: prefer the Actividad still awaiting a
+    justificación (empty), else the most recently created one.
+    """
     result = await db.execute(
-        select(Actividad).where(
+        select(Actividad)
+        .where(
             Actividad.cuenta_cobro_id == cuenta_id,
             Actividad.obligacion_id == obligacion_id,
         )
+        .order_by(Actividad.created_at.desc())
     )
-    return result.scalar_one_or_none()
+    rows = list(result.scalars().all())
+    if not rows:
+        return None
+    sin_justificacion = [a for a in rows if not (a.justificacion or "").strip()]
+    return sin_justificacion[0] if sin_justificacion else rows[0]
+
+
+def _descripcion_fallback(ob: ObligacionJustificada) -> str:
+    """Deterministic `descripcion` fallback — NEVER the obligación text, NEVER the
+    justificación. Used only when the discovery agent didn't produce an `actividad`
+    (e.g. an older client posting a payload without that field)."""
+    if ob.evidencias:
+        titulos = ", ".join(e.titulo for e in ob.evidencias[:3])
+        return f"Actividades del período soportadas en {len(ob.evidencias)} evidencia(s): {titulos}."
+    return "Actividad registrada sin evidencia asociada en el período consultado."
 
 
 async def _existing_evidencia_urls(db: AsyncSession, actividad_id: uuid.UUID) -> set[str]:
@@ -149,7 +173,7 @@ async def persistir_evidencias(
             actividad = Actividad(
                 cuenta_cobro_id=cuenta_id,
                 obligacion_id=obligacion_uuid,
-                descripcion=ob.descripcion or ob.justificacion,
+                descripcion=ob.actividad.strip() or _descripcion_fallback(ob),
                 justificacion=ob.justificacion,
             )
             db.add(actividad)

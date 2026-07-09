@@ -81,3 +81,69 @@ async def test_evidence_justify_no_evidence_uses_fallback():
 
     assert result["justificaciones"][0]["evidencias"] == []
     assert "No se encontraron evidencias" in result["justificaciones"][0]["justificacion"]
+    # Fallback actividad must never echo the obligación's own text.
+    assert result["justificaciones"][0]["actividad"] != "Asistir a reuniones"
+    assert result["justificaciones"][0]["actividad"] != result["justificaciones"][0]["justificacion"]
+
+
+@pytest.mark.asyncio
+async def test_evidence_justify_parses_strict_actividad_justificacion_format():
+    """When the LLM follows the ACTIVIDAD:/JUSTIFICACION: contract, both fields are
+    parsed out distinctly (not both set to the same raw response text)."""
+    from app.agent.nodes import evidence_justify as mod
+
+    fake_resp = MagicMock()
+    fake_resp.content = (
+        "ACTIVIDAD: Elaboré y entregué el informe mensual de avance al supervisor.\n"
+        "JUSTIFICACION: El informe adjunto (informe.pdf, 2024-04-10) demuestra el "
+        "cumplimiento de la obligación de reportar avances mensuales."
+    )
+    mock_llm = AsyncMock()
+    mock_llm.complete = AsyncMock(return_value=fake_resp)
+
+    state = {
+        "obligaciones_contexto": [{"id": "ob1", "descripcion": "Entregar informe mensual"}],
+        "matched_evidence": {
+            "ob1": [{"source": "drive", "title": "informe.pdf", "link": "https://drive/x", "date": "2024-04-10"}]
+        },
+    }
+
+    with patch.object(mod, "get_llm", return_value=mock_llm):
+        result = await mod.evidence_justify_node(state)
+
+    just = result["justificaciones"][0]
+    assert just["actividad"] == "Elaboré y entregué el informe mensual de avance al supervisor."
+    assert just["justificacion"].startswith("El informe adjunto")
+    assert just["actividad"] != just["justificacion"]
+    # Neither field echoes the obligación's own text.
+    assert just["actividad"] != "Entregar informe mensual"
+    assert just["justificacion"] != "Entregar informe mensual"
+
+
+@pytest.mark.asyncio
+async def test_evidence_justify_near_identical_llm_output_falls_back_deterministically():
+    """If the LLM (despite the FORBID rules) returns the SAME text for both ACTIVIDAD
+    and JUSTIFICACION, the node must not persist two copies — justificacion falls
+    back to the deterministic text instead."""
+    from app.agent.nodes import evidence_justify as mod
+
+    texto_repetido = "Se cumplió la obligación conforme a lo solicitado en el período."
+    fake_resp = MagicMock()
+    fake_resp.content = f"ACTIVIDAD: {texto_repetido}\nJUSTIFICACION: {texto_repetido}"
+    mock_llm = AsyncMock()
+    mock_llm.complete = AsyncMock(return_value=fake_resp)
+
+    state = {
+        "obligaciones_contexto": [{"id": "ob1", "descripcion": "Entregar informe mensual"}],
+        "matched_evidence": {
+            "ob1": [{"source": "drive", "title": "informe.pdf", "link": "https://drive/x", "date": "2024-04-10"}]
+        },
+    }
+
+    with patch.object(mod, "get_llm", return_value=mock_llm):
+        result = await mod.evidence_justify_node(state)
+
+    just = result["justificaciones"][0]
+    assert just["actividad"] == texto_repetido
+    assert just["justificacion"] != texto_repetido
+    assert just["actividad"] != just["justificacion"]

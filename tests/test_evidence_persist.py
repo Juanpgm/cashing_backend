@@ -102,11 +102,15 @@ async def scenario(db: AsyncSession) -> dict[str, Any]:
 
 
 def _obligacion_justificada(
-    obligacion: Obligacion, *, justificacion: str = "Entregué el informe mensual."
+    obligacion: Obligacion,
+    *,
+    justificacion: str = "Entregué el informe mensual.",
+    actividad: str = "Elaboré y entregué el informe mensual de actividades del contrato.",
 ) -> ObligacionJustificada:
     return ObligacionJustificada(
         obligacion_id=str(obligacion.id),
         descripcion=obligacion.descripcion,
+        actividad=actividad,
         justificacion=justificacion,
         evidencias=[
             EvidenceLink(
@@ -179,6 +183,86 @@ async def test_persistir_no_sobreescribe_justificacion_existente(
 
     await db.refresh(existente)
     assert existente.justificacion == "Texto escrito manualmente por el usuario."
+
+
+async def test_persistir_usa_actividad_no_descripcion_ni_justificacion(
+    db: AsyncSession, scenario: dict[str, Any]
+) -> None:
+    """Actividad.descripcion must come from `actividad`, never echo the obligación
+    text nor the justificación — that was the root cause of DOCX informes showing
+    "Actividad realizada" == "Justificación" or == the obligación text."""
+    user, obligacion, cuenta = scenario["user"], scenario["obligacion"], scenario["cuenta"]
+    entrada = [
+        _obligacion_justificada(
+            obligacion,
+            actividad="Elaboré y presenté el informe de avance mensual al supervisor.",
+            justificacion="El informe demuestra el cumplimiento de la obligación de reportar avances.",
+        )
+    ]
+
+    await evidence_persist_service.persistir_evidencias(db, user.id, cuenta.id, entrada)
+
+    result = await db.execute(select(Actividad).where(Actividad.obligacion_id == obligacion.id))
+    actividad = result.scalar_one()
+    assert actividad.descripcion == "Elaboré y presenté el informe de avance mensual al supervisor."
+    assert actividad.descripcion != obligacion.descripcion
+    assert actividad.descripcion != actividad.justificacion
+
+
+async def test_persistir_sin_actividad_usa_fallback_deterministico_no_obligacion(
+    db: AsyncSession, scenario: dict[str, Any]
+) -> None:
+    """Backward compatibility: a client posting the OLD payload shape (no `actividad`
+    field — schema default "") must still get a descripcion that is NOT the
+    obligación text and NOT the justificación (deterministic fallback instead)."""
+    user, obligacion, cuenta = scenario["user"], scenario["obligacion"], scenario["cuenta"]
+    entrada = [_obligacion_justificada(obligacion, actividad="", justificacion="Justificación del agente.")]
+
+    await evidence_persist_service.persistir_evidencias(db, user.id, cuenta.id, entrada)
+
+    result = await db.execute(select(Actividad).where(Actividad.obligacion_id == obligacion.id))
+    actividad = result.scalar_one()
+    assert actividad.descripcion != obligacion.descripcion
+    assert actividad.descripcion != "Justificación del agente."
+    assert "evidencia" in actividad.descripcion.lower()
+
+
+async def test_persistir_multiples_actividades_misma_obligacion_no_lanza_multiple_results(
+    db: AsyncSession, scenario: dict[str, Any]
+) -> None:
+    """Regression: if /cruzar (or any other flow) already created MORE THAN ONE
+    Actividad for the same cuenta+obligación, persistir_evidencias must not raise
+    MultipleResultsFound — it must deterministically pick one (preferring the
+    Actividad still missing a justificación) and attach the evidence there."""
+    user, obligacion, cuenta = scenario["user"], scenario["obligacion"], scenario["cuenta"]
+
+    primera = Actividad(
+        cuenta_cobro_id=cuenta.id,
+        obligacion_id=obligacion.id,
+        descripcion="Evidencia documental: doc1.pdf",
+        justificacion="Ya tiene justificación de /cruzar.",
+    )
+    segunda = Actividad(
+        cuenta_cobro_id=cuenta.id,
+        obligacion_id=obligacion.id,
+        descripcion="Evidencia documental: doc2.pdf",
+        justificacion="",
+    )
+    db.add_all([primera, segunda])
+    await db.commit()
+
+    entrada = [_obligacion_justificada(obligacion, justificacion="Justificación generada por el agente.")]
+
+    summary = await evidence_persist_service.persistir_evidencias(db, user.id, cuenta.id, entrada)
+
+    assert summary.actividades_creadas == 0
+    assert summary.evidencias_creadas == 1
+
+    await db.refresh(segunda)
+    await db.refresh(primera)
+    # Attached to the one that still lacked a justificación, not the one that had it.
+    assert segunda.justificacion == "Justificación generada por el agente."
+    assert primera.justificacion == "Ya tiene justificación de /cruzar."
 
 
 async def test_persistir_otro_usuario_falla_404(db: AsyncSession, scenario: dict[str, Any]) -> None:

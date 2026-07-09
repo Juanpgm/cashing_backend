@@ -53,6 +53,10 @@ class AgentState(TypedDict, total=False):
     # Justificaciones generadas por obligación (evidence_justify)
     justificaciones: list[dict[str, Any]] | None
 
+    # Actividades de meses anteriores del mismo contrato (grounding temporal,
+    # evita que evidence_justify repita literalmente la redacción previa)
+    actividades_previas: list[str] | None
+
     # Estado de envío de cuenta de cobro
     email_sent: bool | None
     email_sent_id: str | None
