@@ -1,5 +1,6 @@
 """File upload validation: MIME type, extension, size."""
 
+import os
 import re
 
 ALLOWED_MIME_TYPES: dict[str, list[str]] = {
@@ -42,17 +43,50 @@ _MAGIC_SIGNATURES: dict[str, list[bytes]] = {
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [b"PK\x03\x04"],
     "application/vnd.openxmlformats-officedocument.presentationml.presentation": [b"PK\x03\x04"],
     "application/msword": [b"\xd0\xcf\x11\xe0"],
+    "application/vnd.ms-excel": [b"\xd0\xcf\x11\xe0"],  # legacy .xls = OLE compound doc
     "text/plain": [],  # No magic bytes for plain text — accept any content
     "text/html": [],
     "text/csv": [],
 }
 
+# libmagic (python-magic) is OPT-IN and OFF by default. On some platforms
+# (observed on Windows + CPython 3.14) loading libmagic through ctypes triggers a
+# native access violation that crashes the whole process — uncatchable by a Python
+# try/except, so it takes the entire test suite / worker down with it. The manual
+# magic-byte signatures above are deterministic and cross-platform, so we rely on
+# them by default and only consult libmagic when explicitly enabled (e.g. on Linux
+# prod where it is stable) via FILE_VALIDATION_USE_LIBMAGIC=1.
+_USE_LIBMAGIC = os.getenv("FILE_VALIDATION_USE_LIBMAGIC", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+
+def _detect_mime_with_libmagic(content: bytes) -> str | None:
+    """Return the MIME type per libmagic, or None if disabled/unavailable.
+
+    Never raises — any import/OS error degrades to None so callers fall back to the
+    manual magic-byte signatures. Guarded by _USE_LIBMAGIC so libmagic is not even
+    imported unless explicitly enabled (see note above).
+    """
+    if not _USE_LIBMAGIC:
+        return None
+    try:
+        import magic
+
+        return magic.from_buffer(content[:2048], mime=True)
+    except Exception:
+        return None
+
 
 def validate_mime_type(content: bytes, declared_content_type: str) -> bool:
-    """Validate file content matches declared MIME type using magic bytes.
+    """Validate file content matches the declared MIME type using magic bytes.
 
-    Uses libmagic when available. Falls back to manual magic-byte signatures
-    for common types so validation still runs on platforms without libmagic.
+    Relies on deterministic manual magic-byte signatures by default. libmagic is
+    consulted only when explicitly enabled (FILE_VALIDATION_USE_LIBMAGIC=1); when
+    disabled or unavailable, validation still runs via the manual signatures.
     """
     # Normalize declared type (strip parameters like charset)
     base_type = declared_content_type.split(";")[0].strip().lower()
@@ -61,28 +95,20 @@ def validate_mime_type(content: bytes, declared_content_type: str) -> bool:
         return False
 
     signatures = _MAGIC_SIGNATURES.get(base_type)
-    if signatures is None:
-        # Unknown type not in our signatures map — try libmagic, permissive fallback
-        try:
-            import magic
-
-            detected = magic.from_buffer(content[:2048], mime=True)
-            return detected == base_type
-        except (ImportError, OSError, Exception):
-            return True  # Can't validate — allow through
 
     # Empty signature list means we accept any content for this type (e.g. text/plain)
-    if not signatures:
+    if signatures is not None and not signatures:
         return True
 
-    # Try libmagic first for precise detection; fall back to manual magic bytes
-    try:
-        import magic
-
-        detected = magic.from_buffer(content[:2048], mime=True)
+    # Precise detection via libmagic only if explicitly enabled; otherwise None.
+    detected = _detect_mime_with_libmagic(content)
+    if detected is not None:
         return detected == base_type
-    except (ImportError, OSError, Exception):
+
+    # Manual magic-byte check (default path). No signature on record → permissive.
+    if signatures:
         return any(content[: len(sig)] == sig for sig in signatures)
+    return True
 
 
 def get_safe_filename(filename: str) -> str:

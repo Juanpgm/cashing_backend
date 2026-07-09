@@ -1,6 +1,5 @@
 """Pytest configuration and shared fixtures."""
 
-import asyncio
 from collections.abc import AsyncGenerator
 from typing import Any
 
@@ -28,14 +27,6 @@ TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 
 engine_test = create_async_engine(TEST_DATABASE_URL, echo=False)
 async_session_test = async_sessionmaker(engine_test, class_=AsyncSession, expire_on_commit=False)
-
-
-@pytest.fixture(scope="session")
-def event_loop():
-    """Create a single event loop for the entire test session."""
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
 
 
 @pytest.fixture(autouse=True)
