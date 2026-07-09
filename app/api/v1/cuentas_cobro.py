@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from typing import cast
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -10,12 +11,14 @@ from fastapi.responses import HTMLResponse, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import app.tools.catalog  # noqa: F401 — import-for-side-effect: populates TOOL_REGISTRY
 from app.adapters.storage.s3_adapter import S3StorageAdapter
 from app.api.deps import CurrentUser, get_pdf_storage
 from app.core.database import get_db
+from app.core.exceptions import ValidationError
 from app.models.borrador_cuenta_cobro import BorradorCuentaCobro
 from app.models.contrato import Contrato
-from app.models.cuenta_cobro import CuentaCobro
+from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
 from app.schemas.cobertura import CoberturaResponse
 from app.schemas.cuenta_cobro import (
     ActividadCreate,
@@ -31,7 +34,18 @@ from app.schemas.cuenta_cobro import (
     GenerarPDFResponse,
     PDFUrlResponse,
 )
-from app.services import cobertura_service, constancia_service, cruzar_service, cuenta_cobro_service, informe_service
+from app.schemas.google_workspace import EvidencePersistRequest, EvidencePersistSummary
+from app.services import (
+    cobertura_service,
+    constancia_service,
+    cruzar_service,
+    cuenta_cobro_service,
+    evidence_persist_service,
+    informe_service,
+    pdf_signature_service,
+)
+from app.tools.context import ToolContext
+from app.tools.invoke import invoke_tool
 
 logger = structlog.get_logger("api.cuentas_cobro")
 
@@ -221,6 +235,24 @@ async def cruzar_documentos(
     return await cruzar_service.cruzar_documentos(db, current_user.id, cuenta_id)
 
 
+@router.post("/{cuenta_id}/evidencias/persistir", response_model=EvidencePersistSummary)
+async def persistir_evidencias(
+    cuenta_id: uuid.UUID,
+    data: EvidencePersistRequest,
+    current_user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> EvidencePersistSummary:
+    """Persist evidence discovered by POST /integraciones/evidencias/descubrir.
+
+    The frontend posts back the `obligaciones` list it received from the
+    discovery agent. For each entry, upserts one Actividad (linked by
+    obligacion_id, never overwriting a user-written justificación) and creates
+    one link-type Evidencia per evidence link found. Idempotent — re-persisting
+    the same result does not duplicate rows.
+    """
+    return await evidence_persist_service.persistir_evidencias(db, current_user.id, cuenta_id, data.obligaciones)
+
+
 @router.get(
     "/{cuenta_id}/constancia.pdf",
     response_class=Response,
@@ -234,9 +266,13 @@ async def descargar_constancia(
     """Generate and download a PDF constancia of contractual obligation fulfillment.
 
     The PDF includes contract metadata, checklist status, activities performed,
-    and visual signature blocks for the contractor and supervisor.
+    and visual signature blocks for the contractor and supervisor. When PDF
+    signing is enabled (``PDF_SIGNATURE_ENABLED``), a PAdES digital signature is
+    applied before returning.
     """
     pdf_bytes, filename = await constancia_service.generar_constancia_pdf(db, current_user.id, cuenta_id)
+    if pdf_signature_service.firma_activa():
+        pdf_bytes = await pdf_signature_service.firmar_pdf(pdf_bytes)
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
@@ -255,12 +291,43 @@ async def cambiar_estado(
     Transition a CuentaCobro to a new state.
 
     Valid transitions:
-    - borrador → enviada
     - enviada → aprobada | rechazada
     - rechazada → borrador
     - aprobada → pagada
+
+    Reaching ENVIADA is intentionally rejected here: use POST /radicar instead,
+    which enforces the document checklist gate before allowing the transition
+    (both from borrador and from rechazada / resubmission). Letting this
+    endpoint set estado=enviada directly would bypass that gate entirely.
     """
+    if data.estado == EstadoCuentaCobro.ENVIADA:
+        raise ValidationError(
+            "No se puede establecer el estado 'enviada' directamente vía PATCH /estado. "
+            "Use POST /cuentas-cobro/{id}/radicar, que valida el checklist de documentos "
+            "antes de radicar."
+        )
     return await cuenta_cobro_service.cambiar_estado(db, user.id, cuenta_id, data.estado)
+
+
+@router.post("/{cuenta_id}/radicar", response_model=CuentaCobroResponse)
+async def radicar_cuenta(
+    cuenta_id: uuid.UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> CuentaCobroResponse:
+    """
+    Radicar (submit) a CuentaCobro: transitions it to ENVIADA once its document
+    checklist is complete.
+
+    Only allowed from BORRADOR or RECHAZADA. Returns 422 if mandatory checklist
+    requisitos are still pending, listing them in the error detail.
+    """
+    # Routed through the shared tool registry (app/tools/catalog/cuentas.py) — same
+    # invocation surface as the /mcp "radicar_cuenta" tool. No explicit commit here:
+    # the tool wrapper (and the service it calls) only flush; the request's `get_db`
+    # dependency commits after a successful response, same as before this swap.
+    result = await invoke_tool("radicar_cuenta", ToolContext(db=db, usuario=user), {"cuenta_id": cuenta_id})
+    return cast(CuentaCobroResponse, result)
 
 
 @router.post("/{cuenta_id}/generar-pdf", response_model=GenerarPDFResponse)

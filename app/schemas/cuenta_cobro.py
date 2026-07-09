@@ -42,7 +42,12 @@ class CuentaCobroCreate(BaseModel):
     contrato_id: uuid.UUID
     mes: int = Field(ge=1, le=12)
     anio: int = Field(ge=2020, le=2099)
-    valor: Decimal = Field(gt=0, decimal_places=2)
+    valor: Decimal | None = Field(
+        default=None,
+        gt=0,
+        decimal_places=2,
+        description="Optional. Defaults to contrato.valor_mensual when not provided.",
+    )
 
     model_config = {
         "json_schema_extra": {

@@ -39,8 +39,12 @@ async def test_descubrir_endpoint_returns_justifications(client, test_user):
         fuentes={"email": 1, "drive": 0, "calendar": 0},
     )
 
+    # Patched at the service module (the single real implementation both the
+    # endpoint and the /mcp "descubrir_evidencias" tool call through
+    # `invoke_tool`), not at an endpoint-local alias — the endpoint no longer
+    # imports the service directly, it dispatches via the shared tool registry.
     with patch(
-        "app.api.v1.integraciones.eds.descubrir_evidencias",
+        "app.services.evidence_discovery_service.descubrir_evidencias",
         AsyncMock(return_value=canned),
     ):
         resp = await client.post(

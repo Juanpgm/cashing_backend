@@ -4,19 +4,18 @@ from __future__ import annotations
 
 import uuid
 from datetime import date
+from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from httpx import AsyncClient
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from app.adapters.storage.s3_adapter import S3StorageAdapter
 from app.api.deps import get_pdf_storage
 from app.main import app as fastapi_app
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
-
+from httpx import AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -113,6 +112,31 @@ async def test_crear_cuenta_cobro_mes_invalido(
     client: AsyncClient, test_user: dict[str, Any], contrato: Contrato
 ) -> None:
     payload = {"contrato_id": str(contrato.id), "mes": 13, "anio": 2024, "valor": "3000000.00"}
+    resp = await client.post("/api/v1/cuentas-cobro/", json=payload, headers=test_user["headers"])
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_crear_cuenta_cobro_sin_valor_usa_valor_mensual(
+    client: AsyncClient, test_user: dict[str, Any], contrato: Contrato
+) -> None:
+    """POST without `valor` falls back to contrato.valor_mensual (3_000_000)."""
+    payload = {"contrato_id": str(contrato.id), "mes": 4, "anio": 2024}
+    resp = await client.post("/api/v1/cuentas-cobro/", json=payload, headers=test_user["headers"])
+    assert resp.status_code == 201, resp.text
+    assert Decimal(resp.json()["valor"]) == Decimal("3000000.00")
+
+
+@pytest.mark.asyncio
+async def test_crear_cuenta_cobro_sin_valor_ni_valor_mensual_422(
+    client: AsyncClient, test_user: dict[str, Any], db: AsyncSession, contrato: Contrato
+) -> None:
+    """Neither `valor` nor contrato.valor_mensual available → domain ValidationError (422)."""
+    contrato.valor_mensual = 0
+    db.add(contrato)
+    await db.commit()
+
+    payload = {"contrato_id": str(contrato.id), "mes": 4, "anio": 2024}
     resp = await client.post("/api/v1/cuentas-cobro/", json=payload, headers=test_user["headers"])
     assert resp.status_code == 422
 
@@ -304,16 +328,87 @@ async def test_agregar_actividad_estado_invalido(
 
 
 @pytest.mark.asyncio
-async def test_cambiar_estado_borrador_a_enviada(
+async def test_cambiar_estado_borrador_a_enviada_rechazado_usar_radicar(
     client: AsyncClient, test_user: dict[str, Any], cuenta_borrador: CuentaCobro
 ) -> None:
+    """PATCH /estado must NOT allow reaching ENVIADA directly — that bypasses the
+    checklist gate enforced by POST /radicar. The caller must use /radicar instead."""
     resp = await client.patch(
         f"/api/v1/cuentas-cobro/{cuenta_borrador.id}/estado",
         json={"estado": "enviada"},
         headers=test_user["headers"],
     )
+    assert resp.status_code == 422
+    assert "radicar" in resp.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_cambiar_estado_rechazada_a_enviada_rechazado_usar_radicar(
+    client: AsyncClient, test_user: dict[str, Any], contrato: Contrato, db: AsyncSession
+) -> None:
+    """Same bypass, this time from RECHAZADA (resubmission path) — also must be blocked."""
+    cc = CuentaCobro(contrato_id=contrato.id, mes=8, anio=2024, valor=3_000_000, estado=EstadoCuentaCobro.RECHAZADA)
+    db.add(cc)
+    await db.commit()
+
+    resp = await client.patch(
+        f"/api/v1/cuentas-cobro/{cc.id}/estado",
+        json={"estado": "enviada"},
+        headers=test_user["headers"],
+    )
+    assert resp.status_code == 422
+    assert "radicar" in resp.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_cambiar_estado_enviada_a_aprobada_sigue_funcionando(
+    client: AsyncClient, test_user: dict[str, Any], contrato: Contrato, db: AsyncSession
+) -> None:
+    cc = CuentaCobro(contrato_id=contrato.id, mes=9, anio=2024, valor=3_000_000, estado=EstadoCuentaCobro.ENVIADA)
+    db.add(cc)
+    await db.commit()
+
+    resp = await client.patch(
+        f"/api/v1/cuentas-cobro/{cc.id}/estado",
+        json={"estado": "aprobada"},
+        headers=test_user["headers"],
+    )
     assert resp.status_code == 200
-    assert resp.json()["estado"] == "enviada"
+    assert resp.json()["estado"] == "aprobada"
+
+
+@pytest.mark.asyncio
+async def test_cambiar_estado_aprobada_a_pagada_sigue_funcionando(
+    client: AsyncClient, test_user: dict[str, Any], contrato: Contrato, db: AsyncSession
+) -> None:
+    cc = CuentaCobro(contrato_id=contrato.id, mes=10, anio=2024, valor=3_000_000, estado=EstadoCuentaCobro.APROBADA)
+    db.add(cc)
+    await db.commit()
+
+    resp = await client.patch(
+        f"/api/v1/cuentas-cobro/{cc.id}/estado",
+        json={"estado": "pagada"},
+        headers=test_user["headers"],
+    )
+    assert resp.status_code == 200
+    assert resp.json()["estado"] == "pagada"
+
+
+@pytest.mark.asyncio
+async def test_cambiar_estado_rechazada_a_borrador_sigue_funcionando(
+    client: AsyncClient, test_user: dict[str, Any], contrato: Contrato, db: AsyncSession
+) -> None:
+    cc = CuentaCobro(contrato_id=contrato.id, mes=11, anio=2024, valor=3_000_000, estado=EstadoCuentaCobro.RECHAZADA)
+    db.add(cc)
+    await db.commit()
+
+    resp = await client.patch(
+        f"/api/v1/cuentas-cobro/{cc.id}/estado",
+        json={"estado": "borrador"},
+        headers=test_user["headers"],
+    )
+    assert resp.status_code == 200
+    assert resp.json()["estado"] == "borrador"
 
 
 @pytest.mark.asyncio

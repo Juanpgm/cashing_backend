@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from app.adapters.email.port import EmailMessage
 from app.schemas.google_workspace import EvidenceDiscoveryRequest
+from app.tools.invoke import invoke_tool as real_invoke_tool
+from httpx import AsyncClient
 
 
 def _email(mid: str, subject: str, body: str) -> EmailMessage:
@@ -56,7 +58,7 @@ async def test_descubrir_evidencias_full_flow():
     filter_llm = AsyncMock()
     filter_llm.complete = AsyncMock(return_value=MagicMock(content='[{"idx": 0, "verdict": "TRABAJO"}]'))
     matcher_llm = AsyncMock()
-    matcher_llm.complete = AsyncMock(return_value=MagicMock(content="RELEVANTE", total_tokens=5))
+    matcher_llm.complete = AsyncMock(return_value=MagicMock(content="[1]", total_tokens=5))
     justify_llm = AsyncMock()
     justify_llm.complete = AsyncMock(return_value=MagicMock(content="Elaboré y entregué el informe mensual de actividades del contrato."))
 
@@ -114,7 +116,7 @@ async def test_descubrir_evidencias_filters_promo_emails():
     filter_llm = AsyncMock()
     filter_llm.complete = AsyncMock(return_value=MagicMock(content="[]"))
     matcher_llm = AsyncMock()
-    matcher_llm.complete = AsyncMock(return_value=MagicMock(content="RELEVANTE"))
+    matcher_llm.complete = AsyncMock(return_value=MagicMock(content="[1]"))
     justify_llm = AsyncMock()
     justify_llm.complete = AsyncMock(return_value=MagicMock(content="No se encontraron evidencias."))
 
@@ -163,3 +165,43 @@ async def test_descubrir_evidencias_requires_obligaciones_or_contrato():
 
     with pytest.raises(ValidationError):
         await eds.descubrir_evidencias(MagicMock(), uuid.uuid4(), req)
+
+
+@pytest.mark.asyncio
+async def test_descubrir_evidencias_endpoint_routes_through_tool_registry(
+    client: AsyncClient, test_user: dict[str, Any]
+) -> None:
+    """POST /integraciones/evidencias/descubrir must dispatch through
+    `invoke_tool("descubrir_evidencias", ...)` — the shared tool registry (same
+    handler the /mcp server exposes) — rather than calling the service directly.
+
+    Reuses the GOOGLE_NOT_CONNECTED scenario (cheap to trigger, no LLM/Google
+    mocking needed) so this also re-confirms the swap preserved error mapping.
+    """
+    disconnected = MagicMock()
+    disconnected.connected = False
+
+    spy = AsyncMock(side_effect=real_invoke_tool)
+
+    with (
+        patch("app.api.v1.integraciones.invoke_tool", spy),
+        patch(
+            "app.services.evidence_discovery_service.gws.get_integration_status",
+            AsyncMock(return_value=disconnected),
+        ),
+    ):
+        resp = await client.post(
+            "/api/v1/integraciones/evidencias/descubrir",
+            headers=test_user["headers"],
+            json={
+                "obligaciones": [{"descripcion": "Asistir a reuniones"}],
+                "fecha_inicio": "2024-04-01",
+                "fecha_fin": "2024-04-30",
+            },
+        )
+
+    assert resp.status_code == 502, resp.text
+    assert resp.json()["code"] == "GOOGLE_NOT_CONNECTED"
+    spy.assert_awaited_once()
+    assert spy.await_args is not None
+    assert spy.await_args.args[0] == "descubrir_evidencias"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from typing import cast
 from urllib.parse import quote
 
 import structlog
@@ -9,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import app.tools.catalog  # noqa: F401 — import-for-side-effect: populates TOOL_REGISTRY
 from app.api.deps import CurrentUser
 from app.core.config import settings
 from app.core.database import get_db
@@ -27,8 +29,9 @@ from app.schemas.google_workspace import (
     GoogleConnectURLResponse,
     GoogleIntegrationStatus,
 )
-from app.services import evidence_discovery_service as eds
 from app.services import google_workspace_service as gws
+from app.tools.context import ToolContext
+from app.tools.invoke import invoke_tool
 
 logger = structlog.get_logger("api.integraciones")
 router = APIRouter(prefix="/integraciones", tags=["integraciones"])
@@ -108,7 +111,11 @@ async def descubrir_evidencias(
     el cumplimiento de las obligaciones del período, y devuelve, por obligación, el texto de
     justificación más los links a las evidencias para montar la Cuenta de Cobro / Radicación.
     """
-    return await eds.descubrir_evidencias(db=db, usuario_id=user.id, req=body)
+    # Routed through the shared tool registry (app/tools/catalog/evidencias.py) — same
+    # invocation surface as the /mcp "descubrir_evidencias" tool. Read-only, no credits
+    # consumed here (consumes_credits is declarative metadata only, not yet enforced).
+    result = await invoke_tool("descubrir_evidencias", ToolContext(db=db, usuario=user), body)
+    return cast(EvidenceDiscoveryResponse, result)
 
 
 # ── Gmail ────────────────────────────────────────────────────────────────────

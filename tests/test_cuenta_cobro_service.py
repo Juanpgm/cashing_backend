@@ -5,12 +5,9 @@ from __future__ import annotations
 import uuid
 from datetime import date
 from decimal import Decimal
-from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from app.core.exceptions import (
     AlreadyExistsError,
     ForbiddenError,
@@ -24,7 +21,7 @@ from app.models.obligacion import Obligacion, TipoObligacion
 from app.models.usuario import Usuario
 from app.schemas.cuenta_cobro import ActividadCreate, CuentaCobroCreate
 from app.services import cuenta_cobro_service
-
+from sqlalchemy.ext.asyncio import AsyncSession
 
 # ---------------------------------------------------------------------------
 # Helpers / shared fixtures
@@ -155,6 +152,47 @@ async def test_crear_cuenta_cobro_duplicada(db: AsyncSession) -> None:
     await db.refresh(user)
 
     with pytest.raises(AlreadyExistsError):
+        await cuenta_cobro_service.crear_cuenta_cobro(db, user.id, data)
+
+
+# ---------------------------------------------------------------------------
+# crear_cuenta_cobro — valor defaults from contrato.valor_mensual (B.2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_crear_cuenta_cobro_sin_valor_usa_valor_mensual_del_contrato(db: AsyncSession) -> None:
+    user = await _make_user(db, creditos=100)
+    contrato = await _make_contrato(db, user.id)  # valor_mensual=3_000_000
+    await db.commit()
+
+    data = CuentaCobroCreate(contrato_id=contrato.id, mes=1, anio=2024)
+    resp = await cuenta_cobro_service.crear_cuenta_cobro(db, user.id, data)
+
+    assert resp.valor == Decimal("3000000.00")
+
+
+@pytest.mark.asyncio
+async def test_crear_cuenta_cobro_con_valor_explicito_sobreescribe_valor_mensual(db: AsyncSession) -> None:
+    user = await _make_user(db, creditos=100)
+    contrato = await _make_contrato(db, user.id)  # valor_mensual=3_000_000
+    await db.commit()
+
+    data = CuentaCobroCreate(contrato_id=contrato.id, mes=1, anio=2024, valor=Decimal("5000000.00"))
+    resp = await cuenta_cobro_service.crear_cuenta_cobro(db, user.id, data)
+
+    assert resp.valor == Decimal("5000000.00")
+
+
+@pytest.mark.asyncio
+async def test_crear_cuenta_cobro_sin_valor_ni_valor_mensual_falla(db: AsyncSession) -> None:
+    user = await _make_user(db, creditos=100)
+    contrato = await _make_contrato(db, user.id)
+    contrato.valor_mensual = 0  # simulate a contrato with no monthly value configured
+    await db.commit()
+
+    data = CuentaCobroCreate(contrato_id=contrato.id, mes=1, anio=2024)
+    with pytest.raises(ValidationError):
         await cuenta_cobro_service.crear_cuenta_cobro(db, user.id, data)
 
 

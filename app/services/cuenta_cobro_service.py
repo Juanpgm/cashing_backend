@@ -17,6 +17,7 @@ from app.adapters.storage.port import StoragePort
 from app.agent.tools.pdf_generator import generate_pdf_from_html
 from app.core.config import settings
 from app.core.exceptions import (
+    CHECKLIST_INCOMPLETE,
     AlreadyExistsError,
     ForbiddenError,
     InsufficientCreditsError,
@@ -40,14 +41,17 @@ from app.schemas.cuenta_cobro import (
     GenerarPDFResponse,
     PDFUrlResponse,
 )
+from app.services import checklist_service
 
 logger = structlog.get_logger("service.cuenta_cobro")
 
-# Valid state machine transitions
+# Valid state machine transitions.
+# RECHAZADA -> ENVIADA lets a resubmission (POST /radicar) go straight back to
+# ENVIADA without forcing a detour through BORRADOR first.
 _TRANSICIONES: dict[EstadoCuentaCobro, set[EstadoCuentaCobro]] = {
     EstadoCuentaCobro.BORRADOR: {EstadoCuentaCobro.ENVIADA},
     EstadoCuentaCobro.ENVIADA: {EstadoCuentaCobro.APROBADA, EstadoCuentaCobro.RECHAZADA},
-    EstadoCuentaCobro.RECHAZADA: {EstadoCuentaCobro.BORRADOR},
+    EstadoCuentaCobro.RECHAZADA: {EstadoCuentaCobro.BORRADOR, EstadoCuentaCobro.ENVIADA},
     EstadoCuentaCobro.APROBADA: {EstadoCuentaCobro.PAGADA},
     EstadoCuentaCobro.PAGADA: set(),
 }
@@ -194,6 +198,12 @@ async def crear_cuenta_cobro(
     if contrato is None:
         raise NotFoundError("Contrato", str(data.contrato_id))
 
+    # Resolve valor: explicit value wins, otherwise fall back to the contrato's
+    # monthly value (B.2). Fail fast if neither is available.
+    valor = data.valor if data.valor is not None else contrato.valor_mensual
+    if not valor:
+        raise ValidationError("valor is required when the contract has no valor_mensual configured.")
+
     # Check credits
     user_result = await db.execute(select(Usuario).where(Usuario.id == usuario_id))
     usuario = user_result.scalar_one_or_none()
@@ -242,7 +252,7 @@ async def crear_cuenta_cobro(
         contrato_id=data.contrato_id,
         mes=data.mes,
         anio=data.anio,
-        valor=float(data.valor),
+        valor=float(valor),
         estado=EstadoCuentaCobro.BORRADOR,
     )
     db.add(cuenta)
@@ -668,6 +678,40 @@ async def cambiar_estado(
         estado_nuevo=nuevo_estado,
     )
     return await _reload_cuenta_response(db, cuenta_id)
+
+
+async def radicar_cuenta(
+    db: AsyncSession,
+    usuario_id: uuid.UUID,
+    cuenta_id: uuid.UUID,
+) -> CuentaCobroResponse:
+    """Submit (radicar) a CuentaCobro, gating the transition on checklist readiness.
+
+    Only allowed from BORRADOR or RECHAZADA. Builds/refreshes the document
+    checklist via `checklist_service.construir_checklist_completo` and blocks
+    the submission when mandatory requisitos are still pending, surfacing
+    their labels. The actual state transition (and `fecha_envio` stamping) is
+    delegated to `cambiar_estado`, which owns the state machine — this
+    function never mutates `cuenta.estado` directly.
+    """
+    cuenta = await _get_cuenta_con_ownership(db, usuario_id, cuenta_id)
+
+    if cuenta.estado not in (EstadoCuentaCobro.BORRADOR, EstadoCuentaCobro.RECHAZADA):
+        raise ValidationError(
+            f"No se puede radicar una cuenta en estado '{cuenta.estado}'. "
+            "Solo se permite en borrador o rechazada."
+        )
+
+    payload = await checklist_service.construir_checklist_completo(db, cuenta)
+    resumen = payload["resumen"]
+    if not resumen["radicacion_lista"]:
+        pendientes = ", ".join(resumen["lista_pendientes"]) or "requisitos pendientes por definir"
+        raise ValidationError(
+            f"No se puede radicar: faltan requisitos del checklist. Pendientes: {pendientes}.",
+            code=CHECKLIST_INCOMPLETE,
+        )
+
+    return await cambiar_estado(db, usuario_id, cuenta_id, EstadoCuentaCobro.ENVIADA)
 
 
 async def generar_pdf(
