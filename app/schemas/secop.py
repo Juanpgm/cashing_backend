@@ -151,6 +151,10 @@ class SecopSincronizarDocumentosResult(BaseModel):
     documentos_omitidos_duplicados: int
     confirmar: bool
     documentos: list[SecopDocumentoResponse]
+    # Ids of archive datasets that failed during the fetch (e.g. Socrata throttling).
+    # Non-empty means the result is partial — few documents may be an artifact, not
+    # the real count. Defaults to empty for a complete fetch.
+    datasets_con_error: list[str] = []
 
 
 class SecopContratoDetalleResponse(BaseModel):

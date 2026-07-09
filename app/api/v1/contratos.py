@@ -5,12 +5,13 @@ from __future__ import annotations
 import uuid
 
 import structlog
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser
 from app.core.database import get_db
 from app.schemas.agent import ObligacionesExtraerResponse
+from app.schemas.semantic_search import ObligacionSimilar
 from app.schemas.contrato import (
     ContratoContextoAgenteResponse,
     ContratoCreate,
@@ -22,7 +23,7 @@ from app.schemas.contrato import (
     PeriodoPendienteResponse,
 )
 from app.schemas.documento_fuente import ContratoConfiguracionResponse
-from app.services import contrato_service, document_service
+from app.services import contrato_service, document_service, semantic_search_service
 
 logger = structlog.get_logger("api.contratos")
 
@@ -56,6 +57,24 @@ async def obtener_contrato(
 ) -> ContratoResponse:
     """Obtiene un contrato con todas sus obligaciones."""
     return await contrato_service.obtener_contrato(db, user.id, contrato_id)
+
+
+@router.get("/{contrato_id}/obligaciones/similares", response_model=list[ObligacionSimilar])
+async def buscar_obligaciones_similares(
+    contrato_id: uuid.UUID,
+    user: CurrentUser,
+    q: str = Query(min_length=1, max_length=500, description="Texto de consulta para la búsqueda semántica"),
+    top_k: int = Query(default=5, ge=1, le=20),
+    db: AsyncSession = Depends(get_db),
+) -> list[ObligacionSimilar]:
+    """Búsqueda semántica de obligaciones del contrato por similitud de embeddings.
+
+    Ordena las obligaciones (que ya tengan embedding) por cercanía coseno al texto
+    consultado. Usa pgvector en Postgres y un fallback en Python en SQLite.
+    """
+    return await semantic_search_service.buscar_obligaciones_similares(
+        db, user.id, contrato_id, q, top_k
+    )
 
 
 @router.patch("/{contrato_id}", response_model=ContratoResponse)

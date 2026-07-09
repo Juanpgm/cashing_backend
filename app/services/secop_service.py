@@ -110,22 +110,37 @@ async def _query_socrata(dataset_id: str, where_clause: str, limit: int = 500) -
     return results
 
 
-async def _query_docs_datasets(where_clause: str) -> list[dict[str, Any]]:
+async def _query_docs_datasets(
+    where_clause: str, failed_out: list[str] | None = None
+) -> list[dict[str, Any]]:
     """Fan-out: query all archive document datasets in parallel.
 
     Each row is annotated with ``_secop_dataset`` so callers can derive ``tipo_origen``.
     Errors from individual datasets are logged and skipped (partial results are fine).
+    When ``failed_out`` is provided, the ids of datasets that errored are appended to
+    it so callers can tell "the contract has few docs" from "Socrata throttled us".
     """
     raw_results = await asyncio.gather(
         *[_query_socrata(ds, where_clause, limit=1000) for ds in _ALL_DOCS_DATASETS],
         return_exceptions=True,
     )
     rows: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
     for ds_id, result in zip(_ALL_DOCS_DATASETS, raw_results, strict=False):
         if isinstance(result, Exception):
             log.warning("secop_docs_dataset_error", dataset=ds_id, error=str(result))
+            if failed_out is not None:
+                failed_out.append(ds_id)
             continue
         for raw in result:
+            # Dedup by SECOP document id across datasets: the archive datasets can
+            # overlap, so the same document may come back from more than one. Keep the
+            # first occurrence; rows without an id_documento can't be deduped, keep them.
+            doc_id = str(raw.get("id_documento") or "").strip()
+            if doc_id:
+                if doc_id in seen_ids:
+                    continue
+                seen_ids.add(doc_id)
             annotated = dict(raw)
             annotated["_secop_dataset"] = ds_id
             rows.append(annotated)
@@ -749,14 +764,19 @@ async def consulta_completa(
 
 
 def _meses_calendario(fecha_inicio: date, fecha_fin: date) -> int:
-    """Count calendar months the contract spans (both endpoints inclusive).
+    """Count the months of service a contract spans, for monthly-value proration.
 
-    Counts distinct calendar months touched: Jan 19 – Jun 30 → 6 months.
-    The +1 applies when fecha_fin.day >= fecha_inicio.day, meaning the
-    end month is reached at least as far as the start month, so it counts.
+    Uses the month difference and adds one extra month only when the end day is
+    STRICTLY past the start day, i.e. the final partial month is actually served:
+      - Jan 1 → Feb 1  → 1  (one month of service, not two calendar months)
+      - Jan 1 → Jan 1 (next year) → 12
+      - Jan 19 → Jun 30 → 6  (30 > 19 → the last partial month counts)
+      - same day → 0 → clamped to 1
+    A `>=` here would over-count anniversary/first-of-month endpoints by one,
+    understating the monthly value (e.g. a 1-month contract billed as ½).
     """
     meses = (fecha_fin.year - fecha_inicio.year) * 12 + (fecha_fin.month - fecha_inicio.month)
-    if fecha_fin.day >= fecha_inicio.day:
+    if fecha_fin.day > fecha_inicio.day:
         meses += 1
     return max(1, meses)
 
@@ -1023,24 +1043,25 @@ async def sincronizar_documentos_secop(
     all_docs: list[SecopDocumento] = []
     docs_guardados = 0
     docs_omitidos = 0
+    # Datasets that errored (e.g. Socrata throttling) across all fan-out calls, so
+    # the caller can distinguish a genuinely doc-poor contract from a partial fetch.
+    failed_datasets: list[str] = []
 
     async def _fetch_docs_for_contrato(contrato: SecopContrato) -> tuple[list[dict[str, Any]], SecopContrato]:
         if not contrato.numero_contrato:
             return [], contrato
         safe_num = contrato.numero_contrato.replace("'", "''")
-        rows = await _query_socrata(
-            _DS_DOCUMENTOS,
-            where_clause=f"n_mero_de_contrato = '{safe_num}'",
-            limit=100,
+        # Fan out across ALL archive datasets (2018→today), not just the 2025 one,
+        # so contracts with pre-2025 documents are not silently under-reported.
+        rows = await _query_docs_datasets(
+            f"n_mero_de_contrato = '{safe_num}'", failed_out=failed_datasets
         )
         return rows, contrato
 
     async def _fetch_docs_for_proceso(proceso: SecopProceso) -> tuple[list[dict[str, Any]], SecopProceso]:
         safe_proc = proceso.id_proceso_secop.replace("'", "''")
-        rows = await _query_socrata(
-            _DS_DOCUMENTOS,
-            where_clause=f"proceso = '{safe_proc}'",
-            limit=100,
+        rows = await _query_docs_datasets(
+            f"proceso = '{safe_proc}'", failed_out=failed_datasets
         )
         return rows, proceso
 
@@ -1183,6 +1204,7 @@ async def sincronizar_documentos_secop(
         documentos_omitidos_duplicados=docs_omitidos,
         confirmar=confirmar,
         documentos=docs_response,
+        datasets_con_error=sorted(set(failed_datasets)),
     )
 
 
