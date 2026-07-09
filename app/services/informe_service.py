@@ -20,18 +20,35 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.adapters.llm import get_llm
+from app.agent.prompts.supervision_tercera_persona import (
+    TERCERA_PERSONA_SYSTEM_PROMPT,
+    build_tercera_persona_prompt,
+    parse_tercera_persona,
+)
 from app.core.exceptions import ACTIVIDADES_MISSING, ForbiddenError, NotFoundError, ValidationError
 from app.models.actividad import Actividad
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro
 from app.models.obligacion import Obligacion
 from app.models.usuario import Usuario
+from app.schemas.agent import LLMMessage
 
 logger = structlog.get_logger("service.informe")
 
 _MESES = [
-    "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
-    "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre",
+    "Enero",
+    "Febrero",
+    "Marzo",
+    "Abril",
+    "Mayo",
+    "Junio",
+    "Julio",
+    "Agosto",
+    "Septiembre",
+    "Octubre",
+    "Noviembre",
+    "Diciembre",
 ]
 
 
@@ -95,8 +112,16 @@ def _add_actividades_table(
     doc: Document,
     actividades: list[Actividad],
     obligaciones_by_id: dict[uuid.UUID, Obligacion],
+    overrides: dict[uuid.UUID, tuple[str, str]] | None = None,
 ) -> None:
-    """Render activities as a bordered table: # | Obligación | Actividad | Justificación."""
+    """Render activities as a bordered table: # | Obligación | Actividad | Justificación.
+
+    ``overrides`` optionally maps an activity id to a ``(actividad, justificacion)``
+    pair to render instead of ``act.descripcion``/``act.justificacion`` (used by the
+    supervisión report to render third-person text). The obligación column is never
+    affected by overrides. Defaults to None, preserving the exact original behavior
+    for the actividades report.
+    """
     headers = ["#", "Obligación", "Actividad realizada", "Justificación"]
     table = doc.add_table(rows=1 + len(actividades), cols=len(headers))
     table.style = "Table Grid"
@@ -111,10 +136,75 @@ def _add_actividades_table(
         row = table.rows[idx]
         ob = obligaciones_by_id.get(act.obligacion_id) if act.obligacion_id else None
         ob_text = ob.descripcion if ob else "—"
+        override = overrides.get(act.id) if overrides else None
+        actividad_text = override[0] if override else act.descripcion
+        justificacion_text = override[1] if override else (act.justificacion or "—")
         row.cells[0].text = str(idx)
         row.cells[1].text = ob_text
-        row.cells[2].text = act.descripcion
-        row.cells[3].text = act.justificacion or "—"
+        row.cells[2].text = actividad_text
+        row.cells[3].text = justificacion_text
+
+
+async def _convertir_actividades_tercera_persona(
+    actividades: list[Actividad],
+) -> dict[uuid.UUID, tuple[str, str]]:
+    """Batch-rewrite each activity's descripcion/justificacion into third person.
+
+    Makes a SINGLE LLM call over all non-empty texts (both columns, flattened across
+    all activities) to keep the supervisión report generation cheap and fast. Fails
+    OPEN on any error, empty batch, or unparseable/mismatched response: returns an
+    empty dict so the caller falls back to the original first-person text and report
+    generation never breaks because of this conversion step.
+    """
+    empty_markers = {"", "—"}
+
+    # (actividad_id, column) -> flattened text index, built only for non-empty texts.
+    entries: list[tuple[uuid.UUID, str]] = []
+    textos: list[str] = []
+    for act in actividades:
+        descripcion = (act.descripcion or "").strip()
+        if descripcion and descripcion not in empty_markers:
+            entries.append((act.id, "descripcion"))
+            textos.append(descripcion)
+        justificacion = (act.justificacion or "").strip()
+        if justificacion and justificacion not in empty_markers:
+            entries.append((act.id, "justificacion"))
+            textos.append(justificacion)
+
+    if not textos:
+        return {}
+
+    try:
+        llm = get_llm()
+        resp = await llm.complete(
+            [
+                LLMMessage(role="system", content=TERCERA_PERSONA_SYSTEM_PROMPT),
+                LLMMessage(role="user", content=build_tercera_persona_prompt(textos)),
+            ],
+            temperature=0.2,
+            max_tokens=min(2048, 120 * len(textos)),
+        )
+        reescritos = parse_tercera_persona(resp.content, expected=len(textos))
+        if reescritos is None:
+            await logger.awarning("informe_supervision.tercera_persona_parse_failed", batch_size=len(textos))
+            return {}
+    except Exception as exc:
+        await logger.awarning("informe_supervision.tercera_persona_llm_error", error=str(exc), batch_size=len(textos))
+        return {}
+
+    by_actividad: dict[uuid.UUID, dict[str, str]] = {}
+    for (act_id, column), texto in zip(entries, reescritos, strict=True):
+        by_actividad.setdefault(act_id, {})[column] = texto
+
+    overrides: dict[uuid.UUID, tuple[str, str]] = {}
+    for act in actividades:
+        converted = by_actividad.get(act.id)
+        if not converted:
+            continue
+        actividad_text = converted.get("descripcion", act.descripcion)
+        justificacion_text = converted.get("justificacion", act.justificacion or "—")
+        overrides[act.id] = (actividad_text, justificacion_text)
+    return overrides
 
 
 # ── Public API ──────────────────────────────────────────────────────────────
@@ -124,9 +214,7 @@ async def generar_informe_actividades_docx(
     db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: uuid.UUID
 ) -> tuple[bytes, str]:
     """Generate the contractor's activities report as DOCX. Returns (bytes, filename)."""
-    cuenta, contrato, usuario, obligaciones, actividades = await _load_context(
-        db, usuario_id, cuenta_id
-    )
+    cuenta, contrato, usuario, obligaciones, actividades = await _load_context(db, usuario_id, cuenta_id)
     if not actividades:
         raise ValidationError(
             "No hay actividades registradas. Genera o ingresa actividades antes de descargar el informe.",
@@ -142,9 +230,7 @@ async def generar_informe_actividades_docx(
 
     title = doc.add_heading("Informe de actividades del contratista", level=1)
     title.alignment = 1  # center
-    doc.add_paragraph(
-        f"Período reportado: {_periodo_str(cuenta)}"
-    ).alignment = 1
+    doc.add_paragraph(f"Período reportado: {_periodo_str(cuenta)}").alignment = 1
     doc.add_paragraph()
 
     _add_kv_table(
@@ -181,10 +267,7 @@ async def generar_informe_actividades_docx(
     buf = io.BytesIO()
     doc.save(buf)
 
-    filename = (
-        f"informe-actividades-{contrato.numero_contrato}-"
-        f"{cuenta.anio}-{cuenta.mes:02d}.docx"
-    )
+    filename = f"informe-actividades-{contrato.numero_contrato}-{cuenta.anio}-{cuenta.mes:02d}.docx"
     await logger.ainfo(
         "informe_actividades_generado",
         cuenta_id=str(cuenta_id),
@@ -198,9 +281,7 @@ async def generar_informe_supervision_docx(
     db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: uuid.UUID
 ) -> tuple[bytes, str]:
     """Generate the supervisor's report as DOCX. Returns (bytes, filename)."""
-    cuenta, contrato, usuario, obligaciones, actividades = await _load_context(
-        db, usuario_id, cuenta_id
-    )
+    cuenta, contrato, usuario, obligaciones, actividades = await _load_context(db, usuario_id, cuenta_id)
     if not actividades:
         raise ValidationError(
             "No hay actividades registradas. Genera o ingresa actividades antes de descargar el informe.",
@@ -208,6 +289,7 @@ async def generar_informe_supervision_docx(
         )
 
     obligaciones_by_id = {ob.id: ob for ob in obligaciones}
+    overrides = await _convertir_actividades_tercera_persona(actividades)
 
     doc = Document()
     style = doc.styles["Normal"]
@@ -243,7 +325,7 @@ async def generar_informe_supervision_docx(
     )
 
     doc.add_heading("Actividades verificadas", level=2)
-    _add_actividades_table(doc, actividades, obligaciones_by_id)
+    _add_actividades_table(doc, actividades, obligaciones_by_id, overrides=overrides)
 
     doc.add_paragraph()
     doc.add_heading("Concepto del supervisor", level=2)
@@ -261,10 +343,7 @@ async def generar_informe_supervision_docx(
     buf = io.BytesIO()
     doc.save(buf)
 
-    filename = (
-        f"informe-supervision-{contrato.numero_contrato}-"
-        f"{cuenta.anio}-{cuenta.mes:02d}.docx"
-    )
+    filename = f"informe-supervision-{contrato.numero_contrato}-{cuenta.anio}-{cuenta.mes:02d}.docx"
     await logger.ainfo(
         "informe_supervision_generado",
         cuenta_id=str(cuenta_id),
@@ -284,18 +363,14 @@ def _safe_dirname(text: str, max_len: int = 80) -> str:
     return cleaned or "obligacion"
 
 
-async def generar_zip_evidencias(
-    db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: uuid.UUID
-) -> tuple[bytes, str]:
+async def generar_zip_evidencias(db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: uuid.UUID) -> tuple[bytes, str]:
     """Build a ZIP with one folder per obligation containing a README.txt placeholder.
 
     The structure helps the contractor organize physical evidence files by
     obligation. Each folder holds:
       - README.txt (description of obligation + activities + checklist)
     """
-    cuenta, contrato, _usuario, obligaciones, actividades = await _load_context(
-        db, usuario_id, cuenta_id
-    )
+    cuenta, contrato, _usuario, obligaciones, actividades = await _load_context(db, usuario_id, cuenta_id)
 
     actividades_por_ob: dict[uuid.UUID | None, list[Actividad]] = {}
     for act in actividades:
@@ -324,8 +399,7 @@ async def generar_zip_evidencias(
         if not obligaciones:
             zf.writestr(
                 "00_sin_obligaciones/LEEME.txt",
-                "El contrato no tiene obligaciones registradas. "
-                "Cargue el contrato y extraiga obligaciones primero.\n",
+                "El contrato no tiene obligaciones registradas. Cargue el contrato y extraiga obligaciones primero.\n",
             )
 
         for idx, ob in enumerate(obligaciones, start=1):
@@ -376,10 +450,7 @@ async def generar_zip_evidencias(
                 lines.append("")
             zf.writestr("99_otras_actividades/LEEME.txt", "\n".join(lines))
 
-    filename = (
-        f"evidencias-{contrato.numero_contrato}-"
-        f"{cuenta.anio}-{cuenta.mes:02d}.zip"
-    )
+    filename = f"evidencias-{contrato.numero_contrato}-{cuenta.anio}-{cuenta.mes:02d}.zip"
     await logger.ainfo(
         "zip_evidencias_generado",
         cuenta_id=str(cuenta_id),
