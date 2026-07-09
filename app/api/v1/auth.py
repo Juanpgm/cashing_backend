@@ -70,7 +70,7 @@ async def google_login(
     The backend verifies the token with firebase-admin, upserts the user,
     and returns the same JWT pair as email/password login.
     """
-    tokens = await auth_service.google_auth(db, data.id_token)
+    tokens = await auth_service.google_auth(db, data.id_token, data.invite_code)
     await log_audit_event(
         action="google_login",
         user_id="google",

@@ -9,7 +9,12 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.exceptions import AlreadyExistsError, NotFoundError, UnauthorizedError
+from app.core.exceptions import (
+    AlreadyExistsError,
+    InviteRequiredError,
+    NotFoundError,
+    UnauthorizedError,
+)
 from app.core.security import (
     create_access_token,
     create_refresh_token,
@@ -18,6 +23,7 @@ from app.core.security import (
     verify_password,
 )
 from app.models.credito import Credito, TipoCredito
+from app.models.invite_code import InviteCode
 from app.models.token_blacklist import TokenBlacklist
 from app.models.usuario import RolUsuario, Usuario
 from app.adapters.storage.port import StoragePort
@@ -44,11 +50,36 @@ async def _resolve_photo_url(photo_url: str | None) -> str | None:
         return None
 
 
+async def _consume_invite_code(db: AsyncSession, code: str | None) -> None:
+    """Validate and consume one use of an invite code when the waitlist gate is on.
+
+    No-op when ``WAITLIST_ENABLED`` is False. Otherwise raises ``InviteRequiredError``
+    if the code is missing, unknown, inactive, or already exhausted. On success it
+    increments the code's usage counter within the caller's transaction, so a later
+    failure (e.g. duplicate email) rolls the consumption back atomically.
+    """
+    if not settings.WAITLIST_ENABLED:
+        return
+
+    if not code:
+        raise InviteRequiredError()
+
+    result = await db.execute(select(InviteCode).where(InviteCode.codigo == code))
+    invite = result.scalar_one_or_none()
+    if invite is None or not invite.disponible:
+        raise InviteRequiredError("Código de invitación inválido o agotado.")
+
+    invite.usos_actuales += 1
+    await db.flush()
+
+
 async def register(db: AsyncSession, data: RegisterRequest) -> UserResponse:
     """Register a new user and auto-import their SECOP contracts if cedula is provided."""
     result = await db.execute(select(Usuario).where(Usuario.email == data.email))
     if result.scalar_one_or_none() is not None:
         raise AlreadyExistsError("Usuario", "email")
+
+    await _consume_invite_code(db, data.invite_code)
 
     user = Usuario(
         email=data.email,
@@ -128,13 +159,16 @@ async def login(db: AsyncSession, email: str, password: str) -> TokenResponse:
     return TokenResponse(access_token=access_token, refresh_token=refresh_token)
 
 
-async def google_auth(db: AsyncSession, id_token: str) -> TokenResponse:
+async def google_auth(
+    db: AsyncSession, id_token: str, invite_code: str | None = None
+) -> TokenResponse:
     """Authenticate (or register) a user via Firebase Google Sign-in.
 
     Flow:
     1. Verify the Firebase ID token with firebase-admin.
     2. Find an existing user by google_id OR email (links accounts automatically).
-    3. Create a new user if none found (upsert with signup bonus credits).
+    3. Create a new user if none found (upsert with signup bonus credits). New
+       accounts pass through the waitlist gate; existing users log in unimpeded.
     4. Return our own JWT pair — same as email login, so the frontend is token-agnostic.
     """
     from app.core.firebase_admin import verify_firebase_token
@@ -162,7 +196,8 @@ async def google_auth(db: AsyncSession, id_token: str) -> TokenResponse:
     user = result.scalar_one_or_none()
 
     if user is None:
-        # First-time Google sign-in — create account
+        # First-time Google sign-in — gated account creation
+        await _consume_invite_code(db, invite_code)
         user = Usuario(
             email=email,
             nombre=nombre,
@@ -246,6 +281,11 @@ async def get_user_by_id(db: AsyncSession, user_id: uuid.UUID) -> UserResponse:
         raise NotFoundError("Usuario", str(user_id))
     response = UserResponse.model_validate(user)
     response.photo_url = await _resolve_photo_url(response.photo_url)
+    # Balance is derived from the credit ledger (source of truth), not the cache,
+    # so it is always correct even if the denormalized cache ever drifts.
+    from app.services import credito_service
+
+    response.creditos_disponibles = await credito_service.obtener_saldo(db, user_id)
     return response
 
 

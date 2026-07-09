@@ -17,6 +17,7 @@ from app.models.documento_cuenta_cobro import (  # noqa: F401
 from app.models.documento_fuente import DocumentoFuente  # noqa: F401
 from app.models.evidencia import Evidencia  # noqa: F401
 from app.models.google_token import GoogleToken  # noqa: F401
+from app.models.invite_code import InviteCode  # noqa: F401
 from app.models.obligacion import Obligacion  # noqa: F401
 from app.models.pago import Pago  # noqa: F401
 from app.models.plantilla import Plantilla  # noqa: F401

@@ -12,6 +12,9 @@ class RegisterRequest(BaseModel):
     nombre: str = Field(min_length=1, max_length=255)
     cedula: str | None = Field(default=None, max_length=20)
     telefono: str | None = Field(default=None, max_length=20)
+    invite_code: str | None = Field(
+        default=None, max_length=64, description="Invite code, required only when the waitlist gate is enabled"
+    )
 
 
 class LoginRequest(BaseModel):
@@ -21,6 +24,9 @@ class LoginRequest(BaseModel):
 
 class GoogleAuthRequest(BaseModel):
     id_token: str = Field(min_length=1, description="Firebase ID token from signInWithPopup")
+    invite_code: str | None = Field(
+        default=None, max_length=64, description="Invite code, required only for new accounts when the waitlist gate is enabled"
+    )
 
 
 class TokenResponse(BaseModel):
