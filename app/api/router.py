@@ -3,6 +3,7 @@
 from fastapi import APIRouter
 
 from app.api.v1.actividades import router as actividades_router
+from app.api.v1.agent_chat import router as agent_chat_router
 from app.api.v1.agent_sessions import router as agent_sessions_router
 from app.api.v1.auth import router as auth_router
 from app.api.v1.chat import router as chat_router
@@ -15,7 +16,8 @@ from app.api.v1.evidencias import router as evidencias_router
 from app.api.v1.health import router as health_router
 from app.api.v1.integraciones import router as integraciones_router
 from app.api.v1.onboarding import router as onboarding_router
-from app.api.v1.pagos import creditos_router, router as pagos_router
+from app.api.v1.pagos import creditos_router
+from app.api.v1.pagos import router as pagos_router
 from app.api.v1.plantillas import router as plantillas_router
 from app.api.v1.requisitos_cuenta import router as requisitos_cuenta_router
 from app.api.v1.secop import router as secop_router
@@ -25,6 +27,7 @@ api_v1_router = APIRouter(prefix="/api/v1")
 api_v1_router.include_router(auth_router)
 api_v1_router.include_router(chat_router)
 api_v1_router.include_router(agent_sessions_router)
+api_v1_router.include_router(agent_chat_router)
 api_v1_router.include_router(documentos_router)
 api_v1_router.include_router(contratos_router)
 api_v1_router.include_router(cuentas_cobro_router)
