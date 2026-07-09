@@ -56,6 +56,8 @@ test_upload.pdf
 *.db
 *.db-journal
 *.db.bak
+*.db.bak-*
+*.db.stale
 
 # Local runtime storage (uploaded documents)
 local_storage/
@@ -66,3 +68,4 @@ local_storage/
 # Temp / scratch files
 tmp*.txt
 _tmp*.py
+_*.log
