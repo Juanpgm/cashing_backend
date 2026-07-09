@@ -20,6 +20,7 @@ class AgentState(TypedDict, total=False):
     messages: list[LLMMessage]
     user_input: str
     response: str
+    tokens_used: int
 
     # Document processing
     document_id: uuid.UUID | None

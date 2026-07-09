@@ -87,7 +87,7 @@ async def chat(
     return ChatMessageResponse(
         session_id=convo.id,
         content=response_text,
-        tokens_used=0,
+        tokens_used=int(result_state.get("tokens_used", 0) or 0),
     )
 
 

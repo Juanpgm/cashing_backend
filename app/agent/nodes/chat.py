@@ -32,6 +32,7 @@ async def chat_node(state: AgentState) -> AgentState:
         return {
             **state,
             "response": resp.content,
+            "tokens_used": resp.total_tokens,
             "messages": [*history, LLMMessage(role="assistant", content=resp.content)],
         }
     except Exception as exc:
