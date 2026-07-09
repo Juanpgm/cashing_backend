@@ -1,4 +1,4 @@
-"""Embedding service — generates and stores text-embedding-004 vectors for obligations."""
+"""Embedding service — generates and stores text-embedding-3-small (1536-dim) vectors for obligations."""
 
 from __future__ import annotations
 

@@ -7,17 +7,30 @@ to `vector(1536)` so we do not need pgvector SQLAlchemy types at model level.
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 from uuid import UUID
 
 import structlog
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.obligacion import Obligacion
 
 logger = structlog.get_logger("agent.tools.vector_search")
 
-# Embedding dimension must match the model used (text-embedding-004 = 1536)
+# Embedding dimension must match the model used (text-embedding-3-small = 1536)
 EMBEDDING_DIM = 1536
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    """Cosine similarity; 0.0 on length mismatch or zero-norm."""
+    if len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    return 0.0 if na == 0.0 or nb == 0.0 else dot / (na * nb)
 
 
 def encode_embedding(embedding: list[float]) -> str:
@@ -62,15 +75,27 @@ async def semantic_search_obligaciones(
             f"got {len(query_embedding)}."
         )
 
-    query_vector_str = "[" + ",".join(str(f) for f in query_embedding) + "]"
+    # pgvector on Postgres (uses the native operator); Python cosine on SQLite so the
+    # tool works in local/tests instead of silently returning [] on a raised query.
+    if db.bind.dialect.name == "postgresql":
+        return await _pg_search(db, query_embedding, contrato_id, limit, min_similarity)
+    return await _python_search(db, query_embedding, contrato_id, limit, min_similarity)
 
+
+async def _pg_search(
+    db: AsyncSession,
+    query_embedding: list[float],
+    contrato_id: UUID | None,
+    limit: int,
+    min_similarity: float,
+) -> list[dict[str, Any]]:
+    query_vector_str = "[" + ",".join(str(f) for f in query_embedding) + "]"
     where_clause = "o.embedding IS NOT NULL"
     params: dict[str, Any] = {
         "query_vector": query_vector_str,
         "limit": limit,
         "min_similarity": min_similarity,
     }
-
     if contrato_id is not None:
         where_clause += " AND o.contrato_id = :contrato_id"
         params["contrato_id"] = str(contrato_id)
@@ -91,15 +116,47 @@ async def semantic_search_obligaciones(
         LIMIT :limit
         """
     )
-
     try:
         result = await db.execute(sql, params)
-        rows = result.mappings().all()
-        return [dict(row) for row in rows]
+        return [dict(row) for row in result.mappings().all()]
     except Exception as exc:
+        # Surface the real error in logs (don't hide pgvector/SQL bugs), but keep the
+        # agent node resilient by returning no matches rather than crashing.
         await logger.aerror("vector_search_failed", error=str(exc))
-        # Fallback: return empty list rather than crashing the node
         return []
+
+
+async def _python_search(
+    db: AsyncSession,
+    query_embedding: list[float],
+    contrato_id: UUID | None,
+    limit: int,
+    min_similarity: float,
+) -> list[dict[str, Any]]:
+    stmt = select(Obligacion).where(Obligacion.embedding.is_not(None))
+    if contrato_id is not None:
+        stmt = stmt.where(Obligacion.contrato_id == contrato_id)
+    obligaciones = (await db.execute(stmt)).scalars().all()
+
+    scored: list[dict[str, Any]] = []
+    for ob in obligaciones:
+        emb = decode_embedding(ob.embedding)
+        if emb is None:
+            continue
+        similarity = _cosine(query_embedding, emb)
+        if similarity >= min_similarity:
+            scored.append(
+                {
+                    "id": ob.id,
+                    "contrato_id": ob.contrato_id,
+                    "descripcion": ob.descripcion,
+                    "tipo": getattr(ob.tipo, "value", ob.tipo),
+                    "orden": ob.orden,
+                    "similarity": similarity,
+                }
+            )
+    scored.sort(key=lambda d: d["similarity"], reverse=True)
+    return scored[:limit]
 
 
 async def store_obligacion_embedding(
