@@ -635,15 +635,28 @@ async def upload_document(
         if r.scalar_one_or_none() is None:
             raise NotFoundError("Contrato", str(contrato_id))
 
-    # Two-tier scoping. Derive contrato_id from the cuenta up-front so downstream
-    # dedup/replace logic sees it, then decide the document's scope: contract-level
-    # requisitos (RUT, cédula, contrato, RPC…) produce a SHARED document
-    # (cuenta_cobro_id NULL) that fulfils the requisito in every cuenta; everything
-    # else stays strictly scoped to this cuenta.
-    if contrato_id is None and cuenta_cobro_id is not None:
-        cc_lookup = await db.execute(select(CuentaCobro).where(CuentaCobro.id == cuenta_cobro_id))
+    # Two-tier scoping. Verify ownership of cuenta_cobro_id unconditionally (not only
+    # when contrato_id is omitted) — a caller could otherwise pass their own valid
+    # contrato_id alongside someone else's cuenta_cobro_id and reach the checklist
+    # link below without ever having cuenta ownership checked. Also derive contrato_id
+    # from the cuenta up-front so downstream dedup/replace logic sees it, then decide
+    # the document's scope: contract-level requisitos (RUT, cédula, contrato, RPC…)
+    # produce a SHARED document (cuenta_cobro_id NULL) that fulfils the requisito in
+    # every cuenta; everything else stays strictly scoped to this cuenta.
+    if cuenta_cobro_id is not None:
+        cc_lookup = await db.execute(
+            select(CuentaCobro)
+            .join(Contrato, Contrato.id == CuentaCobro.contrato_id)
+            .where(
+                CuentaCobro.id == cuenta_cobro_id,
+                Contrato.usuario_id == user_id,
+                Contrato.deleted_at.is_(None),
+            )
+        )
         cc = cc_lookup.scalar_one_or_none()
-        if cc is not None:
+        if cc is None:
+            raise NotFoundError("CuentaCobro", str(cuenta_cobro_id))
+        if contrato_id is None:
             contrato_id = cc.contrato_id
 
     from app.services.checklist_service import es_nivel_contrato as _es_nivel_contrato
@@ -874,13 +887,9 @@ async def upload_document(
         )
         raise
 
-    # When uploading via the checklist flow (cuenta_cobro_id provided, contrato_id not),
-    # derive contrato_id from the cuenta so DocumentoFuente stays traceable per contract.
-    if contrato_id is None and cuenta_cobro_id is not None:
-        cc_lookup = await db.execute(select(CuentaCobro).where(CuentaCobro.id == cuenta_cobro_id))
-        cc = cc_lookup.scalar_one_or_none()
-        if cc is not None:
-            contrato_id = cc.contrato_id
+    # NOTE: cuenta_cobro_id ownership + contrato_id derivation from the cuenta already
+    # happened unconditionally above (before dedup/replace logic), so contrato_id is
+    # already resolved and ownership-verified here whenever cuenta_cobro_id was given.
 
     # Store the safe name; preserve the original in metadata for traceability.
     metadata: dict[str, str] = {}
@@ -909,6 +918,9 @@ async def upload_document(
     await logger.ainfo("document_uploaded", doc_id=str(doc.id), filename=filename, contrato_id=str(contrato_id))
 
     # Optional: link uploaded document to a cuenta de cobro checklist requisito.
+    # Safe: ownership of cuenta_cobro_id was already verified against user_id above
+    # (unconditionally, whenever cuenta_cobro_id is not None) — checklist_service
+    # itself does not re-check ownership, so callers must guarantee it before invoking it.
     if cuenta_cobro_id is not None and requisito_codigo is not None:
         from app.services import checklist_service
 
