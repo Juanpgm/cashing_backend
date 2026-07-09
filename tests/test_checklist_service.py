@@ -46,9 +46,7 @@ async def contrato(db: AsyncSession, test_user: dict[str, Any]) -> Contrato:
     return c
 
 
-async def _make_cuenta(
-    db: AsyncSession, contrato: Contrato, mes: int, anio: int = 2024
-) -> CuentaCobro:
+async def _make_cuenta(db: AsyncSession, contrato: Contrato, mes: int, anio: int = 2024) -> CuentaCobro:
     cc = CuentaCobro(
         contrato_id=contrato.id,
         mes=mes,
@@ -65,9 +63,7 @@ async def _make_cuenta(
 # ── asegurar_checklist ─────────────────────────────────────────────────────
 
 
-async def test_asegurar_checklist_creates_rows_first_cuenta(
-    db: AsyncSession, contrato: Contrato
-) -> None:
+async def test_asegurar_checklist_creates_rows_first_cuenta(db: AsyncSession, contrato: Contrato) -> None:
     cuenta = await _make_cuenta(db, contrato, mes=1)
 
     filas = await checklist_service.asegurar_checklist(db, cuenta)
@@ -83,9 +79,7 @@ async def test_asegurar_checklist_creates_rows_first_cuenta(
     assert "ACTA_INICIO" in codigos
 
 
-async def test_asegurar_checklist_contract_level_appears_every_cuenta(
-    db: AsyncSession, contrato: Contrato
-) -> None:
+async def test_asegurar_checklist_contract_level_appears_every_cuenta(db: AsyncSession, contrato: Contrato) -> None:
     """Contract-level requisitos (CONTRATO, RUT, CEDULA, ACTA_INICIO) appear on EVERY
     cuenta — they are auto-fulfilled by the shared contract-level document, so
     solo_primera_cuenta no longer hides them on later cuentas."""
@@ -104,9 +98,7 @@ async def test_asegurar_checklist_contract_level_appears_every_cuenta(
     assert "ACTA_INICIO" in codigos
 
 
-async def test_asegurar_checklist_is_idempotent(
-    db: AsyncSession, contrato: Contrato
-) -> None:
+async def test_asegurar_checklist_is_idempotent(db: AsyncSession, contrato: Contrato) -> None:
     cuenta = await _make_cuenta(db, contrato, mes=1)
 
     filas1 = await checklist_service.asegurar_checklist(db, cuenta)
@@ -118,11 +110,7 @@ async def test_asegurar_checklist_is_idempotent(
     # No duplicate rows in DB
     from sqlalchemy import select
 
-    res = await db.execute(
-        select(DocumentoCuentaCobro).where(
-            DocumentoCuentaCobro.cuenta_cobro_id == cuenta.id
-        )
-    )
+    res = await db.execute(select(DocumentoCuentaCobro).where(DocumentoCuentaCobro.cuenta_cobro_id == cuenta.id))
     rows = list(res.scalars().all())
     codigos = [r.requisito_codigo for r in rows]
     assert len(codigos) == len(set(codigos))
@@ -153,13 +141,21 @@ async def test_new_cuenta_does_not_inherit_old_cuenta_links(
 
     # Contract-level document (CONTRATO): shared, cuenta_cobro_id NULL.
     df_contrato = DocumentoFuente(
-        usuario_id=user.id, contrato_id=contrato.id, cuenta_cobro_id=None,
-        storage_key="k/contrato", nombre="contrato.pdf", tipo=TipoDocumentoFuente.CONTRATO,
+        usuario_id=user.id,
+        contrato_id=contrato.id,
+        cuenta_cobro_id=None,
+        storage_key="k/contrato",
+        nombre="contrato.pdf",
+        tipo=TipoDocumentoFuente.CONTRATO,
     )
     # Cuenta-level document (SEGURIDAD_SOCIAL): strictly scoped to cuenta1.
     df_cuenta = DocumentoFuente(
-        usuario_id=user.id, contrato_id=contrato.id, cuenta_cobro_id=cuenta1.id,
-        storage_key="k/ss", nombre="planilla.pdf", tipo=TipoDocumentoFuente.SEGURIDAD_SOCIAL,
+        usuario_id=user.id,
+        contrato_id=contrato.id,
+        cuenta_cobro_id=cuenta1.id,
+        storage_key="k/ss",
+        nombre="planilla.pdf",
+        tipo=TipoDocumentoFuente.SEGURIDAD_SOCIAL,
     )
     db.add_all([df_contrato, df_cuenta])
     await db.commit()
@@ -182,9 +178,7 @@ async def test_new_cuenta_does_not_inherit_old_cuenta_links(
 # ── detectar_desde_secop ───────────────────────────────────────────────────
 
 
-async def test_detectar_desde_secop_scores_and_autolinks(
-    db: AsyncSession, contrato: Contrato
-) -> None:
+async def test_detectar_desde_secop_scores_and_autolinks(db: AsyncSession, contrato: Contrato) -> None:
     # Seed SECOP docs with names that match keywords for distinct requisitos
     doc_contrato = SecopDocumento(
         id_documento_secop="DOC-1",
@@ -251,9 +245,7 @@ async def test_detectar_desde_secop_scores_and_autolinks(
 # ── manual transitions ─────────────────────────────────────────────────────
 
 
-async def test_marcar_no_aplica_and_cumplido_manual(
-    db: AsyncSession, contrato: Contrato
-) -> None:
+async def test_marcar_no_aplica_and_cumplido_manual(db: AsyncSession, contrato: Contrato) -> None:
     cuenta = await _make_cuenta(db, contrato, mes=1)
     await checklist_service.asegurar_checklist(db, cuenta)
     await db.commit()
@@ -262,9 +254,7 @@ async def test_marcar_no_aplica_and_cumplido_manual(
     await db.commit()
     assert fila.estado == EstadoRequisito.NO_APLICA
 
-    fila2 = await checklist_service.marcar_cumplido_manual(
-        db, cuenta.id, "COMPROBANTE_PAGO_SS"
-    )
+    fila2 = await checklist_service.marcar_cumplido_manual(db, cuenta.id, "COMPROBANTE_PAGO_SS")
     await db.commit()
     assert fila2.estado == EstadoRequisito.CUMPLIDO_MANUAL
 
@@ -272,9 +262,7 @@ async def test_marcar_no_aplica_and_cumplido_manual(
 # ── resumen ────────────────────────────────────────────────────────────────
 
 
-async def test_computar_resumen_marks_radicacion_lista_when_complete(
-    db: AsyncSession, contrato: Contrato
-) -> None:
+async def test_computar_resumen_marks_radicacion_lista_when_complete(db: AsyncSession, contrato: Contrato) -> None:
     cuenta = await _make_cuenta(db, contrato, mes=1)
     await checklist_service.asegurar_checklist(db, cuenta)
     await db.commit()
@@ -283,11 +271,7 @@ async def test_computar_resumen_marks_radicacion_lista_when_complete(
 
     from sqlalchemy import select
 
-    res = await db.execute(
-        select(DocumentoCuentaCobro).where(
-            DocumentoCuentaCobro.cuenta_cobro_id == cuenta.id
-        )
-    )
+    res = await db.execute(select(DocumentoCuentaCobro).where(DocumentoCuentaCobro.cuenta_cobro_id == cuenta.id))
     filas = list(res.scalars().all())
 
     # Mark all obligatorios as cumplido_manual or no_aplica
@@ -305,9 +289,7 @@ async def test_computar_resumen_marks_radicacion_lista_when_complete(
     assert resumen["cumplidos"] == resumen["total"]
 
 
-async def test_computar_resumen_radicacion_no_lista_si_falta(
-    db: AsyncSession, contrato: Contrato
-) -> None:
+async def test_computar_resumen_radicacion_no_lista_si_falta(db: AsyncSession, contrato: Contrato) -> None:
     cuenta = await _make_cuenta(db, contrato, mes=1)
     filas = await checklist_service.asegurar_checklist(db, cuenta)
     await db.commit()
@@ -315,3 +297,287 @@ async def test_computar_resumen_radicacion_no_lista_si_falta(
     resumen = checklist_service.computar_resumen(filas, catalogo)
     assert resumen["pendientes"] > 0
     assert resumen["radicacion_lista"] is False
+
+
+# ── 1:N document links per requisito ────────────────────────────────────────
+
+
+async def _make_documento_fuente(
+    db: AsyncSession,
+    test_user: dict[str, Any],
+    contrato: Contrato,
+    cuenta: CuentaCobro,
+    nombre: str,
+    tipo: TipoDocumentoFuente = TipoDocumentoFuente.RPC,
+) -> DocumentoFuente:
+    df = DocumentoFuente(
+        usuario_id=test_user["user"].id,
+        contrato_id=contrato.id,
+        cuenta_cobro_id=cuenta.id,
+        storage_key=f"k/{nombre}",
+        nombre=nombre,
+        tipo=tipo,
+    )
+    db.add(df)
+    await db.commit()
+    await db.refresh(df)
+    return df
+
+
+async def test_vincular_documento_fuente_es_idempotente(
+    db: AsyncSession, contrato: Contrato, test_user: dict[str, Any]
+) -> None:
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    await checklist_service.asegurar_checklist(db, cuenta)
+    await db.commit()
+    df = await _make_documento_fuente(db, test_user, contrato, cuenta, "rpc.pdf")
+
+    await checklist_service.vincular_documento_fuente(db, cuenta.id, "RPC", df.id)
+    await db.commit()
+    await checklist_service.vincular_documento_fuente(db, cuenta.id, "RPC", df.id)
+    await db.commit()
+
+    payload = await checklist_service.construir_checklist_completo(db, cuenta)
+    item = next(i for i in payload["items"] if i["requisito"]["codigo"] == "RPC")
+    assert len(item["documentos_fuente"]) == 1
+    assert item["documentos_fuente"][0]["id"] == df.id
+    assert item["estado"] == EstadoRequisito.CARGADO
+
+
+async def test_vincular_documento_fuente_multiples_agrega_sin_sobreescribir(
+    db: AsyncSession, contrato: Contrato, test_user: dict[str, Any]
+) -> None:
+    """Linking 3 different documents to the same requisito must keep ALL of them
+    (the previous behaviour overwrote the singular FK on every new link — data loss)."""
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    await checklist_service.asegurar_checklist(db, cuenta)
+    await db.commit()
+
+    df1 = await _make_documento_fuente(db, test_user, contrato, cuenta, "rpc-original.pdf")
+    df2 = await _make_documento_fuente(db, test_user, contrato, cuenta, "rpc-adicion-1.pdf")
+    df3 = await _make_documento_fuente(db, test_user, contrato, cuenta, "rpc-adicion-2.pdf")
+
+    for df in (df1, df2, df3):
+        await checklist_service.vincular_documento_fuente(db, cuenta.id, "RPC", df.id)
+        await db.commit()
+
+    from sqlalchemy import select
+
+    fila_res = await db.execute(
+        select(DocumentoCuentaCobro).where(
+            DocumentoCuentaCobro.cuenta_cobro_id == cuenta.id,
+            DocumentoCuentaCobro.requisito_codigo == "RPC",
+        )
+    )
+    fila = fila_res.scalar_one()
+    assert fila.estado == EstadoRequisito.CARGADO
+    # Primary slot must be the FIRST one linked — never overwritten by later links.
+    assert fila.documento_fuente_id == df1.id
+
+    payload = await checklist_service.construir_checklist_completo(db, cuenta)
+    item = next(i for i in payload["items"] if i["requisito"]["codigo"] == "RPC")
+    ids = [d["id"] for d in item["documentos_fuente"]]
+    assert ids == [df1.id, df2.id, df3.id]
+    assert item["documento_fuente"]["id"] == df1.id
+
+
+async def test_vincular_documento_fuente_concurrent_insert_no_lanza(
+    db: AsyncSession, contrato: Contrato, test_user: dict[str, Any]
+) -> None:
+    """Simulates a race: another request already inserted the same vinculo row
+    between our idempotency SELECT and the INSERT. The IntegrityError raised by
+    the unique constraint must be caught (via a savepoint) and treated as an
+    idempotent no-op instead of propagating."""
+    from unittest.mock import patch
+
+    from app.models.documento_cuenta_cobro import DocumentoRequisitoVinculo
+
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    await checklist_service.asegurar_checklist(db, cuenta)
+    await db.commit()
+    df = await _make_documento_fuente(db, test_user, contrato, cuenta, "rpc.pdf")
+
+    fila = await checklist_service._get_fila(db, cuenta.id, "RPC")
+
+    # A concurrent request "wins the race": inserts the vinculo AND promotes it
+    # to primary before our call runs its own idempotency check.
+    db.add(DocumentoRequisitoVinculo(documento_cuenta_cobro_id=fila.id, documento_fuente_id=df.id))
+    fila.documento_fuente_id = df.id
+    fila.estado = EstadoRequisito.CARGADO
+    await db.commit()
+
+    original_execute = db.execute
+    call_count = {"n": 0}
+
+    async def _fake_execute(stmt, *args, **kwargs):
+        call_count["n"] += 1
+        # 3rd db.execute inside vincular_documento_fuente is the "ya_vinculado"
+        # idempotency SELECT — fake it as empty to simulate the TOCTOU race
+        # (the row already exists, but our SELECT ran before the concurrent commit).
+        if call_count["n"] == 3:
+
+            class _EmptyResult:
+                def scalar_one_or_none(self) -> None:
+                    return None
+
+            return _EmptyResult()
+        return await original_execute(stmt, *args, **kwargs)
+
+    with patch.object(db, "execute", side_effect=_fake_execute):
+        result_fila = await checklist_service.vincular_documento_fuente(db, cuenta.id, "RPC", df.id)
+
+    assert result_fila.estado == EstadoRequisito.CARGADO
+    assert result_fila.documento_fuente_id == df.id
+
+
+async def test_vincular_secop_no_limpia_documento_fuente(
+    db: AsyncSession, contrato: Contrato, test_user: dict[str, Any]
+) -> None:
+    """A SECOP link must coexist with an existing uploaded document (mixed sources)."""
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    await checklist_service.asegurar_checklist(db, cuenta)
+    await db.commit()
+    df = await _make_documento_fuente(db, test_user, contrato, cuenta, "rpc.pdf")
+    await checklist_service.vincular_documento_fuente(db, cuenta.id, "RPC", df.id)
+    await db.commit()
+
+    sd = SecopDocumento(
+        id_documento_secop="DOC-MIX-1",
+        numero_contrato=contrato.numero_contrato,
+        nombre_archivo="rpc-secop.pdf",
+        descripcion="RPC",
+        datos_raw={},
+    )
+    db.add(sd)
+    await db.commit()
+
+    fila = await checklist_service.vincular_secop_documento(db, cuenta.id, "RPC", sd.id)
+    await db.commit()
+
+    assert fila.documento_fuente_id == df.id  # NOT cleared
+    assert fila.secop_documento_id == sd.id
+    assert fila.estado == EstadoRequisito.CARGADO  # uploaded doc still outranks detection
+
+    payload = await checklist_service.construir_checklist_completo(db, cuenta)
+    item = next(i for i in payload["items"] if i["requisito"]["codigo"] == "RPC")
+    assert len(item["documentos_fuente"]) == 1
+    assert len(item["secop_documentos"]) == 1
+
+
+async def test_desvincular_uno_no_afecta_los_demas(
+    db: AsyncSession, contrato: Contrato, test_user: dict[str, Any]
+) -> None:
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    await checklist_service.asegurar_checklist(db, cuenta)
+    await db.commit()
+    df1 = await _make_documento_fuente(db, test_user, contrato, cuenta, "rpc-1.pdf")
+    df2 = await _make_documento_fuente(db, test_user, contrato, cuenta, "rpc-2.pdf")
+    df3 = await _make_documento_fuente(db, test_user, contrato, cuenta, "rpc-3.pdf")
+    for df in (df1, df2, df3):
+        await checklist_service.vincular_documento_fuente(db, cuenta.id, "RPC", df.id)
+    await db.commit()
+
+    # Unlink a NON-primary document — the primary and the remaining one stay.
+    fila = await checklist_service.desvincular(db, cuenta.id, "RPC", documento_fuente_id=df2.id)
+    await db.commit()
+
+    assert fila.documento_fuente_id == df1.id
+    assert fila.estado == EstadoRequisito.CARGADO
+
+    payload = await checklist_service.construir_checklist_completo(db, cuenta)
+    item = next(i for i in payload["items"] if i["requisito"]["codigo"] == "RPC")
+    ids = {d["id"] for d in item["documentos_fuente"]}
+    assert ids == {df1.id, df3.id}
+
+
+async def test_desvincular_primario_promueve_siguiente(
+    db: AsyncSession, contrato: Contrato, test_user: dict[str, Any]
+) -> None:
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    await checklist_service.asegurar_checklist(db, cuenta)
+    await db.commit()
+    df1 = await _make_documento_fuente(db, test_user, contrato, cuenta, "rpc-1.pdf")
+    df2 = await _make_documento_fuente(db, test_user, contrato, cuenta, "rpc-2.pdf")
+    for df in (df1, df2):
+        await checklist_service.vincular_documento_fuente(db, cuenta.id, "RPC", df.id)
+    await db.commit()
+
+    # Unlink the PRIMARY (df1) — df2 must be promoted, estado stays CARGADO.
+    fila = await checklist_service.desvincular(db, cuenta.id, "RPC", documento_fuente_id=df1.id)
+    await db.commit()
+
+    assert fila.documento_fuente_id == df2.id
+    assert fila.estado == EstadoRequisito.CARGADO
+
+
+async def test_desvincular_uno_preserva_cumplido_manual(
+    db: AsyncSession, contrato: Contrato, test_user: dict[str, Any]
+) -> None:
+    """Unlinking ONE of several links must not clobber a manually-set estado
+    (CUMPLIDO_MANUAL/NO_APLICA) with the auto-derived estado."""
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    await checklist_service.asegurar_checklist(db, cuenta)
+    await db.commit()
+    df1 = await _make_documento_fuente(db, test_user, contrato, cuenta, "rpc-1.pdf")
+    df2 = await _make_documento_fuente(db, test_user, contrato, cuenta, "rpc-2.pdf")
+    for df in (df1, df2):
+        await checklist_service.vincular_documento_fuente(db, cuenta.id, "RPC", df.id)
+    await db.commit()
+
+    fila = await checklist_service.marcar_cumplido_manual(db, cuenta.id, "RPC")
+    await db.commit()
+    assert fila.estado == EstadoRequisito.CUMPLIDO_MANUAL
+
+    fila = await checklist_service.desvincular(db, cuenta.id, "RPC", documento_fuente_id=df2.id)
+    await db.commit()
+
+    assert fila.estado == EstadoRequisito.CUMPLIDO_MANUAL
+
+
+async def test_desvincular_todos_los_links_vuelve_a_pendiente(
+    db: AsyncSession, contrato: Contrato, test_user: dict[str, Any]
+) -> None:
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    await checklist_service.asegurar_checklist(db, cuenta)
+    await db.commit()
+    df1 = await _make_documento_fuente(db, test_user, contrato, cuenta, "rpc-1.pdf")
+    df2 = await _make_documento_fuente(db, test_user, contrato, cuenta, "rpc-2.pdf")
+    for df in (df1, df2):
+        await checklist_service.vincular_documento_fuente(db, cuenta.id, "RPC", df.id)
+    await db.commit()
+
+    await checklist_service.desvincular(db, cuenta.id, "RPC", documento_fuente_id=df1.id)
+    await db.commit()
+    fila = await checklist_service.desvincular(db, cuenta.id, "RPC", documento_fuente_id=df2.id)
+    await db.commit()
+
+    assert fila.documento_fuente_id is None
+    assert fila.secop_documento_id is None
+    assert fila.estado == EstadoRequisito.PENDIENTE
+
+    payload = await checklist_service.construir_checklist_completo(db, cuenta)
+    item = next(i for i in payload["items"] if i["requisito"]["codigo"] == "RPC")
+    assert item["documentos_fuente"] == []
+
+
+async def test_desvincular_legacy_sin_argumentos_remueve_todo(
+    db: AsyncSession, contrato: Contrato, test_user: dict[str, Any]
+) -> None:
+    """No-args call keeps the pre-existing behaviour: remove EVERY link at once."""
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    await checklist_service.asegurar_checklist(db, cuenta)
+    await db.commit()
+    df1 = await _make_documento_fuente(db, test_user, contrato, cuenta, "rpc-1.pdf")
+    df2 = await _make_documento_fuente(db, test_user, contrato, cuenta, "rpc-2.pdf")
+    for df in (df1, df2):
+        await checklist_service.vincular_documento_fuente(db, cuenta.id, "RPC", df.id)
+    await db.commit()
+
+    fila = await checklist_service.desvincular(db, cuenta.id, "RPC")
+    await db.commit()
+
+    assert fila.documento_fuente_id is None
+    assert fila.estado == EstadoRequisito.PENDIENTE
+    payload = await checklist_service.construir_checklist_completo(db, cuenta)
+    item = next(i for i in payload["items"] if i["requisito"]["codigo"] == "RPC")
+    assert item["documentos_fuente"] == []

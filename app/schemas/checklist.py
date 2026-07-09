@@ -83,6 +83,8 @@ class RequisitoChecklistItem(BaseModel):
     estado: EstadoRequisito
     documento_fuente: DocumentoFuenteRef | None = None
     secop_documento: SecopDocumentoRef | None = None
+    documentos_fuente: list[DocumentoFuenteRef] = Field(default_factory=list)
+    secop_documentos: list[SecopDocumentoRef] = Field(default_factory=list)
     confianza_deteccion: Decimal | None = None
     observaciones: str | None = None
     candidatos_secop: list[SecopCandidatoOut] = Field(default_factory=list)
@@ -146,15 +148,23 @@ class PatchRequisitoBody(BaseModel):
     secop_documento_id: uuid.UUID | None = Field(
         None, description="Link a SECOP cached document. Sets estado=DETECTADO."
     )
-    desvincular: bool | None = Field(
-        None, description="If true, removes any link and sets estado=PENDIENTE."
+    desvincular: bool | None = Field(None, description="If true, removes ALL links and sets estado=PENDIENTE.")
+    desvincular_documento_fuente_id: uuid.UUID | None = Field(
+        None,
+        description=(
+            "Removes ONE specific linked DocumentoFuente. If it was the primary link, "
+            "the oldest remaining link of the same kind is promoted; if none remain, "
+            "estado=PENDIENTE."
+        ),
     )
-    no_aplica: bool | None = Field(
-        None, description="If true, marks the requisito as NO_APLICA."
+    desvincular_secop_documento_id: uuid.UUID | None = Field(
+        None,
+        description=(
+            "Removes ONE specific linked SecopDocumento. If it was the primary link, "
+            "the oldest remaining link of the same kind is promoted; if none remain, "
+            "estado=PENDIENTE."
+        ),
     )
-    cumplido_manual: bool | None = Field(
-        None, description="If true, marks the requisito as CUMPLIDO_MANUAL."
-    )
-    observaciones: str | None = Field(
-        None, description="Optional notes (independent of estado)."
-    )
+    no_aplica: bool | None = Field(None, description="If true, marks the requisito as NO_APLICA.")
+    cumplido_manual: bool | None = Field(None, description="If true, marks the requisito as CUMPLIDO_MANUAL.")
+    observaciones: str | None = Field(None, description="Optional notes (independent of estado).")

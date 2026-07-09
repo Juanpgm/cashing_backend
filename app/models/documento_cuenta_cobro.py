@@ -86,6 +86,56 @@ class DocumentoCuentaCobro(UUIDMixin, TimestampMixin, Base):
     secop_documento: Mapped[SecopDocumento | None] = relationship(  # type: ignore[name-defined]  # noqa: F821
         foreign_keys=[secop_documento_id], lazy="raise"
     )
+    # All 1:N links for this requisito (superset of the primary documento_fuente/secop_documento
+    # above — the primary fields are kept in sync as "the first/preferred link" for backward
+    # compatibility). Load explicitly with selectinload where needed.
+    vinculos: Mapped[list[DocumentoRequisitoVinculo]] = relationship(  # type: ignore[name-defined]
+        "DocumentoRequisitoVinculo",
+        foreign_keys="DocumentoRequisitoVinculo.documento_cuenta_cobro_id",
+        primaryjoin="DocumentoCuentaCobro.id == DocumentoRequisitoVinculo.documento_cuenta_cobro_id",
+        order_by="DocumentoRequisitoVinculo.created_at",
+        cascade="all, delete-orphan",
+        lazy="raise",
+    )
+
+
+class DocumentoRequisitoVinculo(UUIDMixin, TimestampMixin, Base):
+    """One of the (possibly many) documents linked to a single checklist requisito.
+
+    A requisito used to hold AT MOST ONE document via the singular FKs on
+    ``DocumentoCuentaCobro`` (``documento_fuente_id`` / ``secop_documento_id``), which
+    silently overwrote on every new link (data loss when a requisito legitimately needs
+    several files, e.g. RPC original + RPC de adición). This table holds every link;
+    the singular FKs on the parent row are kept as "the primary link" for backward
+    compatibility with existing readers/tests.
+    """
+
+    __tablename__ = "documento_requisito_vinculos"
+    __table_args__ = (
+        UniqueConstraint("documento_cuenta_cobro_id", "documento_fuente_id", name="uq_docreqvinc_docccobro_fuente"),
+        UniqueConstraint("documento_cuenta_cobro_id", "secop_documento_id", name="uq_docreqvinc_docccobro_secop"),
+        CheckConstraint(
+            "(documento_fuente_id IS NULL) <> (secop_documento_id IS NULL)",
+            name="ck_docreqvinc_una_fuente",
+        ),
+    )
+
+    documento_cuenta_cobro_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("documentos_cuenta_cobro.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    documento_fuente_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("documentos_fuente.id", ondelete="CASCADE"), nullable=True
+    )
+    secop_documento_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("secop_documentos.id", ondelete="CASCADE"), nullable=True
+    )
+
+    documento_fuente: Mapped[DocumentoFuente | None] = relationship(  # type: ignore[name-defined]  # noqa: F821
+        foreign_keys=[documento_fuente_id], lazy="raise"
+    )
+    secop_documento: Mapped[SecopDocumento | None] = relationship(  # type: ignore[name-defined]  # noqa: F821
+        foreign_keys=[secop_documento_id], lazy="raise"
+    )
 
 
 class DocumentoChecklistCandidato(UUIDMixin, TimestampMixin, Base):

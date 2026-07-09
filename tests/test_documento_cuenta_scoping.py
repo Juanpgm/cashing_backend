@@ -234,3 +234,57 @@ async def test_eliminar_documento_resetea_fila_a_pendiente(db: AsyncSession, tes
     fila = await _fila(db, ca, "RUT")
     assert fila.estado == EstadoRequisito.PENDIENTE
     assert fila.documento_fuente_id is None
+
+
+async def test_documento_nivel_contrato_multidoc_compartido(db: AsyncSession, test_user: dict[str, Any]) -> None:
+    """RPC (contract-level) can hold MULTIPLE shared documents at once (e.g. RPC
+    original + RPC de adición) in one cuenta, and the shared pool still
+    auto-satisfies OTHER cuentas of the same contract (1:N model, two-tier)."""
+    user = test_user["user"]
+    c = await _contrato(db, user.id)
+    ca = await _cuenta(db, c, mes=1)
+    cb = await _cuenta(db, c, mes=2)
+
+    df_original = DocumentoFuente(
+        usuario_id=user.id,
+        contrato_id=c.id,
+        cuenta_cobro_id=None,
+        storage_key="k/rpc-original",
+        nombre="rpc-original.pdf",
+        tipo=TipoDocumentoFuente.RPC,
+    )
+    df_adicion = DocumentoFuente(
+        usuario_id=user.id,
+        contrato_id=c.id,
+        cuenta_cobro_id=None,
+        storage_key="k/rpc-adicion",
+        nombre="rpc-adicion.pdf",
+        tipo=TipoDocumentoFuente.RPC,
+    )
+    db.add_all([df_original, df_adicion])
+    await db.commit()
+    await db.refresh(df_original)
+    await db.refresh(df_adicion)
+
+    await checklist_service.asegurar_checklist(db, ca)
+    await checklist_service.asegurar_checklist(db, cb)
+    await db.commit()
+
+    # Cuenta A: explicitly link BOTH shared RPC documents to the same requisito.
+    await checklist_service.vincular_documento_fuente(db, ca.id, "RPC", df_original.id)
+    await checklist_service.vincular_documento_fuente(db, ca.id, "RPC", df_adicion.id)
+    await db.commit()
+
+    payload_a = await checklist_service.construir_checklist_completo(db, ca)
+    rpc_a = next(i for i in payload_a["items"] if i["requisito"]["codigo"] == "RPC")
+    assert rpc_a["estado"] == EstadoRequisito.CARGADO
+    assert {d["id"] for d in rpc_a["documentos_fuente"]} == {df_original.id, df_adicion.id}
+
+    # Cuenta B: never explicitly linked — auto-link from the SAME shared pool still
+    # satisfies the requisito (conservative: picks a single best candidate).
+    await checklist_service.auto_vincular_documentos_fuente(db, cb)
+    await db.commit()
+    payload_b = await checklist_service.construir_checklist_completo(db, cb)
+    rpc_b = next(i for i in payload_b["items"] if i["requisito"]["codigo"] == "RPC")
+    assert rpc_b["estado"] == EstadoRequisito.CARGADO
+    assert len(rpc_b["documentos_fuente"]) >= 1

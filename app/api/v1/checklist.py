@@ -165,12 +165,20 @@ async def actualizar_requisito(
     """Actualiza un requisito del checklist.
 
     Acciones soportadas (usar **una** por llamada, además de `observaciones`):
-    - `documento_fuente_id` → vincula un DocumentoFuente subido; estado=`cargado`
-    - `secop_documento_id` → vincula un documento SECOP; estado=`detectado`
-    - `desvincular: true` → remueve enlaces; estado=`pendiente`
+    - `documento_fuente_id` → vincula (agrega) un DocumentoFuente subido; estado=`cargado`
+    - `secop_documento_id` → vincula (agrega) un documento SECOP; estado=`detectado`
+    - `desvincular: true` → remueve TODOS los enlaces; estado=`pendiente`
+    - `desvincular_documento_fuente_id` → remueve UN DocumentoFuente enlazado específico
+    - `desvincular_secop_documento_id` → remueve UN SecopDocumento enlazado específico
     - `no_aplica: true` → estado=`no_aplica`
     - `cumplido_manual: true` → estado=`cumplido_manual`
     - `observaciones` → set/update observaciones (puede combinarse)
+
+    Un requisito puede tener MÚLTIPLES documentos enlazados (p. ej. RPC original +
+    RPC de adición); `documento_fuente_id`/`secop_documento_id` agregan sin
+    sobreescribir enlaces previos. El primer enlace de cada tipo es el "primario"
+    (expuesto en `documento_fuente`/`secop_documento`); todos aparecen en
+    `documentos_fuente`/`secop_documentos`.
     """
     # Ownership check via cuenta
     await cuenta_cobro_service._get_cuenta_con_ownership(db, user.id, cuenta_id)
@@ -179,13 +187,16 @@ async def actualizar_requisito(
         body.documento_fuente_id is not None,
         body.secop_documento_id is not None,
         bool(body.desvincular),
+        body.desvincular_documento_fuente_id is not None,
+        body.desvincular_secop_documento_id is not None,
         bool(body.no_aplica),
         bool(body.cumplido_manual),
     ]
     if sum(actions) > 1:
         raise ValidationError(
             "Provide at most one state action per call "
-            "(documento_fuente_id, secop_documento_id, desvincular, no_aplica, cumplido_manual)."
+            "(documento_fuente_id, secop_documento_id, desvincular, "
+            "desvincular_documento_fuente_id, desvincular_secop_documento_id, no_aplica, cumplido_manual)."
         )
 
     if body.documento_fuente_id is not None:
@@ -194,6 +205,14 @@ async def actualizar_requisito(
         await checklist_service.vincular_secop_documento(db, cuenta_id, requisito_codigo, body.secop_documento_id)
     elif body.desvincular:
         await checklist_service.desvincular(db, cuenta_id, requisito_codigo)
+    elif body.desvincular_documento_fuente_id is not None:
+        await checklist_service.desvincular(
+            db, cuenta_id, requisito_codigo, documento_fuente_id=body.desvincular_documento_fuente_id
+        )
+    elif body.desvincular_secop_documento_id is not None:
+        await checklist_service.desvincular(
+            db, cuenta_id, requisito_codigo, secop_documento_id=body.desvincular_secop_documento_id
+        )
     elif body.no_aplica:
         await checklist_service.marcar_no_aplica(db, cuenta_id, requisito_codigo)
     elif body.cumplido_manual:

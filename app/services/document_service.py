@@ -1087,15 +1087,27 @@ async def eliminar_documento(
     if doc is None:
         raise NotFoundError("Documento", str(doc_id))
 
-    # Reset any checklist rows linked to this document back to PENDIENTE. The FK is
-    # ON DELETE SET NULL, which would otherwise leave a CARGADO row with no document.
-    from app.models.documento_cuenta_cobro import DocumentoCuentaCobro, EstadoRequisito
+    # Remove this document's link from every checklist row that references it — as
+    # the primary link OR as one of several secondary links (1:N model). Each row
+    # goes through the vinculo-aware desvincular(), which promotes the oldest
+    # remaining link of the same kind into the primary slot when one exists, or
+    # resets to PENDIENTE when this was the last link. Done explicitly here (rather
+    # than relying on the FK's ON DELETE CASCADE) because SQLite test runs don't
+    # enable foreign-key enforcement.
+    from app.models.documento_cuenta_cobro import DocumentoCuentaCobro, DocumentoRequisitoVinculo
+    from app.services import checklist_service
 
-    linked = await db.execute(select(DocumentoCuentaCobro).where(DocumentoCuentaCobro.documento_fuente_id == doc_id))
-    for fila in linked.scalars().all():
-        fila.documento_fuente_id = None
-        fila.confianza_deteccion = None
-        fila.estado = EstadoRequisito.PENDIENTE
+    filas_afectadas = await db.execute(
+        select(DocumentoCuentaCobro)
+        .join(
+            DocumentoRequisitoVinculo,
+            DocumentoRequisitoVinculo.documento_cuenta_cobro_id == DocumentoCuentaCobro.id,
+        )
+        .where(DocumentoRequisitoVinculo.documento_fuente_id == doc_id)
+    )
+    for fila in filas_afectadas.scalars().unique().all():
+        ref = fila.requisito_codigo or str(fila.requisito_cuenta_id)
+        await checklist_service.desvincular(db, fila.cuenta_cobro_id, ref, documento_fuente_id=doc_id)
 
     storage = _get_storage(settings.S3_BUCKET_DOCUMENTOS)
     try:

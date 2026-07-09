@@ -14,6 +14,7 @@ from decimal import Decimal
 
 import structlog
 from sqlalchemy import ColumnElement, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -28,6 +29,7 @@ from app.models.cuenta_cobro import CuentaCobro
 from app.models.documento_cuenta_cobro import (
     DocumentoChecklistCandidato,
     DocumentoCuentaCobro,
+    DocumentoRequisitoVinculo,
     EstadoRequisito,
 )
 from app.models.documento_fuente import DocumentoFuente
@@ -553,6 +555,7 @@ async def detectar_desde_secop(
             fila.secop_documento_id = top[0][0].id
             fila.confianza_deteccion = top[0][1]
             fila.estado = EstadoRequisito.DETECTADO
+            db.add(DocumentoRequisitoVinculo(documento_cuenta_cobro_id=fila.id, secop_documento_id=top[0][0].id))
 
     # Custom (per-cuenta) requisitos: keyword scoring against their own keywords.
     # Candidates are not persisted (DocumentoChecklistCandidato FK targets the standard
@@ -582,6 +585,7 @@ async def detectar_desde_secop(
                 fila.secop_documento_id = top[0][0].id
                 fila.confianza_deteccion = top[0][1]
                 fila.estado = EstadoRequisito.DETECTADO
+                db.add(DocumentoRequisitoVinculo(documento_cuenta_cobro_id=fila.id, secop_documento_id=top[0][0].id))
 
     await db.flush()
     return resultado
@@ -628,22 +632,65 @@ async def _get_fila(db: AsyncSession, cuenta_id: uuid.UUID, requisito_ref: str) 
     )
 
 
+def _estado_segun_vinculos(fila: DocumentoCuentaCobro) -> EstadoRequisito:
+    """Derive estado from what's currently in the primary slots.
+
+    A user-uploaded document always outranks a SECOP detection: if a
+    documento_fuente is present (primary slot non-null implies at least one
+    vinculo of that kind exists) the row is CARGADO, regardless of a
+    secop_documento also being linked (mixed sources may coexist).
+    """
+    if fila.documento_fuente_id is not None:
+        return EstadoRequisito.CARGADO
+    if fila.secop_documento_id is not None:
+        return EstadoRequisito.DETECTADO
+    return EstadoRequisito.PENDIENTE
+
+
 async def vincular_documento_fuente(
     db: AsyncSession,
     cuenta_id: uuid.UUID,
     requisito_codigo: str,
     documento_fuente_id: uuid.UUID,
 ) -> DocumentoCuentaCobro:
-    """Link a user-uploaded DocumentoFuente to a checklist row."""
+    """Link a user-uploaded DocumentoFuente to a checklist row.
+
+    Appends: creates a new vinculo row (idempotent — linking the same document
+    twice is a no-op) and, only if the primary slot is empty, promotes it to
+    primary. An existing non-empty primary slot is NEVER overwritten — that was
+    the previous last-write-wins data-loss bug. A requisito may therefore end up
+    with several linked documents (e.g. RPC original + RPC de adición).
+    """
     fila = await _get_fila(db, cuenta_id, requisito_codigo)
-    # Verify DocumentoFuente exists
     doc_res = await db.execute(select(DocumentoFuente).where(DocumentoFuente.id == documento_fuente_id))
     if doc_res.scalar_one_or_none() is None:
         raise NotFoundError("DocumentoFuente", str(documento_fuente_id))
-    fila.documento_fuente_id = documento_fuente_id
-    fila.secop_documento_id = None
-    fila.confianza_deteccion = None
-    fila.estado = EstadoRequisito.CARGADO
+
+    ya_vinculado = await db.execute(
+        select(DocumentoRequisitoVinculo).where(
+            DocumentoRequisitoVinculo.documento_cuenta_cobro_id == fila.id,
+            DocumentoRequisitoVinculo.documento_fuente_id == documento_fuente_id,
+        )
+    )
+    if ya_vinculado.scalar_one_or_none() is None:
+        try:
+            async with db.begin_nested():
+                db.add(
+                    DocumentoRequisitoVinculo(
+                        documento_cuenta_cobro_id=fila.id, documento_fuente_id=documento_fuente_id
+                    )
+                )
+                await db.flush()
+        except IntegrityError:
+            # A concurrent request already inserted the same vinculo between our
+            # SELECT and INSERT — idempotent no-op. Rolling back to the savepoint
+            # keeps the outer transaction usable.
+            pass
+        else:
+            if fila.documento_fuente_id is None:
+                fila.documento_fuente_id = documento_fuente_id
+
+    fila.estado = _estado_segun_vinculos(fila)
     await db.flush()
     return fila
 
@@ -654,25 +701,133 @@ async def vincular_secop_documento(
     requisito_codigo: str,
     secop_documento_id: uuid.UUID,
 ) -> DocumentoCuentaCobro:
+    """Link a SECOP cached document to a checklist row.
+
+    Same append semantics as ``vincular_documento_fuente``: a new vinculo row is
+    created (idempotent) and only promoted to primary if that slot is empty.
+    No longer clears ``documento_fuente_id`` — a checklist row can hold both an
+    uploaded document and a SECOP-detected one at the same time.
+    """
     fila = await _get_fila(db, cuenta_id, requisito_codigo)
     doc_res = await db.execute(select(SecopDocumento).where(SecopDocumento.id == secop_documento_id))
     if doc_res.scalar_one_or_none() is None:
         raise NotFoundError("SecopDocumento", str(secop_documento_id))
-    fila.secop_documento_id = secop_documento_id
-    fila.documento_fuente_id = None
-    fila.estado = EstadoRequisito.DETECTADO
+
+    ya_vinculado = await db.execute(
+        select(DocumentoRequisitoVinculo).where(
+            DocumentoRequisitoVinculo.documento_cuenta_cobro_id == fila.id,
+            DocumentoRequisitoVinculo.secop_documento_id == secop_documento_id,
+        )
+    )
+    if ya_vinculado.scalar_one_or_none() is None:
+        try:
+            async with db.begin_nested():
+                db.add(
+                    DocumentoRequisitoVinculo(documento_cuenta_cobro_id=fila.id, secop_documento_id=secop_documento_id)
+                )
+                await db.flush()
+        except IntegrityError:
+            # A concurrent request already inserted the same vinculo between our
+            # SELECT and INSERT — idempotent no-op.
+            pass
+        else:
+            if fila.secop_documento_id is None:
+                fila.secop_documento_id = secop_documento_id
+
     # confianza_deteccion is informational; clear unless we look it up
     fila.confianza_deteccion = None
+    fila.estado = _estado_segun_vinculos(fila)
     await db.flush()
     return fila
 
 
-async def desvincular(db: AsyncSession, cuenta_id: uuid.UUID, requisito_codigo: str) -> DocumentoCuentaCobro:
+async def desvincular(
+    db: AsyncSession,
+    cuenta_id: uuid.UUID,
+    requisito_codigo: str,
+    *,
+    documento_fuente_id: uuid.UUID | None = None,
+    secop_documento_id: uuid.UUID | None = None,
+    vinculo_id: uuid.UUID | None = None,
+) -> DocumentoCuentaCobro:
+    """Remove link(s) from a checklist row.
+
+    No args (legacy behaviour): removes EVERY link and resets to PENDIENTE.
+    With ``documento_fuente_id`` / ``secop_documento_id`` / ``vinculo_id``: removes
+    only that ONE specific link. If it was the primary link, the oldest remaining
+    vinculo of the same kind (documento_fuente or secop_documento) is promoted
+    into the primary slot; if none remain, that primary slot is cleared. estado
+    is always recomputed from what remains (PENDIENTE only when nothing is left).
+    """
     fila = await _get_fila(db, cuenta_id, requisito_codigo)
-    fila.documento_fuente_id = None
-    fila.secop_documento_id = None
-    fila.confianza_deteccion = None
-    fila.estado = EstadoRequisito.PENDIENTE
+
+    if documento_fuente_id is None and secop_documento_id is None and vinculo_id is None:
+        await db.execute(
+            DocumentoRequisitoVinculo.__table__.delete().where(
+                DocumentoRequisitoVinculo.documento_cuenta_cobro_id == fila.id
+            )
+        )
+        fila.documento_fuente_id = None
+        fila.secop_documento_id = None
+        fila.confianza_deteccion = None
+        fila.estado = EstadoRequisito.PENDIENTE
+        await db.flush()
+        return fila
+
+    stmt = select(DocumentoRequisitoVinculo).where(DocumentoRequisitoVinculo.documento_cuenta_cobro_id == fila.id)
+    if vinculo_id is not None:
+        stmt = stmt.where(DocumentoRequisitoVinculo.id == vinculo_id)
+    elif documento_fuente_id is not None:
+        stmt = stmt.where(DocumentoRequisitoVinculo.documento_fuente_id == documento_fuente_id)
+    else:
+        stmt = stmt.where(DocumentoRequisitoVinculo.secop_documento_id == secop_documento_id)
+
+    vinculo = (await db.execute(stmt)).scalar_one_or_none()
+    if vinculo is None:
+        # Nothing to remove — idempotent no-op.
+        return fila
+
+    era_fuente = vinculo.documento_fuente_id is not None
+    era_primaria = (era_fuente and fila.documento_fuente_id == vinculo.documento_fuente_id) or (
+        not era_fuente and fila.secop_documento_id == vinculo.secop_documento_id
+    )
+
+    await db.delete(vinculo)
+    await db.flush()
+
+    if era_primaria:
+        kind_col = (
+            DocumentoRequisitoVinculo.documento_fuente_id
+            if era_fuente
+            else DocumentoRequisitoVinculo.secop_documento_id
+        )
+        siguiente = (
+            (
+                await db.execute(
+                    select(DocumentoRequisitoVinculo)
+                    .where(
+                        DocumentoRequisitoVinculo.documento_cuenta_cobro_id == fila.id,
+                        kind_col.isnot(None),
+                    )
+                    .order_by(DocumentoRequisitoVinculo.created_at.asc())
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if era_fuente:
+            fila.documento_fuente_id = siguiente.documento_fuente_id if siguiente else None
+        else:
+            fila.secop_documento_id = siguiente.secop_documento_id if siguiente else None
+
+    if fila.documento_fuente_id is None and fila.secop_documento_id is None:
+        fila.confianza_deteccion = None
+    # Only recompute estado from the remaining links when it was already in an
+    # auto-derived state. A manual override (CUMPLIDO_MANUAL/NO_APLICA) must survive
+    # unlinking a single document — the user's manual decision is not tied to any
+    # particular link and removing ONE of several must not silently revert it.
+    if fila.estado in (EstadoRequisito.CARGADO, EstadoRequisito.DETECTADO, EstadoRequisito.PENDIENTE):
+        fila.estado = _estado_segun_vinculos(fila)
     await db.flush()
     return fila
 
@@ -803,6 +958,12 @@ async def auto_vincular_documentos_fuente(
             continue
         pool_ids = ids_contrato if es_nivel_contrato(req_codigo) else ids_cuenta
         if fila.documento_fuente_id not in pool_ids:
+            await db.execute(
+                DocumentoRequisitoVinculo.__table__.delete().where(
+                    DocumentoRequisitoVinculo.documento_cuenta_cobro_id == fila.id,
+                    DocumentoRequisitoVinculo.documento_fuente_id == fila.documento_fuente_id,
+                )
+            )
             fila.documento_fuente_id = None
             fila.confianza_deteccion = None
             fila.estado = EstadoRequisito.PENDIENTE
@@ -833,8 +994,8 @@ async def auto_vincular_documentos_fuente(
             continue
         cands.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
         best_score, _, _, best_doc = cands[0]
+        db.add(DocumentoRequisitoVinculo(documento_cuenta_cobro_id=fila.id, documento_fuente_id=best_doc.id))
         fila.documento_fuente_id = best_doc.id
-        fila.secop_documento_id = None
         fila.confianza_deteccion = best_score
         fila.estado = EstadoRequisito.CARGADO
         vinculados += 1
@@ -855,8 +1016,8 @@ async def auto_vincular_documentos_fuente(
                 if score > best_score:
                     best_score, best_doc = score, doc
             if best_doc is not None and best_score >= _AUTO_LINK_FUENTE_THRESHOLD:
+                db.add(DocumentoRequisitoVinculo(documento_cuenta_cobro_id=fila.id, documento_fuente_id=best_doc.id))
                 fila.documento_fuente_id = best_doc.id
-                fila.secop_documento_id = None
                 fila.confianza_deteccion = best_score
                 fila.estado = EstadoRequisito.CARGADO
                 vinculados += 1
@@ -998,6 +1159,59 @@ def computar_resumen(
 # ── assemble full response payload ─────────────────────────────────────────
 
 
+def _ref_documento_fuente(d: DocumentoFuente) -> dict:
+    return {
+        "id": d.id,
+        "nombre": d.nombre,
+        "tipo": d.tipo.value if hasattr(d.tipo, "value") else str(d.tipo),
+        "categoria": d.categoria.value if d.categoria else None,
+        "categoria_confianza": d.categoria_confianza,
+        "categoria_override": d.categoria_override,
+    }
+
+
+def _ref_secop_documento(d: SecopDocumento) -> dict:
+    return {
+        "id": d.id,
+        "nombre_archivo": d.nombre_archivo,
+        "descripcion": d.descripcion,
+        "url_descarga": d.url_descarga,
+        "categoria": d.categoria.value if d.categoria else None,
+        "categoria_confianza": d.categoria_confianza,
+        "categoria_override": d.categoria_override,
+    }
+
+
+def _todos_los_documentos_fuente(fila: DocumentoCuentaCobro) -> list[dict]:
+    """All linked DocumentoFuente for this row, primary first, then the rest of
+    the vinculos ordered by created_at (oldest first)."""
+    vistos: set[uuid.UUID] = set()
+    resultado: list[dict] = []
+    if fila.documento_fuente is not None:
+        resultado.append(_ref_documento_fuente(fila.documento_fuente))
+        vistos.add(fila.documento_fuente.id)
+    for v in fila.vinculos:
+        if v.documento_fuente is not None and v.documento_fuente.id not in vistos:
+            resultado.append(_ref_documento_fuente(v.documento_fuente))
+            vistos.add(v.documento_fuente.id)
+    return resultado
+
+
+def _todos_los_secop_documentos(fila: DocumentoCuentaCobro) -> list[dict]:
+    """All linked SecopDocumento for this row, primary first, then the rest of
+    the vinculos ordered by created_at (oldest first)."""
+    vistos: set[uuid.UUID] = set()
+    resultado: list[dict] = []
+    if fila.secop_documento is not None:
+        resultado.append(_ref_secop_documento(fila.secop_documento))
+        vistos.add(fila.secop_documento.id)
+    for v in fila.vinculos:
+        if v.secop_documento is not None and v.secop_documento.id not in vistos:
+            resultado.append(_ref_secop_documento(v.secop_documento))
+            vistos.add(v.secop_documento.id)
+    return resultado
+
+
 async def construir_checklist_completo(
     db: AsyncSession,
     cuenta: CuentaCobro,
@@ -1030,6 +1244,8 @@ async def construir_checklist_completo(
         .options(
             selectinload(DocumentoCuentaCobro.documento_fuente),
             selectinload(DocumentoCuentaCobro.secop_documento),
+            selectinload(DocumentoCuentaCobro.vinculos).selectinload(DocumentoRequisitoVinculo.documento_fuente),
+            selectinload(DocumentoCuentaCobro.vinculos).selectinload(DocumentoRequisitoVinculo.secop_documento),
         )
         .where(DocumentoCuentaCobro.cuenta_cobro_id == cuenta.id)
     )
@@ -1198,31 +1414,10 @@ async def construir_checklist_completo(
             {
                 "requisito": requisito_block,
                 "estado": fila.estado,
-                "documento_fuente": (
-                    {
-                        "id": df.id,
-                        "nombre": df.nombre,
-                        "tipo": df.tipo.value if hasattr(df.tipo, "value") else str(df.tipo),
-                        "categoria": df.categoria.value if df.categoria else None,
-                        "categoria_confianza": df.categoria_confianza,
-                        "categoria_override": df.categoria_override,
-                    }
-                    if df is not None
-                    else None
-                ),
-                "secop_documento": (
-                    {
-                        "id": sd.id,
-                        "nombre_archivo": sd.nombre_archivo,
-                        "descripcion": sd.descripcion,
-                        "url_descarga": sd.url_descarga,
-                        "categoria": sd.categoria.value if sd.categoria else None,
-                        "categoria_confianza": sd.categoria_confianza,
-                        "categoria_override": sd.categoria_override,
-                    }
-                    if sd is not None
-                    else None
-                ),
+                "documento_fuente": _ref_documento_fuente(df) if df is not None else None,
+                "secop_documento": _ref_secop_documento(sd) if sd is not None else None,
+                "documentos_fuente": _todos_los_documentos_fuente(fila),
+                "secop_documentos": _todos_los_secop_documentos(fila),
                 "confianza_deteccion": fila.confianza_deteccion,
                 "observaciones": fila.observaciones,
                 "candidatos_secop": [
