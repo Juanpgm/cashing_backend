@@ -48,6 +48,9 @@ sean asignadas…" si aparece en el contrato — es parte del listado oficial.
 que debes extraer. Cualquier ítem numerado que aparezca DESPUÉS de ese cierre \
 (p. ej. obligaciones sobre seguridad social, software, bioseguridad, manejo de información, \
 transparencia o similares) son obligaciones generales administrativas — NO las incluyas.
+7. Si tu respuesta se estructura como JSON (campos "descripcion", "tipo", "etiqueta"), el \
+campo "tipo" debe ser EXACTAMENTE la palabra "especifica" en minúsculas — NUNCA "OBLIGACION \
+ESPECIFICA", "obligación específica" ni ninguna otra variante con la palabra OBLIGACION.
 
 FORMATO DE RESPUESTA — una línea por obligación, sin texto adicional:
 OBLIGACION|especifica|<etiqueta>|<descripcion>
