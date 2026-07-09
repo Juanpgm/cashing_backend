@@ -14,6 +14,7 @@ from app.core.exceptions import ExternalServiceError, NotFoundError, ValidationE
 from app.models.credito import TipoCredito
 from app.models.pago import EstadoPago, Pago, TipoPago
 from app.schemas.pago import IniciarPagoRequest, IniciarPagoResponse, PagoResponse, WompiWebhookEvent
+from app.services import notification_service
 from app.services.credito_service import agregar_creditos
 
 logger = structlog.get_logger("service.pago")
@@ -111,6 +112,13 @@ async def procesar_webhook_wompi(
             "pago_aprobado",
             pago_id=str(pago.id),
             creditos=cantidad_creditos,
+        )
+        await notification_service.notificar(
+            event="pago.aprobado",
+            usuario_id=pago.usuario_id,
+            titulo="Pago aprobado",
+            cuerpo=f"Tu pago fue aprobado. Se acreditaron {cantidad_creditos} créditos.",
+            data={"pago_id": str(pago.id), "creditos": cantidad_creditos},
         )
     elif status_str in ("DECLINED", "ERROR", "VOIDED"):
         pago.estado = EstadoPago.RECHAZADO if status_str == "DECLINED" else EstadoPago.ERROR

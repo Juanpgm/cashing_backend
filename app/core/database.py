@@ -1,14 +1,17 @@
 """Async SQLAlchemy 2.0 database engine and session management."""
 
-import ssl
 from collections.abc import AsyncGenerator
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
 from app.core.config import settings
+from app.core.db_ssl import prepare_pg_url
 
 _is_sqlite = settings.DATABASE_URL.startswith("sqlite")
+# SSL is decided by host (localhost → off, remote managed DB → on), so local dev
+# can connect to Neon/Railway over SSL without flipping ENVIRONMENT.
+_db_url, _connect_args = prepare_pg_url(settings.DATABASE_URL)
 
 _engine_kwargs: dict = {
     "echo": settings.is_development,
@@ -18,18 +21,10 @@ if not _is_sqlite:
         pool_size=10,
         max_overflow=5,
         pool_pre_ping=True,
+        connect_args=_connect_args,
     )
-    if settings.is_production:
-        # Production (Railway): require SSL but skip cert verification for managed DBs
-        _ssl_ctx = ssl.create_default_context()
-        _ssl_ctx.check_hostname = False
-        _ssl_ctx.verify_mode = ssl.CERT_NONE
-        _engine_kwargs["connect_args"] = {"ssl": _ssl_ctx}
-    else:
-        # Local dev: disable SSL entirely (Docker / local PostgreSQL)
-        _engine_kwargs["connect_args"] = {"ssl": False}
 
-engine = create_async_engine(settings.DATABASE_URL, **_engine_kwargs)
+engine = create_async_engine(_db_url, **_engine_kwargs)
 
 async_session_factory = async_sessionmaker(
     engine,

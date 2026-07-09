@@ -61,21 +61,12 @@ def do_run_migrations(connection) -> None:  # type: ignore[no-untyped-def]
 
 async def run_async_migrations() -> None:
     """Run migrations in 'online' mode using async engine."""
-    import ssl
+    from app.core.db_ssl import prepare_pg_url
 
-    is_sqlite = settings.DATABASE_URL.startswith("sqlite")
-    connect_args: dict = {}
-    if not is_sqlite:
-        if settings.ENVIRONMENT == "production":
-            ssl_ctx = ssl.create_default_context()
-            ssl_ctx.check_hostname = False
-            ssl_ctx.verify_mode = ssl.CERT_NONE
-            connect_args = {"ssl": ssl_ctx}
-        else:
-            connect_args = {"ssl": False}
+    db_url, connect_args = prepare_pg_url(settings.DATABASE_URL)
 
     connectable = async_engine_from_config(
-        {"sqlalchemy.url": settings.DATABASE_URL},
+        {"sqlalchemy.url": db_url},
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
         connect_args=connect_args,

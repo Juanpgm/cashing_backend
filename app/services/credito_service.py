@@ -5,15 +5,44 @@ from __future__ import annotations
 import uuid
 
 import structlog
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.exceptions import InsufficientCreditsError
 from app.models.credito import Credito, TipoCredito
+from app.models.usuario import Usuario
 from app.schemas.pago import BalanceCreditosResponse, CreditoResponse
 
 logger = structlog.get_logger("service.credito")
+
+
+async def _ledger_balance(db: AsyncSession, usuario_id: uuid.UUID) -> int:
+    """SUM of the credit ledger — the single source of truth for the balance."""
+    q = await db.execute(
+        select(func.coalesce(func.sum(Credito.cantidad), 0)).where(
+            Credito.usuario_id == usuario_id
+        )
+    )
+    return int(q.scalar_one())
+
+
+async def _sync_cache(db: AsyncSession, usuario_id: uuid.UUID) -> int:
+    """Set the denormalized ``usuarios.creditos_disponibles`` cache to the ledger sum.
+
+    Must be called within the same transaction as any credit mutation so the cache
+    (used by the fast credit gate) never drifts from the ledger. Returns the balance.
+    """
+    balance = await _ledger_balance(db, usuario_id)
+    await db.execute(
+        sa_update(Usuario).where(Usuario.id == usuario_id).values(creditos_disponibles=balance)
+    )
+    return balance
+
+
+async def obtener_saldo(db: AsyncSession, usuario_id: uuid.UUID) -> int:
+    """Current credit balance from the ledger (source of truth) — just the number."""
+    return await _ledger_balance(db, usuario_id)
 
 
 async def obtener_balance(
@@ -22,17 +51,14 @@ async def obtener_balance(
 ) -> BalanceCreditosResponse:
     """Return current credit balance and recent transactions."""
     # Aggregate balance via SUM(cantidad) — positive=compra/bonus, negative=consumo
-    balance_q = await db.execute(
-        select(func.coalesce(func.sum(Credito.cantidad), 0)).where(
-            Credito.usuario_id == usuario_id
-        )
-    )
-    balance: int = int(balance_q.scalar_one())
+    balance: int = await _ledger_balance(db, usuario_id)
 
     movimientos_q = await db.execute(
         select(Credito)
         .where(Credito.usuario_id == usuario_id)
-        .order_by(Credito.created_at.desc())
+        # Secondary key so ties on created_at are deterministic on Postgres
+        # (microsecond timestamps can collide; SQLite is second-resolution).
+        .order_by(Credito.created_at.desc(), Credito.id.desc())
         .limit(50)
     )
     movimientos = [CreditoResponse.model_validate(c) for c in movimientos_q.scalars().all()]
@@ -54,6 +80,8 @@ async def agregar_creditos(
         referencia=referencia,
     )
     db.add(credito)
+    await db.flush()  # make the new row visible to the SUM below
+    await _sync_cache(db, usuario_id)
     await db.commit()
     await db.refresh(credito)
     logger.info("creditos_added", usuario_id=str(usuario_id), cantidad=cantidad, tipo=tipo)
@@ -78,8 +106,21 @@ async def consumir_creditos(
         referencia=accion,
     )
     db.add(credito)
+    await db.flush()
+    await _sync_cache(db, usuario_id)
     await db.commit()
     logger.info("creditos_consumed", usuario_id=str(usuario_id), cantidad=cantidad, accion=accion)
+
+
+async def reconciliar_creditos(db: AsyncSession, usuario_id: uuid.UUID) -> int:
+    """Fix a drifted cache: set ``creditos_disponibles`` to the ledger sum. Returns it.
+
+    Use to repair rows whose cache diverged before the sync was in place (e.g. a
+    Wompi top-up that only wrote the ledger).
+    """
+    balance = await _sync_cache(db, usuario_id)
+    await db.commit()
+    return balance
 
 
 async def otorgar_creditos_signup(
