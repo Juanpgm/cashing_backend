@@ -17,8 +17,20 @@ from app.tools.catalog import (
     checklist,
     cuentas,
     evidencias,
+    importar_documento,
     informes,
+    listar_contratos,
+    listar_cuentas_cobro,
     secop,
 )
 
-__all__ = ["checklist", "cuentas", "evidencias", "informes", "secop"]
+__all__ = [
+    "checklist",
+    "cuentas",
+    "evidencias",
+    "importar_documento",
+    "informes",
+    "listar_contratos",
+    "listar_cuentas_cobro",
+    "secop",
+]

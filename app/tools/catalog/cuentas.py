@@ -24,9 +24,14 @@ from app.tools.registry import tool
         "authenticated user's contratos, deducting credits from their balance. Fails if the "
         "contrato doesn't belong to the user, if credits are insufficient, or if a cuenta "
         "already exists for that contrato/mes/anio. The checklist is NOT created yet — it is "
-        "materialized once the requisitos mode is chosen (a separate step). Args: contrato_id "
-        "(UUID), mes (1-12), anio (2020-2099), valor (optional; defaults to the contrato's "
-        "valor_mensual when omitted)."
+        "materialized once the requisitos mode is chosen (a separate step). REQUIRES A REAL "
+        "contrato_id UUID — if the user didn't give you one explicitly, call `listar_contratos` "
+        "FIRST to obtain it; never invent a UUID or pass a placeholder/description string. "
+        "REQUIRES BOTH mes AND anio as separate integers — never omit anio even if only the "
+        "month was emphasized in the request. Args: contrato_id (UUID, from listar_contratos), "
+        "mes (integer 1-12), anio (integer 2020-2099, e.g. 2026), valor (optional; defaults to "
+        "the contrato's valor_mensual when omitted). Example call: {\"contrato_id\": "
+        "\"<uuid from listar_contratos>\", \"mes\": 7, \"anio\": 2026}."
     ),
     input_model=CuentaCobroCreate,
     output_model=CuentaCobroResponse,
