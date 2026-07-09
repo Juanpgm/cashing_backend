@@ -9,7 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.storage.port import StoragePort
-from app.core.exceptions import ForbiddenError, NotFoundError, ValidationError
+from app.core.exceptions import NotFoundError, ValidationError
 from app.core.file_validation import validate_file_extension, validate_file_size, validate_mime_type
 from app.models.actividad import Actividad
 from app.models.evidencia import Evidencia
@@ -57,7 +57,7 @@ async def subir_evidencia(
     if not validate_file_size(len(data)):
         raise ValidationError(f"Archivo demasiado grande ({len(data)} bytes). Máximo 10MB.")
     if not validate_mime_type(data, content_type):
-        raise ValidationError(f"Tipo MIME no coincide con la extensión del archivo.")
+        raise ValidationError("Tipo MIME no coincide con la extensión del archivo.")
 
     await _get_actividad_owned(db, actividad_id, usuario_id)
 
@@ -130,6 +130,16 @@ async def obtener_url_descarga(
     # Verify ownership
     await _get_actividad_owned(db, evidencia.actividad_id, usuario_id)
 
+    if evidencia.storage_key is None:
+        # Link evidence (Gmail/Drive/Calendar) — the url IS the destination, no
+        # storage round-trip needed and nothing to actually "expire".
+        return EvidenciaPresignedResponse(
+            id=evidencia.id,
+            nombre_archivo=evidencia.nombre_archivo,
+            presigned_url=evidencia.url or "",
+            expires_in_seconds=0,
+        )
+
     presigned = await storage.presigned_url(key=evidencia.storage_key, expires_in=3600)
     return EvidenciaPresignedResponse(
         id=evidencia.id,
@@ -152,10 +162,11 @@ async def eliminar_evidencia(
 
     await _get_actividad_owned(db, evidencia.actividad_id, usuario_id)
 
-    try:
-        await storage.delete(key=evidencia.storage_key)
-    except Exception:
-        logger.warning("storage_delete_failed", key=evidencia.storage_key)
+    if evidencia.storage_key is not None:
+        try:
+            await storage.delete(key=evidencia.storage_key)
+        except Exception:
+            logger.warning("storage_delete_failed", key=evidencia.storage_key)
 
     await db.delete(evidencia)
     await db.commit()

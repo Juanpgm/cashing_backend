@@ -5,8 +5,9 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from typing import Literal
+from urllib.parse import urlparse
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
 # ── OAuth ────────────────────────────────────────────────────────────────────
 
@@ -193,6 +194,25 @@ class EvidenceLink(BaseModel):
     link: str
     fecha: str = ""
 
+    @field_validator("link")
+    @classmethod
+    def _link_must_be_http_or_https(cls, value: str) -> str:
+        """Reject anything but http(s) URLs.
+
+        This model is shared between the evidence-discovery RESPONSE (Gmail/Drive/
+        Calendar links, always https) and the evidence-persist REQUEST, whose
+        `link` is stored verbatim into `Evidencia.url` and later served back as
+        `presigned_url`, rendered as an href by the frontend. Without this guard
+        a `javascript:`/`data:` URL becomes a stored-XSS payload. Since discovery
+        only ever produces https URLs, restricting the shared schema to http(s)
+        is safe for both call sites and is the narrowest change that closes the
+        persist-side hole.
+        """
+        scheme = urlparse(value).scheme.lower()
+        if scheme not in ("http", "https"):
+            raise ValueError("link must be an http(s) URL")
+        return value
+
 
 class ObligacionJustificada(BaseModel):
     obligacion_id: str
@@ -209,6 +229,25 @@ class EvidenceDiscoveryResponse(BaseModel):
         default_factory=dict,
         description="Conteo de evidencias por fuente: email/drive/calendar",
     )
+
+
+class EvidencePersistRequest(BaseModel):
+    """Body for POST /cuentas-cobro/{id}/evidencias/persistir.
+
+    Mirrors the `obligaciones` field of `EvidenceDiscoveryResponse` — the frontend
+    can post back exactly what it received from POST /integraciones/evidencias/descubrir.
+    """
+
+    obligaciones: list[ObligacionJustificada] = Field(default_factory=list)
+
+
+class EvidencePersistSummary(BaseModel):
+    """Result of persisting discovered evidence into Actividad/Evidencia rows."""
+
+    actividades_creadas: int
+    actividades_actualizadas: int
+    evidencias_creadas: int
+    evidencias_omitidas: int
 
 
 # ── Integration test responses ───────────────────────────────────────────────

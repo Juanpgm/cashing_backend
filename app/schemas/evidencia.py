@@ -24,12 +24,20 @@ class EvidenciaUploadResponse(BaseModel):
 
 
 class EvidenciaResponse(BaseModel):
+    """Read schema for an evidencia — either an uploaded file or an external link.
+
+    Uploaded files populate storage_key/tipo_archivo/tamano_bytes; link evidence
+    (from the evidence-discovery agent) populates fuente/url instead.
+    """
+
     id: uuid.UUID
     actividad_id: uuid.UUID
-    storage_key: str
+    storage_key: str | None = None
     nombre_archivo: str
-    tipo_archivo: str
-    tamano_bytes: int
+    tipo_archivo: str | None = None
+    tamano_bytes: int | None = None
+    fuente: str | None = None
+    url: str | None = None
     created_at: datetime
 
     model_config = {"from_attributes": True}
