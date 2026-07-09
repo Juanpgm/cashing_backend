@@ -20,7 +20,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.core.exceptions import ForbiddenError, NotFoundError, ValidationError
+from app.core.exceptions import ACTIVIDADES_MISSING, ForbiddenError, NotFoundError, ValidationError
 from app.models.actividad import Actividad
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro
@@ -129,7 +129,8 @@ async def generar_informe_actividades_docx(
     )
     if not actividades:
         raise ValidationError(
-            "No hay actividades registradas. Genera o ingresa actividades antes de descargar el informe."
+            "No hay actividades registradas. Genera o ingresa actividades antes de descargar el informe.",
+            code=ACTIVIDADES_MISSING,
         )
 
     obligaciones_by_id = {ob.id: ob for ob in obligaciones}
@@ -202,7 +203,8 @@ async def generar_informe_supervision_docx(
     )
     if not actividades:
         raise ValidationError(
-            "No hay actividades registradas. Genera o ingresa actividades antes de descargar el informe."
+            "No hay actividades registradas. Genera o ingresa actividades antes de descargar el informe.",
+            code=ACTIVIDADES_MISSING,
         )
 
     obligaciones_by_id = {ob.id: ob for ob in obligaciones}

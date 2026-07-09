@@ -27,7 +27,7 @@ from app.agent.nodes.evidence_orchestrator import evidence_orchestrator_node
 from app.agent.prompts.email_evidence import build_obligation_queries
 from app.agent.prompts.evidence_filter import score_non_personal_email
 from app.agent.state import AgentState
-from app.core.exceptions import ExternalServiceError, ValidationError
+from app.core.exceptions import GOOGLE_NOT_CONNECTED, ExternalServiceError, ValidationError
 from app.models.obligacion import Obligacion
 from app.schemas.google_workspace import (
     EvidenceDiscoveryRequest,
@@ -144,7 +144,9 @@ async def descubrir_evidencias(
     status = await gws.get_integration_status(db, usuario_id)
     if not status.connected:
         raise ExternalServiceError(
-            "Google", "La cuenta de Google no está conectada. Usa /integraciones/google/connect."
+            "Google",
+            "La cuenta de Google no está conectada. Usa /integraciones/google/connect.",
+            code=GOOGLE_NOT_CONNECTED,
         )
 
     # 1. Reunir evidencia cruda de Gmail (filtra no-personal en origen).

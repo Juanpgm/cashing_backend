@@ -2,12 +2,22 @@
 
 from fastapi import HTTPException, status
 
+# --- Structured error codes ---
+#
+# Additive, machine-readable companions to `detail` (which stays free text).
+# Frontend recovery paths should match on `code` instead of sniffing `detail`
+# or the HTTP status code.
+ACTIVIDADES_MISSING = "ACTIVIDADES_MISSING"
+GOOGLE_NOT_CONNECTED = "GOOGLE_NOT_CONNECTED"
+CHECKLIST_INCOMPLETE = "CHECKLIST_INCOMPLETE"
+
 
 class DomainError(Exception):
     """Base domain error."""
 
-    def __init__(self, detail: str = "An error occurred") -> None:
+    def __init__(self, detail: str = "An error occurred", code: str | None = None) -> None:
         self.detail = detail
+        self.code = code
         super().__init__(detail)
 
 
@@ -64,11 +74,22 @@ class RateLimitExceededError(DomainError):
         super().__init__(detail)
 
 
+class InviteRequiredError(DomainError):
+    """Waitlist gate is enabled and a valid invite code was not provided."""
+
+    def __init__(
+        self, detail: str = "Se requiere un código de invitación válido para registrarse."
+    ) -> None:
+        super().__init__(detail)
+
+
 class ExternalServiceError(DomainError):
     """External API call failed."""
 
-    def __init__(self, service: str = "External service", detail: str = "unavailable") -> None:
-        super().__init__(f"{service}: {detail}")
+    def __init__(
+        self, service: str = "External service", detail: str = "unavailable", code: str | None = None
+    ) -> None:
+        super().__init__(f"{service}: {detail}", code=code)
 
 
 # --- HTTP Exception mapping ---
@@ -82,6 +103,7 @@ EXCEPTION_STATUS_MAP: dict[type[DomainError], int] = {
     ForbiddenError: status.HTTP_403_FORBIDDEN,
     RateLimitExceededError: status.HTTP_429_TOO_MANY_REQUESTS,
     ExternalServiceError: status.HTTP_502_BAD_GATEWAY,
+    InviteRequiredError: status.HTTP_403_FORBIDDEN,
 }
 
 
