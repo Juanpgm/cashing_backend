@@ -9,9 +9,16 @@ import structlog
 
 from app.adapters.llm import get_llm
 from app.agent.state import AgentState
+from app.core.config import settings
 from app.schemas.agent import LLMMessage
 
 logger = structlog.get_logger("agent.nodes.evidence_matcher")
+
+# Keyword-overlap threshold used both as the initial candidate filter and as the
+# conservative fallback when the LLM relevance call errors out or returns
+# unparseable output (see `_llm_relevance_batch`).
+_KEYWORD_THRESHOLD = 0.15
+_FALLBACK_ACCEPT_THRESHOLD = 0.30
 
 _RELEVANCE_BATCH_SYSTEM = """\
 Eres un clasificador. Dada una obligación contractual y una lista numerada de evidencias, \
@@ -39,11 +46,28 @@ def _keyword_score(obligation_text: str, evidence_text: str) -> float:
     return len(overlap) / len(ob_words)
 
 
-async def _llm_relevance_batch(obligation: str, evidences: list[str], llm) -> list[bool]:
+def _fallback_flags(keyword_scores: list[float] | None, n: int) -> list[bool]:
+    """Conservative fallback when the LLM call errors or returns unparseable output.
+
+    Rather than failing fully closed (dropping every candidate for the obligación —
+    "minimum effort"), accept candidates whose keyword overlap already clears a
+    stricter deterministic bar (>= 0.30, double the initial 0.15 filter). Garbage
+    LLM output must NOT accept low-score candidates: if no keyword_scores were
+    provided, or none clear the bar, this still returns all-False.
+    """
+    if not keyword_scores:
+        return [False] * n
+    return [score >= _FALLBACK_ACCEPT_THRESHOLD for score in keyword_scores]
+
+
+async def _llm_relevance_batch(
+    obligation: str, evidences: list[str], llm, keyword_scores: list[float] | None = None
+) -> list[bool]:
     """Classify all candidate evidences for one obligation in a SINGLE LLM call.
 
-    Returns a boolean per evidence (same order). Fails closed (all False) on error or
-    unparseable output — consistent with the previous "if unsure, not relevant" rule.
+    Returns a boolean per evidence (same order). On error or unparseable output,
+    falls back to `_fallback_flags` (deterministic keyword-score bar) instead of
+    dropping every candidate — see module docstring / `_FALLBACK_ACCEPT_THRESHOLD`.
     """
     if not evidences:
         return []
@@ -65,12 +89,12 @@ async def _llm_relevance_batch(obligation: str, evidences: list[str], llm) -> li
         )
         match = _JSON_RE.search(resp.content)
         if not match:
-            return [False] * len(evidences)
+            return _fallback_flags(keyword_scores, len(evidences))
         nums = json.loads(match.group(0))
         relevant_idx = {int(n) for n in nums if isinstance(n, (int, float))}
         return [(i + 1) in relevant_idx for i in range(len(evidences))]
     except Exception:
-        return [False] * len(evidences)
+        return _fallback_flags(keyword_scores, len(evidences))
 
 
 async def evidence_matcher_node(state: AgentState) -> AgentState:
@@ -108,19 +132,34 @@ async def evidence_matcher_node(state: AgentState) -> AgentState:
         # Step 1: keyword filter (≥0.15 threshold)
         candidates = [
             ev for ev in evidence_raw
-            if _keyword_score(ob_text, ev.get("content", "")) >= 0.15
+            if _keyword_score(ob_text, ev.get("content", "")) >= _KEYWORD_THRESHOLD
         ]
 
-        # Step 2: LLM relevance on top-5 candidates — ONE batched call, not one per candidate
+        # Max-effort fallback: an obligación with ZERO candidates above threshold
+        # would otherwise stay silently empty. Instead, take its best candidates
+        # with ANY positive keyword overlap (score > 0) and still let the LLM
+        # judge them — better an obligación gets a weak-but-checked candidate
+        # than none at all.
+        if not candidates:
+            scored = [
+                (ev, _keyword_score(ob_text, ev.get("content", "")))
+                for ev in evidence_raw
+            ]
+            positive = [(ev, s) for ev, s in scored if s > 0]
+            positive.sort(key=lambda pair: pair[1], reverse=True)
+            candidates = [ev for ev, _ in positive[:3]]
+
+        # Step 2: LLM relevance on top-N candidates — ONE batched call, not one per candidate
         if candidates:
             # Sort by keyword score descending
             candidates = sorted(
                 candidates,
                 key=lambda e: _keyword_score(ob_text, e.get("content", "")),
                 reverse=True,
-            )[:5]
+            )[: settings.EVIDENCE_MATCHER_TOP_N]
+            keyword_scores = [_keyword_score(ob_text, ev.get("content", "")) for ev in candidates]
             flags = await _llm_relevance_batch(
-                ob_text, [ev.get("content", "") for ev in candidates], llm
+                ob_text, [ev.get("content", "") for ev in candidates], llm, keyword_scores
             )
             matched[str(ob_id)] = [ev for ev, keep in zip(candidates, flags) if keep]
         else:

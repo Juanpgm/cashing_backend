@@ -195,6 +195,18 @@ class Settings(BaseSettings):
     PDF_SIGNATURE_KEY_PATH: str = ""
     PDF_SIGNATURE_KEY_PASSPHRASE: str = ""
 
+    # Evidence discovery — "maximum effort" caps. These replace hardcoded slices
+    # in evidence_discovery_service / drive_fetch / calendar_fetch / evidence_matcher
+    # so the fan-out can be tuned per environment instead of silently truncating.
+    # 0 = no cap (process ALL obligaciones).
+    EVIDENCE_MAX_OBLIGACIONES_QUERIES: int = 0
+    EVIDENCE_QUERIES_PER_OBLIGACION: int = 3
+    EVIDENCE_MAX_QUERIES_TOTAL: int = 24
+    EVIDENCE_MAX_EMAILS_TOTAL: int = 60
+    EVIDENCE_MAX_FILES_TOTAL: int = 60
+    EVIDENCE_MAX_EVENTS: int = 100
+    EVIDENCE_MATCHER_TOP_N: int = 8
+
     @field_validator("CORS_ORIGINS", mode="before")
     @classmethod
     def parse_cors_origins(cls, v: Any) -> list[str]:

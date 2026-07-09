@@ -15,10 +15,11 @@ import structlog
 from app.adapters.calendar.calendar_adapter import GoogleCalendarAdapter
 from app.agent.prompts.email_evidence import _extract_keywords
 from app.agent.state import AgentState
+from app.core.config import settings
 
 logger = structlog.get_logger("agent.nodes.calendar_fetch")
 
-MAX_EVENTS = 50
+MAX_TERMS_TOTAL = 12
 
 
 def _to_rfc3339(date_str: str, end_of_day: bool = False) -> str:
@@ -36,12 +37,18 @@ def _event_start(event: dict) -> str:
 
 
 def _build_calendar_query(obligaciones: list[dict]) -> str | None:
-    """Extrae keywords de las obligaciones para sesgar la búsqueda de Calendar."""
+    """Extrae keywords de TODAS las obligaciones para sesgar la búsqueda de Calendar.
+
+    Máximo esfuerzo: a diferencia de una búsqueda que solo mira las primeras
+    obligaciones, esto combina keywords de cada obligación (no solo las primeras
+    3) y solo capa el TOTAL de términos combinados (MAX_TERMS_TOTAL), tras
+    deduplicar, para no producir una query desmesuradamente larga.
+    """
     keywords: list[str] = []
-    for ob in obligaciones[:3]:
+    for ob in obligaciones:
         desc = ob.get("descripcion") or ""
         keywords.extend(_extract_keywords(desc)[:2])
-    unique = list(dict.fromkeys(keywords))[:6]
+    unique = list(dict.fromkeys(keywords))[:MAX_TERMS_TOTAL]
     return " ".join(unique) if unique else None
 
 
@@ -79,7 +86,9 @@ async def calendar_fetch_node(state: AgentState) -> AgentState:
 
     adapter = GoogleCalendarAdapter(db)
     try:
-        events = await adapter.search_events(user_id, time_min, time_max, max_results=MAX_EVENTS, q=q)
+        events = await adapter.search_events(
+            user_id, time_min, time_max, max_results=settings.EVIDENCE_MAX_EVENTS, q=q
+        )
     except Exception as exc:
         await logger.aerror("calendar_fetch_error", error=str(exc), user_id=str(user_id))
         return {

@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from app.adapters.email.port import EmailMessage
+from app.models.contrato import Contrato
+from app.models.usuario import Usuario
 from app.schemas.google_workspace import EvidenceDiscoveryRequest
 from app.tools.invoke import invoke_tool as real_invoke_tool
 from httpx import AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession
 
 
 def _email(mid: str, subject: str, body: str) -> EmailMessage:
@@ -205,3 +208,228 @@ async def test_descubrir_evidencias_endpoint_routes_through_tool_registry(
     spy.assert_awaited_once()
     assert spy.await_args is not None
     assert spy.await_args.args[0] == "descubrir_evidencias"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Max-effort fan-out: ALL obligaciones get queries, not just the first 3.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_gather_gmail_evidence_queries_all_obligaciones_not_just_first_three():
+    """5 obligaciones with distinct keywords → every one contributes at least one
+    Gmail query. Previously only the first 3 obligaciones (`obligaciones[:3]`) were
+    ever queried — this is the "maximum effort" fan-out fix."""
+    from app.services import evidence_discovery_service as eds
+
+    # Each description starts with a distinctive verb (>4 chars) — guaranteed to
+    # survive both `_extract_keywords` (order-preserving) and the `keywords[:4]`
+    # cap in `build_obligation_queries`, since it's always the first candidate.
+    obligaciones = [
+        {"id": f"ob{i}", "descripcion": desc}
+        for i, desc in enumerate(
+            [
+                "Auditar sistemas informáticos gubernamentales locales",
+                "Certificar procesos administrativos regionales anuales",
+                "Diagnosticar infraestructuras comunitarias territoriales rurales",
+                "Evaluar convenios interinstitucionales culturales nacionales",
+                "Fiscalizar plataformas tecnológicas municipales digitales",
+            ],
+            start=1,
+        )
+    ]
+
+    captured_queries: list[str] = []
+
+    async def _fake_search(usuario_id, query, max_results):
+        captured_queries.append(query)
+        return []
+
+    adapter = MagicMock()
+    adapter.search_messages = AsyncMock(side_effect=_fake_search)
+
+    with patch.object(eds, "GmailAdapter", return_value=adapter):
+        await eds._gather_gmail_evidence(
+            MagicMock(), uuid.uuid4(), obligaciones, "2024-04-01", "2024-04-30", None, None
+        )
+
+    # Each obligación's distinctive keyword-subject query must appear somewhere.
+    keyword_terms = ["auditar", "certificar", "diagnosticar", "evaluar", "fiscalizar"]
+    for term in keyword_terms:
+        assert any(term in q for q in captured_queries), (
+            f"expected a query mentioning '{term}' (obligación not queried) — captured: {captured_queries}"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Date-range default from contrato when fecha_inicio/fecha_fin are omitted
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def _make_user(db: AsyncSession) -> Usuario:
+    user = Usuario(
+        email="discovery-dates@test.com",
+        nombre="Discovery Dates",
+        cedula="111222333",
+        password_hash="hashed",
+        rol="contratista",
+        activo=True,
+        creditos_disponibles=100,
+    )
+    db.add(user)
+    await db.flush()
+    return user
+
+
+async def _make_contrato(db: AsyncSession, usuario_id: uuid.UUID) -> Contrato:
+    contrato = Contrato(
+        usuario_id=usuario_id,
+        numero_contrato="CTR-DISC-001",
+        objeto="Prestación de servicios",
+        valor_total=36_000_000,
+        valor_mensual=3_000_000,
+        fecha_inicio=date(2024, 2, 1),
+        fecha_fin=date(2024, 12, 31),
+    )
+    db.add(contrato)
+    await db.flush()
+    return contrato
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IDOR: contrato/cuenta ownership must be verified before any evidence is gathered
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def _make_victim_user(db: AsyncSession) -> Usuario:
+    user = Usuario(
+        email="victim-discovery@test.com",
+        nombre="Victim",
+        cedula="999888777",
+        password_hash="hashed",
+        rol="contratista",
+        activo=True,
+        creditos_disponibles=100,
+    )
+    db.add(user)
+    await db.flush()
+    return user
+
+
+@pytest.mark.asyncio
+async def test_descubrir_evidencias_cuenta_id_ajena_lanza_not_found(db: AsyncSession) -> None:
+    """Passing another user's cuenta_id must 404, not leak their contrato/obligaciones."""
+    from app.core.exceptions import NotFoundError
+    from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
+    from app.services import evidence_discovery_service as eds
+
+    attacker = await _make_user(db)
+    victim = await _make_victim_user(db)
+    victim_contrato = await _make_contrato(db, victim.id)
+    victim_cuenta = CuentaCobro(
+        contrato_id=victim_contrato.id,
+        mes=1,
+        anio=2024,
+        estado=EstadoCuentaCobro.BORRADOR,
+        valor=1_000_000,
+    )
+    db.add(victim_cuenta)
+    await db.commit()
+
+    req = EvidenceDiscoveryRequest(cuenta_id=victim_cuenta.id, fecha_inicio="2024-04-01", fecha_fin="2024-04-30")
+
+    with pytest.raises(NotFoundError):
+        await eds.descubrir_evidencias(db, attacker.id, req)
+
+
+@pytest.mark.asyncio
+async def test_descubrir_evidencias_contrato_id_ajeno_lanza_not_found(db: AsyncSession) -> None:
+    """Passing another user's contrato_id must 404, not leak their obligaciones."""
+    from app.core.exceptions import NotFoundError
+    from app.services import evidence_discovery_service as eds
+
+    attacker = await _make_user(db)
+    victim = await _make_victim_user(db)
+    victim_contrato = await _make_contrato(db, victim.id)
+    await db.commit()
+
+    req = EvidenceDiscoveryRequest(
+        contrato_id=victim_contrato.id, fecha_inicio="2024-04-01", fecha_fin="2024-04-30"
+    )
+
+    with pytest.raises(NotFoundError):
+        await eds.descubrir_evidencias(db, attacker.id, req)
+
+
+@pytest.mark.asyncio
+async def test_descubrir_evidencias_propio_cuenta_id_no_lanza_not_found(db: AsyncSession) -> None:
+    """A user's own cuenta_id must resolve past the ownership check (reaches the
+    Google-connected check, proving no NotFoundError was raised for legit ids)."""
+    from app.core.exceptions import ExternalServiceError
+    from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
+    from app.services import evidence_discovery_service as eds
+
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+    cuenta = CuentaCobro(
+        contrato_id=contrato.id,
+        mes=1,
+        anio=2024,
+        estado=EstadoCuentaCobro.BORRADOR,
+        valor=1_000_000,
+    )
+    db.add(cuenta)
+    await db.commit()
+
+    req = EvidenceDiscoveryRequest(
+        obligaciones=[{"id": "ob1", "descripcion": "Entregar informe mensual"}],
+        cuenta_id=cuenta.id,
+        fecha_inicio="2024-04-01",
+        fecha_fin="2024-04-30",
+    )
+
+    disconnected = MagicMock()
+    disconnected.connected = False
+    with (
+        patch.object(eds.gws, "get_integration_status", AsyncMock(return_value=disconnected)),
+        pytest.raises(ExternalServiceError),
+    ):
+        await eds.descubrir_evidencias(db, user.id, req)
+
+
+@pytest.mark.asyncio
+async def test_descubrir_evidencias_default_fechas_desde_contrato(db: AsyncSession) -> None:
+    """When fecha_inicio/fecha_fin are omitted but contrato_id is given, the service
+    defaults fecha_inicio to the contrato's own fecha_inicio and fecha_fin to today —
+    instead of silently requiring the frontend to always supply both."""
+    from app.services import evidence_discovery_service as eds
+
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+    await db.commit()
+
+    req = EvidenceDiscoveryRequest(
+        obligaciones=[{"id": "ob1", "descripcion": "Entregar informe mensual de actividades"}],
+        contrato_id=contrato.id,
+    )
+
+    gmail = MagicMock()
+    gmail.search_messages = AsyncMock(return_value=[])
+    drive_adapter = MagicMock()
+    drive_adapter.search_files = AsyncMock(return_value=[])
+    cal_adapter = MagicMock()
+    cal_adapter.search_events = AsyncMock(return_value=[])
+    justify_llm = AsyncMock()
+    justify_llm.complete = AsyncMock(return_value=MagicMock(content="No hay evidencia."))
+
+    with (
+        patch.object(eds.gws, "get_integration_status", AsyncMock(return_value=_connected_status())),
+        patch.object(eds, "GmailAdapter", return_value=gmail),
+        patch("app.agent.nodes.drive_fetch.DriveAdapter", return_value=drive_adapter),
+        patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", return_value=cal_adapter),
+        patch("app.agent.nodes.evidence_justify.get_llm", return_value=justify_llm),
+    ):
+        resp = await eds.descubrir_evidencias(db, user.id, req)
+
+    assert "2024-02-01" in resp.resumen
+    assert date.today().isoformat() in resp.resumen

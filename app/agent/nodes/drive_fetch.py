@@ -12,13 +12,13 @@ import structlog
 from app.adapters.drive.drive_adapter import DriveAdapter
 from app.agent.prompts.email_evidence import _extract_keywords
 from app.agent.state import AgentState
+from app.core.config import settings
 
 logger = structlog.get_logger("agent.nodes.drive_fetch")
 
 # Términos genéricos de evidencia documental en la función pública.
 _GENERIC_TERMS = ("informe", "acta", "entrega", "soporte", "reporte")
 MAX_FILES_PER_QUERY = 10
-MAX_FILES_TOTAL = 25
 
 
 def _to_drive_datetime(date_str: str, end_of_day: bool = False) -> str:
@@ -81,10 +81,17 @@ async def drive_fetch_node(state: AgentState) -> AgentState:
     fecha_fin = str(contrato.get("fecha_fin", ""))
 
     # Construir queries: por obligación si existen, si no genéricas.
+    max_obligaciones = settings.EVIDENCE_MAX_OBLIGACIONES_QUERIES
+    obligaciones_para_query = obligaciones if max_obligaciones <= 0 else obligaciones[:max_obligaciones]
+
     queries: list[str] = []
     if obligaciones:
-        for oblig in obligaciones[:3]:
-            queries.extend(build_drive_queries(str(oblig.get("descripcion", "")), fecha_inicio, fecha_fin)[:2])
+        for oblig in obligaciones_para_query:
+            queries.extend(
+                build_drive_queries(str(oblig.get("descripcion", "")), fecha_inicio, fecha_fin)[
+                    : settings.EVIDENCE_QUERIES_PER_OBLIGACION
+                ]
+            )
     else:
         queries = build_drive_queries(state.get("user_input", ""), fecha_inicio, fecha_fin)
 
@@ -95,7 +102,7 @@ async def drive_fetch_node(state: AgentState) -> AgentState:
     adapter = DriveAdapter(db)
     files_by_id: dict[str, dict] = {}
     try:
-        for query in unique_queries[:5]:
+        for query in unique_queries[: settings.EVIDENCE_MAX_QUERIES_TOTAL]:
             try:
                 files = await adapter.search_files(user_id, query, MAX_FILES_PER_QUERY)
             except Exception as exc:
@@ -120,6 +127,6 @@ async def drive_fetch_node(state: AgentState) -> AgentState:
             "error": f"Error explorando Drive: {exc}. Verifica que tu cuenta de Google esté conectada.",
         }
 
-    drive_evidencias = list(files_by_id.values())[:MAX_FILES_TOTAL]
+    drive_evidencias = list(files_by_id.values())[: settings.EVIDENCE_MAX_FILES_TOTAL]
     await logger.ainfo("drive_fetch_complete", user_id=str(user_id), files=len(drive_evidencias))
     return {**state, "drive_evidencias": drive_evidencias}
