@@ -25,9 +25,25 @@ from app.models.documento_fuente import DocumentoFuente
 from app.schemas.agent import LLMResponse, LLMToolCall
 from app.services import agent_chat_service
 from app.services.agent_chat_service import (
+    SYSTEM_PROMPT_TEMPLATE,
     _expand_attachments_for_tools,
     _recover_tool_calls_from_content,
 )
+
+
+class TestResiliencePrompt:
+    """The system prompt must steer the model to ask instead of refusing, and to
+    treat informe de supervisión as a real capability (regression: the model replied
+    "no puedo generar informes de supervisión")."""
+
+    def test_prompt_forbids_refusing_supported_tasks(self) -> None:
+        assert "no puedo" in SYSTEM_PROMPT_TEMPLATE.lower()  # mentioned to forbid it
+        assert "informe de supervisión" in SYSTEM_PROMPT_TEMPLATE
+
+    def test_prompt_asks_user_when_blocked(self) -> None:
+        lowered = SYSTEM_PROMPT_TEMPLATE.lower()
+        assert "pregunta al usuario" in lowered or "pídeselo" in lowered
+        assert "resiliente" in lowered and "interactivo" in lowered
 from app.tools.context import ToolAttachment
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession

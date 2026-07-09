@@ -66,12 +66,15 @@ async def generar_informe_actividades(ctx: ToolContext, params: GenerarInformeIn
 @tool(
     name="generar_informe_supervision",
     description=(
-        "Generate the 'informe de supervisión' DOCX from the cuenta's already-registered "
-        "activities and link it into the checklist as cargado for requisito INFORME_SUPERVISION. "
-        "No file upload needed — the document is produced entirely from data already in the "
-        "system. Fails with ValidationError if the checklist is not yet defined for this cuenta "
-        "or if it has no activities. Args: cuenta_id (UUID of the cuenta de cobro; must belong to "
-        "the authenticated user)."
+        "Generate the 'informe de supervisión' DOCX for a cuenta de cobro. This IS a supported "
+        "capability — always available, never refuse it. It reuses the SAME obligations, "
+        "activities and justifications as the informe de actividades, presented in the "
+        "supervisor's format/framing (verification of compliance + supervisor's concept), and "
+        "links it into the checklist as cargado for requisito INFORME_SUPERVISION. No file upload "
+        "needed — produced entirely from data already in the system. Fails with ValidationError "
+        "if the checklist is not yet defined for this cuenta or if it has no activities (in that "
+        "case, tell the user what's missing and offer to fix it — do not refuse). Args: cuenta_id "
+        "(UUID of the cuenta de cobro; must belong to the authenticated user)."
     ),
     input_model=GenerarInformeInput,
     output_model=RequisitoChecklistItem,
