@@ -4,7 +4,7 @@ import uuid
 from datetime import date
 from decimal import Decimal
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -12,10 +12,24 @@ from pydantic import BaseModel, Field
 
 
 class LLMMessage(BaseModel):
-    role: str = Field(description="Role: system, user, or assistant")
+    role: str = Field(description="Role: system, user, assistant, or tool")
     # Plain text for normal completions, or a list of multimodal content parts
     # (e.g. {"type": "text", ...} + {"type": "image_url"/"file", ...}) for vision input.
-    content: str | list[dict[str, Any]]
+    # Empty string is valid for an assistant message that only carries tool_calls.
+    content: str | list[dict[str, Any]] = ""
+    # Present on role="tool" messages: the id of the LLMToolCall this message answers.
+    tool_call_id: str | None = None
+    # Present on role="assistant" messages that requested tool calls (OpenAI shape,
+    # as returned by litellm — list of {"id", "type", "function": {"name", "arguments"}}).
+    tool_calls: list[dict[str, Any]] | None = None
+
+
+class LLMToolCall(BaseModel):
+    """A single tool call requested by the model (parsed from litellm's response)."""
+
+    id: str
+    name: str
+    arguments: dict[str, Any]
 
 
 class LLMResponse(BaseModel):
@@ -24,6 +38,7 @@ class LLMResponse(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    tool_calls: list[LLMToolCall] | None = None
 
 
 # --- Chat schemas ---
@@ -174,6 +189,35 @@ class DocumentProcessResponse(BaseModel):
     document_id: uuid.UUID
     texto_extraido: str
     metadata: dict[str, str | int | float | None] | None = None
+
+
+# --- Free-form agent chat (tool-calling) schemas ---
+#
+# Response contract for POST /api/v1/agent/chat — see `app.services.agent_chat_service`.
+# FROZEN: the frontend is built against this exact JSON shape, keep field names stable.
+
+
+class ToolEvent(BaseModel):
+    """One tool invocation performed by the agent loop while answering a message."""
+
+    tool: str
+    status: Literal["ok", "error"]
+    resumen: str
+
+
+class DocumentoAdjuntoResumen(BaseModel):
+    """Summary of one file attachment processed during the chat turn."""
+
+    filename: str
+    caracteres_extraidos: int = Field(description="Characters of text extracted from this attachment (0 if binary).")
+
+
+class AgentChatResult(BaseModel):
+    session_id: str
+    content: str
+    tool_events: list[ToolEvent] = Field(default_factory=list)
+    documentos: list[DocumentoAdjuntoResumen] = Field(default_factory=list)
+    tokens_used: int = 0
 
 
 # --- Agent state schemas ---

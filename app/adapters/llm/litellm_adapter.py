@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -10,7 +11,7 @@ from pydantic import BaseModel
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from app.core.config import settings
-from app.schemas.agent import LLMMessage, LLMResponse
+from app.schemas.agent import LLMMessage, LLMResponse, LLMToolCall
 
 logger = structlog.get_logger("llm")
 
@@ -49,7 +50,29 @@ class LiteLLMAdapter:
 
     @staticmethod
     def _to_litellm_messages(messages: list[LLMMessage]) -> list[dict[str, Any]]:
-        return [{"role": m.role, "content": m.content} for m in messages]
+        result: list[dict[str, Any]] = []
+        for m in messages:
+            entry: dict[str, Any] = {"role": m.role, "content": m.content}
+            if m.tool_call_id is not None:
+                entry["tool_call_id"] = m.tool_call_id
+            if m.tool_calls is not None:
+                entry["tool_calls"] = m.tool_calls
+            result.append(entry)
+        return result
+
+    @staticmethod
+    def _rewrite_model_for_tools(model: str, tools: list[dict[str, Any]] | None) -> str:
+        """Rewrite ``ollama/<model>`` to ``ollama_chat/<model>`` when tools are requested.
+
+        LiteLLM's ``ollama/`` provider talks to Ollama's `/api/generate` endpoint,
+        which has weak/absent native tool-calling support; ``ollama_chat/`` uses
+        `/api/chat`, which properly returns structured ``tool_calls``. Only rewrite
+        when tools are actually being sent so plain completions keep using the
+        originally configured provider prefix.
+        """
+        if tools and model.startswith("ollama/") and not model.startswith("ollama_chat/"):
+            return "ollama_chat/" + model[len("ollama/") :]
+        return model
 
     @staticmethod
     def _api_key_for(model: str) -> str | None:
@@ -71,7 +94,7 @@ class LiteLLMAdapter:
     @staticmethod
     def _api_base_for(model: str) -> str | None:
         """Resolve provider-specific api_base overrides."""
-        if model.startswith("ollama/"):
+        if model.startswith(("ollama/", "ollama_chat/")):
             return settings.OLLAMA_BASE_URL
         return None
 
@@ -88,8 +111,12 @@ class LiteLLMAdapter:
         temperature: float,
         max_tokens: int,
         response_format: type[BaseModel] | dict[str, Any] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
     ) -> LLMResponse:
         import litellm
+
+        model = self._rewrite_model_for_tools(model, tools)
 
         kwargs: dict = {
             "model": model,
@@ -100,6 +127,10 @@ class LiteLLMAdapter:
         }
         if response_format is not None:
             kwargs["response_format"] = response_format
+        if tools:
+            kwargs["tools"] = tools
+            if tool_choice is not None:
+                kwargs["tool_choice"] = tool_choice
         api_base = self._api_base_for(model)
         if api_base:
             kwargs["api_base"] = api_base
@@ -116,7 +147,40 @@ class LiteLLMAdapter:
             prompt_tokens=usage.prompt_tokens if usage else 0,
             completion_tokens=usage.completion_tokens if usage else 0,
             total_tokens=usage.total_tokens if usage else 0,
+            tool_calls=self._parse_tool_calls(choice.message),
         )
+
+    @staticmethod
+    def _parse_tool_calls(message: Any) -> list[LLMToolCall] | None:
+        """Parse litellm's ``choice.message.tool_calls`` into ``LLMToolCall`` list.
+
+        ``arguments`` normally arrives from litellm as a JSON object string, but some
+        providers may already hand back a native dict, or a syntactically valid JSON
+        string that decodes to something other than an object (e.g. an array or a
+        scalar). Any of these malformed/unexpected shapes degrades to ``{}`` with a
+        warning rather than raising, since a badly-formed tool call is a model error
+        the caller should be able to surface, not a crash.
+        """
+        raw_calls = getattr(message, "tool_calls", None)
+        if not raw_calls:
+            return None
+
+        parsed: list[LLMToolCall] = []
+        for call in raw_calls:
+            fn = call.function
+            if isinstance(fn.arguments, dict):
+                arguments: Any = fn.arguments
+            else:
+                try:
+                    arguments = json.loads(fn.arguments) if fn.arguments else {}
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning("llm_tool_call_bad_arguments", name=fn.name, raw=fn.arguments)
+                    arguments = {}
+            if not isinstance(arguments, dict):
+                logger.warning("llm_tool_call_non_dict_arguments", name=fn.name, raw=fn.arguments)
+                arguments = {}
+            parsed.append(LLMToolCall(id=call.id, name=fn.name, arguments=arguments))
+        return parsed
 
     async def complete(
         self,
@@ -126,6 +190,8 @@ class LiteLLMAdapter:
         temperature: float = 0.3,
         max_tokens: int = 2048,
         response_format: type[BaseModel] | dict[str, Any] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
         fallback: bool = True,
     ) -> LLMResponse:
         """Complete with automatic fallback through model chain.
@@ -133,6 +199,12 @@ class LiteLLMAdapter:
         When ``response_format`` is a Pydantic model class (or a json_schema
         dict), LiteLLM requests structured output; the response ``content`` is
         then a JSON string the caller can validate with ``model_validate_json``.
+
+        When ``tools`` is set, they are forwarded to the provider (OpenAI
+        function-calling schema — see ``app.tools.llm_schema.to_openai_tools``)
+        and ``LLMResponse.tool_calls`` is populated if the model requests one or
+        more invocations. See ``_rewrite_model_for_tools`` for the Ollama
+        provider caveat.
 
         Set ``fallback=False`` to try only the requested model — used for vision
         calls, where the text-only fallback models cannot read image parts and
@@ -144,11 +216,14 @@ class LiteLLMAdapter:
 
         for m in models:
             try:
-                await logger.ainfo("llm_request", model=m, msg_count=len(messages))
-                result = await self._call_model(m, litellm_msgs, temperature, max_tokens, response_format)
+                called_model = self._rewrite_model_for_tools(m, tools)
+                await logger.ainfo("llm_request", model=called_model, msg_count=len(messages))
+                result = await self._call_model(
+                    m, litellm_msgs, temperature, max_tokens, response_format, tools, tool_choice
+                )
                 await logger.ainfo(
                     "llm_response",
-                    model=m,
+                    model=called_model,
                     tokens=result.total_tokens,
                 )
                 return result
