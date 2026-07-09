@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "development"
     CORS_ORIGINS: list[str] = ["http://localhost:19006", "http://localhost:3000"]
 
+    # MCP server — mounts the curated tool registry (app.tools.registry.TOOL_REGISTRY)
+    # at /mcp via app.mcp.server. Never exposes auth/payments/credits — see app/tools/catalog.
+    MCP_ENABLED: bool = True
+
     # Database
     DATABASE_URL: str = "postgresql+asyncpg://cashin:password@localhost:5432/cashin"
 
@@ -171,6 +175,25 @@ class Settings(BaseSettings):
     CREDITS_PER_CHAT_MESSAGE: int = 1
     CREDITS_PER_EVIDENCE_COLLECTION: int = 5
     FREE_CREDITS_ON_SIGNUP: int = 30
+
+    # Waitlist / invite-code gate: when True, account creation (email + first-time
+    # Google sign-in) requires a valid, active, non-exhausted invite code.
+    WAITLIST_ENABLED: bool = False
+
+    # Outbound notifications: pluggable channel, off by default. Fail-open — a
+    # delivery failure never breaks the triggering operation.
+    NOTIFICATIONS_ENABLED: bool = False
+    NOTIFICATION_CHANNEL: str = "log"  # "log" | "webhook"
+    NOTIFICATION_WEBHOOK_URL: str = ""
+
+    # PDF digital signature (PAdES). Off by default. Without CERT/KEY paths an
+    # ephemeral self-signed cert is used (technically valid, NO legal validity).
+    # For legal validity in Colombia, point these at a cert from an accredited
+    # entity (e.g. Certicámara, Andes SCD).
+    PDF_SIGNATURE_ENABLED: bool = False
+    PDF_SIGNATURE_CERT_PATH: str = ""
+    PDF_SIGNATURE_KEY_PATH: str = ""
+    PDF_SIGNATURE_KEY_PASSPHRASE: str = ""
 
     @field_validator("CORS_ORIGINS", mode="before")
     @classmethod
