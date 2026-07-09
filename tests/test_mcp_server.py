@@ -84,14 +84,27 @@ async def _make_user_with_contrato(db: AsyncSession) -> tuple[Usuario, Contrato]
 
 @pytest.mark.asyncio
 async def test_curated_server_exposes_exactly_the_registry() -> None:
-    """The curated server must mirror TOOL_REGISTRY exactly — no REST routes leak."""
+    """The curated server must mirror TOOL_REGISTRY exactly, MINUS any tool tagged
+    "chat_only" (e.g. `importar_documento`, which requires `ToolContext.attachments`
+    — only ever populated by `agent_chat_service.chat_with_tools` — so it would be a
+    permanently-broken tool if advertised to MCP clients)."""
     mcp = get_mcp_server()
     tools = await mcp.list_tools()
     tool_names = {t.name for t in tools}
 
-    assert tool_names == set(TOOL_REGISTRY.keys())
+    expected_names = {name for name, spec in TOOL_REGISTRY.items() if "chat_only" not in spec.tags}
+    assert tool_names == expected_names
     for t in tools:
         assert (t.description or "").strip(), f"{t.name} has an empty MCP description"
+
+
+def test_chat_only_tools_still_reach_the_agent_chat_llm_schema() -> None:
+    """`chat_only` only narrows the MCP surface — the agent-chat tool-calling loop
+    (which supplies attachments) must still see `importar_documento`."""
+    from app.tools.llm_schema import to_openai_tools
+
+    names = {t["function"]["name"] for t in to_openai_tools()}
+    assert "importar_documento" in names
 
 
 # --- 2. app.mcp.auth.get_request_token ---------------------------------------

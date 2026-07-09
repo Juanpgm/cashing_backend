@@ -138,6 +138,14 @@ def build_mcp_server() -> FastMCP:
         # app/main.py for why the mount is at path="" rather than "/mcp".
     )
     for spec in TOOL_REGISTRY.values():
+        if "chat_only" in spec.tags:
+            # e.g. importar_documento, which requires ToolContext.attachments — only
+            # populated by app.services.agent_chat_service.chat_with_tools. The MCP
+            # wrapper (_make_wrapper above) never provides attachments, so exposing
+            # this tool here would advertise a permanently-broken capability to every
+            # MCP client. It remains available to the agent-chat loop via
+            # `to_openai_tools()`, which is unaffected by this filter.
+            continue
         _register_tool(mcp, spec)
 
     _mcp = mcp
