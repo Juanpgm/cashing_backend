@@ -73,6 +73,10 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 filterwarnings = ["ignore::DeprecationWarning"]
+markers = [
+    "live_llm: hits a real local Ollama server (opt-in: -m live_llm)",
+]
+addopts = "-m \"not live_llm\""
 
 [tool.coverage.run]
 source = ["app"]
