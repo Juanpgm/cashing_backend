@@ -9,9 +9,11 @@ from fastapi import APIRouter, Depends, File, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.storage.s3_adapter import S3StorageAdapter
-from app.api.deps import CurrentUser, get_pdf_storage
+from app.api.deps import CurrentUser
 from app.core.config import settings
 from app.core.database import get_db
+from app.core.exceptions import ValidationError
+from app.core.file_validation import MAX_EVIDENCE_FILES_PER_REQUEST
 from app.schemas.evidencia import EvidenciaPresignedResponse, EvidenciaResponse, EvidenciaUploadResponse
 from app.services import evidencia_service
 
@@ -27,26 +29,40 @@ def get_evidencia_storage() -> S3StorageAdapter:
 
 @router.post(
     "/actividades/{actividad_id}",
-    response_model=EvidenciaUploadResponse,
+    response_model=list[EvidenciaUploadResponse],
     status_code=status.HTTP_201_CREATED,
 )
 async def subir_evidencia(
     actividad_id: uuid.UUID,
     user: CurrentUser,
-    file: UploadFile = File(...),
+    files: list[UploadFile] = File(...),
     db: AsyncSession = Depends(get_db),
     storage: S3StorageAdapter = Depends(get_evidencia_storage),
-) -> EvidenciaUploadResponse:
-    """Sube un archivo de evidencia para una actividad."""
-    data = await file.read()
-    return await evidencia_service.subir_evidencia(
+) -> list[EvidenciaUploadResponse]:
+    """Sube uno o varios archivos de evidencia para una actividad (cualquier formato).
+
+    Accepts multiple files per request (FastAPI still handles a single file sent
+    under the `files` field correctly — the list just has one entry). All files
+    are validated before any is stored; one invalid file rejects the whole batch.
+    """
+    if len(files) > MAX_EVIDENCE_FILES_PER_REQUEST:
+        raise ValidationError(
+            f"Máximo {MAX_EVIDENCE_FILES_PER_REQUEST} archivos por solicitud (se enviaron {len(files)})."
+        )
+    archivos = [
+        (
+            f.filename or "upload",
+            f.content_type or "application/octet-stream",
+            await f.read(),
+        )
+        for f in files
+    ]
+    return await evidencia_service.subir_evidencias(
         db=db,
         storage=storage,
         usuario_id=user.id,
         actividad_id=actividad_id,
-        filename=file.filename or "upload",
-        content_type=file.content_type or "application/octet-stream",
-        data=data,
+        archivos=archivos,
     )
 
 

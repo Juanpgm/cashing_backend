@@ -3,6 +3,8 @@
 import os
 import re
 
+from app.core.exceptions import ValidationError
+
 ALLOWED_MIME_TYPES: dict[str, list[str]] = {
     "application/pdf": [".pdf"],
     "image/jpeg": [".jpg", ".jpeg"],
@@ -144,3 +146,105 @@ def validate_file_extension(filename: str) -> bool:
 def validate_file_size(size_bytes: int) -> bool:
     """Check file doesn't exceed max size."""
     return 0 < size_bytes <= MAX_FILE_SIZE_BYTES
+
+
+# ── Evidence uploads: permissive allowlist (any format) ─────────────────────
+#
+# Contract/checklist documents (above) use a small CLOSED allowlist because they
+# are structured business documents. Evidence attached to an `Actividad` is the
+# opposite: contractors upload photos from their phone, screen recordings, voice
+# notes, forwarded emails (.eml/.msg), zipped folders, spreadsheets exported from
+# anywhere, etc. Enforcing a closed allowlist there would just mean contractors
+# can't upload their evidence. So evidence validation flips the model: accept
+# EVERYTHING except a small BLOCKLIST of executables/scripts, still enforcing a
+# (larger) size cap and — when the extension happens to match a format we know
+# the magic bytes for — a content/extension consistency check as defense in depth.
+
+BLOCKED_EVIDENCE_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        ".exe",
+        ".dll",
+        ".msi",
+        ".bat",
+        ".cmd",
+        ".com",
+        ".scr",
+        ".ps1",
+        ".sh",
+        ".vbs",
+        ".js",
+        ".jar",
+        ".apk",
+        ".app",
+        ".deb",
+        ".rpm",
+        ".lnk",
+        ".reg",
+    }
+)
+
+# Evidence can be video/audio/photos from a phone, so the cap is well above the
+# 10MB document limit.
+MAX_EVIDENCE_FILE_SIZE_BYTES = 25 * 1024 * 1024  # 25MB
+
+# Upper bound on how many files a single evidence upload request may contain.
+# Without this, a client could attach an unbounded number of files to one request,
+# forcing the server to read all of them into memory before any validation runs.
+MAX_EVIDENCE_FILES_PER_REQUEST = 10
+
+# Reverse of ALLOWED_MIME_TYPES: extension -> its expected MIME type. Used only to
+# look up a known magic-byte signature for defense-in-depth on evidence uploads —
+# NOT to restrict which extensions are allowed (evidence allows any extension not
+# in the blocklist above).
+_EXT_TO_MIME: dict[str, str] = {ext: mime for mime, exts in ALLOWED_MIME_TYPES.items() for ext in exts}
+
+
+def _final_extension(filename: str) -> str:
+    """Return the lowercase final extension (with leading dot) of the sanitized filename.
+
+    Sanitizing first collapses double-extension tricks like "invoice.pdf.exe" into
+    a single trailing extension ("invoice_pdf.exe"), so checking the extension
+    AFTER sanitization is what actually catches that attack — checking the raw
+    filename would not.
+
+    Trailing dots/spaces are stripped from the raw filename BEFORE sanitizing:
+    without this, "malware.exe." ends in an empty/"." extension (Windows silently
+    drops trailing dots when it creates the file on disk) which is not in
+    `BLOCKED_EVIDENCE_EXTENSIONS`, evading the blocklist entirely.
+    """
+    safe = sanitize_filename(filename.rstrip(". "))
+    if "." not in safe:
+        return ""
+    return "." + safe.rsplit(".", maxsplit=1)[-1].lower()
+
+
+def validate_evidence_file(filename: str, size: int, content_type: str, content: bytes) -> None:
+    """Validate an evidence file upload. Raises ValidationError, returns None if OK.
+
+    Unlike `validate_file_extension` (closed allowlist for documents), this accepts
+    ANY file format except `BLOCKED_EVIDENCE_EXTENSIONS`. `content_type` is accepted
+    for API symmetry / logging but is NOT used to gate acceptance — the declared
+    content-type for arbitrary evidence formats (phone photos, .eml, .zip, ...) is
+    not a reliable signal and evidence isn't restricted to known MIME types anyway.
+    Content/extension consistency is instead checked via magic bytes, and only for
+    extensions we have a signature for (see `_EXT_TO_MIME` / `_MAGIC_SIGNATURES`).
+    """
+    del content_type  # see docstring — accepted but intentionally not enforced
+
+    if size <= 0:
+        raise ValidationError(f"El archivo está vacío: {filename}")
+    if size > MAX_EVIDENCE_FILE_SIZE_BYTES:
+        max_mb = MAX_EVIDENCE_FILE_SIZE_BYTES // (1024 * 1024)
+        raise ValidationError(f"Archivo demasiado grande ({size} bytes, máximo {max_mb}MB): {filename}")
+    if ".." in filename or filename.startswith("/"):
+        raise ValidationError(f"Nombre de archivo no permitido: {filename}")
+
+    ext = _final_extension(filename)
+    if ext in BLOCKED_EVIDENCE_EXTENSIONS:
+        raise ValidationError(f"Tipo de archivo no permitido: {filename}")
+
+    expected_mime = _EXT_TO_MIME.get(ext)
+    if expected_mime is not None:
+        signatures = _MAGIC_SIGNATURES.get(expected_mime)
+        if signatures and not any(content[: len(sig)] == sig for sig in signatures):
+            raise ValidationError(f"El contenido del archivo no coincide con su extensión: {filename}")
