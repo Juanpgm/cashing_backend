@@ -150,9 +150,36 @@ def get_mcp_server() -> FastMCP:
 
 
 def mcp_asgi_app() -> ASGIApp:
-    """Return the streamable-http ASGI app for mounting at `/mcp`.
+    """Return the streamable-http ASGI app serving the `/mcp` route.
 
     See the module docstring for why the caller (`app.main`) must separately
     wire `get_mcp_server().session_manager.run()` into its own lifespan.
     """
     return get_mcp_server().streamable_http_app()
+
+
+class MCPDispatchMiddleware:
+    """Pure-ASGI dispatcher that forwards `/mcp` traffic to the MCP sub-app.
+
+    Why not ``app.mount("", mcp_asgi_app())``: a Mount with an empty path is a
+    catch-all that FULL-matches every path no route above claimed. That
+    silently replaces two Starlette behaviors for the entire application:
+    the trailing-slash redirect (routes defined as ``/x/`` stop
+    307-redirecting ``/x`` and fall into the MCP sub-app's plain-text 404
+    instead) and FastAPI's JSON 404 envelope. Dispatching by exact path
+    prefix keeps `/mcp` working without touching anything else. The scope is
+    forwarded unmodified because FastMCP's internal streamable-http route
+    already lives at ``/mcp``.
+    """
+
+    def __init__(self, app: ASGIApp, mcp_app: ASGIApp | None = None) -> None:
+        self._app = app
+        self._mcp_app = mcp_app if mcp_app is not None else mcp_asgi_app()
+
+    async def __call__(self, scope, receive, send):  # type: ignore[no-untyped-def]
+        if scope["type"] == "http" and (
+            scope["path"] == "/mcp" or scope["path"].startswith("/mcp/")
+        ):
+            await self._mcp_app(scope, receive, send)
+            return
+        await self._app(scope, receive, send)

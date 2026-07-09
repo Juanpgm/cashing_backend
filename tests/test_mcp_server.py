@@ -205,35 +205,67 @@ async def test_round_trip_write_then_read_through_mcp_layer_commits(
     assert checklist_structured["items"] == []
 
 
-# --- 5. Mounting toggled by MCP_ENABLED --------------------------------------
+# --- 5. Dispatch middleware toggled by MCP_ENABLED ---------------------------
 
 
-def _has_mcp_mount(routes: list) -> bool:
-    """The MCP mount is registered with path="" (see app.main for why) — it's
-    the only Mount route with an empty path, so that's what identifies it."""
-    from starlette.routing import Mount
+def _has_mcp_dispatcher(app) -> bool:  # type: ignore[no-untyped-def]
+    """The /mcp dispatcher is a path-scoped ASGI middleware, NOT a Mount —
+    a catch-all Mount("") broke trailing-slash redirects app-wide."""
+    from app.mcp.server import MCPDispatchMiddleware
 
-    return any(isinstance(route, Mount) and route.path == "" for route in routes)
+    return any(m.cls is MCPDispatchMiddleware for m in app.user_middleware)
 
 
-def test_mcp_mounted_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mcp_dispatcher_registered_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "MCP_ENABLED", True)
     import app.main as main_module
 
     importlib.reload(main_module)
     try:
-        assert _has_mcp_mount(main_module.app.routes)
+        assert _has_mcp_dispatcher(main_module.app)
     finally:
         importlib.reload(main_module)
 
 
-def test_mcp_not_mounted_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mcp_dispatcher_absent_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "MCP_ENABLED", False)
     import app.main as main_module
 
     importlib.reload(main_module)
     try:
-        assert not _has_mcp_mount(main_module.app.routes)
+        assert not _has_mcp_dispatcher(main_module.app)
+    finally:
+        importlib.reload(main_module)
+
+
+def test_mcp_dispatch_does_not_break_slash_redirects_or_json_404(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for the catch-all Mount("") bug: with MCP enabled, an API
+    route defined with a trailing slash (e.g. /api/v1/contratos/) must still
+    resolve when called without it (307 redirect or auth error — anything but
+    a plain-text 404), and unmatched paths must keep FastAPI's JSON 404."""
+    from starlette.testclient import TestClient
+
+    monkeypatch.setattr(settings, "MCP_ENABLED", True)
+    import app.main as main_module
+
+    importlib.reload(main_module)
+    try:
+        # raise_server_exceptions off + no lifespan needed: routing happens
+        # before any handler/DB work for the paths asserted here.
+        client = TestClient(main_module.app, raise_server_exceptions=False)
+
+        no_slash = client.get("/api/v1/contratos", follow_redirects=False)
+        assert no_slash.status_code != 404, (
+            "trailing-slash redirect was swallowed by the MCP dispatch"
+        )
+
+        unmatched = client.get("/definitely-not-a-route")
+        assert unmatched.status_code == 404
+        assert unmatched.headers["content-type"].startswith("application/json"), (
+            "unmatched paths must keep FastAPI's JSON 404 envelope"
+        )
     finally:
         importlib.reload(main_module)
 
@@ -243,18 +275,17 @@ def test_mcp_not_mounted_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.asyncio
 async def test_post_mcp_initialize_is_not_a_404() -> None:
-    """Smoke-test the exact mount shape app.main uses — `Mount("", app=mcp_asgi_app())`
-    — without needing a live Postgres/SQLite-backed FastAPI lifespan just to
-    prove the route is wired up (see app/mcp/server.py docstring on why the
-    session manager must be started explicitly instead of relying on the
-    parent app's lifespan)."""
-    from app.mcp.server import mcp_asgi_app
+    """Smoke-test the exact dispatch shape app.main uses —
+    `MCPDispatchMiddleware` wrapping the app — without needing a live
+    Postgres/SQLite-backed FastAPI lifespan just to prove the route is wired
+    up (see app/mcp/server.py docstring on why the session manager must be
+    started explicitly instead of relying on the parent app's lifespan)."""
+    from app.mcp.server import MCPDispatchMiddleware
     from httpx import ASGITransport, AsyncClient
     from starlette.applications import Starlette
-    from starlette.routing import Mount
 
     mcp = get_mcp_server()
-    wrapper_app = Starlette(routes=[Mount("", app=mcp_asgi_app())])
+    wrapper_app = MCPDispatchMiddleware(Starlette())
 
     async with mcp.session_manager.run():
         transport = ASGITransport(app=wrapper_app)

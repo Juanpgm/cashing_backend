@@ -141,6 +141,18 @@ app = FastAPI(
 
 # --- Middleware (order matters: last added = first executed) ---
 
+# /mcp is dispatched by a path-scoped ASGI middleware instead of a Mount:
+# a catch-all Mount("") full-matched every unclaimed path, which disabled
+# Starlette's trailing-slash redirect app-wide (routes defined as "/x/"
+# returned the MCP sub-app's plain-text 404 when called as "/x") and
+# replaced FastAPI's JSON 404. Added FIRST so it runs innermost, i.e. /mcp
+# requests still traverse CORS/audit/security-headers like everything else.
+# See app/mcp/server.py::MCPDispatchMiddleware.
+if settings.MCP_ENABLED:
+    from app.mcp.server import MCPDispatchMiddleware
+
+    app.add_middleware(MCPDispatchMiddleware)
+
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(AuditMiddleware)
 app.add_middleware(
@@ -219,20 +231,6 @@ async def test_ui() -> RedirectResponse:
     return RedirectResponse(url="/static/test_ui.html")
 
 
-# --- MCP Server: curated tool registry (app.tools.registry.TOOL_REGISTRY), see app/mcp/server.py ---
-#
-# Mounted last, at an EMPTY path (`path=""` is explicitly valid for Starlette's
-# Mount — it forwards the full, unmodified request path to the sub-app), and
-# not at "/mcp": FastMCP's own streamable-http route already IS "/mcp"
-# internally (see app/mcp/server.py). Mounting at "/mcp" too would either
-# double the path to "/mcp/mcp", or — if the internal route were rooted at
-# "/" instead — produce a same-path Mount whose empty remaining_path doesn't
-# exactly match the sub-app's Route("/"), triggering Starlette's
-# redirect_slashes middleware (a 307 to "/mcp/") on every call. Mounting at
-# "" and registering it LAST means it only ever receives requests that didn't
-# match any route above (health, static, api routes), and forwards them
-# untouched so "/mcp" lands on the sub-app's own "/mcp" route with no redirect.
-if settings.MCP_ENABLED:
-    from app.mcp.server import mcp_asgi_app
-
-    app.mount("", mcp_asgi_app())
+# NOTE: /mcp is served by MCPDispatchMiddleware (registered in the middleware
+# section above), NOT by app.mount(). A catch-all Mount("") here broke
+# trailing-slash redirects for the whole API — see the middleware comment.
