@@ -1,23 +1,19 @@
 """API dependencies — DB session, current user, credit checks, storage."""
 
-import uuid
 from typing import Annotated
 
 from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from jose import JWTError
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.drive.drive_adapter import DriveAdapter
 from app.adapters.email.gmail_adapter import GmailAdapter
 from app.adapters.storage import get_storage as _get_storage
 from app.adapters.storage.s3_adapter import S3StorageAdapter
+from app.core.auth import authenticate_bearer
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.exceptions import ForbiddenError, InsufficientCreditsError, UnauthorizedError
-from app.core.security import decode_token
-from app.models.token_blacklist import TokenBlacklist
 from app.models.usuario import Usuario
 
 _bearer_scheme = HTTPBearer(auto_error=False)
@@ -32,31 +28,7 @@ async def get_current_user(
     if not credentials:
         raise UnauthorizedError("Missing or invalid authorization header")
 
-    token = credentials.credentials
-    try:
-        payload = decode_token(token)
-    except JWTError:
-        raise UnauthorizedError("Invalid or expired token") from None
-
-    if payload.get("type") != "access":
-        raise UnauthorizedError("Invalid token type")
-
-    jti = payload.get("jti", "")
-    blacklisted = await db.execute(select(TokenBlacklist).where(TokenBlacklist.jti == jti))
-    if blacklisted.scalar_one_or_none() is not None:
-        raise UnauthorizedError("Token has been revoked")
-
-    user_id = payload.get("sub", "")
-    try:
-        uid = uuid.UUID(user_id)
-    except ValueError:
-        raise UnauthorizedError("Invalid token subject") from None
-
-    result = await db.execute(select(Usuario).where(Usuario.id == uid))
-    user = result.scalar_one_or_none()
-
-    if user is None or not user.activo or user.is_deleted:
-        raise UnauthorizedError("User not found or inactive")
+    user = await authenticate_bearer(credentials.credentials, db)
 
     # Store user_id in request state for audit logging
     request.state.user_id = str(user.id)
