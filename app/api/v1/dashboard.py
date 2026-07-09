@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+from datetime import date
+
 import structlog
 from fastapi import APIRouter, Depends
-from sqlalchemy import func, select
+from sqlalchemy import and_, case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser
 from app.core.database import get_db
 from app.models.contrato import Contrato
 from app.models.credito import Credito, TipoCredito
-from app.models.cuenta_cobro import CuentaCobro
+from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
 
 logger = structlog.get_logger("api.dashboard")
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
@@ -24,7 +26,9 @@ async def get_dashboard(
 ) -> dict:
     """Return aggregated dashboard stats for the current user.
 
-    Used by the frontend landing page after login.
+    Used by the frontend landing page after login. Kept to 3 DB round-trips
+    (contratos / cuentas / créditos) via conditional aggregation, because every
+    extra query costs a full network round-trip on a remote Postgres (Neon).
     """
     # --- Contratos activos ------------------------------------------------
     contratos_result = await db.execute(
@@ -35,36 +39,84 @@ async def get_dashboard(
     )
     contratos_activos: int = contratos_result.scalar_one() or 0
 
-    # --- Cuentas pendientes -----------------------------------------------
+    # --- Cuentas: pendientes + pagos del mes en UNA sola query ------------
+    # Both aggregate over cuentas_cobro joined to the user's contratos, so a single
+    # conditional aggregation replaces two separate COUNT round-trips.
+    # Use enum members, not string literals: Postgres native enums reject any value
+    # not in the type (SQLite silently tolerated the invalid "en_revision").
+    now = date.today()
     cuentas_result = await db.execute(
-        select(func.count(CuentaCobro.id))
+        select(
+            func.coalesce(
+                func.sum(
+                    case(
+                        (
+                            CuentaCobro.estado.in_(
+                                [EstadoCuentaCobro.BORRADOR, EstadoCuentaCobro.ENVIADA]
+                            ),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ),
+                0,
+            ).label("pendientes"),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (
+                            and_(
+                                CuentaCobro.estado == EstadoCuentaCobro.APROBADA,
+                                func.extract("year", CuentaCobro.created_at) == now.year,
+                                func.extract("month", CuentaCobro.created_at) == now.month,
+                            ),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ),
+                0,
+            ).label("pagos_mes"),
+        )
         .join(Contrato, CuentaCobro.contrato_id == Contrato.id)
-        .where(
-            Contrato.usuario_id == user.id,
-            CuentaCobro.estado.in_(["borrador", "en_revision"]),
-        )
+        .where(Contrato.usuario_id == user.id)
     )
-    cuentas_pendientes: int = cuentas_result.scalar_one() or 0
+    cuentas_row = cuentas_result.one()
+    cuentas_pendientes: int = int(cuentas_row.pendientes or 0)
+    total_pagos_mes: int = int(cuentas_row.pagos_mes or 0)
 
-    # --- Créditos disponibles ---------------------------------------------------
-    # CONSUMO records store negative cantidad, so a simple SUM gives the real
-    # balance without the double-negative error of separating ingreso/consumo.
+    # --- Créditos: ingreso + consumo + saldo en UNA sola query -----------
+    # CONSUMO records store negative cantidad, so SUM(all) IS the balance. The
+    # headline saldo (= SUM of the whole ledger) stays the single source of truth,
+    # matching /auth/me and /pagos/creditos/balance — now without 3 separate SUMs.
     try:
-        ingreso_result = await db.execute(
-            select(func.coalesce(func.sum(Credito.cantidad), 0)).where(
-                Credito.usuario_id == user.id,
-                Credito.tipo.in_([TipoCredito.COMPRA, TipoCredito.BONUS]),
-            )
+        creditos_result = await db.execute(
+            select(
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (
+                                Credito.tipo.in_([TipoCredito.COMPRA, TipoCredito.BONUS]),
+                                Credito.cantidad,
+                            ),
+                            else_=0,
+                        )
+                    ),
+                    0,
+                ).label("ingreso"),
+                func.coalesce(
+                    func.sum(
+                        case((Credito.tipo == TipoCredito.CONSUMO, Credito.cantidad), else_=0)
+                    ),
+                    0,
+                ).label("consumo"),
+                func.coalesce(func.sum(Credito.cantidad), 0).label("saldo"),
+            ).where(Credito.usuario_id == user.id)
         )
-        consumo_result = await db.execute(
-            select(func.coalesce(func.sum(Credito.cantidad), 0)).where(
-                Credito.usuario_id == user.id,
-                Credito.tipo == TipoCredito.CONSUMO,
-            )
-        )
-        ingreso_total: int = int(ingreso_result.scalar_one() or 0)
-        consumo_total: int = int(consumo_result.scalar_one() or 0)  # already negative
-        creditos_disponibles: int = max(0, ingreso_total + consumo_total)
+        creditos_row = creditos_result.one()
+        ingreso_total: int = int(creditos_row.ingreso or 0)
+        consumo_total: int = int(creditos_row.consumo or 0)  # already negative
+        creditos_disponibles: int = int(creditos_row.saldo or 0)
         creditos_detalle = {
             "ingreso": ingreso_total,
             "consumido": abs(consumo_total),
@@ -73,23 +125,6 @@ async def get_dashboard(
     except Exception:
         creditos_disponibles = 0
         creditos_detalle = {"ingreso": 0, "consumido": 0, "saldo": 0}
-
-    # --- Total pagos del mes (cuentas cobro aprobadas) --------------------
-    from datetime import date
-    from sqlalchemy import extract
-
-    now = date.today()
-    total_pagos_result = await db.execute(
-        select(func.count(CuentaCobro.id))
-        .join(Contrato, CuentaCobro.contrato_id == Contrato.id)
-        .where(
-            Contrato.usuario_id == user.id,
-            CuentaCobro.estado == "aprobada",
-            extract("year", CuentaCobro.created_at) == now.year,
-            extract("month", CuentaCobro.created_at) == now.month,
-        )
-    )
-    total_pagos_mes: int = total_pagos_result.scalar_one() or 0
 
     return {
         "contratos_activos": contratos_activos,

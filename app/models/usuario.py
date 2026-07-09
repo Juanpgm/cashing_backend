@@ -34,8 +34,15 @@ class Usuario(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
     creditos_disponibles: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     failed_login_attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
-    # Relationships
-    contratos: Mapped[list["Contrato"]] = relationship(back_populates="usuario", lazy="selectin")  # type: ignore[name-defined]  # noqa: F821
-    suscripciones: Mapped[list["Suscripcion"]] = relationship(back_populates="usuario", lazy="selectin")  # type: ignore[name-defined]  # noqa: F821
+    # Relationships.
+    # lazy="raise_on_sql": these are NOT auto-loaded. Loading a Usuario is on the
+    # hot path (every authenticated request goes through get_current_user), and
+    # eager "selectin" here triggered a 7-query cascade (contratos → obligaciones /
+    # cuentas_cobro → actividades / borradores, plus suscripciones + preferencias)
+    # on data no caller actually used. Any endpoint that genuinely needs one of
+    # these must eager-load it explicitly (e.g. .options(selectinload(Usuario.contratos))),
+    # which fails loud here instead of silently firing the cascade.
+    contratos: Mapped[list["Contrato"]] = relationship(back_populates="usuario", lazy="raise_on_sql")  # type: ignore[name-defined]  # noqa: F821
+    suscripciones: Mapped[list["Suscripcion"]] = relationship(back_populates="usuario", lazy="raise_on_sql")  # type: ignore[name-defined]  # noqa: F821
     agent_runs: Mapped[list["AgentRun"]] = relationship(back_populates="usuario", lazy="dynamic")  # type: ignore[name-defined]  # noqa: F821
-    preferencias: Mapped[list["PreferenciaUsuario"]] = relationship(back_populates="usuario", lazy="selectin")  # type: ignore[name-defined]  # noqa: F821
+    preferencias: Mapped[list["PreferenciaUsuario"]] = relationship(back_populates="usuario", lazy="raise_on_sql")  # type: ignore[name-defined]  # noqa: F821
