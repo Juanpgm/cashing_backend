@@ -138,6 +138,36 @@ def _make_llm_response(content: str) -> MagicMock:
 
 
 @pytest.mark.asyncio
+async def test_llm_relevance_batch_partial_selection() -> None:
+    """A single batch call classifies all candidates; only the indices returned are relevant."""
+    candidates = [
+        {"content": "irrelevante uno", "source": "a.pdf"},
+        {"content": "evidencia relevante dos", "source": "b.pdf"},
+        {"content": "irrelevante tres", "source": "c.pdf"},
+    ]
+    mock_llm = AsyncMock()
+    mock_llm.complete = AsyncMock(return_value=_make_llm_response("[2]"))
+
+    flags = await cruzar_service._llm_relevance_batch("obligación X", candidates, mock_llm)
+
+    assert flags == [False, True, False]
+    # Exactly ONE LLM call for all three candidates (the whole point of batching)
+    assert mock_llm.complete.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_llm_relevance_batch_fails_closed_on_garbage() -> None:
+    """Unparseable / error responses mark every candidate as not-relevant (fail closed)."""
+    candidates = [{"content": "x", "source": "a.pdf"}, {"content": "y", "source": "b.pdf"}]
+    mock_llm = AsyncMock()
+    mock_llm.complete = AsyncMock(return_value=_make_llm_response("no soy un array"))
+
+    flags = await cruzar_service._llm_relevance_batch("obligación X", candidates, mock_llm)
+
+    assert flags == [False, False]
+
+
+@pytest.mark.asyncio
 async def test_cruzar_raises_not_found_for_unknown_cuenta(db: AsyncSession) -> None:
     """Non-existent cuenta_id must raise NotFoundError, not crash."""
     user = await _make_user(db)
@@ -203,8 +233,8 @@ async def test_cruzar_creates_actividades_for_relevant_docs(db: AsyncSession) ->
     )
     await db.commit()
 
-    # Mock both LLM calls: relevance → RELEVANTE, justification → a short sentence
-    mock_relevance_resp = _make_llm_response("RELEVANTE")
+    # Mock both LLM calls: relevance → batch array [1], justification → a short sentence
+    mock_relevance_resp = _make_llm_response("[1]")
     mock_justification_resp = _make_llm_response(
         "El informe técnico mensual de consultoría fue elaborado según se evidencia en informe_marzo.pdf."
     )
@@ -291,7 +321,7 @@ async def test_cruzar_clears_existing_actividades_before_run(db: AsyncSession) -
     assert len(list(before_result.scalars().all())) == 1
 
     mock_llm = AsyncMock()
-    mock_llm.complete = AsyncMock(return_value=_make_llm_response("NO_RELEVANTE"))
+    mock_llm.complete = AsyncMock(return_value=_make_llm_response("[]"))
 
     with patch("app.services.cruzar_service.get_llm", return_value=mock_llm):
         with patch("app.services.cruzar_service.quality_gate_node", new_callable=AsyncMock) as mock_gate:

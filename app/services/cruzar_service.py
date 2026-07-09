@@ -11,6 +11,7 @@ set of uploaded documents.
 from __future__ import annotations
 
 import calendar
+import json
 import re
 from datetime import date
 from uuid import UUID
@@ -25,7 +26,7 @@ from app.agent.nodes.quality_gate import quality_gate_node
 from app.agent.prompts.cruzar import (
     CRUZAR_JUSTIFICATION_SYSTEM,
     CRUZAR_JUSTIFICATION_USER,
-    CRUZAR_RELEVANCE_SYSTEM,
+    CRUZAR_RELEVANCE_BATCH_SYSTEM,
 )
 from app.core.exceptions import ForbiddenError, NotFoundError
 from app.models.actividad import Actividad
@@ -61,27 +62,47 @@ def _keyword_score(obligation_text: str, evidence_text: str) -> float:
     return len(ob_words & ev_words) / len(ob_words)
 
 
-async def _llm_relevance(obligation_text: str, candidate: dict, llm) -> bool:
-    """Binary LLM relevance check — returns True only if evidence explicitly demonstrates obligation."""
+_RELEVANCE_JSON_RE = re.compile(r"\[.*\]", re.DOTALL)
+
+
+async def _llm_relevance_batch(
+    obligation_text: str, candidates: list[dict], llm
+) -> list[bool]:
+    """Classify ALL candidates for one obligation in a SINGLE LLM call.
+
+    Returns a bool per candidate (same order). Fails closed (all False) on error or
+    unparseable output — consistent with the previous "if unsure, not relevant" rule.
+    Replaces the former per-candidate _llm_relevance (N calls → 1 per obligation).
+    """
+    if not candidates:
+        return []
+
+    listado = "\n".join(
+        f"{i + 1}. {c['content'][:1000]}" for i, c in enumerate(candidates)
+    )
     user_content = (
         f"Obligación: {obligation_text[:500]}\n\n"
-        f"Evidencia: {candidate['content'][:1000]}\n\n"
-        "¿Es la evidencia relevante para esta obligación?"
+        f"Evidencias:\n{listado}\n\n"
+        "¿Cuáles evidencias son relevantes? Responde solo el array JSON de números."
     )
     try:
         resp = await llm.complete(
             [
-                LLMMessage(role="system", content=CRUZAR_RELEVANCE_SYSTEM),
+                LLMMessage(role="system", content=CRUZAR_RELEVANCE_BATCH_SYSTEM),
                 LLMMessage(role="user", content=user_content),
             ],
             temperature=0.0,
-            max_tokens=16,
+            max_tokens=64,
         )
-        result = resp.content.upper()
-        return "RELEVANTE" in result and "NO_RELEVANTE" not in result
+        match = _RELEVANCE_JSON_RE.search(resp.content)
+        if not match:
+            return [False] * len(candidates)
+        nums = json.loads(match.group(0))
+        relevant_idx = {int(n) for n in nums if isinstance(n, (int, float))}
+        return [(i + 1) in relevant_idx for i in range(len(candidates))]
     except Exception as exc:
         await logger.awarning("cruzar.relevance_llm_error", error=str(exc))
-        return False
+        return [False] * len(candidates)
 
 
 async def _llm_justification(obligation_text: str, candidate: dict, llm) -> str:
@@ -227,10 +248,9 @@ async def cruzar_documentos(
             reverse=True,
         )[:5]
 
-        # Step 4c: LLM binary relevance check on each candidate
-        for candidate in candidates:
-            is_relevant = await _llm_relevance(ob_text, candidate, llm_relevance)
-
+        # Step 4c: LLM relevance — ONE batched call per obligation, not one per candidate
+        flags = await _llm_relevance_batch(ob_text, candidates, llm_relevance)
+        for candidate, is_relevant in zip(candidates, flags):
             if not is_relevant:
                 await logger.ainfo(
                     "cruzar.candidate_not_relevant",

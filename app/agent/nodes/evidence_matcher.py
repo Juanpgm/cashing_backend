@@ -13,11 +13,12 @@ from app.schemas.agent import LLMMessage
 
 logger = structlog.get_logger("agent.nodes.evidence_matcher")
 
-_RELEVANCE_SYSTEM = """\
-Eres un clasificador binario. Dado el texto de una evidencia y una obligación contractual, \
-determina si la evidencia es RELEVANTE para demostrar el cumplimiento de esa obligación.
+_RELEVANCE_BATCH_SYSTEM = """\
+Eres un clasificador. Dada una obligación contractual y una lista numerada de evidencias, \
+indica cuáles evidencias son RELEVANTES para demostrar el cumplimiento de esa obligación.
 
-Responde SOLO con: RELEVANTE o NO_RELEVANTE
+Responde SOLO con un array JSON de los números (empezando en 1) de las evidencias relevantes. \
+Ejemplo: [1, 3]. Si ninguna es relevante, responde [].
 """
 
 _JSON_RE = re.compile(r"\[.*\]", re.DOTALL)
@@ -38,25 +39,38 @@ def _keyword_score(obligation_text: str, evidence_text: str) -> float:
     return len(overlap) / len(ob_words)
 
 
-async def _llm_relevance(obligation: str, evidence: str, llm) -> bool:
-    """Ask LLM if evidence is relevant for obligation."""
+async def _llm_relevance_batch(obligation: str, evidences: list[str], llm) -> list[bool]:
+    """Classify all candidate evidences for one obligation in a SINGLE LLM call.
+
+    Returns a boolean per evidence (same order). Fails closed (all False) on error or
+    unparseable output — consistent with the previous "if unsure, not relevant" rule.
+    """
+    if not evidences:
+        return []
+
+    listado = "\n".join(f"{i + 1}. {ev[:600]}" for i, ev in enumerate(evidences))
     prompt = (
         f"Obligación: {obligation[:500]}\n\n"
-        f"Evidencia: {evidence[:1000]}\n\n"
-        "¿Es la evidencia relevante para esta obligación?"
+        f"Evidencias:\n{listado}\n\n"
+        "¿Cuáles evidencias son relevantes? Responde solo el array JSON de números."
     )
     try:
         resp = await llm.complete(
             [
-                LLMMessage(role="system", content=_RELEVANCE_SYSTEM),
+                LLMMessage(role="system", content=_RELEVANCE_BATCH_SYSTEM),
                 LLMMessage(role="user", content=prompt),
             ],
             temperature=0.0,
-            max_tokens=16,
+            max_tokens=64,
         )
-        return "RELEVANTE" in resp.content.upper() and "NO_RELEVANTE" not in resp.content.upper()
+        match = _JSON_RE.search(resp.content)
+        if not match:
+            return [False] * len(evidences)
+        nums = json.loads(match.group(0))
+        relevant_idx = {int(n) for n in nums if isinstance(n, (int, float))}
+        return [(i + 1) in relevant_idx for i in range(len(evidences))]
     except Exception:
-        return False
+        return [False] * len(evidences)
 
 
 async def evidence_matcher_node(state: AgentState) -> AgentState:
@@ -97,7 +111,7 @@ async def evidence_matcher_node(state: AgentState) -> AgentState:
             if _keyword_score(ob_text, ev.get("content", "")) >= 0.15
         ]
 
-        # Step 2: LLM relevance on top-5 candidates
+        # Step 2: LLM relevance on top-5 candidates — ONE batched call, not one per candidate
         if candidates:
             # Sort by keyword score descending
             candidates = sorted(
@@ -105,12 +119,10 @@ async def evidence_matcher_node(state: AgentState) -> AgentState:
                 key=lambda e: _keyword_score(ob_text, e.get("content", "")),
                 reverse=True,
             )[:5]
-            relevant = []
-            for ev in candidates:
-                is_rel = await _llm_relevance(ob_text, ev.get("content", ""), llm)
-                if is_rel:
-                    relevant.append(ev)
-            matched[str(ob_id)] = relevant
+            flags = await _llm_relevance_batch(
+                ob_text, [ev.get("content", "") for ev in candidates], llm
+            )
+            matched[str(ob_id)] = [ev for ev, keep in zip(candidates, flags) if keep]
         else:
             matched[str(ob_id)] = []
 

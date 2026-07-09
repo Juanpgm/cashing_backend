@@ -153,11 +153,11 @@ async def test_evidence_matcher_low_overlap():
 
 @pytest.mark.asyncio
 async def test_evidence_matcher_matches_relevant():
-    """Matches evidence to obligation when LLM says RELEVANTE."""
+    """Matches evidence to obligation when the batched LLM marks candidate 1 relevant."""
     from app.agent.nodes.evidence_matcher import evidence_matcher_node
 
     fake_resp = MagicMock()
-    fake_resp.content = "RELEVANTE"
+    fake_resp.content = "[1]"  # batched format: candidate 1 is relevant
     fake_resp.total_tokens = 10
 
     mock_llm = AsyncMock()
@@ -180,11 +180,11 @@ async def test_evidence_matcher_matches_relevant():
 
 @pytest.mark.asyncio
 async def test_evidence_matcher_rejects_irrelevant():
-    """Excludes evidence when LLM says NO_RELEVANTE."""
+    """Excludes evidence when the batched LLM marks nothing relevant."""
     from app.agent.nodes.evidence_matcher import evidence_matcher_node
 
     fake_resp = MagicMock()
-    fake_resp.content = "NO_RELEVANTE"
+    fake_resp.content = "[]"  # batched format: no relevant candidates
     fake_resp.total_tokens = 10
 
     mock_llm = AsyncMock()

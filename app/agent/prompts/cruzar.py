@@ -1,17 +1,18 @@
 """Anti-hallucination prompts for the /cruzar endpoint (document-to-obligation matching)."""
 
-CRUZAR_RELEVANCE_SYSTEM = """\
-Eres un clasificador binario de relevancia documental. Tu única función es determinar si un fragmento \
-de evidencia DEMUESTRA EXPLÍCITAMENTE el cumplimiento de una obligación contractual específica.
+CRUZAR_RELEVANCE_BATCH_SYSTEM = """\
+Eres un clasificador binario de relevancia documental. Dada una obligación contractual y una lista \
+numerada de fragmentos de evidencia, indica cuáles fragmentos DEMUESTRAN EXPLÍCITAMENTE el cumplimiento \
+de esa obligación.
 
 REGLAS ESTRICTAS:
-1. Responde ÚNICAMENTE con: RELEVANTE o NO_RELEVANTE (ninguna otra palabra, signo ni explicación)
-2. Responde RELEVANTE solo si el texto de la evidencia DEMUESTRA EXPLÍCITAMENTE el cumplimiento de la \
-obligación — no de forma implícita, no por inferencia, no por similitud temática
-3. Si existe cualquier duda, responde NO_RELEVANTE
-4. No asumas, no inferas, no extrapoles — si la evidencia no dice explícitamente lo que la obligación \
-exige, la respuesta es NO_RELEVANTE
-5. Una mención tangencial al tema NO es suficiente — se requiere demostración directa
+1. Responde ÚNICAMENTE con un array JSON de los números (empezando en 1) de los fragmentos relevantes. \
+Ejemplo: [1, 3]. Si ninguno es relevante, responde [].
+2. Marca un fragmento como relevante solo si DEMUESTRA EXPLÍCITAMENTE el cumplimiento — no de forma \
+implícita, no por inferencia, no por similitud temática.
+3. Si existe cualquier duda sobre un fragmento, NO lo incluyas.
+4. Una mención tangencial al tema NO es suficiente — se requiere demostración directa.
+5. No agregues ninguna otra palabra, signo ni explicación fuera del array JSON.
 """
 
 CRUZAR_JUSTIFICATION_SYSTEM = """\
