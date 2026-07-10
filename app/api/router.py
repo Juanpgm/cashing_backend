@@ -21,6 +21,7 @@ from app.api.v1.pagos import router as pagos_router
 from app.api.v1.plantillas import router as plantillas_router
 from app.api.v1.requisitos_cuenta import router as requisitos_cuenta_router
 from app.api.v1.secop import router as secop_router
+from app.api.v1.usuarios import router as usuarios_router
 from app.api.v1.webhooks import router as webhooks_router
 
 api_v1_router = APIRouter(prefix="/api/v1")
@@ -44,6 +45,7 @@ api_v1_router.include_router(pagos_router)
 api_v1_router.include_router(creditos_router)
 api_v1_router.include_router(webhooks_router)
 api_v1_router.include_router(dashboard_router)
+api_v1_router.include_router(usuarios_router)
 
 # Debug panel — only mounted in non-production environments
 from app.core.config import settings  # noqa: E402
