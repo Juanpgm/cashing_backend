@@ -7,21 +7,21 @@ Ports & Adapters architecture enables future cloud migration without touching co
 
 ## Stack
 
+> ⚠️ Historical/aspirational — the implemented architecture differs; see CLAUDE.md (custom CompiledGraph engine, no LangGraph/CrewAI). In particular: no LangGraph/CrewAI/langgraph-checkpoint dependency (a custom `CompiledGraph` engine in `app/agent/engine.py` is used instead), pgvector is used where available but SQLite dev/test runs fall back without it, and Langfuse is optional/inactive unless `LANGFUSE_*` keys are configured.
+
 | Layer          | Technology                        | Purpose                                           |
 | -------------- | --------------------------------- | ------------------------------------------------- |
 | Runtime        | Python 3.12 + FastAPI             | Async API framework                               |
-| AI Engine      | LangGraph + LiteLLM               | Agent workflows + LLM abstraction (100+ models)   |
-| Subagents      | CrewAI ≥0.100                     | Parallel agent crews (evidence, doc assembly)     |
-| Checkpointing  | langgraph-checkpoint-postgres     | Persistent agent state + HIL resume               |
+| AI Engine      | Custom `CompiledGraph` + LiteLLM  | Agent workflows + LLM abstraction (100+ models)   |
 | Local LLM      | Ollama                            | Zero-cost local models for dev/privacy            |
 | MCP            | mcp[cli] (Anthropic SDK)          | Agent tool servers (Gmail, Drive, Calendar)       |
 | Google APIs    | google-api-python-client          | Gmail, Drive, Calendar integration                |
-| Database       | PostgreSQL 16 + pgvector          | Primary data + semantic search on embeddings      |
+| Database       | PostgreSQL 16 + pgvector (optional) | Primary data + semantic search on embeddings    |
 | Storage        | Cloudflare R2 / MinIO             | S3-compatible object storage                      |
 | Document gen   | WeasyPrint + python-docx + Jinja2 | PDF and DOCX generation from templates            |
 | OCR            | pytesseract + pdf2image           | Scanned document text extraction                  |
 | SECOP          | Socrata API (data.gov.co)         | SECOP II public contracts (datasets jbjy-vk9h, p6dx-8zbt) |
-| Observability  | Langfuse (self-hosted)            | LLM trace logging, quality scores, cost tracking  |
+| Observability  | Langfuse (self-hosted, optional)  | LLM trace logging, quality scores, cost tracking  |
 | Payments       | Wompi                             | Colombian payment gateway                         |
 | Deploy         | Railway                           | Docker container (zero-config CI/CD)              |
 
@@ -63,7 +63,7 @@ make dev
 ## Architecture
 
 ```
-HTTP Request → FastAPI (api/v1/) → Service Layer → LangGraph Agent → LLM + DB + Storage
+HTTP Request → FastAPI (api/v1/) → Service Layer → Agent Engine (CompiledGraph) → LLM + DB + Storage
 ```
 
 ### Ports & Adapters (cloud-agnostic)
@@ -106,7 +106,7 @@ Register in `mcp_servers/mcp_config.json` to use with Claude Code.
 ```
 app/
 ├── api/        # FastAPI routes (/api/v1/)
-├── agent/      # LangGraph AI agent (nodes, prompts, tools, crews)
+├── agent/      # Custom CompiledGraph AI agent (nodes, prompts, tools)
 ├── models/     # SQLAlchemy models (18+ domain models)
 ├── schemas/    # Pydantic v2 schemas
 ├── services/   # Business logic layer
@@ -128,11 +128,22 @@ Copy `.env.example` → `.env` and configure:
 
 ## Deploy (Railway)
 
-Push to GitHub → Railway auto-deploys via `Dockerfile`.
+Push to GitHub → Railway auto-deploys via `Dockerfile` (`railway.toml` sets `builder = "DOCKERFILE"` —
+there is no separate Procfile; the Dockerfile `CMD` is the single source of truth for the start command).
 
-- Start: `alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 2`
+- Start: `uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1` (single worker is intentional —
+  see below)
 - Health check: `GET /health`
 - PostgreSQL managed by Railway
+- **Migrations/schema run in-process at startup**, inside the FastAPI `lifespan` handler
+  (`app/main.py`): `Base.metadata.create_all` builds the base schema (idempotent, source of truth),
+  then Alembic is invoked as a subprocess to either `stamp head` (fresh create_all-built DB) or
+  `upgrade head` (apply pending ALTER deltas on an already-versioned DB). There is no separate
+  release/migration step in the deploy pipeline.
+- **Single worker is intentional**: with migrations running in-process at startup, multiple workers
+  would race to run `create_all`/`alembic stamp-or-upgrade` concurrently on boot. Scale out via
+  Railway replicas (separate instances, each running its own lifespan) rather than `--workers N`
+  in-process, or extract the migration step into a dedicated release phase before increasing workers.
 
 ## License
 

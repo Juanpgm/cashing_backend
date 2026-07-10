@@ -1,5 +1,7 @@
 # Plan de Mejora CashIn — Sistema Agéntico Autónomo de Cuentas de Cobro
 
+> ⚠️ Historical/aspirational — the implemented architecture differs; see CLAUDE.md (custom CompiledGraph engine, no LangGraph/CrewAI).
+
 > **Versión:** 1.0 | **Fecha:** 2026-05-08
 > **Actualizar vía:** `/workflow-improver`
 > **Estado actual:** Fase 0 — En implementación
