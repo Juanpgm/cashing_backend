@@ -75,6 +75,15 @@ class TestResiliencePrompt:
         lowered = SYSTEM_PROMPT_TEMPLATE.lower()
         assert "pregunta al usuario" in lowered or "pídeselo" in lowered
         assert "resiliente" in lowered and "interactivo" in lowered
+
+    def test_prompt_requires_gathering_contrato_mes_anio_before_crear_cuenta(self) -> None:
+        """Regression for the live bug: the model called `crear_cuenta_cobro` with
+        `mes`/`anio` missing right after a zip drop. The prompt must explicitly tell
+        it to gather contrato_id + mes + anio TOGETHER before that call."""
+        lowered = SYSTEM_PROMPT_TEMPLATE.lower()
+        assert "antes de llamar a `crear_cuenta_cobro`" in lowered
+        assert "contrato_id" in lowered
+        assert "mes y anio" in lowered
 from app.tools.context import ToolAttachment
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -290,3 +299,46 @@ async def test_chat_with_tools_imports_document_from_inside_zip(
     docs = rows.scalars().all()
     assert len(docs) == 1
     assert docs[0].nombre == "contrato.docx"
+
+
+@pytest.mark.asyncio
+async def test_premature_crear_cuenta_cobro_shows_clean_error_not_pydantic_dump(
+    db: AsyncSession, test_user: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exact reproduction of the live failure: the model called `crear_cuenta_cobro`
+    with `mes`/`anio` missing (only `contrato_id` supplied). The resulting
+    `ToolEvent.resumen` shown to the user must be a clean Spanish summary — NEVER a
+    raw pydantic dump like "3 validation errors for CuentaCobroCreate ..." — and the
+    loop must recover (not 500) and reach a final assistant answer.
+    """
+    user = test_user["user"]
+    tool_call = LLMToolCall(
+        id="call_1",
+        name="crear_cuenta_cobro",
+        arguments={"contrato_id": str(uuid.uuid4())},  # missing mes AND anio
+    )
+    scripted = ScriptedLLM(
+        [
+            LLMResponse(content="", model="fake", tool_calls=[tool_call], total_tokens=10),
+            LLMResponse(
+                content="¿Para qué mes y año quieres crear la cuenta de cobro?", model="fake", total_tokens=10
+            ),
+        ]
+    )
+    _patch_llm(monkeypatch, scripted)
+
+    result = await agent_chat_service.chat_with_tools(db, user, "Creá la cuenta de febrero", None, {})
+
+    assert scripted.call_count == 2
+    assert len(result.tool_events) == 1
+    event = result.tool_events[0]
+    assert event.tool == "crear_cuenta_cobro"
+    assert event.status == "error"
+
+    lowered = event.resumen.lower()
+    assert "validation error" not in lowered
+    assert "pydantic" not in lowered
+    assert "field required" not in lowered
+    assert "mes" in lowered
+
+    assert result.content == "¿Para qué mes y año quieres crear la cuenta de cobro?"

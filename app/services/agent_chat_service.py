@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 import structlog
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -34,6 +35,7 @@ from app.agent.tools.document_parser import (
     iter_archive_members,
     parse_document,
 )
+from app.core.exceptions import DomainError
 from app.models.conversacion import Conversacion
 from app.models.usuario import Usuario
 from app.schemas.agent import AgentChatResult, DocumentoAdjuntoResumen, LLMMessage, LLMToolCall, ToolEvent
@@ -122,6 +124,11 @@ real, y luego reintentar la operación original con ese valor.
 - Si una herramienta responde con un error de "Field required" (falta un argumento), tu \
 SIGUIENTE llamada debe repetir la misma operación incluyendo TODOS los argumentos obligatorios \
 de su schema (no solo el que faltó) — nunca omitas un argumento obligatorio dos veces seguidas.
+- Antes de llamar a `crear_cuenta_cobro`, reúne SIEMPRE los tres datos juntos: contrato_id \
+(descubierto con `listar_contratos`, nunca nulo), mes y anio. Si el usuario solo dijo el mes \
+(por ejemplo "febrero") y no el año, asume el año en curso solo si es evidente por el contexto; \
+si falta algún dato que no puedes descubrir con una herramienta de lectura, PREGÚNTALO antes de \
+llamar la herramienta — nunca la llames con datos incompletos.
 - NUNCA le pidas al usuario un `contrato_id`, `cuenta_id` ni ningún UUID/ID interno — el \
 usuario no los conoce ni debería tener que conocerlos. Si necesitas uno, descúbrelo con las \
 herramientas de lectura; jamás lo preguntes como si fuera un dato que el usuario pudiera darte.
@@ -486,6 +493,54 @@ def _serialize_tool_result(payload: Any) -> str:
     return serialized
 
 
+# Maps an id-shaped field name to the read-only tool that discovers a real value for
+# it — used by `_format_tool_error` to tell the LLM how to recover from a pydantic
+# validation failure instead of just repeating the same bad call.
+_ID_DISCOVERY_TOOLS = {
+    "contrato_id": "listar_contratos",
+    "cuenta_id": "listar_cuentas_cobro",
+}
+
+
+def _format_tool_error(exc: Exception, tool_name: str) -> tuple[str, str]:
+    """Turn a tool-loop exception into `(user_resumen, llm_detail)`.
+
+    `user_resumen` is what the USER sees in the trace (`ToolEvent.resumen`) — it must
+    read as a clean Spanish sentence, never a raw pydantic/validation dump (the live
+    bug this fixes: the UI showed "3 validation errors for CuentaCobroCreate ..."
+    verbatim). `llm_detail` is fed back to the model as the tool result's "error"
+    field — it can be more technical/actionable since only the LLM reads it, and its
+    job is to make the model's NEXT tool call succeed instead of repeating the same
+    mistake.
+    """
+    if isinstance(exc, ValidationError):
+        campos = list(
+            dict.fromkeys(".".join(str(part) for part in error.get("loc", ())) or "?" for error in exc.errors())
+        )
+        campos_text = ", ".join(campos)
+        user_resumen = f"No pude ejecutar {tool_name}: faltan o son inválidos estos datos: {campos_text}."
+
+        discovery_tools = [tool_hint for field_name, tool_hint in _ID_DISCOVERY_TOOLS.items() if field_name in campos]
+        llm_parts = [f"No se pudo ejecutar `{tool_name}`: faltan o son inválidos estos argumentos: {campos_text}."]
+        if discovery_tools:
+            llm_parts.append(
+                "Antes de reintentar, llama a "
+                + " y a ".join(f"`{t}`" for t in discovery_tools)
+                + " para obtener el/los identificador(es) real(es) — nunca inventes un UUID."
+            )
+        llm_parts.append(
+            "Vuelve a llamar la herramienta incluyendo TODOS sus argumentos obligatorios "
+            "(por ejemplo, mes como entero 1-12 y anio como entero), no solo el que faltó."
+        )
+        return user_resumen, " ".join(llm_parts)
+
+    if isinstance(exc, DomainError):
+        llm_detail = f"{exc.detail} (code={exc.code})" if exc.code else exc.detail
+        return exc.detail, llm_detail
+
+    return f"Ocurrió un error al ejecutar {tool_name}.", str(exc)[:300]
+
+
 async def _load_or_create_conversation(db: AsyncSession, usuario: Usuario, session_id: str | None) -> Conversacion:
     convo: Conversacion | None = None
     if session_id:
@@ -609,9 +664,10 @@ async def chat_with_tools(
         for call in calls:
             spec = TOOL_REGISTRY.get(call.name)
             if spec is None:
-                error_detail = f"Unknown tool: {call.name}"
-                tool_events.append(ToolEvent(tool=call.name, status="error", resumen=error_detail))
-                result_payload: Any = {"error": error_detail}
+                llm_detail = f"Unknown tool: {call.name}"
+                user_resumen = f"No reconozco la herramienta solicitada ({call.name})."
+                tool_events.append(ToolEvent(tool=call.name, status="error", resumen=user_resumen))
+                result_payload: Any = {"error": llm_detail}
             else:
                 try:
                     output = await invoke_tool(call.name, tool_ctx, _normalize_tool_args(call.arguments))
@@ -637,8 +693,9 @@ async def chat_with_tools(
                     # an async-aware context (SQLAlchemy's MissingGreenlet).
                     await db.refresh(usuario)
                     await db.refresh(convo)
-                    result_payload = {"error": str(exc)}
-                    tool_events.append(ToolEvent(tool=call.name, status="error", resumen=str(exc)))
+                    user_resumen, llm_detail = _format_tool_error(exc, call.name)
+                    result_payload = {"error": llm_detail}
+                    tool_events.append(ToolEvent(tool=call.name, status="error", resumen=user_resumen))
                     await logger.awarning("agent_chat_tool_error", tool=call.name, error=str(exc))
 
             messages.append(

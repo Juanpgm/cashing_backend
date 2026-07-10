@@ -17,9 +17,12 @@ from app.core.exceptions import CHECKLIST_INCOMPLETE, DomainError, NotFoundError
 from app.core.security import hash_password
 from app.models.contrato import Contrato
 from app.models.usuario import Usuario
+from app.schemas.cuenta_cobro import CuentaCobroCreate
+from app.tools.catalog.cuentas import CrearCuentaCobroInput
 from app.tools.context import ToolContext
 from app.tools.invoke import invoke_tool, list_tools
 from app.tools.registry import TOOL_REGISTRY
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 EXPECTED_TOOL_NAMES = {
@@ -152,3 +155,83 @@ async def test_crear_cuenta_cobro_then_radicar_incomplete_checklist(db: AsyncSes
     with pytest.raises(DomainError) as exc_info:
         await invoke_tool("radicar_cuenta", ctx, {"cuenta_id": str(cuenta_response.id)})
     assert exc_info.value.code == CHECKLIST_INCOMPLETE
+
+
+class TestCrearCuentaCobroInputMonthNames:
+    """`crear_cuenta_cobro` must accept a Spanish month NAME for `mes` — the live bug:
+    the user said "creá la cuenta de febrero" and the tool only understood integers.
+    The lenient parsing lives ONLY on this tool-specific input model, never on the
+    shared REST schema `CuentaCobroCreate`."""
+
+    _CONTRATO_ID = "00000000-0000-0000-0000-000000000000"
+
+    def test_lowercase_month_name_coerced_to_int(self) -> None:
+        params = CrearCuentaCobroInput(contrato_id=self._CONTRATO_ID, mes="febrero", anio=2026)
+        assert params.mes == 2
+
+    def test_capitalized_month_name_coerced_to_int(self) -> None:
+        params = CrearCuentaCobroInput(contrato_id=self._CONTRATO_ID, mes="Diciembre", anio=2026)
+        assert params.mes == 12
+
+    def test_numeric_string_coerced_to_int(self) -> None:
+        params = CrearCuentaCobroInput(contrato_id=self._CONTRATO_ID, mes="2", anio=2026)
+        assert params.mes == 2
+
+    def test_integer_month_passes_through_unchanged(self) -> None:
+        params = CrearCuentaCobroInput(contrato_id=self._CONTRATO_ID, mes=7, anio=2026)
+        assert params.mes == 7
+
+    def test_setiembre_spelling_variant_accepted(self) -> None:
+        params = CrearCuentaCobroInput(contrato_id=self._CONTRATO_ID, mes="setiembre", anio=2026)
+        assert params.mes == 9
+
+    def test_unknown_month_name_fails_validation(self) -> None:
+        with pytest.raises(ValidationError):
+            CrearCuentaCobroInput(contrato_id=self._CONTRATO_ID, mes="xyz", anio=2026)
+
+    def test_out_of_range_numeric_month_still_fails(self) -> None:
+        with pytest.raises(ValidationError):
+            CrearCuentaCobroInput(contrato_id=self._CONTRATO_ID, mes=13, anio=2026)
+
+    def test_model_dump_builds_a_valid_cuenta_cobro_create(self) -> None:
+        """The handler builds `CuentaCobroCreate(**params.model_dump())` — proves that
+        round-trip stays valid once `mes` has been coerced to an int."""
+        params = CrearCuentaCobroInput(contrato_id=self._CONTRATO_ID, mes="febrero", anio=2026)
+        payload = CuentaCobroCreate(**params.model_dump())
+        assert payload.mes == 2
+        assert payload.anio == 2026
+
+    @pytest.mark.asyncio
+    async def test_invoke_tool_end_to_end_with_month_name(self, db: AsyncSession) -> None:
+        user = Usuario(
+            email="crear_cuenta_mes@example.com",
+            nombre="Mes Nombre User",
+            cedula="40404040",
+            password_hash=hash_password("StrongPass1!"),
+            rol="contratista",
+            activo=True,
+            creditos_disponibles=100,
+        )
+        db.add(user)
+        await db.flush()
+        contrato = Contrato(
+            usuario_id=user.id,
+            numero_contrato="TC-MES-0001",
+            objeto="Objeto de prueba para mes por nombre",
+            valor_total=12_000_000,
+            valor_mensual=1_000_000,
+            fecha_inicio=date(2026, 1, 1),
+            fecha_fin=date(2026, 12, 31),
+            documento_proveedor="40404040",
+        )
+        db.add(contrato)
+        await db.commit()
+        await db.refresh(user)
+        await db.refresh(contrato)
+
+        ctx = ToolContext(db=db, usuario=user)
+        cuenta = await invoke_tool(
+            "crear_cuenta_cobro", ctx, {"contrato_id": str(contrato.id), "mes": "febrero", "anio": 2026}
+        )
+        assert cuenta.mes == 2
+        assert cuenta.anio == 2026
