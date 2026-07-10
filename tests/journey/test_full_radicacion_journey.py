@@ -27,16 +27,18 @@ Journey (all steps via the HTTP API, ASGITransport client from conftest.py):
   10. Autogenerate the two informes (INFORME_ACTIVIDADES / INFORME_SUPERVISION).
   11. Radicar -> 200, estado=enviada, fecha_envio set.
 
-FRICTION FOUND (documented, not fixed — this is a test-only slice):
-  SECOP import always returns `obligaciones=[]` (see
-  `secop_service._mapear_a_contrato_create`) — SECOP has no obligaciones
-  dataset. A contract imported from SECOP has ZERO obligaciones until the user
-  (or an LLM extraction step, not exercised here) adds them via
-  `POST /contratos/{id}/obligaciones`. That call is made below but is
-  deliberately NOT counted in the manual/auto ledger: it's a step the journey
-  as specified doesn't ask us to score, but it is real friction worth flagging
-  — a SECOP-imported contract looks "ready" but silently blocks
-  actividades/informe generation until obligaciones exist.
+FRICTION FOUND (partially mitigated, bug #6):
+  SECOP's `objeto` field is usually a short paragraph with no enumerated
+  obligations section, so `secop_service._mapear_a_contrato_create` and the
+  best-effort LLM fallback in `importar_contratos_secop` commonly still land
+  on ZERO obligaciones (as exercised below, with the LLM mocked to return
+  nothing — see bug #6 fix). Unlike before, this is no longer a silent dead
+  end: the import result now carries `requiere_obligaciones=true` per
+  contract, so a caller can react immediately instead of discovering the gap
+  deep inside `contrato_service.contrato_listo`. The user still has to add
+  obligaciones via `POST /contratos/{id}/obligaciones`; that call is made
+  below but is deliberately NOT counted in the manual/auto ledger: it's a step
+  the journey as specified doesn't ask us to score.
 """
 
 from __future__ import annotations
@@ -178,11 +180,23 @@ async def test_full_radicacion_journey(
         "documento_proveedor": cedula,
     }
 
-    with patch(
-        "app.services.secop_service._query_socrata",
-        new_callable=AsyncMock,
-        return_value=[secop_row],
+    # LLM fallback: the objeto text above has no enumerated obligations section,
+    # so the best-effort extraction (bug #6) genuinely finds nothing here — mocked
+    # deterministically instead of hitting a real provider.
+    empty_obligaciones_llm = LLMResponse(content="", model="fake", total_tokens=5)
+
+    with (
+        patch(
+            "app.services.secop_service._query_socrata",
+            new_callable=AsyncMock,
+            return_value=[secop_row],
+        ),
+        patch("app.adapters.llm.get_llm") as mock_get_llm,
     ):
+        mock_llm = AsyncMock()
+        mock_llm.complete = AsyncMock(return_value=empty_obligaciones_llm)
+        mock_get_llm.return_value = mock_llm
+
         resp = await client.post(
             f"/api/v1/secop/importar?documento_proveedor={cedula}&confirmar=true",
             headers=headers,
@@ -196,6 +210,7 @@ async def test_full_radicacion_journey(
     assert contrato["supervisor_nombre"] == "Carlos Supervisor"
     assert Decimal(contrato["valor_mensual"]) > 0
     assert contrato["obligaciones"] == []  # confirms the friction noted in the module docstring
+    assert contrato["requiere_obligaciones"] is True  # bug #6: no silent dead end
     ledger.auto("SECOP auto-completó numero_contrato/objeto/valores/fechas/entidad/supervisor")
     contrato_id = contrato["id"]
 

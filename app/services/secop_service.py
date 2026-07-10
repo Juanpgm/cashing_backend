@@ -16,17 +16,20 @@ import structlog
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent.tools.contract_parser import extract_obligaciones_verbatim
 from app.core.config import settings
 from app.core.exceptions import ExternalServiceError, NotFoundError, ValidationError
 from app.models.categoria_documento import CategoriaDocumento
 from app.models.contrato import Contrato
+from app.models.obligacion import Obligacion, TipoObligacion
 from app.models.secop import SecopContrato, SecopDocumento, SecopProceso
-from app.schemas.contrato import ContratoCreate, ContratoResponse
+from app.schemas.contrato import ContratoCreate, ContratoResponse, ObligacionCreate
 from app.schemas.secop import (
     ArchivoComprimidoResponse,
     ArchivoInternoItem,
     SecopConsultaCompletaResponse,
     SecopContratoDetalleResponse,
+    SecopContratoImportado,
     SecopContratoResponse,
     SecopDocumentoResponse,
     SecopImportResult,
@@ -50,6 +53,14 @@ _ALL_DOCS_DATASETS = (_DS_DOCS_HIST, _DS_DOCS_2022, _DS_DOCS_2023, _DS_DOCS_2025
 _CACHE_TTL = timedelta(hours=24)
 _CACHE_TTL_DOCS = timedelta(hours=2)  # Documents refresh more frequently
 _PRESTACION = "prestaci"  # substring present in all "Prestación de Servicios" variants
+
+# The per-contract LLM obligaciones fallback (see importar_contratos_secop) can
+# take minutes across retries and the fallback chain. Bound it so a bulk SECOP
+# import can never hang or fail because of it: cap the wall-clock time per
+# contract, and cap how many contracts in a single import run attempt it at
+# all (the rest simply keep requiere_obligaciones=true for manual follow-up).
+SECOP_OBLIGACIONES_LLM_TIMEOUT_S = 20
+SECOP_OBLIGACIONES_LLM_MAX_CONTRATOS = 5
 
 
 # ---------------------------------------------------------------------------
@@ -842,6 +853,14 @@ def _mapear_a_contrato_create(row: dict[str, Any]) -> ContratoCreate | None:
     if entidad:
         entidad = entidad[:255]
 
+    # Best-effort, deterministic first pass: SECOP's "objeto" is usually a short
+    # paragraph with no enumerated obligations section, so this normally yields
+    # nothing — the LLM fallback in importar_contratos_secop picks up from there.
+    obligaciones = [
+        ObligacionCreate(descripcion=o.descripcion, tipo=o.tipo, orden=o.orden, etiqueta=o.etiqueta)
+        for o in extract_obligaciones_verbatim(objeto)
+    ]
+
     return ContratoCreate(
         numero_contrato=numero,
         objeto=objeto,
@@ -853,7 +872,7 @@ def _mapear_a_contrato_create(row: dict[str, Any]) -> ContratoCreate | None:
         supervisor_nombre=supervisor,
         entidad=entidad,
         dependencia=None,
-        obligaciones=[],
+        obligaciones=obligaciones,
     )
 
 
@@ -888,12 +907,16 @@ async def importar_contratos_secop(
     )
     existing_numeros = {r[0] for r in existing_result.all()}
 
-    importados: list[ContratoResponse] = []
+    importados: list[SecopContratoImportado] = []
     omitidos_duplicados = 0
     omitidos_invalidos = 0
     actualizados = 0
+    llm_obligaciones_intentos = 0
 
     from sqlalchemy.orm import selectinload
+
+    def _to_importado(resp: ContratoResponse) -> SecopContratoImportado:
+        return SecopContratoImportado(**resp.model_dump(), requiere_obligaciones=not resp.obligaciones)
 
     for row in rows:
         data = _mapear_a_contrato_create(row)
@@ -904,25 +927,29 @@ async def importar_contratos_secop(
         es_duplicado = data.numero_contrato in existing_numeros
 
         if not confirmar:
-            # Preview mode: build response without persisting
+            # Preview mode: build response without persisting. Obligaciones are
+            # never populated here (no persisted ids to attach them to), so the
+            # signal always reflects that follow-up is needed once confirmed.
             importados.append(
-                ContratoResponse(
-                    id=uuid.uuid4(),
-                    usuario_id=usuario_id,
-                    numero_contrato=data.numero_contrato,
-                    objeto=data.objeto,
-                    valor_total=data.valor_total,
-                    valor_adicion=data.valor_adicion,
-                    valor_mensual=data.valor_mensual,
-                    fecha_inicio=data.fecha_inicio,
-                    fecha_fin=data.fecha_fin,
-                    supervisor_nombre=data.supervisor_nombre,
-                    entidad=data.entidad,
-                    dependencia=data.dependencia,
-                    documento_proveedor=documento_proveedor,
-                    obligaciones=[],
-                    created_at=datetime.now(tz=UTC),
-                    updated_at=datetime.now(tz=UTC),
+                _to_importado(
+                    ContratoResponse(
+                        id=uuid.uuid4(),
+                        usuario_id=usuario_id,
+                        numero_contrato=data.numero_contrato,
+                        objeto=data.objeto,
+                        valor_total=data.valor_total,
+                        valor_adicion=data.valor_adicion,
+                        valor_mensual=data.valor_mensual,
+                        fecha_inicio=data.fecha_inicio,
+                        fecha_fin=data.fecha_fin,
+                        supervisor_nombre=data.supervisor_nombre,
+                        entidad=data.entidad,
+                        dependencia=data.dependencia,
+                        documento_proveedor=documento_proveedor,
+                        obligaciones=[],
+                        created_at=datetime.now(tz=UTC),
+                        updated_at=datetime.now(tz=UTC),
+                    )
                 )
             )
             existing_numeros.add(data.numero_contrato)
@@ -954,7 +981,7 @@ async def importar_contratos_secop(
                     .options(selectinload(Contrato.obligaciones))
                     .where(Contrato.id == existing_contrato.id)
                 )
-                importados.append(ContratoResponse.model_validate(result.scalar_one()))
+                importados.append(_to_importado(ContratoResponse.model_validate(result.scalar_one())))
                 actualizados += 1
             else:
                 omitidos_duplicados += 1
@@ -976,12 +1003,61 @@ async def importar_contratos_secop(
         )
         db.add(contrato)
         await db.flush()
+
+        if data.obligaciones:
+            for ob in data.obligaciones:
+                db.add(
+                    Obligacion(
+                        contrato_id=contrato.id,
+                        descripcion=ob.descripcion,
+                        tipo=TipoObligacion(ob.tipo),
+                        orden=ob.orden,
+                        etiqueta=ob.etiqueta,
+                    )
+                )
+            await db.flush()
+        elif llm_obligaciones_intentos >= SECOP_OBLIGACIONES_LLM_MAX_CONTRATOS:
+            # Per-run cap reached — the LLM fallback (retries x timeout x
+            # fallback chain) is too slow to run for every contract in a bulk
+            # import. Remaining contracts simply keep requiere_obligaciones=true
+            # for manual follow-up.
+            log.info(
+                "secop_obligaciones_llm_skipped_cap",
+                contrato_id=str(contrato.id),
+                numero_contrato=data.numero_contrato,
+                max_contratos=SECOP_OBLIGACIONES_LLM_MAX_CONTRATOS,
+            )
+        else:
+            # Best-effort LLM fallback — must never fail or hang the import.
+            llm_obligaciones_intentos += 1
+            try:
+                from app.services.document_service import extraer_obligaciones_texto
+
+                await asyncio.wait_for(
+                    extraer_obligaciones_texto(data.objeto, contrato.id, db),
+                    timeout=SECOP_OBLIGACIONES_LLM_TIMEOUT_S,
+                )
+            except TimeoutError:
+                log.warning(
+                    "secop_obligaciones_extraction_timeout",
+                    contrato_id=str(contrato.id),
+                    numero_contrato=data.numero_contrato,
+                    timeout_s=SECOP_OBLIGACIONES_LLM_TIMEOUT_S,
+                )
+            except Exception as exc:
+                log.warning(
+                    "secop_obligaciones_extraction_failed",
+                    contrato_id=str(contrato.id),
+                    numero_contrato=data.numero_contrato,
+                    error=str(exc),
+                )
+
         existing_numeros.add(data.numero_contrato)
 
         result = await db.execute(
             select(Contrato).options(selectinload(Contrato.obligaciones)).where(Contrato.id == contrato.id)
         )
-        importados.append(ContratoResponse.model_validate(result.scalar_one()))
+        importados.append(_to_importado(ContratoResponse.model_validate(result.scalar_one())))
 
     if confirmar:
         await db.commit()

@@ -191,6 +191,12 @@ class ArchivoComprimidoResponse(BaseModel):
     error: str | None = None
 
 
+class SecopContratoImportado(ContratoResponse):
+    """ContratoResponse extendido con la señal de obligaciones pendientes tras el import SECOP."""
+
+    requiere_obligaciones: bool = False
+
+
 class SecopImportResult(BaseModel):
     """Resultado de importar contratos SECOP a la base de datos del usuario."""
 
@@ -200,4 +206,4 @@ class SecopImportResult(BaseModel):
     actualizados: int = 0
     omitidos_duplicados: int
     omitidos_invalidos: int
-    contratos: list[ContratoResponse]
+    contratos: list[SecopContratoImportado]
