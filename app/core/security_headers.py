@@ -3,10 +3,10 @@
 from collections.abc import Awaitable, Callable
 
 from fastapi import Request, Response
-from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.core.config import settings
+from app.core.error_response import internal_error_response
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -18,13 +18,16 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     _TEST_UI_PATHS = {"/test-ui", "/static/test_ui.html"}
 
     async def dispatch(self, request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
+        # Catch unhandled exceptions and RETURN the shared redacted error
+        # response instead of re-raising, so the response still gets these
+        # security headers applied below. Re-raising used to let Starlette's
+        # ServerErrorMiddleware (which sits OUTSIDE all app middleware) build
+        # the response instead, skipping this middleware entirely (see also
+        # AuditMiddleware, which had the identical bug).
         try:
             response = await call_next(request)
         except Exception as exc:
-            response = JSONResponse(
-                status_code=500,
-                content={"detail": f"{type(exc).__name__}: {exc}"},
-            )
+            response = internal_error_response(request, exc)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["X-XSS-Protection"] = "1; mode=block"

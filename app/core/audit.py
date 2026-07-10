@@ -7,6 +7,8 @@ import structlog
 from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from app.core.error_response import internal_error_response
+
 logger = structlog.get_logger("audit")
 
 
@@ -25,11 +27,26 @@ class AuditMiddleware(BaseHTTPMiddleware):
         try:
             response = await call_next(request)
         except Exception as exc:
-            from fastapi.responses import JSONResponse
-            response = JSONResponse(
-                status_code=500,
-                content={"detail": f"{type(exc).__name__}: {exc}"},
+            # Build the redacted error response here and RETURN it (do not
+            # re-raise) so it flows out through the normal middleware chain —
+            # CORSMiddleware and SecurityHeadersMiddleware still run on it.
+            # Re-raising used to let Starlette's ServerErrorMiddleware (which
+            # sits OUTSIDE all app middleware) build the response instead,
+            # which bypassed CORS/security headers entirely and produced an
+            # opaque, browser-blocked cross-origin error with no trace_id.
+            await logger.ainfo(
+                "request",
+                trace_id=trace_id,
+                method=request.method,
+                path=request.url.path,
+                status=500,
+                user_id=user_id,
+                ip=request.client.host if request.client else "unknown",
+                user_agent=request.headers.get("user-agent", ""),
             )
+            error_response = internal_error_response(request, exc)
+            error_response.headers["X-Trace-Id"] = trace_id
+            return error_response
 
         await logger.ainfo(
             "request",

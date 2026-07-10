@@ -15,6 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from app.api.router import api_v1_router
 from app.core.audit import AuditMiddleware
 from app.core.config import settings
+from app.core.error_response import internal_error_response
 from app.core.exceptions import DomainError, domain_to_http
 from app.core.rate_limit import limiter
 from app.core.security_headers import SecurityHeadersMiddleware
@@ -198,18 +199,11 @@ async def integrity_error_handler(request: Request, exc: IntegrityError) -> JSON
 
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-    trace_id = getattr(request.state, "trace_id", None)
-    structlog.get_logger("app").error(
-        "unhandled_exception",
-        exc_type=type(exc).__name__,
-        exc_msg=str(exc),
-        path=request.url.path,
-        trace_id=trace_id,
-    )
-    return JSONResponse(
-        status_code=500,
-        content={"detail": f"{type(exc).__name__}: {exc}", "trace_id": trace_id},
-    )
+    # Last-resort handler for exceptions raised outside AuditMiddleware and
+    # SecurityHeadersMiddleware (e.g. in routing itself). Delegates to the
+    # same shared builder those middlewares use so the redaction rule is
+    # applied identically everywhere.
+    return internal_error_response(request, exc)
 
 
 # --- Routes ---

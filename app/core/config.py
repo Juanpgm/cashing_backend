@@ -19,7 +19,9 @@ class Settings(BaseSettings):
 
     # MCP server — mounts the curated tool registry (app.tools.registry.TOOL_REGISTRY)
     # at /mcp via app.mcp.server. Never exposes auth/payments/credits — see app/tools/catalog.
-    MCP_ENABLED: bool = True
+    # Off by default (pilot hardening): opt in explicitly via .env once the surface
+    # has been reviewed for the deployment target, rather than exposing it by default.
+    MCP_ENABLED: bool = False
 
     # Database
     DATABASE_URL: str = "postgresql+asyncpg://cashin:password@localhost:5432/cashin"
