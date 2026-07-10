@@ -39,6 +39,7 @@ async def chat(
     user: CurrentUser,
     message: str = Form(..., min_length=1, max_length=5000),
     session_id: str | None = Form(None),
+    contrato_id: str | None = Form(None),
     files: list[UploadFile] = File(default=[]),
     db: AsyncSession = Depends(get_db),
 ) -> AgentChatResult:
@@ -52,6 +53,11 @@ async def chat(
     Accepts up to 5 file attachments per message, any format except executables
     (same allowlist as evidence uploads — see `validate_evidence_file`), with a
     combined size cap of 40 MB across all attachments in the message.
+
+    `contrato_id` is an OPTIONAL contract context (e.g. the contract the user has
+    currently open in the UI) so the agent never has to ask the user for a raw UUID.
+    It is resolved defensively by the service — a missing, malformed, unknown, or
+    not-owned value is silently ignored (never a 4xx/5xx for this alone).
     """
     if len(files) > MAX_CHAT_FILES:
         raise ValidationError(f"Máximo {MAX_CHAT_FILES} archivos por mensaje.")
@@ -87,4 +93,5 @@ async def chat(
         message=message,
         session_id=session_id,
         attachments=attachments,
+        contrato_id=contrato_id,
     )

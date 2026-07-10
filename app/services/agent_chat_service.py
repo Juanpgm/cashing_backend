@@ -26,6 +26,7 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import app.tools.catalog  # noqa: F401 — import-for-side-effect: populates TOOL_REGISTRY
 from app.adapters.llm import get_llm
 from app.agent.tools.document_parser import (
     _NON_TEXT_EXTENSIONS,
@@ -36,7 +37,7 @@ from app.agent.tools.document_parser import (
 from app.models.conversacion import Conversacion
 from app.models.usuario import Usuario
 from app.schemas.agent import AgentChatResult, DocumentoAdjuntoResumen, LLMMessage, LLMToolCall, ToolEvent
-import app.tools.catalog  # noqa: F401 — import-for-side-effect: populates TOOL_REGISTRY
+from app.services import contrato_service
 from app.tools.context import ToolAttachment, ToolContext
 from app.tools.invoke import invoke_tool
 from app.tools.llm_schema import to_openai_tools
@@ -121,6 +122,19 @@ real, y luego reintentar la operación original con ese valor.
 - Si una herramienta responde con un error de "Field required" (falta un argumento), tu \
 SIGUIENTE llamada debe repetir la misma operación incluyendo TODOS los argumentos obligatorios \
 de su schema (no solo el que faltó) — nunca omitas un argumento obligatorio dos veces seguidas.
+- NUNCA le pidas al usuario un `contrato_id`, `cuenta_id` ni ningún UUID/ID interno — el \
+usuario no los conoce ni debería tener que conocerlos. Si necesitas uno, descúbrelo con las \
+herramientas de lectura; jamás lo preguntes como si fuera un dato que el usuario pudiera darte.
+- Para obtener un contrato: si más abajo hay una sección "## Contexto del contrato", usa ESE \
+contrato_id directamente sin llamar a ninguna herramienta para buscarlo. Si no hay esa sección, \
+llama a `listar_contratos`: si devuelve exactamente un contrato, úsalo sin preguntar nada; si \
+devuelve varios, pregúntale al usuario cuál usar identificándolo por su NÚMERO DE CONTRATO, \
+ENTIDAD u OBJETO (nunca por UUID) y espera su respuesta antes de continuar.
+- Lo mismo aplica para la cuenta de cobro: descúbrela con `listar_cuentas_cobro`; si hay que \
+elegir entre varias, pregunta por mes/año/estado — nunca por su id.
+- Si el usuario adjuntó documentos y en su texto o en el documento aparece un número de \
+contrato, puedes llamar a `listar_contratos` y hacer coincidir por ese número para identificar \
+el contrato correcto — sin pedirle el id en ningún momento.
 - Si el usuario adjuntó archivos en este mensaje, están resumidos más abajo; su \
 contenido de texto ya fue extraído (incluye archivos comprimidos .zip/.tar.gz, cuyo \
 contenido se expande archivo por archivo, y formatos de texto como .txt/.csv/.md/.json). \
@@ -136,14 +150,59 @@ mediante una llamada de función real, nunca describiéndola en el contenido del
 - Sé conciso, directo y profesional."""
 
 
-def _build_system_prompt(attachment_blocks: list[str], importable_filenames: list[str] | None = None) -> str:
+_MAX_OBJETO_CONTEXT_CHARS = 200
+
+
+def _build_system_prompt(
+    attachment_blocks: list[str],
+    importable_filenames: list[str] | None = None,
+    contrato_context: str | None = None,
+) -> str:
     prompt = SYSTEM_PROMPT_TEMPLATE.format(today=date.today().isoformat())
+    if contrato_context:
+        prompt += "\n\n## Contexto del contrato\n\n" + contrato_context
     if attachment_blocks:
         prompt += "\n\n## Archivos adjuntados en este mensaje\n\n" + "\n\n".join(attachment_blocks)
     if importable_filenames:
         nombres = ", ".join(f"`{name}`" for name in importable_filenames)
         prompt += f"\n\nArchivos que puedes importar por nombre exacto: {nombres}."
     return prompt
+
+
+async def _resolve_contrato_context(db: AsyncSession, usuario: Usuario, contrato_id: str | None) -> str | None:
+    """Resolve an OPTIONAL contract context passed by the frontend into a system-prompt block.
+
+    Never raises: a missing/blank/malformed UUID, an unknown contrato_id, or one not
+    owned by `usuario` all resolve to `None` (the agent falls back to discovering the
+    contract itself via `listar_contratos`) — this is a convenience hint, not a
+    trust boundary the rest of the request depends on.
+    """
+    if not contrato_id or not contrato_id.strip():
+        return None
+
+    try:
+        parsed_id = uuid.UUID(contrato_id.strip())
+    except ValueError:
+        await logger.awarning("agent_chat_contrato_context_invalid_uuid", contrato_id=contrato_id)
+        return None
+
+    try:
+        contrato = await contrato_service.obtener_contrato(db, usuario.id, parsed_id)
+    except Exception as exc:
+        # Broad by design: `obtener_contrato` raises `NotFoundError` for an unknown or
+        # not-owned contrato_id, but this helper must never let ANY failure here (a bad
+        # id is just an untrusted hint from the client) escalate into a 4xx/5xx for the
+        # whole chat request.
+        await logger.adebug("agent_chat_contrato_context_not_resolved", contrato_id=contrato_id, error=str(exc))
+        return None
+
+    objeto = contrato.objeto[:_MAX_OBJETO_CONTEXT_CHARS] if contrato.objeto else ""
+    return (
+        "El usuario está trabajando sobre este contrato (usa este contrato_id cuando "
+        "necesites un contrato; NO lo pidas): "
+        f"contrato_id={contrato.id} | N° contrato: {contrato.numero_contrato} | "
+        f"Entidad: {contrato.entidad or 'no registrada'} | Objeto: {objeto}."
+    )
 
 
 def _extract_attachment_text(attachment: ToolAttachment) -> str:
@@ -301,6 +360,32 @@ def _coerce_args_dict(value: Any) -> dict[str, Any] | None:
     return None
 
 
+_TOOL_CALL_WRAPPER_KEYS = {"function", "name", "tool", "arguments", "parameters", "args"}
+
+
+def _normalize_tool_args(args: Any) -> dict[str, Any]:
+    """Unwrap a tool-call arguments dict a weak model wrapped in an OpenAI-ish
+    envelope before it reaches `invoke_tool`.
+
+    llama3.1:8b sometimes emits the arguments as `{"function": "crear_cuenta_cobro",
+    "parameters": {...}}` or `{"name": ..., "arguments": {...}}` instead of the real
+    arguments — passing that straight to the tool's input model would always fail
+    validation. When EVERY key of `args` is an envelope key (so a genuine argument
+    named, say, `contrato_id` is never stripped), return the inner params dict; a
+    wrapper with no inner object collapses to `{}`. Non-wrapper dicts pass through
+    unchanged.
+    """
+    if not isinstance(args, dict) or not args:
+        return args if isinstance(args, dict) else {}
+    if not set(args.keys()) <= _TOOL_CALL_WRAPPER_KEYS:
+        return args
+    for inner_key in ("parameters", "arguments", "args"):
+        inner = args.get(inner_key)
+        if isinstance(inner, dict):
+            return inner
+    return {}
+
+
 def _match_named_shape(candidate: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
     """Match `{"name"/"tool"/"function": <tool name>, "arguments"/"parameters"/"args": {...}}`.
 
@@ -431,12 +516,17 @@ async def chat_with_tools(
     message: str,
     session_id: str | None,
     attachments: dict[str, ToolAttachment] | None = None,
+    contrato_id: str | None = None,
 ) -> AgentChatResult:
     """Run the free-form tool-calling loop for one user message and persist history.
 
     Tool-call/tool-result messages are exchanged with the LLM within this call only
     — they are never written to `Conversacion.mensajes_json`. Only the user message
     and the final assistant answer are persisted, mirroring `agent_service.chat`.
+
+    `contrato_id` is an OPTIONAL contract context supplied by the caller (e.g. the
+    contract the user currently has open in the UI) — see `_resolve_contrato_context`.
+    It saves the agent a round trip of asking the user for a UUID they don't have.
     """
     attachments = attachments or {}
 
@@ -461,7 +551,8 @@ async def chat_with_tools(
     expanded_attachments = _expand_attachments_for_tools(attachments)
     importable_filenames = list(expanded_attachments.keys()) if attachments else []
 
-    system_prompt = _build_system_prompt(attachment_blocks, importable_filenames)
+    contrato_context = await _resolve_contrato_context(db, usuario, contrato_id)
+    system_prompt = _build_system_prompt(attachment_blocks, importable_filenames, contrato_context)
     messages: list[LLMMessage] = [
         LLMMessage(role="system", content=system_prompt),
         *history,
@@ -523,14 +614,12 @@ async def chat_with_tools(
                 result_payload: Any = {"error": error_detail}
             else:
                 try:
-                    output = await invoke_tool(call.name, tool_ctx, call.arguments)
+                    output = await invoke_tool(call.name, tool_ctx, _normalize_tool_args(call.arguments))
                     if "write" in spec.tags:
                         await db.commit()
                     dumped = output.model_dump(mode="json")
                     result_payload = dumped
-                    tool_events.append(
-                        ToolEvent(tool=call.name, status="ok", resumen=_summarize_tool_result(dumped))
-                    )
+                    tool_events.append(ToolEvent(tool=call.name, status="ok", resumen=_summarize_tool_result(dumped)))
                 except Exception as exc:
                     # Broad by design: a tool doing real I/O can raise anything (DomainError,
                     # pydantic ValidationError, KeyError/ValueError/TypeError from bad

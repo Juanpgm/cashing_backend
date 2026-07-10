@@ -114,6 +114,41 @@ async def test_aggregate_attachment_size_over_cap_rejected(client: AsyncClient, 
     assert response.status_code in (400, 422)
 
 
+@pytest.mark.asyncio
+async def test_chat_with_contrato_id_form_field_returns_200(client: AsyncClient, test_user: dict[str, Any]) -> None:
+    """The `contrato_id` Form field is OPTIONAL contract context — an unknown/foreign
+    id must never fail the request (it's resolved defensively by the service)."""
+    fake_llm = _ScriptedLLM([LLMResponse(content="Hola, ¿en qué te ayudo?", model="fake", total_tokens=5)])
+
+    with patch("app.services.agent_chat_service.get_llm", return_value=fake_llm):
+        response = await client.post(
+            "/api/v1/agent/chat",
+            headers=test_user["headers"],
+            data={"message": "Hola", "contrato_id": "00000000-0000-0000-0000-000000000000"},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body.keys()) == {"session_id", "content", "tool_events", "documentos", "tokens_used"}
+
+
+@pytest.mark.asyncio
+async def test_chat_with_malformed_contrato_id_does_not_break_request(
+    client: AsyncClient, test_user: dict[str, Any]
+) -> None:
+    fake_llm = _ScriptedLLM([LLMResponse(content="Hola, ¿en qué te ayudo?", model="fake", total_tokens=5)])
+
+    with patch("app.services.agent_chat_service.get_llm", return_value=fake_llm):
+        response = await client.post(
+            "/api/v1/agent/chat",
+            headers=test_user["headers"],
+            data={"message": "Hola", "contrato_id": "not-a-valid-uuid"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["content"] == "Hola, ¿en qué te ayudo?"
+
+
 def test_chat_endpoint_has_rate_limit_decorator() -> None:
     """Confirm `@limiter.limit(...)` guards POST /agent/chat, mirroring documentos.py."""
     source = Path(agent_chat_module.__file__).read_text(encoding="utf-8")

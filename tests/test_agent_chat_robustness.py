@@ -27,8 +27,39 @@ from app.services import agent_chat_service
 from app.services.agent_chat_service import (
     SYSTEM_PROMPT_TEMPLATE,
     _expand_attachments_for_tools,
+    _normalize_tool_args,
     _recover_tool_calls_from_content,
 )
+
+
+class TestNormalizeToolArgs:
+    """llama3.1:8b sometimes wraps tool arguments in an OpenAI-ish envelope
+    (`{"function": "crear_cuenta_cobro", "parameters": {...}}`) instead of sending
+    the real args — those must be unwrapped before invoke_tool."""
+
+    def test_unwraps_function_parameters_envelope(self) -> None:
+        assert _normalize_tool_args(
+            {"function": "crear_cuenta_cobro", "parameters": {"mes": 2, "anio": 2026}}
+        ) == {"mes": 2, "anio": 2026}
+
+    def test_unwraps_name_arguments_envelope(self) -> None:
+        assert _normalize_tool_args({"name": "listar_contratos", "arguments": {}}) == {}
+
+    def test_empty_wrapper_collapses_to_empty(self) -> None:
+        assert _normalize_tool_args({"function": "listar_contratos"}) == {}
+
+    def test_real_args_pass_through_untouched(self) -> None:
+        real = {"contrato_id": "abc", "mes": 2, "anio": 2026}
+        assert _normalize_tool_args(real) == real
+
+    def test_mixed_real_and_wrapper_key_not_stripped(self) -> None:
+        # A genuine arg alongside a wrapper-looking key must NOT be unwrapped.
+        mixed = {"contrato_id": "abc", "parameters": {"mes": 2}}
+        assert _normalize_tool_args(mixed) == mixed
+
+    def test_non_dict_returns_empty_dict(self) -> None:
+        assert _normalize_tool_args(None) == {}
+        assert _normalize_tool_args("nope") == {}
 
 
 class TestResiliencePrompt:
