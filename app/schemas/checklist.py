@@ -90,6 +90,15 @@ class RequisitoChecklistItem(BaseModel):
     candidatos_secop: list[SecopCandidatoOut] = Field(default_factory=list)
     candidatos_documentos_fuente: list[DocumentoFuenteRef] = Field(default_factory=list)
     updated_at: datetime | None = None
+    deteccion_error: str | None = Field(
+        None,
+        description=(
+            "Set when the last SECOP auto-detection or auto-link pass raised an error "
+            "while processing THIS requisito in the current request. The row is left "
+            "PENDIENTE (or unchanged) instead of failing the whole scan; the frontend "
+            "should show 'detección falló' instead of a silent pendiente."
+        ),
+    )
 
 
 class ChecklistResumen(BaseModel):

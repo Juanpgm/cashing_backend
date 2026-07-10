@@ -459,6 +459,39 @@ async def _secop_documentos_del_contrato(db: AsyncSession, contrato: Contrato) -
     return list(pool.values())
 
 
+_DETECCION_ERRORES_INFO_KEY = "checklist_deteccion_errores"
+
+
+def _marcar_deteccion_error(db: AsyncSession, cuenta_id: uuid.UUID, requisito_ref: str, mensaje: str) -> None:
+    """Record a per-requisito detection/auto-link failure for the lifetime of this request.
+
+    Stored on ``AsyncSession.info`` (a plain dict SQLAlchemy reserves for arbitrary
+    user data on the Session) rather than as an attribute on the ORM instance: the
+    Session is kept alive for the whole request, but ORM instances are only
+    WEAKLY referenced by the identity map — once a function like this one returns
+    and nothing else holds a strong reference to the row, it can be garbage
+    collected before a later call (e.g. `construir_checklist_completo` in the
+    same request) re-queries it, silently losing a plain instance attribute.
+    """
+    errores: dict[tuple[uuid.UUID, str], str] = db.info.setdefault(_DETECCION_ERRORES_INFO_KEY, {})
+    errores[(cuenta_id, requisito_ref)] = mensaje
+
+
+def _limpiar_deteccion_error(db: AsyncSession, cuenta_id: uuid.UUID, requisito_ref: str) -> None:
+    errores: dict[tuple[uuid.UUID, str], str] | None = db.info.get(_DETECCION_ERRORES_INFO_KEY)
+    if errores is not None:
+        errores.pop((cuenta_id, requisito_ref), None)
+
+
+def obtener_deteccion_error(db: AsyncSession, cuenta_id: uuid.UUID, requisito_ref: str) -> str | None:
+    """Read back the last detection/auto-link failure recorded for this requisito
+    in the current request, or None if none was recorded (or it later cleared)."""
+    errores: dict[tuple[uuid.UUID, str], str] | None = db.info.get(_DETECCION_ERRORES_INFO_KEY)
+    if errores is None:
+        return None
+    return errores.get((cuenta_id, requisito_ref))
+
+
 async def detectar_desde_secop(
     db: AsyncSession, cuenta: CuentaCobro
 ) -> dict[str, list[tuple[SecopDocumento, Decimal]]]:
@@ -514,67 +547,39 @@ async def detectar_desde_secop(
         if req.codigo not in rows:
             continue
 
-        scored: list[tuple[SecopDocumento, Decimal]] = []
-
-        # Primary: category-based candidates for this requisito
-        cat_scored = categoria_candidatos.get(req.codigo, [])
-        scored.extend(cat_scored)
-
-        # Fallback: keyword scoring for docs not already captured by category
-        cat_doc_ids = {d.id for d, _ in cat_scored}
-        if req.keywords_deteccion:
-            for doc in secop_docs:
-                if doc.id in cat_doc_ids:
-                    continue
-                kw_score = _keyword_score([doc.nombre_archivo, doc.descripcion], req.keywords_deteccion)
-                if kw_score > 0:
-                    scored.append((doc, kw_score))
-
-        scored.sort(key=lambda x: x[1], reverse=True)
-        top = scored[:TOP_N_CANDIDATES]
-        resultado[req.codigo] = top
-
-        for doc, score in top:
-            db.add(
-                DocumentoChecklistCandidato(
-                    cuenta_cobro_id=cuenta.id,
-                    requisito_codigo=req.codigo,
-                    secop_documento_id=doc.id,
-                    score=score,
-                )
-            )
-
         fila = rows[req.codigo]
-        if (
-            top
-            and fila.estado == EstadoRequisito.PENDIENTE
-            and fila.documento_fuente_id is None
-            and fila.secop_documento_id is None
-            and top[0][1] >= AUTO_LINK_THRESHOLD
-        ):
-            fila.secop_documento_id = top[0][0].id
-            fila.confianza_deteccion = top[0][1]
-            fila.estado = EstadoRequisito.DETECTADO
-            db.add(DocumentoRequisitoVinculo(documento_cuenta_cobro_id=fila.id, secop_documento_id=top[0][0].id))
+        _limpiar_deteccion_error(db, cuenta.id, req.codigo)
+        try:
+            scored: list[tuple[SecopDocumento, Decimal]] = []
 
-    # Custom (per-cuenta) requisitos: keyword scoring against their own keywords.
-    # Candidates are not persisted (DocumentoChecklistCandidato FK targets the standard
-    # catalog); they are recomputed on the fly for display in construir_checklist_completo.
-    # Conservative auto-link: only the top match at/above the standard threshold.
-    if custom_rows:
-        customs = await listar_requisitos_cuenta(db, cuenta.id)
-        for item in customs:
-            fila = custom_rows.get(item.id)
-            if fila is None or not item.keywords_deteccion:
-                continue
-            scored = [
-                (doc, _keyword_score([doc.nombre_archivo, doc.descripcion], item.keywords_deteccion))
-                for doc in secop_docs
-            ]
-            scored = [(d, s) for d, s in scored if s > 0]
+            # Primary: category-based candidates for this requisito
+            cat_scored = categoria_candidatos.get(req.codigo, [])
+            scored.extend(cat_scored)
+
+            # Fallback: keyword scoring for docs not already captured by category
+            cat_doc_ids = {d.id for d, _ in cat_scored}
+            if req.keywords_deteccion:
+                for doc in secop_docs:
+                    if doc.id in cat_doc_ids:
+                        continue
+                    kw_score = _keyword_score([doc.nombre_archivo, doc.descripcion], req.keywords_deteccion)
+                    if kw_score > 0:
+                        scored.append((doc, kw_score))
+
             scored.sort(key=lambda x: x[1], reverse=True)
             top = scored[:TOP_N_CANDIDATES]
-            resultado[str(item.id)] = top
+            resultado[req.codigo] = top
+
+            for doc, score in top:
+                db.add(
+                    DocumentoChecklistCandidato(
+                        cuenta_cobro_id=cuenta.id,
+                        requisito_codigo=req.codigo,
+                        secop_documento_id=doc.id,
+                        score=score,
+                    )
+                )
+
             if (
                 top
                 and fila.estado == EstadoRequisito.PENDIENTE
@@ -586,6 +591,62 @@ async def detectar_desde_secop(
                 fila.confianza_deteccion = top[0][1]
                 fila.estado = EstadoRequisito.DETECTADO
                 db.add(DocumentoRequisitoVinculo(documento_cuenta_cobro_id=fila.id, secop_documento_id=top[0][0].id))
+        except Exception as exc:  # noqa: BLE001 — one bad requisito must not sink the whole scan
+            await logger.aerror(
+                "checklist_deteccion_error",
+                cuenta_id=str(cuenta.id),
+                requisito_codigo=req.codigo,
+                error=str(exc),
+            )
+            resultado.setdefault(req.codigo, [])
+            _marcar_deteccion_error(
+                db, cuenta.id, req.codigo, "No se pudo completar la detección automática para este requisito."
+            )
+
+    # Custom (per-cuenta) requisitos: keyword scoring against their own keywords.
+    # Candidates are not persisted (DocumentoChecklistCandidato FK targets the standard
+    # catalog); they are recomputed on the fly for display in construir_checklist_completo.
+    # Conservative auto-link: only the top match at/above the standard threshold.
+    if custom_rows:
+        customs = await listar_requisitos_cuenta(db, cuenta.id)
+        for item in customs:
+            fila = custom_rows.get(item.id)
+            if fila is None or not item.keywords_deteccion:
+                continue
+            _limpiar_deteccion_error(db, cuenta.id, str(item.id))
+            try:
+                scored = [
+                    (doc, _keyword_score([doc.nombre_archivo, doc.descripcion], item.keywords_deteccion))
+                    for doc in secop_docs
+                ]
+                scored = [(d, s) for d, s in scored if s > 0]
+                scored.sort(key=lambda x: x[1], reverse=True)
+                top = scored[:TOP_N_CANDIDATES]
+                resultado[str(item.id)] = top
+                if (
+                    top
+                    and fila.estado == EstadoRequisito.PENDIENTE
+                    and fila.documento_fuente_id is None
+                    and fila.secop_documento_id is None
+                    and top[0][1] >= AUTO_LINK_THRESHOLD
+                ):
+                    fila.secop_documento_id = top[0][0].id
+                    fila.confianza_deteccion = top[0][1]
+                    fila.estado = EstadoRequisito.DETECTADO
+                    db.add(
+                        DocumentoRequisitoVinculo(documento_cuenta_cobro_id=fila.id, secop_documento_id=top[0][0].id)
+                    )
+            except Exception as exc:  # noqa: BLE001 — one bad requisito must not sink the whole scan
+                await logger.aerror(
+                    "checklist_deteccion_error",
+                    cuenta_id=str(cuenta.id),
+                    requisito_codigo=str(item.id),
+                    error=str(exc),
+                )
+                resultado.setdefault(str(item.id), [])
+                _marcar_deteccion_error(
+                    db, cuenta.id, str(item.id), "No se pudo completar la detección automática para este requisito."
+                )
 
     await db.flush()
     return resultado
@@ -980,12 +1041,23 @@ async def auto_vincular_documentos_fuente(
     for req_codigo, fila in rows.items():
         if fila.estado != EstadoRequisito.PENDIENTE:
             continue
-        for doc in _pool_para(req_codigo):
-            score = _score_fuente_para_requisito(doc, req_codigo)
-            if score >= _AUTO_LINK_FUENTE_THRESHOLD:
-                candidates.setdefault(req_codigo, []).append(
-                    (score, doc.categoria_override, doc.categoria_confianza or 0.0, doc)
-                )
+        _limpiar_deteccion_error(db, cuenta.id, req_codigo)
+        try:
+            for doc in _pool_para(req_codigo):
+                score = _score_fuente_para_requisito(doc, req_codigo)
+                if score >= _AUTO_LINK_FUENTE_THRESHOLD:
+                    candidates.setdefault(req_codigo, []).append(
+                        (score, doc.categoria_override, doc.categoria_confianza or 0.0, doc)
+                    )
+        except Exception as exc:  # noqa: BLE001 — one bad requisito must not sink the whole pass
+            await logger.aerror(
+                "checklist_auto_vincular_error",
+                cuenta_id=str(cuenta.id),
+                requisito_codigo=req_codigo,
+                error=str(exc),
+            )
+            _marcar_deteccion_error(db, cuenta.id, req_codigo, "No se pudo completar el auto-vínculo para este requisito.")
+            candidates.pop(req_codigo, None)
 
     vinculados = 0
     for req_codigo, cands in candidates.items():
@@ -1009,18 +1081,32 @@ async def auto_vincular_documentos_fuente(
             fila = custom_rows.get(item.id)
             if fila is None or fila.estado != EstadoRequisito.PENDIENTE or not item.keywords_deteccion:
                 continue
-            best_doc = None
-            best_score = Decimal("0.000")
-            for doc in docs_cuenta:
-                score = _keyword_score([doc.nombre, doc.texto_extraido], item.keywords_deteccion)
-                if score > best_score:
-                    best_score, best_doc = score, doc
-            if best_doc is not None and best_score >= _AUTO_LINK_FUENTE_THRESHOLD:
-                db.add(DocumentoRequisitoVinculo(documento_cuenta_cobro_id=fila.id, documento_fuente_id=best_doc.id))
-                fila.documento_fuente_id = best_doc.id
-                fila.confianza_deteccion = best_score
-                fila.estado = EstadoRequisito.CARGADO
-                vinculados += 1
+            _limpiar_deteccion_error(db, cuenta.id, str(item.id))
+            try:
+                best_doc = None
+                best_score = Decimal("0.000")
+                for doc in docs_cuenta:
+                    score = _keyword_score([doc.nombre, doc.texto_extraido], item.keywords_deteccion)
+                    if score > best_score:
+                        best_score, best_doc = score, doc
+                if best_doc is not None and best_score >= _AUTO_LINK_FUENTE_THRESHOLD:
+                    db.add(
+                        DocumentoRequisitoVinculo(documento_cuenta_cobro_id=fila.id, documento_fuente_id=best_doc.id)
+                    )
+                    fila.documento_fuente_id = best_doc.id
+                    fila.confianza_deteccion = best_score
+                    fila.estado = EstadoRequisito.CARGADO
+                    vinculados += 1
+            except Exception as exc:  # noqa: BLE001 — one bad requisito must not sink the whole pass
+                await logger.aerror(
+                    "checklist_auto_vincular_error",
+                    cuenta_id=str(cuenta.id),
+                    requisito_codigo=str(item.id),
+                    error=str(exc),
+                )
+                _marcar_deteccion_error(
+                    db, cuenta.id, str(item.id), "No se pudo completar el auto-vínculo para este requisito."
+                )
 
     await logger.ainfo(
         "auto_vincular_resultado",
@@ -1442,6 +1528,11 @@ async def construir_checklist_completo(
                     for d in candidatos_df
                 ],
                 "updated_at": fila.updated_at,
+                "deteccion_error": obtener_deteccion_error(
+                    db,
+                    cuenta.id,
+                    fila.requisito_codigo if fila.requisito_codigo is not None else str(fila.requisito_cuenta_id),
+                ),
             }
         )
 
