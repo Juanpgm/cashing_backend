@@ -5,6 +5,7 @@ working. When enabled, both email registration and first-time Google sign-in
 require a valid, non-exhausted invite code.
 """
 
+import asyncio
 from unittest.mock import patch
 
 import pytest
@@ -13,6 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.exceptions import InviteRequiredError
 from app.models.invite_code import InviteCode
 from app.services import auth_service
 
@@ -167,3 +169,73 @@ async def test_google_new_user_accepts_valid_code(
 
     result = await db.execute(select(InviteCode).where(InviteCode.codigo == "G-INVITE"))
     assert result.scalar_one().usos_actuales == 1
+
+
+# ---------------------------------------------------------------------------
+# TOCTOU race guard — _consume_invite_code must be atomic
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_consume_invite_code_concurrent_only_one_succeeds(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 1-use code hit by two concurrent consumers must let exactly ONE through.
+
+    Regression guard for the read-check-increment TOCTOU: the old
+    SELECT -> check `disponible` -> increment sequence let two concurrent
+    callers both read `usos_actuales < max_usos` as true before either wrote
+    back, double-spending a single-use code. The fix uses a single guarded
+    UPDATE ... WHERE ... RETURNING/rowcount so only one writer can win the row.
+    """
+    from tests.conftest import async_session_test
+
+    monkeypatch.setattr(settings, "WAITLIST_ENABLED", True)
+    db.add(InviteCode(codigo="RACE-CODE", max_usos=1, usos_actuales=0, activo=True))
+    await db.commit()
+
+    async def _attempt() -> str:
+        async with async_session_test() as session:
+            try:
+                await auth_service._consume_invite_code(session, "RACE-CODE")
+            except InviteRequiredError:
+                await session.rollback()
+                return "fail"
+            else:
+                await session.commit()
+                return "ok"
+
+    results = await asyncio.gather(_attempt(), _attempt())
+
+    assert sorted(results) == ["fail", "ok"], (
+        f"expected exactly one success and one InviteRequiredError, got {results}"
+    )
+
+    result = await db.execute(select(InviteCode).where(InviteCode.codigo == "RACE-CODE"))
+    invite = result.scalar_one()
+    assert invite.usos_actuales == 1  # never double-spent past max_usos
+
+
+@pytest.mark.asyncio
+async def test_consume_invite_code_second_sequential_call_fails_when_exhausted(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two SEQUENTIAL calls on a 1-use code: first consumes it, second must fail.
+
+    Simpler, deterministic complement to the concurrent test above — directly
+    exercises the atomic UPDATE...WHERE guard rowcount check.
+    """
+    monkeypatch.setattr(settings, "WAITLIST_ENABLED", True)
+    db.add(InviteCode(codigo="SEQ-CODE", max_usos=1, usos_actuales=0, activo=True))
+    await db.commit()
+
+    await auth_service._consume_invite_code(db, "SEQ-CODE")
+    await db.commit()
+
+    with pytest.raises(InviteRequiredError):
+        await auth_service._consume_invite_code(db, "SEQ-CODE")
+    await db.rollback()
+
+    result = await db.execute(select(InviteCode).where(InviteCode.codigo == "SEQ-CODE"))
+    invite = result.scalar_one()
+    assert invite.usos_actuales == 1

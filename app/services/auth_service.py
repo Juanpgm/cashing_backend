@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 
 import structlog
 from jose import JWTError
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -57,6 +57,14 @@ async def _consume_invite_code(db: AsyncSession, code: str | None) -> None:
     if the code is missing, unknown, inactive, or already exhausted. On success it
     increments the code's usage counter within the caller's transaction, so a later
     failure (e.g. duplicate email) rolls the consumption back atomically.
+
+    Consumption is a single guarded UPDATE (not SELECT-then-check-then-increment):
+    two concurrent callers racing for the last use of a code could both pass the
+    Python-level `disponible` check before either wrote back, double-spending a
+    single-use code (TOCTOU). The UPDATE's WHERE clause re-checks every validity
+    condition against the CURRENT row at write time, and the database serializes
+    concurrent writers to the same row, so only one UPDATE can match — `rowcount`
+    tells us whether we actually won the row.
     """
     if not settings.WAITLIST_ENABLED:
         return
@@ -64,13 +72,17 @@ async def _consume_invite_code(db: AsyncSession, code: str | None) -> None:
     if not code:
         raise InviteRequiredError()
 
-    result = await db.execute(select(InviteCode).where(InviteCode.codigo == code))
-    invite = result.scalar_one_or_none()
-    if invite is None or not invite.disponible:
+    result = await db.execute(
+        update(InviteCode)
+        .where(
+            InviteCode.codigo == code,
+            InviteCode.activo.is_(True),
+            InviteCode.usos_actuales < InviteCode.max_usos,
+        )
+        .values(usos_actuales=InviteCode.usos_actuales + 1)
+    )
+    if result.rowcount != 1:
         raise InviteRequiredError("Código de invitación inválido o agotado.")
-
-    invite.usos_actuales += 1
-    await db.flush()
 
 
 async def register(db: AsyncSession, data: RegisterRequest) -> UserResponse:
