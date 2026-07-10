@@ -12,7 +12,7 @@ evidence_orchestrator → evidence_matcher → evidence_justify.
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import date
 
 import structlog
 from sqlalchemy import select
@@ -222,7 +222,11 @@ async def descubrir_evidencias(
         contrato = await db.get(Contrato, contrato_id)
         if contrato is not None:
             fecha_inicio = fecha_inicio or contrato.fecha_inicio.isoformat()
-            fecha_fin = fecha_fin or datetime.now(UTC).date().isoformat()
+            # Local "today" (not UTC): for a Colombia-time user, the default period
+            # end must be their calendar today. Using UTC pushed fecha_fin to
+            # "tomorrow" for anyone running after ~19:00 local (00:00 UTC), producing
+            # a range that ends on a future date.
+            fecha_fin = fecha_fin or date.today().isoformat()
 
     # Verificar conexión de Google antes de gastar llamadas.
     status = await gws.get_integration_status(db, usuario_id)
