@@ -178,23 +178,23 @@ Chain strategy: stacked-to-main
 
 ## Slice 5 — Template ingestion (P2a) · PR 5 · migration `027` · ~380 lines (risk Medium-High) · depends on #4
 
-- [ ] 5.1 **Checkpoint (mandatory): confirm `backend-local-first-sync` merge status / rebase migration numbers** before starting — this slice touches document-reading paths
-- [ ] 5.2 RED: model test — `PlantillaOrganismo` shape (`usuario_id`, `entidad`, `tipo_documento`, `formato`, `estructura_json` JSONB, `fuente_documento_id` FK, timestamps)
-- [ ] 5.3 GREEN: create `app/models/plantilla_organismo.py`
-- [ ] 5.4 RED+GREEN: `alembic/versions/027_*` — `op.create_table` with JSONB column
-- [ ] 5.5 Neon verification: apply `027` on Neon dev branch; verify JSONB column creates and round-trips a query (behavior differs from SQLite test DB)
-- [ ] 5.6 RED+GREEN: `schemas/plantilla_organismo.py`
-- [ ] 5.7 RED: test successful DOCX extraction persists columns/sections/anexo refs for the organism; anexo ref string preserved verbatim
-- [ ] 5.8 GREEN: extend `requisito_inference_service.py` with structure extraction; normalize organism key via `text_match` over `Contrato.entidad`
-- [ ] 5.9 RED: test unreadable/scanned template degrades safely — no structure persisted, no hard error, ingestion of contract/organism record proceeds
-- [ ] 5.10 GREEN: implement graceful-degradation path
-- [ ] 5.11 RED: test vision fallback chain (reused from CONTRATO extraction, `document_service` L407-426) is retried before declaring failure
-- [ ] 5.12 GREEN: wire resilient reader reuse
-- [ ] 5.13 RED+GREEN: `app/tools/catalog/plantillas_organismo.py` — `ingerir_plantilla_organismo` (write), `obtener_plantilla_organismo` (read)
-- [ ] 5.14 RED: test packager (slice #2) applies organism-specific folder structure when `PlantillaOrganismo` exists, falls back otherwise
-- [ ] 5.15 GREEN: wire real `PlantillaOrganismo` lookup into `informe_service` folder-structure builder (completes deferred task 2.9)
-- [ ] 5.16 Local verification gate: `make format && make lint && uv run python -m pytest` green
-- [ ] 5.17 **No push to remote without explicit user OK**
+- [x] 5.1 **Checkpoint (mandatory): confirm `backend-local-first-sync` merge status / rebase migration numbers** before starting — this slice touches document-reading paths — confirmed via `alembic heads` (026 sole head before this slice; no `backend-local-first-sync` branch present locally); used 027.
+- [x] 5.2 RED: model test — `PlantillaOrganismo` shape (`usuario_id`, `entidad`, `tipo_documento`, `formato`, `estructura_json` JSONB, `fuente_documento_id` FK, timestamps) — `tests/test_plantilla_organismo.py`.
+- [x] 5.3 GREEN: create `app/models/plantilla_organismo.py` — **DEVIATION**: `tipo_documento`/`formato` are plain `String` columns (not `Enum`), per design D5's literal field shape — deliberately avoids adding a new Postgres enum type (and the `values_callable` label-mismatch gotcha class) for this slice; validated as a `Literal` at the schema layer instead. Added a `UniqueConstraint(usuario_id, entidad_normalizada, tipo_documento)` (not in design's literal field list, but required so re-ingestion updates instead of duplicating — matches the ingestion service's upsert behavior).
+- [x] 5.4 RED+GREEN: `alembic/versions/027_*` — `op.create_table` with JSONB column.
+- [x] 5.5 Neon verification: **BLOCKED** — no reachable Neon connection in this session (same constraint as slices #3/#4). Verified instead via (a) `alembic heads`/`alembic history` parse cleanly with `027` as sole head, and (b) compiling the migration's DDL against the `postgresql` dialect via a mock engine (JSONB cannot execute against the sqlite test DB — unlike slices #3/#4's plain column adds, this is a genuine Postgres-only type, so the sqlite dry-run technique used previously does not apply here). Confirmed well-formed `CREATE TABLE`/`CREATE INDEX`/`DROP` DDL for both upgrade and downgrade. Real Postgres/Neon apply still required before merge — **flagged as a pre-merge gate**.
+- [x] 5.6 RED+GREEN: `schemas/plantilla_organismo.py` — **DEVIATION**: `EstructuraPlantillaLLM.anexo_refs` is `list[str]` (literal anexo-reference strings), not design D5's shorthand `anexo_refs: bool` — required to satisfy the spec's explicit "Anexo reference preserved verbatim" acceptance criterion, which a bare boolean cannot. `estructura_json` is an unconstrained JSON blob (no DB schema enforces its shape), so this is an additive superset, not a contradiction — `bool(anexo_refs)` recovers the flag design describes.
+- [x] 5.7 RED: test successful DOCX extraction persists columns/sections/anexo refs for the organism; anexo ref string preserved verbatim — `tests/services/test_plantilla_organismo_ingestion.py` (DAGMA 2-col + COEMPRESAR 3-col+anexo fixtures).
+- [x] 5.8 GREEN: extend `requisito_inference_service.py` with structure extraction (`inferir_estructura_plantilla`, `ingerir_plantilla_organismo`, `obtener_plantilla_organismo`); normalize organism key via `text_match.normalize` over `Contrato.entidad` — **DEVIATION (scoping)**: design's File Changes table names only `requisito_inference_service.py` as touched for this behavior (no separate `plantilla_organismo_service.py` is listed anywhere in design/tasks); persistence/CRUD functions were added to that same file alongside extraction rather than inventing an undeclared service module, since the file already does DB-aware work (`inferir_requisitos` calls `checklist_service`).
+- [x] 5.9 RED: test unreadable/scanned template degrades safely — no structure persisted, no hard error, ingestion of contract/organism record proceeds — `test_unreadable_template_degrades_safely_no_structure_persisted`.
+- [x] 5.10 GREEN: implement graceful-degradation path — `ingerir_plantilla_organismo` returns `(None, avisos)` without persisting or raising when `inferir_estructura_plantilla` returns `None`.
+- [x] 5.11 RED: test vision fallback chain (reused from CONTRATO extraction, `document_service` L407-426) is retried before declaring failure — `test_vision_fallback_retried_before_declaring_failure`.
+- [x] 5.12 GREEN: wire resilient reader reuse — renamed `document_service._vision_model_chain` → public `vision_model_chain()` (one internal call-site updated) so `requisito_inference_service._extraer_estructura_via_vision` reuses the exact same resilient chain instead of a divergent reimplementation.
+- [x] 5.13 RED+GREEN: `app/tools/catalog/plantillas_organismo.py` — `ingerir_plantilla_organismo` (write), `obtener_plantilla_organismo` (read) — `tests/test_plantilla_organismo_tool.py`.
+- [x] 5.14 RED: test packager (slice #2) applies organism-specific folder structure when `PlantillaOrganismo` exists, falls back otherwise — `tests/test_informe_service.py::test_zip_evidencias_uses_anexo_style_folders_when_organismo_template_exists` / `test_zip_evidencias_uses_default_numbered_folders_when_no_organismo_template`. Superseded the slice #2 stub-only test (`test_resolver_estructura_organismo_es_stub_hasta_slice_5` → split into `..._returns_none_when_not_ingested` / `..._returns_real_lookup_when_ingested`).
+- [x] 5.15 GREEN: wire real `PlantillaOrganismo` lookup into `informe_service` folder-structure builder (completes deferred task 2.9) — **DEVIATION (scoping, deliberate)**: tasks/design leave "applies organism-specific folder structure" underspecified (full column/section-driven layout is slice #6's `adaptive-informe-generation` responsibility, applied to the DOCX informes, not this ZIP folder builder). Minimal, testable, zero-regression wiring implemented: when the resolved structure's `anexo_refs` is non-empty (COEMPRESAR-style), evidence folders are numbered `"A{n}_..."` to mirror the institutional "Carpeta ... A1" convention instead of the default `"{idx:02d}_..."`; absent/empty `anexo_refs` (including DAGMA-style, no ingested template, or extraction degradation) keeps the exact pre-slice-5 default numbering — verified no-regression via the "no organismo template" test.
+- [x] 5.16 Local verification gate: `make format && make lint && uv run python -m pytest` green — see slice verification note below.
+- [x] 5.17 **No push to remote without explicit user OK** — not pushed; commits are local only.
 
 **Work-unit commits**: (a) 5.2-5.6 model+migration → `feat(plantilla-organismo): add per-organism template structure model`; (b) 5.7-5.12 → `feat(plantilla-organismo): extract and persist template structure with graceful degradation`; (c) 5.13-5.15 → `feat(paquete): apply organism-specific folder structure when available`.
 
@@ -212,6 +212,7 @@ Chain strategy: stacked-to-main
 - [ ] 6.8 GREEN: implement draft label/header as a constant (not LLM-decided)
 - [ ] 6.9 RED: test one-time obligation section blank in cuota 2's informe after being filled in cuota 1
 - [ ] 6.10 GREEN: honor `una_vez` (slice #4) + `posicion` (slice #3) in generator output
+- [ ] 6.10b Carry-over from slice #4 verify (WARNING 1): fix R7 `stale_final_after_prorroga` temporal ordering — design D4 says warn only when a **later** prórroga exists, but the current rule fires on ANY recorded prórroga (no `fecha_evento` filter), producing a persistent false-positive SOFT warning that never clears when a prórroga was legitimately accounted for before the final cuota. Add the date comparison (prórroga `fecha_evento` vs the final cuota's period) — needs the relevant date threaded into `ValidationContext` (`coherence_validator_service.py:346-370,459-493`).
 - [ ] 6.11 Integration test: extended `generar_informe_cuota` tool signature end-to-end
 - [ ] 6.12 Local verification gate: `make format && make lint && uv run python -m pytest` green
 - [ ] 6.13 **No push to remote without explicit user OK**
