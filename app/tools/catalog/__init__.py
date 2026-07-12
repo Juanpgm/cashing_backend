@@ -14,6 +14,7 @@ evidence.
 """
 
 from app.tools.catalog import (
+    adiciones,
     checklist,
     coherence,
     cuentas,
@@ -27,6 +28,7 @@ from app.tools.catalog import (
 )
 
 __all__ = [
+    "adiciones",
     "checklist",
     "coherence",
     "cuentas",
