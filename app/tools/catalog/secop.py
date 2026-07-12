@@ -14,6 +14,7 @@ from app.schemas.secop import (
     ScraperFallbackResult,
     SecopConfiguracionResponse,
     SecopContratoResponse,
+    SecopEstadoDatasetsResponse,
     SecopImportResult,
 )
 from app.services import secop_scraper_service, secop_service
@@ -108,6 +109,31 @@ async def verificar_configuracion_secop(
     ctx: ToolContext, params: VerificarConfiguracionSecopInput
 ) -> SecopConfiguracionResponse:
     return await secop_service.verificar_configuracion_secop()
+
+
+class ObtenerEstadoDatasetsSecopInput(BaseModel):
+    cedula: str = Field(description="Contractor's cédula (national ID), 5 to 15 digits, digits only.")
+
+
+@tool(
+    name="obtener_estado_datasets_secop",
+    description=(
+        "Report the schema-verification status of the 3 additional SECOP II datasets wired in "
+        "this change (Adiciones, Modificaciones a Procesos, Ubicaciones ejecución) for a "
+        "contractor's cédula, plus any accumulated `datasets_con_error`. Read-only, offline: "
+        "reflects the outcome of the most recent sincronizar_documentos_secop run(s) recorded on "
+        "cached rows, does NOT itself query Socrata. Useful for diagnosing why Adición/ubicación "
+        "data may be missing for a given contractor. Args: cedula (contractor's national ID, "
+        "5-15 digits)."
+    ),
+    input_model=ObtenerEstadoDatasetsSecopInput,
+    output_model=SecopEstadoDatasetsResponse,
+    tags=("read",),
+)
+async def obtener_estado_datasets_secop(
+    ctx: ToolContext, params: ObtenerEstadoDatasetsSecopInput
+) -> SecopEstadoDatasetsResponse:
+    return await secop_service.obtener_estado_datasets_secop(ctx.db, params.cedula)
 
 
 class ExplorarDocumentosSecopAgenticoInput(BaseModel):

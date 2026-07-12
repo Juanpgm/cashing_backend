@@ -158,6 +158,49 @@ class SecopSincronizarDocumentosResult(BaseModel):
     datasets_con_error: list[str] = []
 
 
+class CoberturaDocumentosInfo(BaseModel):
+    """Explains WHY `buscar_documentos_contrato` may return fewer documents than
+    expected — surfaces known Socrata open-data coverage gaps instead of looking
+    like a bug (secop-dataset-ingestion Slice 2, task 2.10b).
+    """
+
+    gap: bool = Field(description="True when this contract's open-data document coverage is known to be partial.")
+    razon: str = Field(description="Human-readable (Spanish) explanation of the coverage gap or its absence.")
+    url_proceso: str | None = Field(
+        default=None,
+        description=(
+            "Link to the contract's process on the SECOP II platform, where the full document set — "
+            "including platform-only documents not exposed by the open-data API — can be consulted manually."
+        ),
+    )
+
+
+class SecopDocumentosConCoberturaResponse(BaseModel):
+    """Documents for a contract plus a structured explanation of open-data coverage."""
+
+    documentos: list[SecopDocumentoResponse]
+    cobertura: CoberturaDocumentosInfo
+
+
+class SecopEstadoDataset(BaseModel):
+    """Per-dataset schema-verification status (secop-dataset-ingestion Slice 2, task 2.9)."""
+
+    dataset_id: str
+    nombre: str
+    estado: Literal["ok", "error", "no_verificado"]
+
+
+class SecopEstadoDatasetsResponse(BaseModel):
+    """Diagnostic snapshot of the 3 new datasets (Adiciones, Modificaciones a
+    Procesos, Ubicaciones) for a cédula's cached contracts. Offline by design
+    (D3): reflects the outcome of the most recent `sincronizar_documentos_secop`
+    run(s), does not itself query Socrata.
+    """
+
+    datasets_con_error: list[str] = []
+    datasets: list[SecopEstadoDataset]
+
+
 class SecopContratoDetalleResponse(BaseModel):
     """Contrato con su proceso y documentos asociados."""
 

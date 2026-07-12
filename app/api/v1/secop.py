@@ -17,6 +17,7 @@ from app.schemas.secop import (
     SecopConsultaCompletaResponse,
     SecopContratoResponse,
     SecopDocumentoResponse,
+    SecopDocumentosConCoberturaResponse,
     SecopImportResult,
     SecopProcesoResponse,
     SecopSincronizarDocumentosResult,
@@ -63,19 +64,23 @@ async def obtener_proceso(
 # GET /documentos/{doc_id}/archivos       — 4-segment path with literal suffix "/archivos"
 # FastAPI resolves these by path depth: the literal "/archivos" suffix makes the 4-segment
 # route unambiguous. No collision exists; no reordering or rename is required.
-@router.get("/documentos/{numero_contrato}", response_model=list[SecopDocumentoResponse])
+@router.get("/documentos/{numero_contrato}", response_model=SecopDocumentosConCoberturaResponse)
 async def buscar_documentos(
     numero_contrato: str,
     user: CurrentUser,
     refresh: bool = Query(False, description="true → fuerza recarga desde SECOP"),
     db: AsyncSession = Depends(get_db),
-) -> list[SecopDocumentoResponse]:
+) -> SecopDocumentosConCoberturaResponse:
     """Lista los documentos SECOP asociados a un número de contrato (formato CO1.PCCNTR.xxxxxxx).
 
     El `numero_contrato` corresponde al campo `referencia_del_contrato` del contrato SECOP
     (visible en la respuesta de GET /secop/contratos como `numero_contrato`).
+
+    Incluye un bloque `cobertura` que explica cuándo un conteo bajo de documentos es
+    esperado (p. ej. contratos de 2024, con cobertura parcial en datos abiertos) en
+    lugar de parecer un error — ver `secop-dataset-ingestion` Slice 2 task 2.10b.
     """
-    return await secop_service.buscar_documentos_contrato(db, numero_contrato, refresh=refresh)
+    return await secop_service.obtener_documentos_con_cobertura(db, numero_contrato, refresh=refresh)
 
 
 @router.get("/documentos/{doc_id}/archivos", response_model=ArchivoComprimidoResponse)

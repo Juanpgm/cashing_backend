@@ -28,12 +28,16 @@ from app.schemas.contrato import ContratoCreate, ContratoResponse, ObligacionCre
 from app.schemas.secop import (
     ArchivoComprimidoResponse,
     ArchivoInternoItem,
+    CoberturaDocumentosInfo,
     SecopConfiguracionResponse,
     SecopConsultaCompletaResponse,
     SecopContratoDetalleResponse,
     SecopContratoImportado,
     SecopContratoResponse,
     SecopDocumentoResponse,
+    SecopDocumentosConCoberturaResponse,
+    SecopEstadoDataset,
+    SecopEstadoDatasetsResponse,
     SecopImportResult,
     SecopProcesoResponse,
     SecopSincronizarDocumentosResult,
@@ -58,6 +62,36 @@ _DS_DOCS_2023 = "3skv-9na7"
 _DS_DOCS_2025 = "dmgg-8hin"  # desde 01/01/2025 + one 2024-12-31 bulk-load batch (not full 2024 coverage)
 _DS_DOCUMENTOS = _DS_DOCS_2025  # backward-compat alias used by sincronizar_documentos
 _DS_MODIFICACIONES = "u8cx-r425"  # SECOP II Modificaciones a contratos
+
+# Slice 2 (secop-dataset-ingestion): Adiciones / Modificaciones a Procesos / Ubicaciones.
+_DS_ADICIONES = "cb9c-h8sn"  # SECOP II Modificaciones a Contratos (filtered to tipo="ADICION EN EL VALOR")
+_DS_MODIF_PROCESOS = "e2u2-swiw"  # SECOP II Modificaciones a Procesos
+_DS_UBICACIONES = "gra4-pcp2"  # SECOP II Ubicaciones ejecucion contratos
+
+# Live schema probe (2026-07-11, tasks.md Slice 2 task 2.1) — DEVIATION from the
+# design/spec join-key assumptions, corrected here per D3's "act on the probe's
+# result":
+#   - cb9c-h8sn: `id_contrato` confirmed present, as assumed. BUT the dataset has
+#     NO structured value field (only identificador/id_contrato/tipo/descripcion/
+#     fecharegistro) — `valor_adicion` must be best-effort parsed from free-text
+#     `descripcion` (see `_extraer_valor_adicion_texto`), and rows must be filtered
+#     to tipo == "ADICION EN EL VALOR" (confirmed live) to mean "Adición" at all.
+#   - e2u2-swiw: real field names are `portafolio` and `proceso`, NOT
+#     `proceso_de_compra`/`id_del_portafolio` as originally assumed. `portafolio`
+#     (format CO1.BDOS.xxx) is what matches our `proceso_de_compra`/
+#     `id_proceso_secop` values — the query VALUE still falls back between those
+#     two of our own fields, it is the SOCRATA FIELD NAME that was wrong, not the
+#     fallback concept. Also: per its own Socrata description, this dataset only
+#     contains processes modified in the "últimos 8 días" (rolling 8-day window) —
+#     most historical contracts legitimately return zero rows here; this is
+#     expected, not a gap.
+#   - gra4-pcp2: `referencia_del_contrato` confirmed present, matches design as-is.
+_DATASET_JOIN_KEYS: dict[str, tuple[str, ...]] = {
+    _DS_ADICIONES: ("id_contrato",),
+    _DS_MODIF_PROCESOS: ("portafolio", "proceso"),
+    _DS_UBICACIONES: ("referencia_del_contrato",),
+}
+
 _ALL_DOCS_DATASETS = (_DS_DOCS_HIST, _DS_DOCS_2022, _DS_DOCS_2023, _DS_DOCS_2025)
 _CACHE_TTL = timedelta(hours=24)
 _CACHE_TTL_DOCS = timedelta(hours=2)  # Documents refresh more frequently
@@ -159,9 +193,142 @@ async def _query_socrata(dataset_id: str, where_clause: str, limit: int = 500) -
     raise ExternalServiceError("SECOP API", "retry loop exhausted unexpectedly")
 
 
-async def _query_docs_datasets(
-    where_clause: str, failed_out: list[str] | None = None
+def _dataset_has_join_key(rows: list[dict[str, Any]], dataset_id: str) -> bool:
+    """Schema-presence guard (D3, spec 'Schema verification before wiring any new
+    dataset'). A dataset that returns zero rows is NOT schema drift — it may
+    simply have no data for this contract (or, for `_DS_MODIF_PROCESOS`, be
+    outside its rolling 8-day window). Only a dataset that DID return rows but
+    none of them expose ANY of its expected join key(s) is treated as unavailable.
+    """
+    expected_keys = _DATASET_JOIN_KEYS.get(dataset_id, ())
+    if not expected_keys or not rows:
+        return True
+    return any(any(key in row for key in expected_keys) for row in rows)
+
+
+async def _query_dataset_guarded(
+    dataset_id: str,
+    where_clause: str,
+    failed_out: list[str],
+    limit: int = 200,
 ) -> list[dict[str, Any]]:
+    """Query one of the schema-guarded datasets (Adiciones/ModifProcesos/Ubicaciones).
+
+    Never raises: a query failure (retries exhausted) or a schema-drift result
+    (rows present but missing the expected join key) both append `dataset_id` to
+    `failed_out` and return an empty list — the caller composes this with the
+    same partial-result contract used by `_query_docs_datasets`.
+    """
+    try:
+        rows = await _query_socrata(dataset_id, where_clause, limit=limit)
+    except ExternalServiceError as exc:
+        log.warning("secop_nuevo_dataset_error", dataset=dataset_id, error=str(exc))
+        failed_out.append(dataset_id)
+        return []
+    if not _dataset_has_join_key(rows, dataset_id):
+        log.warning(
+            "secop_nuevo_dataset_schema_drift",
+            dataset=dataset_id,
+            expected_keys=_DATASET_JOIN_KEYS.get(dataset_id, ()),
+        )
+        failed_out.append(dataset_id)
+        return []
+    return rows
+
+
+# Best-effort peso-amount extraction from cb9c-h8sn's free-text `descripcion`
+# (no structured value field exists — live probe finding, see _DS_ADICIONES note
+# above). Matches "$1.234.567" style Colombian peso amounts; not every row has a
+# parseable amount, in which case `valor_adicion` is None rather than guessed.
+_VALOR_ADICION_RE = re.compile(r"\$\s?(\d{1,3}(?:[.,]\d{3})+)")
+
+
+def _extraer_valor_adicion_texto(descripcion: str | None) -> float | None:
+    if not descripcion:
+        return None
+    match = _VALOR_ADICION_RE.search(descripcion)
+    if not match:
+        return None
+    digits = match.group(1).replace(".", "").replace(",", "")
+    try:
+        return float(digits)
+    except ValueError:
+        return None
+
+
+async def _fetch_nuevos_datasets_contrato(
+    id_contrato_secop: str | None,
+    proceso_de_compra: str | None,
+    id_del_portafolio: str | None,
+    referencia_del_contrato: str | None,
+    failed_out: list[str],
+) -> dict[str, list[dict[str, Any]]]:
+    """Fan out to the 3 new datasets for one contrato (+ its resolved proceso),
+    each via its confirmed join key (spec 'Dataset-specific join semantics
+    preserved'). A contract lacking a given dataset's key(s) is simply skipped
+    for that dataset — zero rows, no error (spec 'No matching key for a
+    contract')."""
+    results: dict[str, list[dict[str, Any]]] = {
+        "_adiciones": [],
+        "_modif_procesos": [],
+        "_ubicaciones": [],
+    }
+
+    coros: list[Any] = []
+    result_keys: list[str] = []
+
+    if id_contrato_secop:
+        safe_id = id_contrato_secop.replace("'", "''")
+        coros.append(
+            _query_dataset_guarded(
+                _DS_ADICIONES,
+                f"id_contrato = '{safe_id}' AND tipo = 'ADICION EN EL VALOR'",
+                failed_out,
+            )
+        )
+        result_keys.append("_adiciones")
+
+    # e2u2-swiw's real field is `portafolio` (see deviation note); prefer the
+    # contrato's proceso_de_compra, fall back to the proceso's id_del_portafolio —
+    # both are our own CO1.BDOS.xxx values, just sourced from different rows.
+    portafolio_value = proceso_de_compra or id_del_portafolio
+    if portafolio_value:
+        safe_port = portafolio_value.replace("'", "''")
+        coros.append(_query_dataset_guarded(_DS_MODIF_PROCESOS, f"portafolio = '{safe_port}'", failed_out))
+        result_keys.append("_modif_procesos")
+
+    if referencia_del_contrato:
+        safe_ref = referencia_del_contrato.replace("'", "''")
+        coros.append(_query_dataset_guarded(_DS_UBICACIONES, f"referencia_del_contrato = '{safe_ref}'", failed_out))
+        result_keys.append("_ubicaciones")
+
+    if coros:
+        fetched = await asyncio.gather(*coros)
+        for key, rows in zip(result_keys, fetched, strict=False):
+            results[key] = rows
+
+    return results
+
+
+def _upsert_nuevos_datasets_raw(
+    datos_raw: dict[str, Any] | None,
+    nuevos: dict[str, list[dict[str, Any]]],
+) -> tuple[dict[str, Any], bool]:
+    """Non-destructive upsert (D1): only overwrite a reserved key when THIS
+    refresh actually returned rows for it — an empty/failed refresh (whether
+    zero rows or a schema/query error already filtered out by
+    `_query_dataset_guarded`) leaves whatever was cached before untouched."""
+    raw = dict(datos_raw or {})
+    changed = False
+    for key in ("_adiciones", "_ubicaciones"):
+        rows = nuevos.get(key)
+        if rows:
+            raw[key] = rows
+            changed = True
+    return raw, changed
+
+
+async def _query_docs_datasets(where_clause: str, failed_out: list[str] | None = None) -> list[dict[str, Any]]:
     """Fan-out: query all archive document datasets in parallel.
 
     Each row is annotated with ``_secop_dataset`` so callers can derive ``tipo_origen``.
@@ -457,6 +624,7 @@ async def buscar_documentos_contrato(
     db: AsyncSession,
     numero_contrato: str,
     refresh: bool = False,
+    datasets_con_error_out: list[str] | None = None,
 ) -> list[SecopDocumentoResponse]:
     """Fetch ALL documents for a contract by both numero_contrato and proceso_de_compra.
 
@@ -470,6 +638,12 @@ async def buscar_documentos_contrato(
     SECOP II contratos dataset (jbjy-vk9h) so that proceso_de_compra is populated
     before running the document queries. Without this step, the document fan-out
     would have no proceso keys and would return zero results.
+
+    ``datasets_con_error_out`` is an optional out-parameter (default ``None``,
+    fully backward compatible): when a caller passes a list, any archive dataset
+    that errors during this call's refresh is appended to it — used by
+    `obtener_documentos_con_cobertura` (task 2.10b) to build its `cobertura`
+    block without duplicating this function's fetch logic.
     """
     # Resolve ALL SecopContrato rows for this numero_contrato.
     # A contract can have multiple rows (original + adiciones/modificaciones),
@@ -588,7 +762,7 @@ async def buscar_documentos_contrato(
 
         if where_parts:
             combined_where = " OR ".join(where_parts)
-            docs_coro = _query_docs_datasets(combined_where)
+            docs_coro = _query_docs_datasets(combined_where, failed_out=datasets_con_error_out)
             gather_results = await asyncio.gather(docs_coro, mod_coro, return_exceptions=True)
             docs_rows: list[dict[str, Any]] = [] if isinstance(gather_results[0], Exception) else gather_results[0]
             mod_rows: list[dict[str, Any]] = [] if isinstance(gather_results[1], Exception) else gather_results[1]
@@ -650,6 +824,19 @@ async def buscar_documentos_contrato(
     return _inject_url_proceso(responses, secop_contrato)
 
 
+def _inject_url_proceso(
+    docs: list[SecopDocumentoResponse],
+    secop_contrato: SecopContrato | None,
+) -> list[SecopDocumentoResponse]:
+    """Inject url_proceso from SecopContrato.datos_raw['urlproceso'] into each document."""
+    url_val = _extract_urlproceso(secop_contrato)
+    if not url_val:
+        return docs
+    for doc in docs:
+        doc.url_proceso = url_val
+    return docs
+
+
 def _compute_tipo_origen(doc: SecopDocumento) -> str:
     """Derive tipo_origen at runtime from datos_raw metadata (no DB column needed)."""
     raw = doc.datos_raw or {}
@@ -668,22 +855,90 @@ def _compute_tipo_origen(doc: SecopDocumento) -> str:
     return "proceso"
 
 
-def _inject_url_proceso(
-    docs: list[SecopDocumentoResponse],
-    secop_contrato: SecopContrato | None,
-) -> list[SecopDocumentoResponse]:
-    """Inject url_proceso from SecopContrato.datos_raw['urlproceso'] into each document."""
+def _extract_urlproceso(secop_contrato: SecopContrato | None) -> str | None:
+    """Extract the SECOP II platform URL from `SecopContrato.datos_raw['urlproceso']`."""
     if not secop_contrato:
-        return docs
+        return None
     raw = secop_contrato.datos_raw or {}
     url_val = raw.get("urlproceso")
     if isinstance(url_val, dict):
         url_val = url_val.get("url")
     if not url_val or not str(url_val).startswith("http"):
-        return docs
-    for doc in docs:
-        doc.url_proceso = str(url_val)
-    return docs
+        return None
+    return str(url_val)
+
+
+def _compute_cobertura(
+    secop_contrato: SecopContrato | None,
+    datasets_con_error: list[str],
+    documentos: list[SecopDocumentoResponse],
+) -> CoberturaDocumentosInfo:
+    """Build the `cobertura` block (task 2.10b): explains partial document
+    coverage instead of leaving it looking like a bug. Gap flag is True when
+    either the contract falls in the known-partial 2024 window (D4) or any
+    archive dataset errored during this fetch."""
+    razones: list[str] = []
+    gap = False
+
+    if secop_contrato is not None and secop_contrato.fecha_inicio and secop_contrato.fecha_inicio.year == 2024:
+        gap = True
+        razones.append(
+            "Este contrato inicia en 2024, año en el que los datasets públicos de SECOP tienen "
+            "cobertura parcial (ver 'secop_docs_gap_2024'): documentos del inicio del contrato "
+            "pueden no estar disponibles vía la API de datos abiertos."
+        )
+
+    if datasets_con_error:
+        gap = True
+        razones.append(
+            "Los siguientes datasets de SECOP fallaron durante la consulta y el resultado puede "
+            f"estar incompleto: {', '.join(sorted(set(datasets_con_error)))}."
+        )
+
+    if not gap:
+        razones.append(
+            "La cobertura de documentos de datos abiertos para este contrato es la esperada. "
+            "Documentos adicionales, si existen, solo están disponibles en la plataforma SECOP II."
+        )
+
+    return CoberturaDocumentosInfo(
+        gap=gap,
+        razon=" ".join(razones),
+        url_proceso=_extract_urlproceso(secop_contrato),
+    )
+
+
+async def obtener_documentos_con_cobertura(
+    db: AsyncSession,
+    numero_contrato: str,
+    refresh: bool = False,
+) -> SecopDocumentosConCoberturaResponse:
+    """Documents for a contract plus a structured `cobertura` explanation (task
+    2.10b) — used by `GET /secop/documentos/{numero_contrato}` so a legitimately
+    small document count (e.g. a 2024 contract, or a Socrata outage) doesn't look
+    like a bug to the caller. Delegates entirely to `buscar_documentos_contrato`
+    (same cache/refresh/dedup behavior), only adding the coverage explanation.
+    """
+    datasets_con_error: list[str] = []
+    documentos = await buscar_documentos_contrato(
+        db, numero_contrato, refresh=refresh, datasets_con_error_out=datasets_con_error
+    )
+
+    contrato_result = await db.execute(
+        select(SecopContrato).where(
+            or_(
+                SecopContrato.numero_contrato == numero_contrato,
+                SecopContrato.referencia_del_contrato == numero_contrato,
+                SecopContrato.proceso_de_compra == numero_contrato,
+            )
+        )
+    )
+    secop_contrato = contrato_result.scalars().first()
+
+    return SecopDocumentosConCoberturaResponse(
+        documentos=documentos,
+        cobertura=_compute_cobertura(secop_contrato, datasets_con_error, documentos),
+    )
 
 
 async def listar_archivos_comprimido(
@@ -1172,16 +1427,12 @@ async def sincronizar_documentos_secop(
         safe_num = contrato.numero_contrato.replace("'", "''")
         # Fan out across ALL archive datasets (2018→today), not just the 2025 one,
         # so contracts with pre-2025 documents are not silently under-reported.
-        rows = await _query_docs_datasets(
-            f"n_mero_de_contrato = '{safe_num}'", failed_out=failed_datasets
-        )
+        rows = await _query_docs_datasets(f"n_mero_de_contrato = '{safe_num}'", failed_out=failed_datasets)
         return rows, contrato
 
     async def _fetch_docs_for_proceso(proceso: SecopProceso) -> tuple[list[dict[str, Any]], SecopProceso]:
         safe_proc = proceso.id_proceso_secop.replace("'", "''")
-        rows = await _query_docs_datasets(
-            f"proceso = '{safe_proc}'", failed_out=failed_datasets
-        )
+        rows = await _query_docs_datasets(f"proceso = '{safe_proc}'", failed_out=failed_datasets)
         return rows, proceso
 
     # Fetch documents for all contratos and procesos in parallel
@@ -1280,6 +1531,60 @@ async def sincronizar_documentos_secop(
                 existing_ids.add(id_doc)
                 docs_guardados += 1
 
+    # ── New datasets (Adiciones, Modificaciones a Procesos, Ubicaciones) ──────
+    # Slice 2 (secop-dataset-ingestion, D1/D5): only wired when persisting, so
+    # preview mode (confirmar=False) keeps its existing zero-extra-query behavior.
+    # Non-destructive upsert: an empty/failed fetch for a given dataset leaves
+    # whatever was previously cached on datos_raw untouched (see
+    # `_upsert_nuevos_datasets_raw`).
+    if confirmar and contratos:
+        proceso_by_id = {p.id_proceso_secop: p for p in procesos}
+
+        async def _fetch_nuevos_para_contrato(
+            contrato: SecopContrato,
+        ) -> tuple[SecopContrato, dict[str, list[dict[str, Any]]], list[str]]:
+            proceso_obj = proceso_by_id.get(contrato.proceso_de_compra) if contrato.proceso_de_compra else None
+            local_failed: list[str] = []
+            nuevos = await _fetch_nuevos_datasets_contrato(
+                id_contrato_secop=contrato.id_contrato_secop,
+                proceso_de_compra=contrato.proceso_de_compra,
+                id_del_portafolio=proceso_obj.id_proceso_secop if proceso_obj else None,
+                referencia_del_contrato=contrato.referencia_del_contrato,
+                failed_out=local_failed,
+            )
+            return contrato, nuevos, local_failed
+
+        nuevos_results = await asyncio.gather(
+            *[_fetch_nuevos_para_contrato(c) for c in contratos], return_exceptions=True
+        )
+        for nuevos_result in nuevos_results:
+            if isinstance(nuevos_result, BaseException):
+                log.warning("secop_nuevos_datasets_contrato_failed", error=str(nuevos_result))
+                continue
+            contrato, nuevos, local_failed = nuevos_result
+            failed_datasets.extend(local_failed)
+
+            raw, changed = _upsert_nuevos_datasets_raw(contrato.datos_raw, nuevos)
+            # Error status reflects THIS run's outcome (overwritten, not merged) —
+            # unlike the data rows above, a dataset that recovers should stop
+            # showing as errored for `obtener_estado_datasets_secop`.
+            if local_failed:
+                raw["_dataset_errors"] = sorted(set(local_failed))
+                changed = True
+            elif "_dataset_errors" in raw:
+                del raw["_dataset_errors"]
+                changed = True
+            if changed:
+                contrato.datos_raw = raw
+
+            modif_rows = nuevos.get("_modif_procesos")
+            if modif_rows:
+                proceso_obj = proceso_by_id.get(contrato.proceso_de_compra) if contrato.proceso_de_compra else None
+                if proceso_obj is not None:
+                    proceso_raw = dict(proceso_obj.datos_raw or {})
+                    proceso_raw["_modif_procesos"] = modif_rows
+                    proceso_obj.datos_raw = proceso_raw
+
     if confirmar:
         await db.commit()
 
@@ -1324,6 +1629,108 @@ async def sincronizar_documentos_secop(
         confirmar=confirmar,
         documentos=docs_response,
         datasets_con_error=sorted(set(failed_datasets)),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Accessors for the 3 new datasets (secop-dataset-ingestion, Slice 2)
+# ---------------------------------------------------------------------------
+
+
+async def obtener_adiciones_contrato(db: AsyncSession, id_contrato: str) -> list[dict[str, Any]]:
+    """Boundary accessor (design D2) — reads cached Adición rows from
+    ``SecopContrato.datos_raw["_adiciones"]``. Never queries Socrata directly:
+    this is the single ingestion owner; `billing-resilience-templates` (migration
+    026) consumes this accessor instead of duplicating the fetch.
+
+    Returns a list of ``{id_contrato_secop, numero_contrato, valor_adicion,
+    fecha_efectiva, raw}`` dicts. ``valor_adicion`` is best-effort-parsed from
+    cb9c-h8sn's free-text ``descripcion`` (no structured value field exists —
+    see the ``_DS_ADICIONES`` deviation note) and may be ``None`` when no peso
+    amount could be extracted; callers must handle that case.
+    """
+    result = await db.execute(select(SecopContrato).where(SecopContrato.id_contrato_secop == id_contrato))
+    contrato = result.scalar_one_or_none()
+    if contrato is None:
+        return []
+
+    adiciones_raw = (contrato.datos_raw or {}).get("_adiciones") or []
+    return [
+        {
+            "id_contrato_secop": row.get("id_contrato") or id_contrato,
+            "numero_contrato": contrato.numero_contrato,
+            "valor_adicion": _extraer_valor_adicion_texto(row.get("descripcion")),
+            "fecha_efectiva": _parse_date(row.get("fecharegistro")),
+            "raw": row,
+        }
+        for row in adiciones_raw
+    ]
+
+
+async def obtener_estado_datasets_secop(db: AsyncSession, cedula: str) -> SecopEstadoDatasetsResponse:
+    """Read-only diagnostic (task 2.9): surfaces per-dataset schema-verification
+    status for the 3 new datasets plus any accumulated `datasets_con_error`,
+    aggregated across every cached SecopContrato/SecopProceso for this cédula.
+
+    Offline by design (D3 — "verify offline, wire constants"): reports the
+    OUTCOME of the most recent `sincronizar_documentos_secop` run(s) recorded on
+    cache rows, it does not itself query Socrata.
+    """
+    if not re.match(r"^\d{5,15}$", cedula):
+        raise ValidationError("La cédula debe contener entre 5 y 15 dígitos")
+
+    contratos_result = await db.execute(select(SecopContrato).where(SecopContrato.cedula_contratista == cedula))
+    contratos = contratos_result.scalars().all()
+
+    errores_acumulados: set[str] = set()
+    tiene_adiciones = False
+    tiene_ubicaciones = False
+    for c in contratos:
+        raw = c.datos_raw or {}
+        errores_acumulados.update(raw.get("_dataset_errors") or [])
+        if raw.get("_adiciones"):
+            tiene_adiciones = True
+        if raw.get("_ubicaciones"):
+            tiene_ubicaciones = True
+
+    proceso_ids = {c.proceso_de_compra for c in contratos if c.proceso_de_compra}
+    tiene_modif_procesos = False
+    if proceso_ids:
+        procesos_result = await db.execute(
+            select(SecopProceso).where(SecopProceso.id_proceso_secop.in_(list(proceso_ids)))
+        )
+        for p in procesos_result.scalars().all():
+            raw = p.datos_raw or {}
+            errores_acumulados.update(raw.get("_dataset_errors") or [])
+            if raw.get("_modif_procesos"):
+                tiene_modif_procesos = True
+
+    def _estado(dataset_id: str, tiene_datos: bool) -> str:
+        if dataset_id in errores_acumulados:
+            return "error"
+        return "ok" if tiene_datos else "no_verificado"
+
+    datasets = [
+        SecopEstadoDataset(
+            dataset_id=_DS_ADICIONES,
+            nombre="Adiciones",
+            estado=_estado(_DS_ADICIONES, tiene_adiciones),
+        ),
+        SecopEstadoDataset(
+            dataset_id=_DS_MODIF_PROCESOS,
+            nombre="Modificaciones a Procesos",
+            estado=_estado(_DS_MODIF_PROCESOS, tiene_modif_procesos),
+        ),
+        SecopEstadoDataset(
+            dataset_id=_DS_UBICACIONES,
+            nombre="Ubicaciones ejecución",
+            estado=_estado(_DS_UBICACIONES, tiene_ubicaciones),
+        ),
+    ]
+
+    return SecopEstadoDatasetsResponse(
+        datasets_con_error=sorted(errores_acumulados),
+        datasets=datasets,
     )
 
 
