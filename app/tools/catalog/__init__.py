@@ -22,6 +22,7 @@ from app.tools.catalog import (
     informes,
     listar_contratos,
     listar_cuentas_cobro,
+    paquete,
     secop,
 )
 
@@ -34,5 +35,6 @@ __all__ = [
     "informes",
     "listar_contratos",
     "listar_cuentas_cobro",
+    "paquete",
     "secop",
 ]
