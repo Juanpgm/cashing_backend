@@ -214,3 +214,15 @@ async def generar_zip_evidencias(db, usuario_id, cuenta_id) -> tuple[bytes, str]
 
 - [ ] None blocking. Free-text `entidad` normalization robustness across organisms is
       a monitored risk (D5) — revisit only if match noise appears in practice.
+
+## Clarification: PACKAGE_PENDIENTE vs CHECKLIST_INCOMPLETE (added slice #3, task 3.0b)
+
+Carried over from the `cuota-packager` spec (slice #2 verify-report WARNING 2) so both
+documents agree: `PACKAGE_PENDIENTE` is an **obligación-level packaging completeness**
+signal owned by `informe_service.generar_zip_evidencias(modo="final")` (LISTO/PENDIENTE
+per obligación, from D2's data flow). `CHECKLIST_INCOMPLETE` is a separate
+**requisito/checklist completeness** signal owned by `checklist_service` +
+`cuenta_cobro_service.radicar_cuenta`. Slice #7's `preparar_radicacion` orchestrator
+(File Changes, `radicacion_prep_service.py`) calls checklist → coherence → packager in
+sequence and surfaces whichever gate fails first — it never merges the two signals into
+one "readiness" flag.

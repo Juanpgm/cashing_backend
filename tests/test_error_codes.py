@@ -328,6 +328,80 @@ async def test_zip_evidencias_modo_final_pendiente_returns_code(
     assert exc_info.value.code == "PACKAGE_PENDIENTE"
 
 
+async def test_zip_evidencias_binary_extraction_leak_returns_code(
+    db: AsyncSession,
+    test_user: dict[str, Any],
+    contrato: Contrato,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Task 3.0a (billing-resilience-templates slice #3, carry-over from slice #2
+    verify-report WARNING 1): a non-UTF8 evidencia whose extracted text (via
+    `document_service.extraer_texto_documento`, mocked here) contains a leak-shaped
+    secret must still trigger `SECRET_DETECTED_IN_PACKAGE` — exercises
+    `informe_service._texto_para_scan`'s binary-extraction fallback branch (the
+    direct UTF-8 decode fails first on the non-UTF8 payload, forcing the extractor
+    path)."""
+    from app.models.evidencia import Evidencia
+    from app.services import informe_service
+
+    user = test_user["user"]
+    ob = Obligacion(
+        contrato_id=contrato.id,
+        descripcion="Obligación de prueba con texto razonable",
+        tipo=TipoObligacion.GENERAL,
+        orden=0,
+    )
+    db.add(ob)
+    await db.commit()
+    await db.refresh(ob)
+    contrato.obligaciones = [ob]
+
+    cc = CuentaCobro(contrato_id=contrato.id, mes=3, anio=2024, estado=EstadoCuentaCobro.BORRADOR, valor=1_000_000)
+    db.add(cc)
+    await db.commit()
+    await db.refresh(cc)
+
+    act = Actividad(
+        cuenta_cobro_id=cc.id, obligacion_id=ob.id, descripcion="Actividad", fecha_realizacion=date(2024, 3, 5)
+    )
+    db.add(act)
+    await db.commit()
+    await db.refresh(act)
+
+    # Non-UTF8 payload — `_texto_para_scan`'s direct `.decode("utf-8")` raises
+    # `UnicodeDecodeError`, forcing the `document_service.extraer_texto_documento`
+    # fallback branch (mocked below to return leak-shaped text).
+    contenido_binario = b"\xff\xd8\xff\xe0fake-binary-pdf-bytes\x00\x01"
+
+    ev = Evidencia(
+        actividad_id=act.id,
+        storage_key=f"evidencias/{act.id}/leak.pdf",
+        nombre_archivo="leak.pdf",
+        tipo_archivo="application/pdf",
+        tamano_bytes=len(contenido_binario),
+    )
+    db.add(ev)
+    await db.commit()
+    await db.refresh(ev)
+    act.evidencias = [ev]
+    await db.refresh(cc)
+
+    monkeypatch.setattr(
+        informe_service,
+        "_get_storage",
+        lambda *_a, **_k: _fake_storage_con_bytes({ev.storage_key: contenido_binario}),
+    )
+    monkeypatch.setattr(
+        informe_service.document_service,
+        "extraer_texto_documento",
+        AsyncMock(return_value=(_LEAK_CORPUS_TEXTO, [])),
+    )
+
+    with pytest.raises(ValidationError) as exc_info:
+        await informe_service.generar_zip_evidencias(db, user.id, cc.id)
+    assert exc_info.value.code == "SECRET_DETECTED_IN_PACKAGE"
+
+
 async def test_unrelated_error_keeps_unchanged_envelope_shape(client: AsyncClient, test_user: dict[str, Any]) -> None:
     """Regression guard: an error without an assigned code has an unchanged envelope.
 

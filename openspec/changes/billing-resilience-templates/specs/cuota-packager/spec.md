@@ -93,3 +93,23 @@ PENDIENTE (missing or incomplete) and MUST include this split in the package man
 
 - Secret-scan detector implementation (existing lib vs bespoke) — proposal §9.2.
 - StoragePort sequential-download cost handling (no new port methods this change).
+
+## Clarification: PACKAGE_PENDIENTE vs CHECKLIST_INCOMPLETE (added slice #3, task 3.0b)
+
+These two error codes guard DIFFERENT completeness dimensions and are never
+interchangeable:
+
+- **`PACKAGE_PENDIENTE`** (this spec) — **obligación-level packaging completeness**:
+  whether every contract obligación has at least one evidencia attached for the
+  cuota being packaged (the LISTO/PENDIENTE split above). Raised only by
+  `generar_zip_evidencias(modo="final")` inside the packager itself.
+- **`CHECKLIST_INCOMPLETE`** (`cuenta_cobro_service.radicar_cuenta`) —
+  **requisito/checklist completeness**: whether every mandatory document
+  requisito (CONTRATO, RPC, SEGURIDAD_SOCIAL, CEDULA, RUT, etc. — see
+  `checklist_service`) has been satisfied, independent of the evidence ZIP.
+
+A cuenta can be `PACKAGE_PENDIENTE` while its checklist is complete (obligaciones
+lack activity evidence but every document requisito is uploaded) or vice versa
+(every obligación has evidence but a mandatory requisito document is missing).
+Slice #7's `preparar_radicacion` orchestrator (see `design.md`) checks BOTH gates
+in sequence — it does not conflate them into a single completeness signal.
