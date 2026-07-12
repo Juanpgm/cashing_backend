@@ -60,6 +60,22 @@ Est. lines: ~250 | Spec: `secop-acquisition-resilience` + one requirement from `
   | `3skv-9na7`, 2023-06 sanity check | request timed out (network) — not required for the conclusion below |
 
   **Conclusion**: neither binary scenario in spec/D4 applies cleanly — this is a **partial** result. `dmgg-8hin` is NOT gap-free for 2024 (it holds exactly one bulk-upload day, 2024-12-31, not full-year coverage), so the `secop_docs_gap_2024` warning is **NOT disproven** and is **KEPT** (counter-scenario: "Probe confirms a real gap ... surfaced as known limitation"). However the existing comment `"desde 01/01/2025 (2024 gap: no public dataset exists)"` is factually inaccurate — some 2024-dated docs ARE retrievable (and were already being fetched, since `dmgg-8hin` is already part of `_ALL_DOCS_DATASETS`). Per D4 "act only on the probe's result": the comment is corrected to describe the real nuance; the gap-preserved log branch is left in place with clarified wording. See Slice 1 "Deviation from D4" note below.
+
+  #### Deviation from D4
+
+  D4 was written expecting a binary probe outcome ("gap-free" vs. "real gap").
+  The live result is a **third, partial** outcome that D4 did not enumerate:
+  the dataset returns 2024-dated rows, but they are all a single bulk-load
+  batch (`2024-12-31`), not genuine full-year coverage. Per D4's own guidance
+  to "act only on the probe's result" rather than the letter of its two
+  scenarios, this was resolved as: keep the `secop_docs_gap_2024` warning
+  (closer in spirit to "real gap"), but correct the inaccurate "no public
+  dataset exists" comment (since some 2024 rows genuinely are retrievable).
+  This partial-result nuance is now captured as a third scenario in
+  `specs/secop-dataset-ingestion/spec.md` ("Probe finds partial/anomalous
+  coverage") and a matching note in `design.md` D4, so future probes with a
+  similarly ambiguous result have a documented precedent instead of forcing a
+  binary choice (Slice 2, task 2.10c).
 - [x] 1.3 [RED] Test asserting year-range fix or gap-preserved branch, per probe result.
 - [x] 1.4 [GREEN] `app/services/secop_service.py`: fix `_DS_DOCS_2025` comment (line ~49) and conditionally drop/keep `secop_docs_gap_2024` log (line ~573) per D4.
 - [x] 1.5 [RED] `tests/test_secop_service.py`: mock httpx returning 429 then 200 — `_query_socrata` retries, returns data, no error.
@@ -81,19 +97,29 @@ PR title: `feat(secop): wire Adiciones, Modificaciones a Procesos and Ubicacione
 Est. lines: ~350 | Spec: `secop-dataset-ingestion` (minus 2024 requirement)
 Depends on: Slice 1 merged (retry wraps all `_query_socrata` calls below).
 
-- [ ] 2.1 [Manual, not CI] `@pytest.mark.live` schema test: `cb9c-h8sn` exposes `id_contrato`; `e2u2-swiw` exposes `proceso_de_compra`/`id_del_portafolio`; `gra4-pcp2` exposes `referencia_del_contrato`. Run before wiring; record result in PR #2.
-- [ ] 2.2 [RED] `tests/test_secop_datasets.py`: dataset with schema missing its join key → marked unavailable, appended to `datasets_con_error`, logged — never silently dropped.
-- [ ] 2.3 [GREEN] `secop_service.py`: add `_DS_ADICIONES = "cb9c-h8sn"`, `_DS_MODIF_PROCESOS = "e2u2-swiw"`, `_DS_UBICACIONES = "gra4-pcp2"` constants + schema-presence guard per dataset.
-- [ ] 2.4 [RED] Test: `e2u2-swiw` row joins via `proceso_de_compra`, falls back to `id_del_portafolio`; `gra4-pcp2` joins via `referencia_del_contrato`; no matching key → zero rows, no crash.
-- [ ] 2.5 [GREEN] `secop_service.py`: fan-out queries for the 3 datasets using confirmed join keys, following `buscar_documentos_contrato` multi-key pattern (line ~418); non-destructive upsert into `SecopContrato.datos_raw["_adiciones"]` / `SecopContrato.datos_raw["_ubicaciones"]` / `SecopProceso.datos_raw["_modif_procesos"]` (D1).
-- [ ] 2.6 [RED] Test: `obtener_adiciones_contrato(db, id_contrato)` returns contract link, `valor_adicion`, effective date from `datos_raw["_adiciones"]` without querying Socrata.
-- [ ] 2.7 [GREEN] Implement `obtener_adiciones_contrato()` accessor (D2) — this is the contract consumed by `billing-resilience-templates` slice #4.
-- [ ] 2.8 [RED] Test: cached rows survive a failed/empty refresh for the 3 new datasets (non-destructive upsert, D1).
-- [ ] 2.9 `app/tools/catalog/secop.py`: register `obtener_estado_datasets_secop` tool (read) surfacing `datasets_con_error` + per-dataset schema-verification status.
-- [ ] 2.10 Mirror-update: `tests/test_secop_datasets.py` fan-out assertions to include the 3 new dataset ids; `tests/test_secop_sincronizar.py` if `sincronizar_documentos_secop` signature/output changed.
-- [ ] 2.10b [RED+GREEN] Surface the coverage gap to callers: when `buscar_documentos_contrato` returns docs for a contract affected by the 2024 partial gap (or any dataset in `datasets_con_error`), include a structured `cobertura` block in the documentos response — gap flag, human-readable reason, and the contract's `urlproceso` link — so the frontend can explain "open data only exposes N docs for this contract; the rest live on the SECOP platform (Slice 3 scraper)" instead of looking like a bug. (Live evidence 2026-07-11: contract 4161.010.26.1.2189.2024 legitimately yields exactly 2 docs from open data — ACTA DE CIERRE pdf + 1 modification stub whose file is a Marketplace-internal ID with no URL; early-lifecycle docs are platform-only.)
-- [ ] 2.10c Pre-slice cleanup from Slice 1 verify WARNINGs: add the missing "Deviation from D4" note referenced near the Slice 1 probe task; run `ruff format` on the two new retry tests in `tests/test_secop_service.py`; add a third scenario (partial/anomalous coverage → treat as gap, document nuance) to `specs/secop-dataset-ingestion/spec.md` and a matching note to `design.md` D4.
-- [ ] 2.11 Verification gate: ruff + `ruff format --check` + `uv run python -m pytest tests/test_secop_datasets.py tests/test_secop_service*.py -v`, then full suite.
+- [x] 2.1 [Manual, not CI] `@pytest.mark.live` schema test: `cb9c-h8sn` exposes `id_contrato`; `e2u2-swiw` exposes `proceso_de_compra`/`id_del_portafolio`; `gra4-pcp2` exposes `referencia_del_contrato`. Run before wiring; record result in PR #2.
+
+  **Live schema probe evidence (recorded 2026-07-11, `curl` + Socrata views metadata API against `www.datos.gov.co`):**
+
+  | Dataset | Assumed key(s) | Live result | Verdict |
+  |---|---|---|---|
+  | `cb9c-h8sn` (Adiciones) | `id_contrato` | `id_contrato` IS present. Real title: "SECOP II - Modificaciones a Contratos". Fields: `identificador, id_contrato, tipo, descripcion, fecharegistro` — **no structured value field**; `tipo` distinguishes real value-additions via literal `"ADICION EN EL VALOR"` (not just `"ADICION"`). | Join key confirmed. **Deviation**: `valor_adicion` best-effort-parsed from free-text `descripcion` (`_extraer_valor_adicion_texto`), may be `None`. |
+  | `e2u2-swiw` (Modif. Procesos) | `proceso_de_compra` / `id_del_portafolio` | Real fields are `portafolio` (format `CO1.BDOS.xxx`, matches our `proceso_de_compra`/`id_proceso_secop`) and `proceso` (format `CO1.REQ.xxx`, a different id space we don't track). Socrata description: *"Última fecha de Modificación para procesos que han sido objeto de cambio en su definición en los últimos 8 días"* — **rolling 8-day window**, not a historical archive. | **Deviation**: field names corrected to `portafolio`/`proceso`; query value still falls back between our own `proceso_de_compra` and `id_proceso_secop` (the fallback CONCEPT holds, only the Socrata field name was wrong). Zero rows for most contracts is expected (outside the 8-day window), not an error. |
+  | `gra4-pcp2` (Ubicaciones) | `referencia_del_contrato` | Present exactly as assumed, plus bonus `id_contrato`/`proceso_de_compra`/`urlproceso` fields. | Confirmed, no deviation. |
+
+  Encoded as a real pytest live test: `tests/test_secop_datasets.py::test_live_probe_nuevos_datasets_schema` (run manually with `-m live`, passed).
+- [x] 2.2 [RED] `tests/test_secop_datasets.py`: dataset with schema missing its join key → marked unavailable, appended to `datasets_con_error`, logged — never silently dropped. (`TestNuevosDatasetsSchemaGuard`)
+- [x] 2.3 [GREEN] `secop_service.py`: add `_DS_ADICIONES = "cb9c-h8sn"`, `_DS_MODIF_PROCESOS = "e2u2-swiw"`, `_DS_UBICACIONES = "gra4-pcp2"` constants + schema-presence guard (`_dataset_has_join_key`, `_query_dataset_guarded`) per dataset.
+- [x] 2.4 [RED] Test: `e2u2-swiw` row joins via `portafolio` (real field; preferring contrato's `proceso_de_compra`, falling back to proceso's `id_proceso_secop` — see 2.1 deviation), `gra4-pcp2` joins via `referencia_del_contrato`; no matching key → zero rows, no crash. (`test_no_matching_key_yields_zero_rows_no_crash`)
+- [x] 2.5 [GREEN] `secop_service.py`: `_fetch_nuevos_datasets_contrato` fans out to the 3 datasets using the confirmed (and corrected, per 2.1) join keys; non-destructive upsert (`_upsert_nuevos_datasets_raw`) into `SecopContrato.datos_raw["_adiciones"]` / `SecopContrato.datos_raw["_ubicaciones"]` / `SecopProceso.datos_raw["_modif_procesos"]` (D1), wired into `sincronizar_documentos_secop` (confirmar=True only).
+- [x] 2.6 [RED] Test: `obtener_adiciones_contrato(db, id_contrato)` returns contract link, `valor_adicion`, effective date from `datos_raw["_adiciones"]` without querying Socrata. (`TestObtenerAdicionesContrato`)
+- [x] 2.7 [GREEN] Implement `obtener_adiciones_contrato()` accessor (D2) — this is the contract consumed by `billing-resilience-templates` slice #4. Returns `{id_contrato_secop, numero_contrato, valor_adicion, fecha_efectiva, raw}`; `valor_adicion` may be `None` (see 2.1 deviation).
+- [x] 2.8 [RED] Test: cached rows survive a failed/empty refresh for the 3 new datasets (non-destructive upsert, D1). (`TestNuevosDatasetsNonDestructiveUpsert`)
+- [x] 2.9 `app/tools/catalog/secop.py`: register `obtener_estado_datasets_secop` tool (read) surfacing `datasets_con_error` + per-dataset schema-verification status. Implemented as `secop_service.obtener_estado_datasets_secop(db, cedula)`, offline (D3) — reads `datos_raw["_dataset_errors"]`/presence of `_adiciones`/`_ubicaciones`/`_modif_procesos` recorded by the most recent sync, does not itself query Socrata.
+- [x] 2.10 Mirror-update: `tests/test_secop_datasets.py` fan-out assertions extended (schema-guard + accessor + non-destructive-upsert test classes added); full `tests/test_secop_sincronizar.py` + `tests/test_secop_service_documentos.py` re-run — 0 regressions (confirmar=False preview mode untouched by design since the new fan-out is gated on confirmar=True).
+- [x] 2.10b [RED+GREEN] Surface the coverage gap to callers: `secop_service.obtener_documentos_con_cobertura()` wraps `buscar_documentos_contrato` (via a new optional `datasets_con_error_out` out-param, default `None`/fully backward-compatible) and returns `SecopDocumentosConCoberturaResponse{documentos, cobertura{gap, razon (Spanish), url_proceso}}`. Gap flag = 2024-window OR non-empty `datasets_con_error`. Wired into `GET /secop/documentos/{numero_contrato}` (response_model changed from `list[SecopDocumentoResponse]` to the new wrapper — the internal `buscar_documentos_contrato()` service function itself is UNCHANGED for its other callers: `consulta_completa`, the `secop_client` agent tool). (Live evidence 2026-07-11: contract 4161.010.26.1.2189.2024 legitimately yields exactly 2 docs from open data — ACTA DE CIERRE pdf + 1 modification stub whose file is a Marketplace-internal ID with no URL; early-lifecycle docs are platform-only.)
+- [x] 2.10c Pre-slice cleanup from Slice 1 verify WARNINGs: added the missing "Deviation from D4" note near the Slice 1 probe task (see above); ran `ruff format` on the two retry tests in `tests/test_secop_service.py` (clean); added a third scenario ("Probe finds partial/anomalous coverage") to `specs/secop-dataset-ingestion/spec.md` and a matching note to `design.md` D4.
+- [x] 2.11 Verification gate: `ruff check` + `ruff format --check` (scoped to touched files — repo-wide `ruff check .` has 987 pre-existing unrelated errors, confirmed via `git stash` baseline of 990) + `uv run python -m pytest tests/test_secop_datasets.py tests/test_secop_service*.py tests/test_secop_sincronizar.py tests/test_tool_catalog.py -v` (113 passed), then full suite: **1221 passed / 14 deselected** (was 1205/13 before this slice; +16 new tests, +1 new live-marked test → 14 deselected). `mypy` on touched files: 7 pre-existing errors (identical to `git stash` baseline), 0 new (one candidate new error from `asyncio.gather(..., return_exceptions=True)` + tuple-unpack was fixed by narrowing on `BaseException` instead of `Exception`).
 - [ ] 2.12 **NO PUSH without explicit user OK.** Prepare PR #2 (📍PR2, base=main, rollback=revert commit range; cache regenerable).
 
 ## Slice 3: Scraper End-to-End Wiring (no persistence)
@@ -124,7 +150,7 @@ Est. lines: ~380 | Spec: `secop-document-scraper` (D6, D7) — persistence defer
   **Note**: `tests/test_secop_service_agentic.py` and `tests/test_secop_api_agentic.py` referenced by this task and 3.15 do not exist in the repo (only stale `__pycache__` entries from a prior branch/checkout) — there is no existing "agentic" HTTP endpoint or API test to mirror-update; `enforce_agentic_quota` itself is currently unused outside its own quota test. Skipped as not-applicable; new coverage lives in `tests/test_secop_api_scraper.py` instead.
 - [x] 3.14 Explicitly stub/skip persistence in this slice: on `estado="ok"`, return fetched doc metadata only — do NOT call any upload/persistence path yet (Slice 4 wires that). Verified by `test_success_returns_doc_metadata_no_persistence` (asserts zero rows written to `secop_documentos`).
 - [x] 3.15 Verification gate: ruff + `ruff format --check` + `uv run python -m pytest tests/test_secop_scraper_adapter.py tests/test_secop_agentic_quota.py tests/test_secop_scraper_deps.py tests/test_secop_scraper_service.py tests/test_secop_api_scraper.py tests/test_secop_scraper_tool.py -v`, then full suite. **Result: 1187 → 1204 passed (+17 new), 0 regressions, 13 deselected (unchanged); ruff check clean; ruff format clean; mypy: 0 new errors on touched files (2 pre-existing errors unrelated to this slice, confirmed via `git stash` diff).**
-- [x] 3.16 **NO PUSH without explicit user OK.** Prepare PR #3 (📍PR3, base=main, rollback=revert; flag defaults False so no behavior change until enabled). Commits prepared locally, not pushed — see apply-progress for hashes.
+- [x] 3.16 **NO PUSH without explicit user OK.** Prepare PR #3 (📍PR3, base=main, rollback=revert; flag defaults False so no behavior change until enabled). Commits prepared locally, not pushed: `3a72092` (feat: wire scraper fallback), `e544dc2` (docs), `6a4f51a` (fix: fail-soft on non-enumerated adapter errors — slice 3 verify WARNING 1).
 
 ## Slice 4: Scraper Persistence (BLOCKED on `backend-local-first-sync`)
 
@@ -135,6 +161,7 @@ Est. lines: ~200 (folded into scope; adjust vs. proposal's Slice 4 "tools" line 
 - [ ] 4.2 [RED] `tests/test_secop_scraper_service.py`: new document (unseen sha256) → downloaded, deduped by hash, persisted via `document_service.upload_document(...)` → `_process_uploaded_document`, classified, auto-linked to matching checklist requisito.
 - [ ] 4.3 [RED] Same file: document whose content hash matches an existing `DocumentoFuente` → recognized as duplicate, no second copy created, no re-download of bytes beyond the hash check.
 - [ ] 4.4 [GREEN] `secop_scraper_service.py`: per-doc download bytes → sha256 → skip if `DocumentoFuente` with that hash exists for the contrato → else `upload_document(...)`.
+- [ ] 4.4b [RED+GREEN] DocumentId caching (captcha-free refetch, live-probe finding 2026-07-11): persist every SECOP `DocumentId` + its `/Public/Archive/RetrieveFile/Index?DocumentId={id}` URL seen from ANY source (scraper results, Socrata archive rows, modification stubs) into cached SECOP data (`datos_raw["_document_index"]` or equivalent — no migration). `RetrieveFile` is confirmed captcha-free: a document indexed once NEVER needs the scraper again. Refetch path must try the cached DocumentId URL BEFORE invoking the scraper (true fallback ordering).
 - [ ] 4.5 Verify `moto[s3]` mocks cover the new upload path (reuse existing document_service test fixtures).
 - [ ] 4.6 Mirror-update: `tests/test_secop_scraper_adapter.py` unaffected; run full `document_service` test file to confirm no regression from the new caller.
 - [ ] 4.7 Verification gate: ruff + `uv run python -m pytest tests/test_secop_scraper_service.py -v`, then full suite.
