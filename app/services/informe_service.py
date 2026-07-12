@@ -42,6 +42,7 @@ from app.models.actividad import Actividad
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro
 from app.models.obligacion import Obligacion
+from app.models.plantilla_organismo import PlantillaOrganismo
 from app.models.usuario import Usuario
 from app.schemas.agent import LLMMessage
 from app.services import document_service, secret_scan_service
@@ -375,16 +376,19 @@ def _safe_dirname(text: str, max_len: int = 80) -> str:
     return cleaned or "obligacion"
 
 
-async def _resolver_estructura_organismo(db: AsyncSession, contrato: Contrato) -> None:
+async def _resolver_estructura_organismo(db: AsyncSession, contrato: Contrato) -> PlantillaOrganismo | None:
     """Look up a per-organism ingested template structure to number/name folders.
 
-    STUB in this slice (billing-resilience-templates, tasks 2.8/2.9): the
-    `PlantillaOrganismo` model doesn't exist until slice #5 (migration `027`,
-    `template-ingestion`). Always returns None so the packager falls back to the
-    default numbered folder structure below; slice #5 task 5.15 replaces this stub
-    with a real lookup without changing the fallback path.
+    Real lookup (billing-resilience-templates, slice #5, task 5.15 — completes
+    the slice #2 stub): delegates to `requisito_inference_service.
+    obtener_plantilla_organismo` (normalized `Contrato.entidad` match). Returns
+    `None` when no template has been ingested for this organism — the packager
+    then falls back to the default numbered folder structure below, exactly as
+    the slice #2 stub always did (zero regression when nothing was ingested).
     """
-    return None
+    from app.services import requisito_inference_service
+
+    return await requisito_inference_service.obtener_plantilla_organismo(db, contrato.usuario_id, contrato.id)
 
 
 @dataclass(frozen=True)
@@ -484,7 +488,14 @@ async def generar_zip_evidencias(
     for act in actividades:
         actividades_por_ob.setdefault(act.obligacion_id, []).append(act)
 
-    await _resolver_estructura_organismo(db, contrato)  # stub this slice — always None
+    estructura_organismo = await _resolver_estructura_organismo(db, contrato)
+    # COEMPRESAR-style organisms number their evidence folders "A{n}_..." (their
+    # institutional template literally references "Carpeta ... A1" anexos) — when
+    # an ingested template for this organism carries anexo references, mirror that
+    # convention instead of the plain "01_..." default. Column layout / section
+    # order from `estructura_json` are consumed by `adaptive-informe-generation`
+    # (slice #6) for the DOCX informes themselves, not by this folder builder.
+    usa_folders_anexo = bool(estructura_organismo and estructura_organismo.estructura_json.get("anexo_refs"))
 
     estados = _calcular_estado_obligaciones(obligaciones, actividades_por_ob)
     pendientes_desc = [e.descripcion for e in estados if not e.listo]
@@ -536,7 +547,8 @@ async def generar_zip_evidencias(
         )
 
     for idx, ob in enumerate(obligaciones, start=1):
-        folder = f"{idx:02d}_{_safe_dirname(ob.descripcion)}"
+        folder_prefix = f"A{idx}" if usa_folders_anexo else f"{idx:02d}"
+        folder = f"{folder_prefix}_{_safe_dirname(ob.descripcion)}"
         acts = actividades_por_ob.get(ob.id, [])
         lines = [
             f"Obligación #{idx} ({ob.tipo.value if ob.tipo else 'general'})",

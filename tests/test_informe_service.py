@@ -254,12 +254,99 @@ async def test_zip_evidencias_usa_bytes_reales_de_storage(
     storage.download.assert_any_call(ev.storage_key)
 
 
-async def test_resolver_estructura_organismo_es_stub_hasta_slice_5(db: AsyncSession, contrato: Contrato) -> None:
-    """No `PlantillaOrganismo` model exists until slice #5 (migration 027) — the
-    lookup hook always returns None, so the packager always falls back to the
-    default numbered folder structure (tasks.md 2.8/2.9)."""
+async def test_resolver_estructura_organismo_returns_none_when_not_ingested(
+    db: AsyncSession, contrato: Contrato
+) -> None:
+    """No `PlantillaOrganismo` has been ingested for this organism — the packager
+    falls back to the default numbered folder structure (billing-resilience-
+    templates, slice #5, task 5.15 — completes the slice #2 stub)."""
     resultado = await informe_service._resolver_estructura_organismo(db, contrato)
     assert resultado is None
+
+
+async def test_resolver_estructura_organismo_returns_real_lookup_when_ingested(
+    db: AsyncSession, contrato: Contrato
+) -> None:
+    """Once a template has been ingested for the contract's organism, the real
+    lookup (`requisito_inference_service.obtener_plantilla_organismo`) replaces
+    the slice #2 stub."""
+    from app.core.text_match import normalize
+    from app.models.plantilla_organismo import PlantillaOrganismo
+
+    plantilla = PlantillaOrganismo(
+        usuario_id=contrato.usuario_id,
+        entidad=contrato.entidad,
+        entidad_normalizada=normalize(contrato.entidad),
+        tipo_documento="informe_actividades",
+        formato="docx",
+        estructura_json={
+            "columnas": ["obligación", "avance del periodo", "evidencia"],
+            "secciones": [],
+            "anexo_refs": ["Ver Anexo: Carpeta /5. EVIDENCIAS/A1"],
+            "notas": "",
+        },
+    )
+    db.add(plantilla)
+    await db.commit()
+
+    resultado = await informe_service._resolver_estructura_organismo(db, contrato)
+    assert resultado is not None
+    assert resultado.estructura_json["anexo_refs"] == ["Ver Anexo: Carpeta /5. EVIDENCIAS/A1"]
+
+
+async def test_zip_evidencias_uses_default_numbered_folders_when_no_organismo_template(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user = test_user["user"]
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: _fake_storage())
+
+    content, _filename = await informe_service.generar_zip_evidencias(db, user.id, cuenta.id)
+
+    with zipfile.ZipFile(io.BytesIO(content)) as zf:
+        folders = {n.split("/")[0] for n in zf.namelist() if "/" in n}
+    assert any(f.startswith(("01_", "02_", "03_")) for f in folders)
+    assert not any(f.startswith("A1_") for f in folders)
+
+
+async def test_zip_evidencias_uses_anexo_style_folders_when_organismo_template_exists(
+    db: AsyncSession,
+    test_user: dict[str, Any],
+    contrato: Contrato,
+    cuenta: CuentaCobro,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the contract's organism has an ingested template whose structure
+    includes anexo references (COEMPRESAR-style, 3-column + literal anexo
+    refs), the packager numbers evidence folders "A{n}_..." to mirror the
+    institutional convention instead of the plain "01_..." default."""
+    from app.core.text_match import normalize
+    from app.models.plantilla_organismo import PlantillaOrganismo
+
+    user = test_user["user"]
+    plantilla = PlantillaOrganismo(
+        usuario_id=user.id,
+        entidad=contrato.entidad,
+        entidad_normalizada=normalize(contrato.entidad),
+        tipo_documento="informe_actividades",
+        formato="docx",
+        estructura_json={
+            "columnas": ["obligación", "avance del periodo", "evidencia"],
+            "secciones": [],
+            "anexo_refs": ["Ver Anexo: Carpeta /5. EVIDENCIAS/A1"],
+            "notas": "",
+        },
+    )
+    db.add(plantilla)
+    await db.commit()
+
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: _fake_storage())
+
+    content, _filename = await informe_service.generar_zip_evidencias(db, user.id, cuenta.id)
+
+    with zipfile.ZipFile(io.BytesIO(content)) as zf:
+        folders = {n.split("/")[0] for n in zf.namelist() if "/" in n}
+    assert any(f.startswith("A1_") for f in folders)
+    assert not any(f.startswith(("01_", "02_", "03_")) for f in folders)
 
 
 async def test_zip_evidencias_estado_pendiente_en_manifest_modo_estandar(
