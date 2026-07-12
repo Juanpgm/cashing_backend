@@ -6,13 +6,11 @@ built in this slice against a stubbed/empty `ValidationContext.adiciones` — th
 `adiciones_contrato` table lands in slice #4, which populates the context and adds
 regression coverage against real data (Reconciliation Note 4 in tasks.md).
 
-Deviation from the literal spec text for R1: `CuentaCobro.numero_cuota`/`posicion`
-do not exist yet (they land in slice #3, migration 025). This slice derives the
-expected cuota number from chronological (anio, mes) ordering among sibling cuentas
-of the same contrato — the same technique `checklist_service._is_first_cuenta`
-already uses and that slice #3 formalizes into a persisted field — and compares it
-against any explicit "Cuota N" mention found in the cuenta's actividades/documentos
-text. See the apply-progress report for the full rationale.
+Slice #3 (migration 025) rewires R1 to read the persisted
+`CuentaCobro.numero_cuota`/`posicion` fields instead of deriving them at read time
+(task 3.12b) — `_make_cuenta` below now sets both explicitly, mirroring what
+`cuenta_cobro_service.crear_cuenta_cobro` would assign for a real, sequentially
+created cuota of the same contrato.
 """
 
 from __future__ import annotations
@@ -23,7 +21,7 @@ from typing import Any
 import pytest
 from app.core.exceptions import COHERENCE_CHECK_FAILED, ValidationError, domain_to_http
 from app.models.contrato import Contrato
-from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
+from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro, PosicionCuota
 from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
 from app.models.obligacion import Obligacion, TipoObligacion
 from app.services import coherence_validator_service as cvs
@@ -111,7 +109,13 @@ async def contrato(db: AsyncSession, test_user: dict[str, Any]) -> Contrato:
 
 
 async def _make_cuenta(
-    db: AsyncSession, contrato: Contrato, mes: int, anio: int = 2024, valor: int = 1_000_000
+    db: AsyncSession,
+    contrato: Contrato,
+    mes: int,
+    anio: int = 2024,
+    valor: int = 1_000_000,
+    numero_cuota: int = 1,
+    posicion: PosicionCuota = PosicionCuota.PRIMERA,
 ) -> CuentaCobro:
     cc = CuentaCobro(
         contrato_id=contrato.id,
@@ -119,6 +123,8 @@ async def _make_cuenta(
         anio=anio,
         estado=EstadoCuentaCobro.BORRADOR,
         valor=valor,
+        numero_cuota=numero_cuota,
+        posicion=posicion,
     )
     db.add(cc)
     await db.commit()
@@ -169,7 +175,9 @@ async def test_r1_no_finding_when_no_cuota_mention(db: AsyncSession, contrato: C
 
 async def test_r1_hard_finding_on_stale_cuota_numero(db: AsyncSession, contrato: Contrato) -> None:
     await _make_cuenta(db, contrato, mes=1)
-    cuenta2 = await _make_cuenta(db, contrato, mes=2)  # numero_cuota_derivado should be 2
+    cuenta2 = await _make_cuenta(
+        db, contrato, mes=2, numero_cuota=2, posicion=PosicionCuota.RECURRENTE
+    )  # numero_cuota_derivado should be 2
     await _make_documento(
         db,
         contrato,
@@ -202,6 +210,27 @@ async def test_r1_no_finding_when_cuota_numero_matches(db: AsyncSession, contrat
     assert findings == []
 
 
+async def test_r1_uses_stored_numero_cuota_not_chronological_derivation(db: AsyncSession, contrato: Contrato) -> None:
+    """Task 3.12b: `numero_cuota_derivado` now comes from `CuentaCobro.numero_cuota`
+    (migration 025), not from re-deriving it via chronological (anio, mes) order.
+    Proven by a cuenta whose stored `numero_cuota` deliberately DIVERGES from what
+    the old chronological-order heuristic would have produced — if the rewiring
+    regressed to the old derivation, this would read 1 (chronologically first)
+    instead of the stored 5."""
+    cuenta = await _make_cuenta(db, contrato, mes=1, numero_cuota=5, posicion=PosicionCuota.RECURRENTE)
+    ctx = await cvs._build_context(db, contrato.usuario_id, cuenta.id)
+    assert ctx.numero_cuota_derivado == 5
+
+
+async def test_r1_falls_back_to_derivation_when_numero_cuota_unset(db: AsyncSession, contrato: Contrato) -> None:
+    """Defensive fallback (task 3.12b): a legacy cuota somehow missing the persisted
+    `numero_cuota` field still gets a usable value via the old chronological-order
+    derivation, instead of crashing the validator."""
+    cuenta = await _make_cuenta(db, contrato, mes=1, numero_cuota=None, posicion=PosicionCuota.PRIMERA)  # type: ignore[arg-type]
+    ctx = await cvs._build_context(db, contrato.usuario_id, cuenta.id)
+    assert ctx.numero_cuota_derivado == 1
+
+
 # ── R2: copied_accumulated_value ─────────────────────────────────────────────
 
 
@@ -214,7 +243,9 @@ async def test_r2_no_finding_without_prior_cuenta(db: AsyncSession, contrato: Co
 
 async def test_r2_hard_finding_on_copied_seguridad_social_block(db: AsyncSession, contrato: Contrato) -> None:
     cuenta1 = await _make_cuenta(db, contrato, mes=1, valor=1_000_000)
-    cuenta2 = await _make_cuenta(db, contrato, mes=2, valor=1_000_000)
+    cuenta2 = await _make_cuenta(
+        db, contrato, mes=2, valor=1_000_000, numero_cuota=2, posicion=PosicionCuota.RECURRENTE
+    )
     texto = "Planilla 123456789 pagada por el contratista."
     await _make_documento(db, contrato, cuenta1, TipoDocumentoFuente.SEGURIDAD_SOCIAL, "ss1.pdf", texto_extraido=texto)
     await _make_documento(db, contrato, cuenta2, TipoDocumentoFuente.SEGURIDAD_SOCIAL, "ss2.pdf", texto_extraido=texto)
@@ -228,7 +259,9 @@ async def test_r2_hard_finding_on_copied_seguridad_social_block(db: AsyncSession
 
 async def test_r2_no_finding_when_value_changed(db: AsyncSession, contrato: Contrato) -> None:
     cuenta1 = await _make_cuenta(db, contrato, mes=1, valor=1_000_000)
-    cuenta2 = await _make_cuenta(db, contrato, mes=2, valor=1_200_000)
+    cuenta2 = await _make_cuenta(
+        db, contrato, mes=2, valor=1_200_000, numero_cuota=2, posicion=PosicionCuota.RECURRENTE
+    )
     texto = "Planilla 123456789 pagada por el contratista."
     await _make_documento(db, contrato, cuenta1, TipoDocumentoFuente.SEGURIDAD_SOCIAL, "ss1.pdf", texto_extraido=texto)
     await _make_documento(db, contrato, cuenta2, TipoDocumentoFuente.SEGURIDAD_SOCIAL, "ss2.pdf", texto_extraido=texto)
@@ -244,11 +277,19 @@ async def test_r2_no_finding_when_value_changed(db: AsyncSession, contrato: Cont
 async def test_r3_hard_finding_on_pila_mismatch(db: AsyncSession, contrato: Contrato) -> None:
     cuenta = await _make_cuenta(db, contrato, mes=1)
     await _make_documento(
-        db, contrato, cuenta, TipoDocumentoFuente.SEGURIDAD_SOCIAL, "planilla.pdf",
+        db,
+        contrato,
+        cuenta,
+        TipoDocumentoFuente.SEGURIDAD_SOCIAL,
+        "planilla.pdf",
         texto_extraido="Planilla número 111222333 correspondiente al período.",
     )
     await _make_documento(
-        db, contrato, cuenta, TipoDocumentoFuente.COMPROBANTE_PAGO_SS, "comprobante.pdf",
+        db,
+        contrato,
+        cuenta,
+        TipoDocumentoFuente.COMPROBANTE_PAGO_SS,
+        "comprobante.pdf",
         texto_extraido="Comprobante de pago de la planilla 999888777.",
     )
 
@@ -262,11 +303,19 @@ async def test_r3_hard_finding_on_pila_mismatch(db: AsyncSession, contrato: Cont
 async def test_r3_no_finding_when_planilla_numbers_match(db: AsyncSession, contrato: Contrato) -> None:
     cuenta = await _make_cuenta(db, contrato, mes=1)
     await _make_documento(
-        db, contrato, cuenta, TipoDocumentoFuente.SEGURIDAD_SOCIAL, "planilla.pdf",
+        db,
+        contrato,
+        cuenta,
+        TipoDocumentoFuente.SEGURIDAD_SOCIAL,
+        "planilla.pdf",
         texto_extraido="Planilla número 111222333 correspondiente al período.",
     )
     await _make_documento(
-        db, contrato, cuenta, TipoDocumentoFuente.COMPROBANTE_PAGO_SS, "comprobante.pdf",
+        db,
+        contrato,
+        cuenta,
+        TipoDocumentoFuente.COMPROBANTE_PAGO_SS,
+        "comprobante.pdf",
         texto_extraido="Comprobante de pago de la planilla 111222333.",
     )
 
@@ -349,7 +398,11 @@ async def test_r6_hard_finding_when_stale_rpc_present_in_stubbed_context(db: Asy
     the real `adiciones_contrato` wiring lands in slice #4 (Reconciliation Note 4)."""
     cuenta = await _make_cuenta(db, contrato, mes=1)
     await _make_documento(
-        db, contrato, cuenta, TipoDocumentoFuente.RPC, "rpc.pdf",
+        db,
+        contrato,
+        cuenta,
+        TipoDocumentoFuente.RPC,
+        "rpc.pdf",
         texto_extraido="Registro Presupuestal de Compromiso RPC-100 del contrato.",
     )
     ctx = await cvs._build_context(db, contrato.usuario_id, cuenta.id)
@@ -381,7 +434,7 @@ async def test_validar_coherencia_runs_full_registry(db: AsyncSession, contrato:
 
 async def test_validar_coherencia_aggregates_hard_and_soft(db: AsyncSession, contrato: Contrato) -> None:
     await _make_cuenta(db, contrato, mes=1)
-    cuenta2 = await _make_cuenta(db, contrato, mes=2)
+    cuenta2 = await _make_cuenta(db, contrato, mes=2, numero_cuota=2, posicion=PosicionCuota.RECURRENTE)
     await _make_documento(db, contrato, cuenta2, TipoDocumentoFuente.INFORME_ACTIVIDADES, "informe-enero-2024.docx")
 
     findings = await cvs.validar_coherencia(db, contrato.usuario_id, cuenta2.id)

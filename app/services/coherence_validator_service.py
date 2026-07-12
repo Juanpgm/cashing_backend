@@ -13,11 +13,11 @@ R6 (`stale_clause_after_adicion`) is a deliberate STUB in this slice: the real
 Slice #4 populates `adiciones` with real events without changing this rule's logic
 (Reconciliation Note 4, tasks.md).
 
-Deviation from the literal spec text for R1: `CuentaCobro.numero_cuota`/`posicion`
-do not exist yet (they land in slice #3, migration 025). This module derives the
-expected cuota number from chronological (anio, mes) ordering among sibling cuentas
-of the same contrato — the same technique `checklist_service._is_first_cuenta`
-already uses and that slice #3 formalizes into a persisted field.
+R1 now reads the persisted `CuentaCobro.numero_cuota` field (migration 025, slice #3)
+instead of deriving it from chronological (anio, mes) ordering at read time — the
+interim derivation used in slice #1 (`_derive_numero_cuota`) is kept ONLY as a
+defensive fallback for a legacy cuota somehow missing the field (task 3.12b,
+slice #1 verify-report WARNING 1).
 """
 
 from __future__ import annotations
@@ -207,10 +207,7 @@ def pila_match(ctx: ValidationContext) -> list[Finding]:
             rule_id="R3",
             severity=Severity.HARD,
             codigo="PILA_MISMATCH",
-            mensaje=(
-                "El número de planilla PILA no coincide entre los documentos de seguridad "
-                "social de esta cuenta."
-            ),
+            mensaje=("El número de planilla PILA no coincide entre los documentos de seguridad social de esta cuenta."),
             contexto={"planillas": {tipo.value: numero for tipo, numero in planilla_por_tipo.items()}},
         )
     ]
@@ -234,8 +231,7 @@ def stale_month_in_filename(ctx: ValidationContext) -> list[Finding]:
                         severity=Severity.SOFT,
                         codigo="STALE_MONTH_IN_FILENAME",
                         mensaje=(
-                            f"El archivo '{doc.nombre}' menciona '{mes}' pero esta cuenta "
-                            f"corresponde a {mes_actual}."
+                            f"El archivo '{doc.nombre}' menciona '{mes}' pero esta cuenta corresponde a {mes_actual}."
                         ),
                         contexto={
                             "documento_id": str(doc.id),
@@ -376,8 +372,10 @@ async def _load_actividades(db: AsyncSession, cuenta_id: uuid.UUID) -> list[Acti
 
 async def _derive_numero_cuota(db: AsyncSession, cuenta: CuentaCobro) -> int:
     """1-based ordinal position of `cuenta` among its contrato's cuentas, ordered
-    chronologically by (anio, mes). Interim signal until slice #3 persists a real
-    `numero_cuota` field (see module docstring)."""
+    chronologically by (anio, mes). DEFENSIVE FALLBACK ONLY (slice #3, task 3.12b):
+    used by `_build_context` solely when `cuenta.numero_cuota` is unset — every cuota
+    created via `cuenta_cobro_service.crear_cuenta_cobro` and every legacy row (via
+    migration 025's backfill) has the field populated in practice."""
     result = await db.execute(
         select(CuentaCobro.id)
         .where(CuentaCobro.contrato_id == cuenta.contrato_id, CuentaCobro.deleted_at.is_(None))
@@ -420,7 +418,9 @@ async def _build_context(db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: uui
     obligaciones = await _load_obligaciones(db, contrato.id)
     actividades = await _load_actividades(db, cuenta.id)
 
-    numero_cuota = await _derive_numero_cuota(db, cuenta)
+    numero_cuota = cuenta.numero_cuota
+    if numero_cuota is None:
+        numero_cuota = await _derive_numero_cuota(db, cuenta)
     prior_cuenta = await _load_prior_cuenta(db, cuenta)
     documentos = await _load_documentos(db, cuenta.id)
     documentos_prior = await _load_documentos(db, prior_cuenta.id) if prior_cuenta is not None else []
