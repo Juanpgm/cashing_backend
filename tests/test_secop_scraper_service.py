@@ -16,7 +16,7 @@ from __future__ import annotations
 import uuid
 from datetime import date
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -155,6 +155,30 @@ class _OkScraper:
         )
 
 
+class _MultiDocScraper:
+    """Returns >1 document in a single trigger — the DTO contract does not bound
+    docs to 1, and `upload_document`'s 'one tipo=CONTRATO doc per contrato'
+    replace-on-upload behavior would silently evict all but the last. The
+    service must surface this known limitation (log warning + notas)."""
+
+    async def fetch_contract_docs(self, notice_uid: str, ref_contrato: str | None = None) -> ScrapeResult:
+        return ScrapeResult(
+            docs=[
+                ScrapedDocDTO(
+                    document_id=f"70{n}",
+                    nombre_archivo=f"Documento {n}.pdf",
+                    url_descarga=f"https://x/RetrieveFile?DocumentId=70{n}",
+                    fecha_carga=date(2026, 1, 5),
+                    extension="pdf",
+                    descripcion=f"Documento {n}",
+                )
+                for n in (1, 2)
+            ],
+            duration_ms=1234,
+            captcha_solved=False,
+        )
+
+
 @pytest.mark.asyncio
 class TestExplorarDocumentosAgentico:
     async def test_captcha_returns_captcha_required_state(self, db: AsyncSession) -> None:
@@ -208,6 +232,27 @@ class TestExplorarDocumentosAgentico:
         # the scraper fallback in any slice.
         persisted = (await db.execute(select(SecopDocumento))).scalars().all()
         assert persisted == []
+
+    async def test_multi_doc_result_warns_eviction_risk(
+        self, db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Slice 4 verify WARNING: a >1-doc scraper result must surface the
+        known tipo=CONTRATO eviction limitation (real data-loss risk) via both
+        a structured log warning and a user-facing `notas` entry — not swallow it."""
+        monkeypatch.setattr(ds, "_get_storage", _FakeStorage)
+        monkeypatch.setattr(ds.settings, "EXTRACTION_MULTIMODAL_FALLBACK_ENABLED", False)
+        user_id = uuid.uuid4()
+        await _seed_contrato(db)
+        await _seed_contrato_usuario(db, user_id)
+        _mock_httpx_download(monkeypatch, b"contenido binario de prueba")
+
+        with patch.object(secop_scraper_service.log, "awarning", new_callable=AsyncMock) as mock_warn:
+            result = await secop_scraper_service.explorar_documentos_agentico(db, _MultiDocScraper(), user_id, _NUMERO)
+
+        assert result.estado == "ok"
+        assert result.notas is not None
+        warned_events = [call.args[0] for call in mock_warn.call_args_list if call.args]
+        assert "secop_scraper_multi_doc_tipo_contrato_eviction_risk" in warned_events
 
     async def test_quota_exceeded_raises_before_invoking_adapter(
         self, db: AsyncSession, monkeypatch: pytest.MonkeyPatch
