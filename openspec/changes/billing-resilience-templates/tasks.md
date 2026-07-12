@@ -1,0 +1,256 @@
+# Tasks: billing-resilience-templates
+
+## Reconciliation Notes (spec ↔ design ran in parallel)
+
+1. **Error-code wiring (spec §CUOTA_POSITION_CONFLICT vs COHERENCE_CHECK_FAILED) — RECONCILED, no conflict.**
+   Design confirms the split spec implies: `CUOTA_POSITION_CONFLICT` is a **write-time**
+   guard raised inside `cuenta_cobro_service.py` when persisting `numero_cuota`/`posicion`
+   (duplicate `final`, duplicate `primera`) — slice #3. `COHERENCE_CHECK_FAILED` is the
+   **validator umbrella**: `coherence_validator_service.validar_coherencia` only *returns*
+   findings; the caller (`cuenta_cobro_service.radicar_cuenta`) raises the error on any
+   HARD finding — slice #1. Both error codes live in `core/exceptions.py`, added in their
+   respective slices. No blocker.
+
+2. **Packager mode semantics (spec "standard" vs "strict/final" vs design's flat gate) — GENUINE CONFLICT, reconciled with a recorded decision, needs human confirmation at apply time.**
+   Design's data-flow diagram and `generar_zip_evidencias(db, usuario_id, cuenta_id)`
+   signature show an unconditional `pendiente? → PACKAGE_PENDIENTE` gate with **no mode
+   parameter**, but the spec requires standard mode to emit a partial package with a
+   PENDIENTE manifest section (non-blocking) and only strict/final mode to raise
+   `PACKAGE_PENDIENTE`. **Reconciled decision**: add `modo: Literal["standard","final"] =
+   "standard"` to `generar_zip_evidencias`; `PACKAGE_PENDIENTE` raises only when
+   `modo == "final"`. `preparar_radicacion` (slice #7) calls the packager with
+   `modo="final"`; direct/manual packaging calls default to `"standard"`. Encoded in
+   slice #2 tasks below — flag for confirmation during `sdd-apply`.
+
+3. **Prórroga vs `informe_final` (contract-addition-events spec vs design D4) — GENUINE CONFLICT, reconciled via a new SOFT rule, needs confirmation.**
+   Spec says a prórroga makes the "previously expected final cuota... no longer treated
+   as final by default." Design D4 keeps `informe_final` a manual flag that a prórroga
+   never silently flips, only emitting a SOFT warning. **Reconciled decision**: keep
+   design's manual-flag approach (safer/explicit, avoids silent data mutation) and encode
+   the spec's warning requirement as a new coherence rule `R7 stale_final_after_prorroga`
+   (SOFT), registered in slice #4 (extends the R1-R6 registry built in slice #1). No
+   auto-unflagging of `informe_final`. Flag for confirmation during `sdd-apply`.
+
+4. **R6 sequencing gap.** Design's `ValidationContext` bundles `adiciones` from slice #1,
+   but the real `adiciones_contrato` table doesn't exist until slice #4. Slice #1 builds
+   R6 against a stubbed/empty `adiciones` list (or `Contrato.valor_adicion` scalar as an
+   interim signal); slice #4 wires `ValidationContext.adiciones` to the real table,
+   completing R6. Encoded as an explicit task in both slices.
+
+---
+
+## Review Workload Forecast
+
+| Field | Value |
+|-------|-------|
+| Estimated changed lines | ~2,460 total across 7 slices (see per-slice column below) |
+| 400-line budget risk | Medium (per-slice); High for the whole change taken together |
+| Chained PRs recommended | Yes |
+| Suggested split | PR 1 → PR 2 → PR 3 → PR 4 → PR 5 → PR 6 → PR 7 (stacked) |
+| Delivery strategy | auto-chain |
+| Chain strategy | stacked-to-main |
+
+Decision needed before apply: No
+Chained PRs recommended: Yes
+Chain strategy: stacked-to-main
+400-line budget risk: Medium
+
+### Suggested Work Units
+
+| Unit | Goal | Likely PR | Notes |
+|------|------|-----------|-------|
+| 1 | Coherence validator (R1-R6) + gate + tool | PR 1 | No migration; independent of #2 |
+| 2 | Packager hardening + secret scan + LISTO/PENDIENTE | PR 2 | No migration; independent of #1; risk Medium-High (real bytes + scan + gate + 2 tools) |
+| 3 | Cuota position model | PR 3 (migration 025) | Depends on #1 (validator reads position) |
+| 4 | Adición events + R7 | PR 4 (migration 026) | Depends on #3; completes R6 |
+| 5 | Template ingestion | PR 5 (migration 027) | Depends on #4; risk Medium-High (adds packager rewiring) |
+| 6 | Adaptive generation | PR 6 | Depends on #3, #5 |
+| 7 | Requisito comprehension + e2e prep | PR 7 | Depends on #1, #2, #5 |
+
+---
+
+## Slice 1 — Coherence validator (P0a) · PR 1 · no migration · ~350 lines
+
+- [x] 1.1 RED: test asserting `COHERENCE_CHECK_FAILED` exists and maps to HTTP 422 in `core/exceptions.py`
+- [x] 1.2 GREEN: add `COHERENCE_CHECK_FAILED` to `core/exceptions.py` + `domain_to_http()`
+- [x] 1.3 RED: unit tests for `Severity`, `Finding` dataclass shape in new `tests/services/test_coherence_validator_service.py`
+- [x] 1.4 GREEN: create `app/services/coherence_validator_service.py` — `Severity`, `Finding`, `ValidationContext`, empty `RULES` registry
+- [x] 1.5 RED: test R1 stale `numero_cuota` vs internal "Cuota Número" (HARD)
+- [x] 1.6 GREEN: implement `stale_cuota_numero` rule — **DEVIATION**: `numero_cuota`/`posicion` don't exist yet (land in slice #3, migration 025); expected number is derived from chronological (anio,mes) ordering among sibling cuentas (same technique as `checklist_service._is_first_cuenta`), compared against any explicit "Cuota N" mention found in actividades/documentos text. See apply-progress for full rationale.
+- [x] 1.7 RED: test R2 copied accumulated value / seg-social block unchanged (HARD)
+- [x] 1.8 GREEN: implement `copied_accumulated_value` rule
+- [x] 1.9 RED: test R3 PILA planilla number mismatch within same cuota (HARD)
+- [x] 1.10 GREEN: implement `pila_match` rule
+- [x] 1.11 RED: test R4 stale month name in filename (SOFT, non-blocking)
+- [x] 1.12 GREEN: implement `stale_month_in_filename` rule
+- [x] 1.13 RED: tests R5 — 8→7 obligación-count-shift regression resolves by text; ambiguous mapping raises HARD
+- [x] 1.14 GREEN: implement `obligacion_text_mapping` rule using `text_match.similar` (pairwise ambiguity over the contract's obligaciones — count-shift-tolerant by construction, never references a stored letter/index)
+- [x] 1.15 RED: test R6 stale clause after Adición (HARD) — build against stubbed/empty `ValidationContext.adiciones` (see Reconciliation Note 4; real table lands slice #4)
+- [x] 1.16 GREEN: implement `stale_clause_after_adicion` rule + `validar_coherencia()` entrypoint (loads context once, runs `RULES`)
+- [x] 1.17 RED+GREEN: `schemas/coherence.py` — `FindingOut`, `ValidarCoherenciaResponse`
+- [x] 1.18 RED: test `radicar_cuenta` raises `COHERENCE_CHECK_FAILED` on any HARD finding; SOFT-only proceeds with warning attached
+- [x] 1.19 GREEN: wire gate into `cuenta_cobro_service.radicar_cuenta` (L716-747), guarded by new `COHERENCE_GATE_ENABLED` config flag (default `True`)
+- [x] 1.20 RED+GREEN: `app/tools/catalog/coherence.py` — `validar_coherencia_cuenta` tool (read-only)
+- [x] 1.21 Integration test: `invoke_tool("validar_coherencia_cuenta")` + `radicar` blocked end-to-end; flag off = bypass
+- [x] 1.22 Update error-codes mirror with `COHERENCE_CHECK_FAILED` — **DEVIATION**: `tests/test_radicar.py::_CODIGOS_OBLIGATORIOS` is a list of checklist requisito codes, not error codes (it has no error-code mirror concept); the actual mirror pattern in this codebase is `tests/test_error_codes.py` (per-code scenario tests). Added `test_radicar_coherence_hard_finding_returns_coherence_check_failed_code` there instead.
+- [x] 1.23 Local verification gate: `make format && make lint && uv run python -m pytest` green — ran `ruff check` (all clean) + targeted pytest (54 passed) + full suite (1159 passed, 12 deselected, 0 failed); mypy has pre-existing unrelated errors elsewhere in the project (153 before this change, confirmed via `git stash`), zero new errors in the 3 new coherence files.
+- [x] 1.24 **No push to remote without explicit user OK** (hard session rule) — not pushed; 2 local commits only.
+
+**Work-unit commits**: (a) 1.1-1.4 domain types → `feat(coherence): add validation context and finding types`; (b) 1.5-1.16 rules → one commit per rule pair or a single `feat(coherence): implement R1-R6 rule catalog` if reviewable at once; (c) 1.17-1.20 gate+tool → `feat(coherence): gate radicar_cuenta on coherence validator`; (d) 1.22 → included in (c).
+
+---
+
+## Slice 2 — Packager hardening (P0b) · PR 2 · no migration · ~380 lines (risk Medium-High)
+
+- [ ] 2.1 RED+GREEN: add `SECRET_DETECTED_IN_PACKAGE`, `PACKAGE_PENDIENTE` to `core/exceptions.py` + HTTP mapping
+- [ ] 2.2 RED: test `escanear_paquete()` catches real-leak corpus (Neon URL regex + API key) in `tests/services/test_secret_scan_service.py`
+- [ ] 2.3 GREEN: create `app/services/secret_scan_service.py` wrapping `detect-secrets` + belt-and-suspenders Postgres/Neon URL regex plugin
+- [ ] 2.4 RED: test clean payload passes with no findings
+- [ ] 2.5 GREEN: confirm plugin set covers clean-pass path
+- [ ] 2.6 RED: test `generar_zip_evidencias` fetches real bytes from `StoragePort` (no placeholder text)
+- [ ] 2.7 GREEN: replace placeholder content with `StoragePort` downloads in `informe_service.generar_zip_evidencias` (L366-460)
+- [ ] 2.8 RED: test default numbered folder structure applied when no `PlantillaOrganismo` exists (fallback only — organism-specific lookup arrives slice #5)
+- [ ] 2.9 GREEN: implement default numbered folder builder (organism-specific branch stubbed to always-fallback until slice #5)
+- [ ] 2.10 RED: test package emission halts with `SECRET_DETECTED_IN_PACKAGE` when scan finds a hit; no zip bytes returned
+- [ ] 2.11 GREEN: wire mandatory secret scan before zip emission, guarded by new `SECRET_SCAN_GATE_ENABLED` config flag (default `True`, disabling documented emergency-only)
+- [ ] 2.12 RED: test standard mode emits partial package with PENDIENTE manifest section, no raise; final mode raises `PACKAGE_PENDIENTE` when incomplete
+- [ ] 2.13 GREEN: add `modo: Literal["standard","final"] = "standard"` param (Reconciliation Note 2); implement LISTO/PENDIENTE split + conditional raise
+- [ ] 2.14 RED+GREEN: `obtener_estado_listo_pendiente` read-only helper (split without producing package)
+- [ ] 2.15 RED+GREEN: `schemas/paquete.py` — manifest/response schemas
+- [ ] 2.16 RED+GREEN: `app/tools/catalog/paquete.py` — `generar_paquete_evidencias` (write), `obtener_estado_listo_pendiente` (read)
+- [ ] 2.17 Integration test: flags off = bypass scan/gate
+- [ ] 2.18 Update `tests/test_radicar.py::_CODIGOS_OBLIGATORIOS` mirror with 2 new codes
+- [ ] 2.19 Local verification gate: `make format && make lint && uv run python -m pytest` green
+- [ ] 2.20 **No push to remote without explicit user OK**
+
+**Work-unit commits**: (a) 2.1-2.5 secret scan service → `feat(paquete): add secret scan service with real-leak corpus tests`; (b) 2.6-2.9 real bytes/folders → `feat(paquete): fetch real bytes and build numbered folder structure`; (c) 2.10-2.16 gate+tools → `feat(paquete): enforce secret-scan and LISTO/PENDIENTE gates`. If (c) alone risks >150 lines combined with (a)+(b), split (c) into its own PR-2b before merge — flag during apply.
+
+---
+
+## Slice 3 — Cuota position model (P1a) · PR 3 · migration `025` · ~320 lines · depends on #1
+
+- [ ] 3.1 Checkpoint: confirm migration number `025` still free (rebase if `backend-local-first-sync` merged with different numbering)
+- [ ] 3.2 RED: model test — `CuentaCobro` accepts `numero_cuota: int|None`, `posicion: enum(primera|recurrente|final)`, `informe_final: bool = False`
+- [ ] 3.3 GREEN: add fields to `app/models/cuenta_cobro.py`
+- [ ] 3.4 RED+GREEN: `alembic/versions/025_*` — explicit `op.add_column` x3 (create_all no-ops column adds) + backfill window (per-contrato chronological anio/mes order)
+- [ ] 3.5 Neon verification: apply `025` on Neon dev branch; verify columns exist and backfill assigns correct `posicion`/`numero_cuota` to legacy rows
+- [ ] 3.6 RED+GREEN: `schemas/cuenta_cobro.py` — include new fields in `CuentaCobroOut`
+- [ ] 3.7 RED: test create first cuota → `posicion=primera`, `numero_cuota=1`
+- [ ] 3.8 GREEN: derive/persist `numero_cuota`/`posicion` at creation in `cuenta_cobro_service.py`
+- [ ] 3.9 RED: test duplicate `informe_final=True` and duplicate `posicion=primera` for same contract both raise `CUOTA_POSITION_CONFLICT`
+- [ ] 3.10 GREEN: add `CUOTA_POSITION_CONFLICT` to `core/exceptions.py`; enforce write-time invariant in `cuenta_cobro_service.py` (Reconciliation Note 1)
+- [ ] 3.11 RED: test one-time obligation required when `posicion=primera`, blank for `recurrente`/`final`
+- [ ] 3.12 GREEN: replace `_is_first_cuenta()` (L266-278) with `posicion == PRIMERA` in `checklist_service.py`
+- [ ] 3.13 Integration test: `crear_cuenta_cobro`/`obtener_cuenta_cobro` outputs include new fields
+- [ ] 3.14 Update `tests/test_radicar.py::_CODIGOS_OBLIGATORIOS` mirror with `CUOTA_POSITION_CONFLICT`
+- [ ] 3.15 Local verification gate: `make format && make lint && uv run python -m pytest` green
+- [ ] 3.16 **No push to remote without explicit user OK**
+
+**Work-unit commits**: (a) 3.2-3.6 model+migration → `feat(cuota-position): add numero_cuota/posicion/informe_final fields`; (b) 3.7-3.10 write-time invariant → `feat(cuota-position): enforce CUOTA_POSITION_CONFLICT at creation`; (c) 3.11-3.12 → `fix(checklist): replace _is_first_cuenta heuristic with stored posicion`.
+
+---
+
+## Slice 4 — Contract Adición events (P1b) · PR 4 · migration `026` · ~350 lines · depends on #3
+
+- [ ] 4.1 Checkpoint: confirm migration number `026` still free (rebase if needed)
+- [ ] 4.2 RED: model test — `adiciones_contrato` table shape (tipo enum, rpc_nuevo, cdp_nuevo, valor_adicion, nueva_fecha_fin, descripcion, fecha_evento); `Obligacion.una_vez: bool = False`
+- [ ] 4.3 GREEN: create `app/models/adicion_contrato.py`; add `una_vez` to `app/models/obligacion.py`
+- [ ] 4.4 RED+GREEN: `alembic/versions/026_*` — `op.create_table` + `op.add_column`
+- [ ] 4.5 Neon verification: apply `026` on Neon dev branch; verify table + column exist
+- [ ] 4.6 RED+GREEN: `schemas/adicion.py` — `AdicionCreate`, `AdicionOut`
+- [ ] 4.7 RED: test recording an Adición with new RPC/CDP persists and is queryable; two events preserved in order (second doesn't overwrite first)
+- [ ] 4.8 GREEN: implement `registrar_adicion`/`listar_adiciones` in new `app/services/adicion_contrato_service.py`
+- [ ] 4.9 GREEN: wire `ValidationContext.adiciones` in `coherence_validator_service.py` to query real `adiciones_contrato` (completes R6, deferred from slice #1 per Reconciliation Note 4)
+- [ ] 4.10 RED: test R6 flags stale clause using real Adición event data (replaces slice #1's stub)
+- [ ] 4.11 RED: test new SOFT rule — prórroga present + `informe_final=True` on an earlier cuota emits a warning, does not auto-unflag (Reconciliation Note 3)
+- [ ] 4.12 GREEN: register `stale_final_after_prorroga` (R7, SOFT) in `RULES`
+- [ ] 4.13 RED+GREEN: `app/tools/catalog/adiciones.py` — `registrar_adicion_contrato` (write), `listar_adiciones_contrato` (read)
+- [ ] 4.14 Local verification gate: `make format && make lint && uv run python -m pytest` green
+- [ ] 4.15 **No push to remote without explicit user OK**
+
+**Work-unit commits**: (a) 4.2-4.6 model+migration → `feat(adiciones): add adiciones_contrato table and una_vez flag`; (b) 4.7-4.8, 4.13 service+tool → `feat(adiciones): record and list contract addition events`; (c) 4.9-4.12 → `feat(coherence): wire real adicion events into R6 and add R7 prorroga warning`.
+
+---
+
+## Slice 5 — Template ingestion (P2a) · PR 5 · migration `027` · ~380 lines (risk Medium-High) · depends on #4
+
+- [ ] 5.1 **Checkpoint (mandatory): confirm `backend-local-first-sync` merge status / rebase migration numbers** before starting — this slice touches document-reading paths
+- [ ] 5.2 RED: model test — `PlantillaOrganismo` shape (`usuario_id`, `entidad`, `tipo_documento`, `formato`, `estructura_json` JSONB, `fuente_documento_id` FK, timestamps)
+- [ ] 5.3 GREEN: create `app/models/plantilla_organismo.py`
+- [ ] 5.4 RED+GREEN: `alembic/versions/027_*` — `op.create_table` with JSONB column
+- [ ] 5.5 Neon verification: apply `027` on Neon dev branch; verify JSONB column creates and round-trips a query (behavior differs from SQLite test DB)
+- [ ] 5.6 RED+GREEN: `schemas/plantilla_organismo.py`
+- [ ] 5.7 RED: test successful DOCX extraction persists columns/sections/anexo refs for the organism; anexo ref string preserved verbatim
+- [ ] 5.8 GREEN: extend `requisito_inference_service.py` with structure extraction; normalize organism key via `text_match` over `Contrato.entidad`
+- [ ] 5.9 RED: test unreadable/scanned template degrades safely — no structure persisted, no hard error, ingestion of contract/organism record proceeds
+- [ ] 5.10 GREEN: implement graceful-degradation path
+- [ ] 5.11 RED: test vision fallback chain (reused from CONTRATO extraction, `document_service` L407-426) is retried before declaring failure
+- [ ] 5.12 GREEN: wire resilient reader reuse
+- [ ] 5.13 RED+GREEN: `app/tools/catalog/plantillas_organismo.py` — `ingerir_plantilla_organismo` (write), `obtener_plantilla_organismo` (read)
+- [ ] 5.14 RED: test packager (slice #2) applies organism-specific folder structure when `PlantillaOrganismo` exists, falls back otherwise
+- [ ] 5.15 GREEN: wire real `PlantillaOrganismo` lookup into `informe_service` folder-structure builder (completes deferred task 2.9)
+- [ ] 5.16 Local verification gate: `make format && make lint && uv run python -m pytest` green
+- [ ] 5.17 **No push to remote without explicit user OK**
+
+**Work-unit commits**: (a) 5.2-5.6 model+migration → `feat(plantilla-organismo): add per-organism template structure model`; (b) 5.7-5.12 → `feat(plantilla-organismo): extract and persist template structure with graceful degradation`; (c) 5.13-5.15 → `feat(paquete): apply organism-specific folder structure when available`.
+
+---
+
+## Slice 6 — Adaptive generation (P2b) · PR 6 · no migration · ~380 lines · depends on #3, #5
+
+- [ ] 6.1 RED: test DAGMA 2-column layout selected when organism has an ingested 2-col template
+- [ ] 6.2 RED: test COEMPRESAR 3-column layout + literal anexo refs included
+- [ ] 6.3 RED: test default 4-column layout used when no organism template exists
+- [ ] 6.4 GREEN: add `organismo`/`posicion`/`prior_context` params to `informe_service` generators (L213-353, `_GENERADORES` dict L42-51); per-organism layout selection from `PlantillaOrganismo`
+- [ ] 6.5 RED: test cuota 3 narrative built from cuotas 1-2 summaries; cuota 1 has no prior context
+- [ ] 6.6 GREEN: implement progressive narrative reading prior cuotas bounded by `_MAX_TEXT_CHARS` (14000), degrading to K=3 most-recent summaries + counts when exceeded
+- [ ] 6.7 RED: test every generated informe carries `es_borrador=True` and a prepended "BORRADOR — sujeto a revisión" header
+- [ ] 6.8 GREEN: implement draft label/header as a constant (not LLM-decided)
+- [ ] 6.9 RED: test one-time obligation section blank in cuota 2's informe after being filled in cuota 1
+- [ ] 6.10 GREEN: honor `una_vez` (slice #4) + `posicion` (slice #3) in generator output
+- [ ] 6.11 Integration test: extended `generar_informe_cuota` tool signature end-to-end
+- [ ] 6.12 Local verification gate: `make format && make lint && uv run python -m pytest` green
+- [ ] 6.13 **No push to remote without explicit user OK**
+
+**Work-unit commits**: (a) 6.1-6.4 → `feat(informe): select per-organism layout for generated informes`; (b) 6.5-6.8 → `feat(informe): add progressive narrative and always-draft label`; (c) 6.9-6.10 → `feat(informe): blank one-time obligations after cuota 1`.
+
+---
+
+## Slice 7 — Requisito comprehension + e2e prep (P2c) · PR 7 · no migration · ~300 lines · depends on #1, #2, #5
+
+- [ ] 7.1 **Checkpoint (mandatory): confirm `backend-local-first-sync` merge status / rebase migration numbers** before starting — this slice touches document-reading paths
+- [ ] 7.2 RED: test structured extraction returns name/category/`solo_primera_cuenta`/autogen-support fields from a requirement document
+- [ ] 7.3 GREEN: add `inferir_requisitos_estructurados` to `requisito_inference_service.py` (extends `inferir_requisitos` L88-168)
+- [ ] 7.4 RED: test checklist preview reflects structured requisitos without persisting until confirmed
+- [ ] 7.5 GREEN: wire structured requisitos into `checklist_service.asegurar_checklist` (L300-369) preview path
+- [ ] 7.6 RED: test full orchestration runs checklist → coherence → packager in order, returns package location + LISTO/PENDIENTE status
+- [ ] 7.7 GREEN: create `app/services/radicacion_prep_service.py` — `preparar_radicacion()` calling `validar_coherencia_cuenta`, then `generar_zip_evidencias(modo="final")`/`obtener_estado_listo_pendiente`
+- [ ] 7.8 RED: test HARD coherence finding halts orchestration before packaging, surfaces `COHERENCE_CHECK_FAILED`
+- [ ] 7.9 GREEN: implement halt-before-packaging branch
+- [ ] 7.10 RED: test secret detection halts orchestration, surfaces `SECRET_DETECTED_IN_PACKAGE`
+- [ ] 7.11 GREEN: propagate packager exception through orchestration
+- [ ] 7.12 RED+GREEN: `app/tools/catalog/` — `inferir_requisitos_estructurados` (read), `preparar_radicacion` (write)
+- [ ] 7.13 Update `tests/journey/test_full_radicacion_journey.py` JourneyLedger — deliberately add the new orchestration step(s); confirm UX friction is acceptable
+- [ ] 7.14 Local verification gate: `make format && make lint && uv run python -m pytest` green
+- [ ] 7.15 **No push to remote without explicit user OK**
+
+**Work-unit commits**: (a) 7.2-7.5 → `feat(requisitos): extract structured requisitos and drive checklist preview`; (b) 7.6-7.12 → `feat(radicacion): orchestrate checklist, coherence, and packaging in preparar_radicacion`; (c) 7.13 → `test(journey): update ledger for radicacion-prep orchestration step`.
+
+---
+
+## Cross-Slice Notes
+
+- `test_radicar.py::_CODIGOS_OBLIGATORIOS` mirror updates: slices #1, #2, #3 (4 new codes total: `COHERENCE_CHECK_FAILED`, `SECRET_DETECTED_IN_PACKAGE`, `PACKAGE_PENDIENTE`, `CUOTA_POSITION_CONFLICT`).
+- `tests/journey/test_full_radicacion_journey.py` JourneyLedger: updated once, in slice #7, when `preparar_radicacion` adds a new orchestration step.
+- Every migration slice (#3, #4, #5) MUST be verified on Neon (create_all no-ops column adds — SQLite test DB masks this).
+- No slice pushes to a remote branch without explicit user OK — this is a hard session rule, encoded as the last task in every slice.
+
+## Review Workload Forecast (recap)
+
+- Estimated changed lines: ~350 / 380 / 320 / 350 / 380 / 380 / 300 (7 slices, ~2,460 total)
+- 400-line budget risk: Medium per slice (slices #2 and #5 flagged Medium-High — may need a further split during apply if the real diff overruns ~400)
+- Chained PRs recommended: Yes
+- Delivery strategy: auto-chain
+- Chain strategy: stacked-to-main
+- Decision needed before apply: No — proceed with next autonomous slice per stacked-to-main, starting with PR 1
+- Suggested work-unit PR split: PR 1 (validator) → PR 2 (packager) → PR 3 (position, migration 025) → PR 4 (adiciones, migration 026) → PR 5 (template ingestion, migration 027) → PR 6 (adaptive generation) → PR 7 (requisito comprehension + e2e prep)
