@@ -129,6 +129,8 @@ Chain strategy: stacked-to-main
 
 ## Slice 3 — Cuota position model (P1a) · PR 3 · migration `025` · ~320 lines · depends on #1
 
+- [ ] 3.0a Carry-over from slice #2 verify (WARNING 1): add RED+GREEN test covering the binary-extraction scan path — a non-UTF8 payload whose `extraer_texto_documento`-extracted text contains a leak-shaped secret must trigger `SECRET_DETECTED_IN_PACKAGE` (mock the extractor; no real credentials).
+- [ ] 3.0b Carry-over from slice #2 verify (WARNING 2): add a clarifying note to `specs/cuota-packager/spec.md` + `design.md` distinguishing "obligación-level packaging completeness" (PACKAGE_PENDIENTE) from "requisito/checklist completeness" (CHECKLIST_INCOMPLETE) — slice #7's `preparar_radicacion` orchestrates BOTH gates.
 - [ ] 3.1 Checkpoint: confirm migration number `025` still free (rebase if `backend-local-first-sync` merged with different numbering)
 - [ ] 3.2 RED: model test — `CuentaCobro` accepts `numero_cuota: int|None`, `posicion: enum(primera|recurrente|final)`, `informe_final: bool = False`
 - [ ] 3.3 GREEN: add fields to `app/models/cuenta_cobro.py`

@@ -1,0 +1,79 @@
+# openspec/config.yaml — cashing-backend
+schema: spec-driven
+
+context: |
+  Stack: Python 3.12, FastAPI, SQLAlchemy 2.0 async (asyncpg), PostgreSQL 16,
+  Alembic, custom async agent engine (app/agent/engine.py, CompiledGraph —
+  NOT LangGraph), LiteLLM, MCP. Package manager: uv.
+  Domain: Colombian contractor billing ("cuentas de cobro"). Preserve Spanish
+  domain nouns verbatim (cuenta de cobro, contrato, obligacion, requisito,
+  radicacion, SECOP, RPC, CDP) — do not translate.
+  Architecture: Ports & Adapters; services never import cloud SDKs/LLM SDKs
+  directly. Implementation order: model -> schema -> service -> api -> test.
+
+language:
+  artifacts: en
+  preserve_terms:
+    - cuenta de cobro
+    - contrato
+    - obligación
+    - requisito
+    - radicación
+    - SECOP
+    - RPC
+    - CDP
+
+strict_tdd: true
+
+testing:
+  test_command: "uv run python -m pytest"
+  test_command_note: >
+    MUST use "uv run python -m pytest" — NOT "uv run pytest". Confirmed hard
+    project convention (docs/BITACORA_NEON_MCP_2026-07.md, 2026-07-08): a
+    native python-magic/libmagic segfault on Windows+py3.12 previously killed
+    bare "uv run pytest" runs mid-suite and masked ~136 false failures. Fixed
+    by defaulting to manual magic-byte MIME validation
+    (FILE_VALIDATION_USE_LIBMAGIC=1 to opt back into libmagic) plus removing a
+    deprecated event_loop fixture. Full suite now runs green (847 passed).
+    Verified in this init: "uv run python -m pytest --collect-only -q" ->
+    1131/1143 tests collected (12 deselected, live_llm marker), 0 errors.
+  single_test: "uv run python -m pytest tests/path/to/test_file.py::test_name -v"
+  framework: pytest + pytest-asyncio (asyncio_mode = auto, no @pytest.mark.asyncio needed)
+  test_db: aiosqlite (in-memory) — NOT PostgreSQL
+  storage_mock: moto[s3]
+  fixtures: factory-boy
+  coverage:
+    command: "make test-cov"  # uv run pytest --cov=app --cov-report=html --cov-report=term-missing
+    threshold: 70
+  quality:
+    lint: "uv run ruff check . && uv run ruff format --check ."
+    typecheck: "uv run mypy app/"  # mypy strict mode + pydantic plugin
+    format: "make format"  # uv run ruff check --fix . && uv run ruff format .
+    pre_commit: ".pre-commit-config.yaml (detect-secrets, detect-private-key, ruff, ruff-format)"
+  pre_commit_gate: "make format && make lint && make test"
+
+rules:
+  proposal:
+    - Include rollback plan for risky changes (especially Alembic migrations)
+    - Flag any change touching the agent engine as CompiledGraph, never LangGraph
+  specs:
+    - Use Given/When/Then for scenarios
+    - Use RFC 2119 keywords (MUST, SHALL, SHOULD, MAY)
+    - Preserve Spanish domain nouns verbatim; prose in English
+  design:
+    - Document architecture decisions with rationale
+    - Respect Ports & Adapters: no boto3/litellm/googleapiclient imports outside adapters/
+  tasks:
+    - Group by phase, use hierarchical numbering
+    - Follow model -> schema -> service -> api -> test order per feature
+    - Keep tasks completable in one session
+  apply:
+    - Follow existing code patterns (services raise domain exceptions, never HTTPException)
+    tdd: true
+    test_command: "uv run python -m pytest"
+  verify:
+    test_command: "uv run python -m pytest"
+    build_command: "make lint"
+    coverage_threshold: 70
+  archive:
+    - Warn before merging destructive deltas (especially DB migrations)
