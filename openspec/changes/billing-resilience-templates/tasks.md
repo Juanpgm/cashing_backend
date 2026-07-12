@@ -102,26 +102,26 @@ Chain strategy: stacked-to-main
 
 ## Slice 2 — Packager hardening (P0b) · PR 2 · no migration · ~380 lines (risk Medium-High)
 
-- [ ] 2.1 RED+GREEN: add `SECRET_DETECTED_IN_PACKAGE`, `PACKAGE_PENDIENTE` to `core/exceptions.py` + HTTP mapping
-- [ ] 2.2 RED: test `escanear_paquete()` catches real-leak corpus (Neon URL regex + API key) in `tests/services/test_secret_scan_service.py`
-- [ ] 2.3 GREEN: create `app/services/secret_scan_service.py` wrapping `detect-secrets` + belt-and-suspenders Postgres/Neon URL regex plugin
-- [ ] 2.4 RED: test clean payload passes with no findings
-- [ ] 2.5 GREEN: confirm plugin set covers clean-pass path
-- [ ] 2.6 RED: test `generar_zip_evidencias` fetches real bytes from `StoragePort` (no placeholder text)
-- [ ] 2.7 GREEN: replace placeholder content with `StoragePort` downloads in `informe_service.generar_zip_evidencias` (L366-460)
-- [ ] 2.8 RED: test default numbered folder structure applied when no `PlantillaOrganismo` exists (fallback only — organism-specific lookup arrives slice #5)
-- [ ] 2.9 GREEN: implement default numbered folder builder (organism-specific branch stubbed to always-fallback until slice #5)
-- [ ] 2.10 RED: test package emission halts with `SECRET_DETECTED_IN_PACKAGE` when scan finds a hit; no zip bytes returned
-- [ ] 2.11 GREEN: wire mandatory secret scan before zip emission, guarded by new `SECRET_SCAN_GATE_ENABLED` config flag (default `True`, disabling documented emergency-only)
-- [ ] 2.12 RED: test standard mode emits partial package with PENDIENTE manifest section, no raise; final mode raises `PACKAGE_PENDIENTE` when incomplete
-- [ ] 2.13 GREEN: add `modo: Literal["standard","final"] = "standard"` param (Reconciliation Note 2); implement LISTO/PENDIENTE split + conditional raise
-- [ ] 2.14 RED+GREEN: `obtener_estado_listo_pendiente` read-only helper (split without producing package)
-- [ ] 2.15 RED+GREEN: `schemas/paquete.py` — manifest/response schemas
-- [ ] 2.16 RED+GREEN: `app/tools/catalog/paquete.py` — `generar_paquete_evidencias` (write), `obtener_estado_listo_pendiente` (read)
-- [ ] 2.17 Integration test: flags off = bypass scan/gate
-- [ ] 2.18 Update `tests/test_radicar.py::_CODIGOS_OBLIGATORIOS` mirror with 2 new codes
-- [ ] 2.19 Local verification gate: `make format && make lint && uv run python -m pytest` green
-- [ ] 2.20 **No push to remote without explicit user OK**
+- [x] 2.1 RED+GREEN: add `SECRET_DETECTED_IN_PACKAGE`, `PACKAGE_PENDIENTE` to `core/exceptions.py` + HTTP mapping
+- [x] 2.2 RED: test `escanear_paquete()` catches real-leak corpus (Neon URL regex + API key) in `tests/services/test_secret_scan_service.py`
+- [x] 2.3 GREEN: create `app/services/secret_scan_service.py` wrapping `detect-secrets` + belt-and-suspenders Postgres/Neon URL regex plugin — **DEVIATION**: uses `SecretsCollection.scan_file` (the realistic non-adhoc pipeline) rather than `scan_line`'s adhoc eager mode, which floods auto-generated Spanish prose with false positives (verified empirically: "Carpeta de evidencias" alone triggered 3 high-entropy hits under eager mode). Each member is scanned via a temp file with a synthetic `.cfg` name so `KeywordDetector` matches unquoted `KEY=VALUE` env-style assignments regardless of the member's real extension. See module docstring for full rationale.
+- [x] 2.4 RED: test clean payload passes with no findings
+- [x] 2.5 GREEN: confirm plugin set covers clean-pass path
+- [x] 2.6 RED: test `generar_zip_evidencias` fetches real bytes from `StoragePort` (no placeholder text)
+- [x] 2.7 GREEN: replace placeholder content with `StoragePort` downloads in `informe_service.generar_zip_evidencias` (L366-460)
+- [x] 2.8 RED: test default numbered folder structure applied when no `PlantillaOrganismo` exists (fallback only — organism-specific lookup arrives slice #5)
+- [x] 2.9 GREEN: implement default numbered folder builder (organism-specific branch stubbed to always-fallback until slice #5) — `_resolver_estructura_organismo()` stub always returns None; slice #5 task 5.15 replaces it
+- [x] 2.10 RED: test package emission halts with `SECRET_DETECTED_IN_PACKAGE` when scan finds a hit; no zip bytes returned
+- [x] 2.11 GREEN: wire mandatory secret scan before zip emission, guarded by new `SECRET_SCAN_GATE_ENABLED` config flag (default `True`, disabling documented emergency-only)
+- [x] 2.12 RED: test standard mode emits partial package with PENDIENTE manifest section, no raise; final mode raises `PACKAGE_PENDIENTE` when incomplete
+- [x] 2.13 GREEN: add `modo: Literal["standard","final"] = "standard"` param (Reconciliation Note 2); implement LISTO/PENDIENTE split + conditional raise — **DEVIATION**: LISTO/PENDIENTE is computed per-OBLIGACIÓN (has ≥1 evidencia attached in this cuenta) rather than via the full `checklist_service`/`RequisitoDocumento` catalog — the packager's domain is the evidence ZIP's own obligación-based folder structure, not the separate contract-level document checklist (RUT/CEDULA/PILA/etc.), which File Changes in design.md never lists `checklist_service.py` as touched for this slice.
+- [x] 2.14 RED+GREEN: `obtener_estado_listo_pendiente` read-only helper (split without producing package)
+- [x] 2.15 RED+GREEN: `schemas/paquete.py` — manifest/response schemas
+- [x] 2.16 RED+GREEN: `app/tools/catalog/paquete.py` — `generar_paquete_evidencias` (write), `obtener_estado_listo_pendiente` (read) — **DEVIATION**: the tool's write handler uploads the resulting zip to storage (`paquetes/{usuario_id}/{cuenta_id}/{filename}`) and returns `PaqueteGeneradoResponse` (storage_key/filename/size_bytes) instead of raw bytes, per spec's Tool Surface note "creates zip artifact in storage" — an agent/MCP tool JSON response can't carry a binary payload. The tool never accepts `modo`; it always packages in `"standard"` mode per Reconciliation Note 2 (`modo="final"` is reserved for the slice #7 `preparar_radicacion` orchestrator calling the service directly).
+- [x] 2.17 Integration test: flags off = bypass scan/gate — `tests/test_paquete_gate.py` (mirrors `test_coherence_gate.py`)
+- [x] 2.18 Update `tests/test_radicar.py::_CODIGOS_OBLIGATORIOS` mirror with 2 new codes — **DEVIATION** (same as slice #1 task 1.22): `_CODIGOS_OBLIGATORIOS` is a checklist requisito-code list, not an error-code mirror; added `test_zip_evidencias_secreto_detectado_returns_code` + `test_zip_evidencias_modo_final_pendiente_returns_code` to `tests/test_error_codes.py` instead (the actual per-code mirror pattern in this codebase).
+- [x] 2.19 Local verification gate: `make format && make lint && uv run python -m pytest` green — `ruff check` clean, `ruff format --check` clean (after one auto-format pass), full suite 1187 passed / 13 deselected (baseline 1169 passed + 18 new tests, 0 regressions); mypy: 2 new errors, both the same pre-existing accepted `get_storage() -> object` attr-defined pattern already present 5x in `document_service.py` — zero new errors in the genuinely new files (`secret_scan_service.py`, `schemas/paquete.py`).
+- [x] 2.20 **No push to remote without explicit user OK** — not pushed; commits are local only.
 
 **Work-unit commits**: (a) 2.1-2.5 secret scan service → `feat(paquete): add secret scan service with real-leak corpus tests`; (b) 2.6-2.9 real bytes/folders → `feat(paquete): fetch real bytes and build numbered folder structure`; (c) 2.10-2.16 gate+tools → `feat(paquete): enforce secret-scan and LISTO/PENDIENTE gates`. If (c) alone risks >150 lines combined with (a)+(b), split (c) into its own PR-2b before merge — flag during apply.
 
@@ -141,12 +141,14 @@ Chain strategy: stacked-to-main
 - [ ] 3.10 GREEN: add `CUOTA_POSITION_CONFLICT` to `core/exceptions.py`; enforce write-time invariant in `cuenta_cobro_service.py` (Reconciliation Note 1)
 - [ ] 3.11 RED: test one-time obligation required when `posicion=primera`, blank for `recurrente`/`final`
 - [ ] 3.12 GREEN: replace `_is_first_cuenta()` (L266-278) with `posicion == PRIMERA` in `checklist_service.py`
+- [ ] 3.12b RED+GREEN: rewire coherence R1 — replace `_derive_numero_cuota()` interim chronological derivation in `coherence_validator_service.py` with the stored `numero_cuota`/`posicion` fields, keeping the rule's external shape (slice #1 verify-report WARNING 1)
+- [ ] 3.12c RED+GREEN: surface SOFT coherence findings in the radicar response — add an `advertencias_coherencia` field to the radicar response schema so callers see SOFT findings without a second `validar_coherencia_cuenta` call (slice #1 verify-report WARNING 2)
 - [ ] 3.13 Integration test: `crear_cuenta_cobro`/`obtener_cuenta_cobro` outputs include new fields
 - [ ] 3.14 Update `tests/test_radicar.py::_CODIGOS_OBLIGATORIOS` mirror with `CUOTA_POSITION_CONFLICT`
 - [ ] 3.15 Local verification gate: `make format && make lint && uv run python -m pytest` green
 - [ ] 3.16 **No push to remote without explicit user OK**
 
-**Work-unit commits**: (a) 3.2-3.6 model+migration → `feat(cuota-position): add numero_cuota/posicion/informe_final fields`; (b) 3.7-3.10 write-time invariant → `feat(cuota-position): enforce CUOTA_POSITION_CONFLICT at creation`; (c) 3.11-3.12 → `fix(checklist): replace _is_first_cuenta heuristic with stored posicion`.
+**Work-unit commits**: (a) 3.2-3.6 model+migration → `feat(cuota-position): add numero_cuota/posicion/informe_final fields`; (b) 3.7-3.10 write-time invariant → `feat(cuota-position): enforce CUOTA_POSITION_CONFLICT at creation`; (c) 3.11-3.12c → `fix(checklist): replace _is_first_cuenta heuristic with stored posicion` + `feat(coherence): rewire R1 to stored position and surface SOFT findings`.
 
 ---
 
