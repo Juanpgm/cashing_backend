@@ -197,6 +197,19 @@ class SecopContratoImportado(ContratoResponse):
     requiere_obligaciones: bool = False
 
 
+class SecopConfiguracionResponse(BaseModel):
+    """Diagnostic/health snapshot for the SECOP Socrata integration.
+
+    Mirrors the `/health/llm` diagnostic pattern (see `LLMHealthResponse`) but
+    exposed as an agent/MCP tool (`verificar_configuracion_secop`) instead of a
+    dedicated HTTP endpoint.
+    """
+
+    status: str  # "ok" | "degraded"
+    token_configured: bool
+    warning: str | None = None
+
+
 class SecopImportResult(BaseModel):
     """Resultado de importar contratos SECOP a la base de datos del usuario."""
 

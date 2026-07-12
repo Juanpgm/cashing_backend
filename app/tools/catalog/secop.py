@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from app.schemas.secop import SecopContratoResponse, SecopImportResult
+from app.schemas.secop import SecopConfiguracionResponse, SecopContratoResponse, SecopImportResult
 from app.services import secop_service
 from app.tools.context import ToolContext
 from app.tools.registry import tool
@@ -79,3 +79,26 @@ async def importar_contrato_secop(ctx: ToolContext, params: ImportarContratoSeco
         usuario_id=ctx.usuario_id,
         confirmar=params.confirmar,
     )
+
+
+class VerificarConfiguracionSecopInput(BaseModel):
+    """No required input — reports this deployment's own SECOP configuration."""
+
+
+@tool(
+    name="verificar_configuracion_secop",
+    description=(
+        "Check whether the SECOP II Socrata integration is properly configured "
+        "(SECOP_APP_TOKEN presence), for diagnostics/support. Read-only, no network call. "
+        "Returns status ('ok' or 'degraded'), token_configured, and a human-readable warning "
+        "when the token is missing (Socrata throttles unauthenticated requests hard). "
+        "No arguments."
+    ),
+    input_model=VerificarConfiguracionSecopInput,
+    output_model=SecopConfiguracionResponse,
+    tags=("read",),
+)
+async def verificar_configuracion_secop(
+    ctx: ToolContext, params: VerificarConfiguracionSecopInput
+) -> SecopConfiguracionResponse:
+    return await secop_service.verificar_configuracion_secop()

@@ -2,8 +2,11 @@
 
 from typing import Any
 
+import structlog
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_log = structlog.get_logger("core.config")
 
 
 class Settings(BaseSettings):
@@ -158,6 +161,23 @@ class Settings(BaseSettings):
 
     # SECOP — datos.gov.co public contracting API
     SECOP_APP_TOKEN: str = ""
+
+    @field_validator("SECOP_APP_TOKEN", mode="after")
+    @classmethod
+    def _warn_if_secop_token_missing(cls, v: str) -> str:
+        """Non-blocking: log a warning instead of raising when the token is empty.
+
+        Socrata throttles unauthenticated requests hard, but the app must still
+        start (see `secop-acquisition-resilience` spec, "Missing SECOP_APP_TOKEN
+        is a warning, not a crash"). `secop_service.verificar_configuracion_secop()`
+        exposes the same signal on demand for support/diagnostics.
+        """
+        if not v:
+            _log.warning(
+                "secop_app_token_missing",
+                note="SECOP_APP_TOKEN is empty — Socrata will throttle; SECOP imports may be partial.",
+            )
+        return v
 
     # SECOP II scraper microservice (Playwright-based). Used by "agentic" mode
     # to fetch contract-phase documents not available in datos.gov.co.
