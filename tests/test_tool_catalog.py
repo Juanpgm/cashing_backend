@@ -37,6 +37,7 @@ EXPECTED_TOOL_NAMES = {
     "persistir_evidencias",
     "crear_cuenta_cobro",
     "radicar_cuenta",
+    "validar_coherencia_cuenta",
 }
 
 FORBIDDEN_NAME_KEYWORDS = (

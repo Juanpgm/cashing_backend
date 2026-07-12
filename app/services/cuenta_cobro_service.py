@@ -18,6 +18,7 @@ from app.agent.tools.pdf_generator import generate_pdf_from_html
 from app.core.config import settings
 from app.core.exceptions import (
     CHECKLIST_INCOMPLETE,
+    COHERENCE_CHECK_FAILED,
     AlreadyExistsError,
     ForbiddenError,
     InsufficientCreditsError,
@@ -41,7 +42,8 @@ from app.schemas.cuenta_cobro import (
     GenerarPDFResponse,
     PDFUrlResponse,
 )
-from app.services import checklist_service
+from app.services import checklist_service, coherence_validator_service
+from app.services.coherence_validator_service import Severity
 
 logger = structlog.get_logger("service.cuenta_cobro")
 
@@ -718,14 +720,17 @@ async def radicar_cuenta(
     usuario_id: uuid.UUID,
     cuenta_id: uuid.UUID,
 ) -> CuentaCobroResponse:
-    """Submit (radicar) a CuentaCobro, gating the transition on checklist readiness.
+    """Submit (radicar) a CuentaCobro, gating the transition on coherence + checklist.
 
-    Only allowed from BORRADOR or RECHAZADA. Builds/refreshes the document
-    checklist via `checklist_service.construir_checklist_completo` and blocks
-    the submission when mandatory requisitos are still pending, surfacing
+    Only allowed from BORRADOR or RECHAZADA. When `COHERENCE_GATE_ENABLED` (default
+    True), first runs `coherence_validator_service.validar_coherencia` and blocks
+    with `ValidationError(code=COHERENCE_CHECK_FAILED)` on any HARD finding — SOFT
+    findings are logged as a warning and never block. Then builds/refreshes the
+    document checklist via `checklist_service.construir_checklist_completo` and
+    blocks the submission when mandatory requisitos are still pending, surfacing
     their labels. The actual state transition (and `fecha_envio` stamping) is
-    delegated to `cambiar_estado`, which owns the state machine — this
-    function never mutates `cuenta.estado` directly.
+    delegated to `cambiar_estado`, which owns the state machine — this function
+    never mutates `cuenta.estado` directly.
     """
     cuenta = await _get_cuenta_con_ownership(db, usuario_id, cuenta_id)
 
@@ -734,6 +739,23 @@ async def radicar_cuenta(
             f"No se puede radicar una cuenta en estado '{cuenta.estado}'. "
             "Solo se permite en borrador o rechazada."
         )
+
+    if settings.COHERENCE_GATE_ENABLED:
+        findings = await coherence_validator_service.validar_coherencia(db, usuario_id, cuenta_id)
+        hallazgos_duros = [f for f in findings if f.severity == Severity.HARD]
+        if hallazgos_duros:
+            detalles = "; ".join(f"[{f.rule_id}] {f.mensaje}" for f in hallazgos_duros)
+            raise ValidationError(
+                f"No se puede radicar: se encontraron inconsistencias. {detalles}",
+                code=COHERENCE_CHECK_FAILED,
+            )
+        if findings:
+            await logger.awarning(
+                "radicar_cuenta.coherencia_advertencias",
+                cuenta_id=str(cuenta_id),
+                usuario_id=str(usuario_id),
+                advertencias=len(findings),
+            )
 
     payload = await checklist_service.construir_checklist_completo(db, cuenta)
     resumen = payload["resumen"]

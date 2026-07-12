@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
+from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -135,6 +136,70 @@ async def test_evidencias_descubrir_google_not_connected_returns_code(
     assert resp.status_code == 502, resp.text
     body = resp.json()
     assert body["code"] == "GOOGLE_NOT_CONNECTED"
+
+
+_CODIGOS_OBLIGATORIOS_RADICAR = [
+    "CONTRATO",
+    "RPC",
+    "SEGURIDAD_SOCIAL",
+    "INFORME_ACTIVIDADES",
+    "INFORME_SUPERVISION",
+    "EVIDENCIAS",
+    "CEDULA",
+    "RUT",
+    "ACTA_INICIO",
+]
+
+
+async def test_radicar_coherence_hard_finding_returns_coherence_check_failed_code(
+    client: AsyncClient, db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
+) -> None:
+    """Mirrors test_radicar_checklist_incompleto_returns_checklist_incomplete_code for
+    the new `COHERENCE_CHECK_FAILED` code (billing-resilience-templates, slice #1):
+    a copied seguridad-social block (R2, HARD) between consecutive cuentas blocks
+    radicación with the structured code, even once the checklist itself is complete."""
+    cuenta1 = CuentaCobro(
+        contrato_id=contrato.id, mes=1, anio=2024, estado=EstadoCuentaCobro.BORRADOR,
+        valor=1_000_000, requisitos_modo="estandar",
+    )
+    cuenta2 = CuentaCobro(
+        contrato_id=contrato.id, mes=2, anio=2024, estado=EstadoCuentaCobro.BORRADOR,
+        valor=1_000_000, requisitos_modo="estandar",
+    )
+    db.add_all([cuenta1, cuenta2])
+    await db.commit()
+    for c in (cuenta1, cuenta2):
+        await db.refresh(c)
+        db.add(
+            DocumentoFuente(
+                usuario_id=contrato.usuario_id,
+                contrato_id=contrato.id,
+                cuenta_cobro_id=c.id,
+                storage_key=f"fake/ss-{c.mes}.pdf",
+                nombre=f"ss-{c.mes}.pdf",
+                tipo=TipoDocumentoFuente.SEGURIDAD_SOCIAL,
+                texto_extraido="Planilla 555666777 pagada por el contratista, sin novedad.",
+            )
+        )
+    await db.commit()
+
+    r = await client.get(f"/api/v1/cuentas-cobro/{cuenta2.id}/checklist", headers=test_user["headers"])
+    assert r.status_code == 200, r.text
+    for codigo in _CODIGOS_OBLIGATORIOS_RADICAR:
+        p = await client.patch(
+            f"/api/v1/cuentas-cobro/{cuenta2.id}/checklist/{codigo}",
+            headers=test_user["headers"],
+            json={"cumplido_manual": True},
+        )
+        assert p.status_code == 200, p.text
+
+    resp = await client.post(
+        f"/api/v1/cuentas-cobro/{cuenta2.id}/radicar",
+        headers=test_user["headers"],
+    )
+    assert resp.status_code == 422, resp.text
+    body = resp.json()
+    assert body["code"] == "COHERENCE_CHECK_FAILED"
 
 
 async def test_unrelated_error_keeps_unchanged_envelope_shape(

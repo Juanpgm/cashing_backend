@@ -15,6 +15,7 @@ evidence.
 
 from app.tools.catalog import (
     checklist,
+    coherence,
     cuentas,
     evidencias,
     importar_documento,
@@ -26,6 +27,7 @@ from app.tools.catalog import (
 
 __all__ = [
     "checklist",
+    "coherence",
     "cuentas",
     "evidencias",
     "importar_documento",
