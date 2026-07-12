@@ -329,7 +329,25 @@ Respuesta: detalles del proceso (entidad, modalidad, precio base, estado, fechas
 
 - `numero_contrato`: `CO1.PCCNTR.9005900` ← número de prueba conocido
 
-Respuesta: lista de archivos con `url_descarga` para bajar PDFs directamente desde SECOP.
+Respuesta (Slice 2 task 2.10b — cambió de una lista plana a un objeto
+estructurado): un `SecopDocumentosConCoberturaResponse` con dos campos:
+
+```json
+{
+  "documentos": [
+    { "id_documento_secop": "...", "nombre_archivo": "...", "url_descarga": "https://...", "...": "..." }
+  ],
+  "cobertura": {
+    "gap": false,
+    "razon": "Cobertura completa: no se detectaron datasets con error ni brecha de 2024.",
+    "url_proceso": "https://community.secop.gov.co/Public/Tendering/..."
+  }
+}
+```
+
+- `documentos`: lista de archivos con `url_descarga` para bajar PDFs directamente desde SECOP (igual que antes).
+- `cobertura.gap`: `true` cuando la cobertura de datos abiertos es parcial (brecha 2024 y/o algún dataset falló) — un conteo bajo de documentos no es necesariamente un bug.
+- `cobertura.url_proceso`: enlace a la plataforma SECOP II donde se puede consultar manualmente el set completo (incluye documentos solo-plataforma que el scraper — `POST /secop/explorar-agentico`, Slice 3/4 — puede intentar traer).
 
 ### 4.4 Consulta completa integrada
 
