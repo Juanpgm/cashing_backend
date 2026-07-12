@@ -1,19 +1,28 @@
 """Coherence validator — pre-radicación read-only rule engine.
 
-Runs the R1-R6 rule catalog (see
+Runs the R1-R7 rule catalog (see
 `openspec/changes/billing-resilience-templates/specs/radicacion-coherence-validator/spec.md`)
 over a cuenta de cobro before it is allowed to radicar. Loads a `ValidationContext`
 once, then runs every registered `CoherenceRule` over it. The caller
 (`cuenta_cobro_service.radicar_cuenta`) raises `COHERENCE_CHECK_FAILED` on any HARD
 finding; SOFT findings never block.
 
-R6 (`stale_clause_after_adicion`) is a deliberate STUB in this slice: the real
-`adiciones_contrato` table lands in slice #4 (migration 026), so
-`ValidationContext.adiciones` is always an empty list here and the rule is a no-op.
-Slice #4 populates `adiciones` with real events without changing this rule's logic
-(Reconciliation Note 4, tasks.md).
+R6 (`stale_clause_after_adicion`) reads the REAL `adiciones_contrato` table
+(migration 026, slice #4, task 4.9) — completing the deliberate stub from slice #1
+(Reconciliation Note 4, tasks.md), where `ValidationContext.adiciones` was always an
+empty list. `_load_adiciones_contexto` chains each event's `rpc_nuevo`/`cdp_nuevo`
+against the closest EARLIER event that set the same field to build R6's expected
+`rpc_anterior`/`rpc_nuevo`/`cdp_anterior`/`cdp_nuevo` dict shape — the model itself
+only stores what an event INTRODUCED, not what it replaced, so a contract's very
+first recorded event correctly produces no R6 finding (no prior value to compare).
 
-R1 now reads the persisted `CuentaCobro.numero_cuota` field (migration 025, slice #3)
+R7 (`stale_final_after_prorroga`, SOFT, task 4.11-4.12) warns when a recorded
+prórroga event exists and the immediately-preceding cuota is flagged
+`informe_final=True` — it NEVER auto-unflags `informe_final` (design D4,
+Reconciliation Note 3, tasks.md): only a human decides whether that cuota is still
+truly final.
+
+R1 reads the persisted `CuentaCobro.numero_cuota` field (migration 025, slice #3)
 instead of deriving it from chronological (anio, mes) ordering at read time — the
 interim derivation used in slice #1 (`_derive_numero_cuota`) is kept ONLY as a
 defensive fallback for a legacy cuota somehow missing the field (task 3.12b,
@@ -37,6 +46,7 @@ from sqlalchemy.orm import selectinload
 from app.core import text_match
 from app.core.exceptions import ForbiddenError, NotFoundError
 from app.models.actividad import Actividad
+from app.models.adicion_contrato import AdicionContrato, TipoAdicion
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro
 from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
@@ -87,10 +97,12 @@ class ValidationContext:
     documentos: list[DocumentoFuente]
     documentos_prior: list[DocumentoFuente]
     numero_cuota_derivado: int
-    # Stubbed/empty until slice #4 wires the real `adiciones_contrato` table
-    # (Reconciliation Note 4). Each item is expected to carry keys such as
-    # `rpc_anterior`/`rpc_nuevo`/`cdp_anterior`/`cdp_nuevo` once populated for real.
+    # Real `adiciones_contrato` events (slice #4, task 4.9), reshaped by
+    # `_load_adiciones_contexto` into R6's expected dict shape: each item carries
+    # `rpc_anterior`/`rpc_nuevo` and/or `cdp_anterior`/`cdp_nuevo` keys.
     adiciones: list[dict[str, Any]] = field(default_factory=list)
+    # Whether the contrato has ANY recorded prórroga event (R7, task 4.11).
+    tiene_prorroga: bool = False
 
 
 CoherenceRule = Callable[[ValidationContext], list[Finding]]
@@ -280,7 +292,7 @@ def obligacion_text_mapping(ctx: ValidationContext) -> list[Finding]:
     return findings
 
 
-# ── R6 — stale clause after Adición (STUB — real table lands slice #4) ─────
+# ── R6 — stale clause after Adición (real `adiciones_contrato` data, slice #4) ──
 
 
 @_register
@@ -288,8 +300,9 @@ def stale_clause_after_adicion(ctx: ValidationContext) -> list[Finding]:
     """HARD: after a recorded Adición event, the new RPC/CDP does not appear in the
     cuenta's text while the pre-Adición identifier still does.
 
-    STUB in this slice: `ctx.adiciones` is always empty (see module docstring),
-    so this rule is a no-op until slice #4 wires real Adición events in.
+    `ctx.adiciones` is built from the real `adiciones_contrato` table (task 4.9) — a
+    contract with no recorded events (or none that introduced a NEW rpc/cdp with a
+    prior value to compare against) yields an empty list and this rule is a no-op.
     """
     if not ctx.adiciones:
         return []
@@ -324,6 +337,37 @@ def stale_clause_after_adicion(ctx: ValidationContext) -> list[Finding]:
                     )
                 )
     return findings
+
+
+# ── R7 — stale informe_final after prórroga (SOFT) ───────────────────────────
+
+
+@_register
+def stale_final_after_prorroga(ctx: ValidationContext) -> list[Finding]:
+    """SOFT: a recorded prórroga event extends the contract's term after a cuota
+    was already marked `informe_final=True` — that cuota is no longer necessarily
+    the contract's last one (spec: "Prórroga extends expected cuota count").
+
+    NEVER auto-unflags `informe_final` (design D4, Reconciliation Note 3,
+    tasks.md) — this rule only surfaces a warning; a human decides whether the
+    flagged cuota is still truly final.
+    """
+    if not ctx.tiene_prorroga:
+        return []
+    if ctx.prior_cuenta is None or not ctx.prior_cuenta.informe_final:
+        return []
+    return [
+        Finding(
+            rule_id="R7",
+            severity=Severity.SOFT,
+            codigo="STALE_FINAL_AFTER_PRORROGA",
+            mensaje=(
+                "La cuota anterior está marcada como informe final, pero el contrato registra "
+                "una prórroga posterior — revise si esa cuota sigue siendo realmente la última."
+            ),
+            contexto={"cuenta_final_id": str(ctx.prior_cuenta.id)},
+        )
+    ]
 
 
 # ── Context loading + entrypoint ─────────────────────────────────────────────
@@ -412,6 +456,43 @@ async def _load_documentos(db: AsyncSession, cuenta_id: uuid.UUID) -> list[Docum
     return list(result.scalars().all())
 
 
+async def _load_adiciones_contexto(db: AsyncSession, contrato_id: uuid.UUID) -> tuple[list[dict[str, Any]], bool]:
+    """Real `adiciones_contrato` wiring (slice #4, task 4.9 — completes R6, replaces
+    the slice #1 stub). Chains each event's `rpc_nuevo`/`cdp_nuevo` against the
+    closest EARLIER event that set that same field to build R6's expected
+    `rpc_anterior`/`rpc_nuevo`/`cdp_anterior`/`cdp_nuevo` dict shape — the model only
+    stores what an event INTRODUCED, not what it replaced, so a field's first-ever
+    recorded value has nothing to chain from and correctly produces no R6 entry.
+
+    Also returns whether the contrato has ANY recorded prórroga event (R7, task
+    4.11) — deliberately independent of the rpc/cdp chain, since a prórroga event
+    need not carry either identifier.
+    """
+    result = await db.execute(
+        select(AdicionContrato)
+        .where(AdicionContrato.contrato_id == contrato_id)
+        .order_by(AdicionContrato.fecha_evento.asc(), AdicionContrato.created_at.asc())
+    )
+    eventos = list(result.scalars().all())
+
+    adiciones: list[dict[str, Any]] = []
+    rpc_anterior: str | None = None
+    cdp_anterior: str | None = None
+    tiene_prorroga = False
+    for evento in eventos:
+        if evento.tipo == TipoAdicion.PRORROGA:
+            tiene_prorroga = True
+        if evento.rpc_nuevo and rpc_anterior:
+            adiciones.append({"rpc_anterior": rpc_anterior, "rpc_nuevo": evento.rpc_nuevo})
+        if evento.cdp_nuevo and cdp_anterior:
+            adiciones.append({"cdp_anterior": cdp_anterior, "cdp_nuevo": evento.cdp_nuevo})
+        if evento.rpc_nuevo:
+            rpc_anterior = evento.rpc_nuevo
+        if evento.cdp_nuevo:
+            cdp_anterior = evento.cdp_nuevo
+    return adiciones, tiene_prorroga
+
+
 async def _build_context(db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: uuid.UUID) -> ValidationContext:
     cuenta = await _load_cuenta(db, usuario_id, cuenta_id)
     contrato = cuenta.contrato
@@ -424,6 +505,7 @@ async def _build_context(db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: uui
     prior_cuenta = await _load_prior_cuenta(db, cuenta)
     documentos = await _load_documentos(db, cuenta.id)
     documentos_prior = await _load_documentos(db, prior_cuenta.id) if prior_cuenta is not None else []
+    adiciones, tiene_prorroga = await _load_adiciones_contexto(db, contrato.id)
 
     return ValidationContext(
         cuenta=cuenta,
@@ -434,12 +516,13 @@ async def _build_context(db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: uui
         documentos=documentos,
         documentos_prior=documentos_prior,
         numero_cuota_derivado=numero_cuota,
-        adiciones=[],
+        adiciones=adiciones,
+        tiene_prorroga=tiene_prorroga,
     )
 
 
 async def validar_coherencia(db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: uuid.UUID) -> list[Finding]:
-    """Run the full R1-R6 rule catalog over a cuenta. Read-only — never raises on a
+    """Run the full R1-R7 rule catalog over a cuenta. Read-only — never raises on a
     HARD finding itself; the caller (`cuenta_cobro_service.radicar_cuenta`) decides
     whether/how to block."""
     ctx = await _build_context(db, usuario_id, cuenta_id)

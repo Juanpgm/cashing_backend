@@ -1,10 +1,11 @@
 """Tests for app.services.coherence_validator_service — pre-radicación rule engine.
 
-Covers the R1-R6 rule catalog (see openspec/changes/billing-resilience-templates/
-specs/radicacion-coherence-validator/spec.md). R6 (stale clause after Adición) is
-built in this slice against a stubbed/empty `ValidationContext.adiciones` — the real
-`adiciones_contrato` table lands in slice #4, which populates the context and adds
-regression coverage against real data (Reconciliation Note 4 in tasks.md).
+Covers the R1-R7 rule catalog (see openspec/changes/billing-resilience-templates/
+specs/radicacion-coherence-validator/spec.md). R6 (stale clause after Adición) was
+built in slice #1 against a stubbed/empty `ValidationContext.adiciones`; slice #4
+(migration 026) wires it to the real `adiciones_contrato` table (Reconciliation Note
+4 in tasks.md, task 4.9-4.10) — see the "R6: real adiciones_contrato data" section
+below. R7 (`stale_final_after_prorroga`, SOFT) is new in slice #4 (task 4.11-4.12).
 
 Slice #3 (migration 025) rewires R1 to read the persisted
 `CuentaCobro.numero_cuota`/`posicion` fields instead of deriving them at read time
@@ -20,6 +21,7 @@ from typing import Any
 
 import pytest
 from app.core.exceptions import COHERENCE_CHECK_FAILED, ValidationError, domain_to_http
+from app.models.adicion_contrato import AdicionContrato, TipoAdicion
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro, PosicionCuota
 from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
@@ -78,10 +80,11 @@ def test_validation_context_shape() -> None:
     )
     assert ctx.numero_cuota_derivado == 1
     assert ctx.adiciones == []
+    assert ctx.tiene_prorroga is False
 
 
-def test_rules_registry_has_six_rules() -> None:
-    assert len(cvs.RULES) == 6
+def test_rules_registry_has_seven_rules() -> None:
+    assert len(cvs.RULES) == 7
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -138,6 +141,30 @@ async def _make_obligacion(db: AsyncSession, contrato: Contrato, descripcion: st
     await db.commit()
     await db.refresh(ob)
     return ob
+
+
+async def _make_adicion(
+    db: AsyncSession,
+    contrato: Contrato,
+    tipo: TipoAdicion,
+    numero: int,
+    fecha_evento: date,
+    rpc_nuevo: str | None = None,
+    cdp_nuevo: str | None = None,
+) -> AdicionContrato:
+    evento = AdicionContrato(
+        contrato_id=contrato.id,
+        tipo=tipo,
+        numero=numero,
+        rpc_nuevo=rpc_nuevo,
+        cdp_nuevo=cdp_nuevo,
+        descripcion="",
+        fecha_evento=fecha_evento,
+    )
+    db.add(evento)
+    await db.commit()
+    await db.refresh(evento)
+    return evento
 
 
 async def _make_documento(
@@ -421,6 +448,111 @@ async def test_r6_hard_finding_when_stale_rpc_present_in_stubbed_context(db: Asy
     assert len(findings) == 1
     assert findings[0].severity == cvs.Severity.HARD
     assert findings[0].rule_id == "R6"
+
+
+# ── R6: real adiciones_contrato data (slice #4, tasks 4.9-4.10) ──────────────
+
+
+async def test_r6_hard_finding_with_real_adicion_events(db: AsyncSession, contrato: Contrato) -> None:
+    """Task 4.10: replaces the slice #1 stub with real `adiciones_contrato` rows.
+    Two recorded events chain RPC-100 -> RPC-200; the cuenta's own text still
+    mentions RPC-100 (the pre-Adición identifier) and never RPC-200."""
+    await _make_adicion(db, contrato, TipoAdicion.ADICION, numero=1, fecha_evento=date(2024, 1, 1), rpc_nuevo="RPC-100")
+    await _make_adicion(db, contrato, TipoAdicion.ADICION, numero=2, fecha_evento=date(2024, 6, 1), rpc_nuevo="RPC-200")
+    cuenta = await _make_cuenta(db, contrato, mes=7)
+    await _make_documento(
+        db,
+        contrato,
+        cuenta,
+        TipoDocumentoFuente.RPC,
+        "rpc.pdf",
+        texto_extraido="Registro Presupuestal de Compromiso RPC-100 del contrato.",
+    )
+
+    ctx = await cvs._build_context(db, contrato.usuario_id, cuenta.id)
+    assert ctx.adiciones == [{"rpc_anterior": "RPC-100", "rpc_nuevo": "RPC-200"}]
+    findings = cvs.stale_clause_after_adicion(ctx)
+    assert len(findings) == 1
+    assert findings[0].severity == cvs.Severity.HARD
+    assert findings[0].rule_id == "R6"
+
+
+async def test_r6_no_finding_on_first_recorded_event_no_prior_chain(db: AsyncSession, contrato: Contrato) -> None:
+    """A contract's FIRST recorded event has no earlier value to compare against —
+    `_load_adiciones_contexto` correctly produces no R6 entry for it (no false
+    positive), even though it introduced a new RPC."""
+    await _make_adicion(db, contrato, TipoAdicion.ADICION, numero=1, fecha_evento=date(2024, 1, 1), rpc_nuevo="RPC-100")
+    cuenta = await _make_cuenta(db, contrato, mes=2)
+
+    ctx = await cvs._build_context(db, contrato.usuario_id, cuenta.id)
+    assert ctx.adiciones == []
+    findings = cvs.stale_clause_after_adicion(ctx)
+    assert findings == []
+
+
+async def test_r6_no_finding_when_new_identifier_already_present(db: AsyncSession, contrato: Contrato) -> None:
+    await _make_adicion(db, contrato, TipoAdicion.ADICION, numero=1, fecha_evento=date(2024, 1, 1), rpc_nuevo="RPC-100")
+    await _make_adicion(db, contrato, TipoAdicion.ADICION, numero=2, fecha_evento=date(2024, 6, 1), rpc_nuevo="RPC-200")
+    cuenta = await _make_cuenta(db, contrato, mes=7)
+    await _make_documento(
+        db,
+        contrato,
+        cuenta,
+        TipoDocumentoFuente.RPC,
+        "rpc.pdf",
+        texto_extraido="Registro Presupuestal de Compromiso RPC-200 del contrato.",
+    )
+
+    ctx = await cvs._build_context(db, contrato.usuario_id, cuenta.id)
+    findings = cvs.stale_clause_after_adicion(ctx)
+    assert findings == []
+
+
+# ── R7: stale_final_after_prorroga (SOFT, slice #4, tasks 4.11-4.12) ─────────
+
+
+async def test_r7_soft_finding_when_prorroga_and_prior_cuota_marked_final(db: AsyncSession, contrato: Contrato) -> None:
+    cuenta1 = await _make_cuenta(db, contrato, mes=1)
+    cuenta1.informe_final = True
+    cuenta1.posicion = PosicionCuota.FINAL
+    db.add(cuenta1)
+    await db.commit()
+
+    await _make_adicion(db, contrato, TipoAdicion.PRORROGA, numero=1, fecha_evento=date(2024, 2, 1))
+    cuenta2 = await _make_cuenta(db, contrato, mes=3, numero_cuota=2, posicion=PosicionCuota.RECURRENTE)
+
+    ctx = await cvs._build_context(db, contrato.usuario_id, cuenta2.id)
+    assert ctx.tiene_prorroga is True
+    findings = cvs.stale_final_after_prorroga(ctx)
+    assert len(findings) == 1
+    assert findings[0].severity == cvs.Severity.SOFT
+    assert findings[0].rule_id == "R7"
+    # Never auto-unflags — the prior cuota's informe_final stays True.
+    await db.refresh(cuenta1)
+    assert cuenta1.informe_final is True
+
+
+async def test_r7_no_finding_without_prorroga(db: AsyncSession, contrato: Contrato) -> None:
+    cuenta1 = await _make_cuenta(db, contrato, mes=1)
+    cuenta1.informe_final = True
+    db.add(cuenta1)
+    await db.commit()
+    cuenta2 = await _make_cuenta(db, contrato, mes=2, numero_cuota=2, posicion=PosicionCuota.RECURRENTE)
+
+    ctx = await cvs._build_context(db, contrato.usuario_id, cuenta2.id)
+    assert ctx.tiene_prorroga is False
+    findings = cvs.stale_final_after_prorroga(ctx)
+    assert findings == []
+
+
+async def test_r7_no_finding_when_prior_cuota_not_marked_final(db: AsyncSession, contrato: Contrato) -> None:
+    await _make_cuenta(db, contrato, mes=1)
+    await _make_adicion(db, contrato, TipoAdicion.PRORROGA, numero=1, fecha_evento=date(2024, 2, 1))
+    cuenta2 = await _make_cuenta(db, contrato, mes=2, numero_cuota=2, posicion=PosicionCuota.RECURRENTE)
+
+    ctx = await cvs._build_context(db, contrato.usuario_id, cuenta2.id)
+    findings = cvs.stale_final_after_prorroga(ctx)
+    assert findings == []
 
 
 # ── validar_coherencia entrypoint ─────────────────────────────────────────────
