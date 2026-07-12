@@ -249,6 +249,31 @@ async def test_one_time_obligation_blank_for_recurrente(db: AsyncSession) -> Non
     assert "DEPENDIENTES" not in codigos
 
 
+async def test_one_time_obligation_follows_stored_posicion_not_chronology(db: AsyncSession) -> None:
+    """Task 3.12: proves the checklist now reads the STORED `posicion` field rather
+    than falling back to the old `_is_first_cuenta` chronological-order heuristic.
+
+    Deliberately inverted setup: the RECURRENTE cuota has the EARLIER month
+    (mes=1) and the PRIMERA cuota has a LATER month (mes=6) — the old
+    "smallest (anio, mes)" heuristic would have wrongly picked the mes=1 cuota
+    as "first" here. Only reading the stored `posicion` gets this right.
+    """
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+    await db.commit()
+
+    cuenta_recurrente = await _make_cuenta_con_posicion(
+        db, contrato, mes=1, posicion=PosicionCuota.RECURRENTE, numero_cuota=2
+    )
+    await _make_cuenta_con_posicion(db, contrato, mes=6, posicion=PosicionCuota.PRIMERA, numero_cuota=1)
+
+    filas = await checklist_service.asegurar_checklist(db, cuenta_recurrente)
+    await db.commit()
+
+    codigos = {f.requisito_codigo for f in filas}
+    assert "DEPENDIENTES" not in codigos
+
+
 async def test_one_time_obligation_blank_for_final(db: AsyncSession) -> None:
     user = await _make_user(db)
     contrato = await _make_contrato(db, user.id)

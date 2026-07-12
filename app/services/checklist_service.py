@@ -25,7 +25,7 @@ from app.core.text_match import solo_digitos as _solo_digitos
 from app.models.actividad import Actividad
 from app.models.categoria_documento import CategoriaDocumento
 from app.models.contrato import Contrato
-from app.models.cuenta_cobro import CuentaCobro
+from app.models.cuenta_cobro import CuentaCobro, PosicionCuota
 from app.models.documento_cuenta_cobro import (
     DocumentoChecklistCandidato,
     DocumentoCuentaCobro,
@@ -263,19 +263,15 @@ async def listar_requisitos_cuenta(db: AsyncSession, cuenta_id: uuid.UUID) -> li
 # ── core lifecycle ─────────────────────────────────────────────────────────
 
 
-async def _is_first_cuenta(db: AsyncSession, cuenta: CuentaCobro) -> bool:
-    """True if this cuenta has the smallest (anio, mes) for its contrato."""
-    res = await db.execute(
-        select(CuentaCobro)
-        .where(
-            CuentaCobro.contrato_id == cuenta.contrato_id,
-            CuentaCobro.deleted_at.is_(None),
-        )
-        .order_by(CuentaCobro.anio.asc(), CuentaCobro.mes.asc())
-        .limit(1)
-    )
-    first = res.scalar_one_or_none()
-    return bool(first and first.id == cuenta.id)
+def _is_first_cuenta(cuenta: CuentaCobro) -> bool:
+    """True when this cuenta's stored `posicion` is PRIMERA.
+
+    Billing-resilience-templates slice #3: replaces the previous read-time
+    positional heuristic (an extra query for the smallest (anio, mes) among the
+    contrato's cuentas) with the persisted `CuentaCobro.posicion` field
+    (migration 025) — no DB round-trip needed.
+    """
+    return cuenta.posicion == PosicionCuota.PRIMERA
 
 
 def _codigos_estandar_a_crear(
@@ -319,7 +315,7 @@ async def asegurar_checklist(db: AsyncSession, cuenta: CuentaCobro) -> list[Docu
     por_codigo = {f.requisito_codigo: f for f in filas if f.requisito_codigo is not None}
     por_custom = {f.requisito_cuenta_id: f for f in filas if f.requisito_cuenta_id is not None}
 
-    is_first = await _is_first_cuenta(db, cuenta)
+    is_first = _is_first_cuenta(cuenta)
 
     codigos_estandar = (
         _codigos_estandar_a_crear(modo, catalogo, custom) if modo != "estandar" else {req.codigo for req in catalogo}
@@ -1056,7 +1052,9 @@ async def auto_vincular_documentos_fuente(
                 requisito_codigo=req_codigo,
                 error=str(exc),
             )
-            _marcar_deteccion_error(db, cuenta.id, req_codigo, "No se pudo completar el auto-vínculo para este requisito.")
+            _marcar_deteccion_error(
+                db, cuenta.id, req_codigo, "No se pudo completar el auto-vínculo para este requisito."
+            )
             candidates.pop(req_codigo, None)
 
     vinculados = 0
