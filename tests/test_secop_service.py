@@ -7,9 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-
 from app.core.exceptions import ExternalServiceError
-
 
 # ── Helper function tests ──────────────────────────────────────────────────
 
@@ -169,9 +167,7 @@ class TestQuerySocrata:
 
         with patch("httpx.AsyncClient") as mock_client_cls:
             mock_client = AsyncMock()
-            mock_client.get.side_effect = httpx.HTTPStatusError(
-                "error", request=mock_request, response=mock_resp
-            )
+            mock_client.get.side_effect = httpx.HTTPStatusError("error", request=mock_request, response=mock_resp)
             mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
             mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=None)
 
@@ -200,9 +196,7 @@ class TestQuerySocrata:
 
         resp_429 = MagicMock()
         resp_429.status_code = 429
-        resp_429.raise_for_status.side_effect = httpx.HTTPStatusError(
-            "429", request=mock_request, response=resp_429
-        )
+        resp_429.raise_for_status.side_effect = httpx.HTTPStatusError("429", request=mock_request, response=resp_429)
 
         resp_200 = MagicMock()
         resp_200.raise_for_status = MagicMock()
@@ -229,9 +223,7 @@ class TestQuerySocrata:
         mock_request = MagicMock()
         resp_500 = MagicMock()
         resp_500.status_code = 500
-        resp_500.raise_for_status.side_effect = httpx.HTTPStatusError(
-            "500", request=mock_request, response=resp_500
-        )
+        resp_500.raise_for_status.side_effect = httpx.HTTPStatusError("500", request=mock_request, response=resp_500)
 
         with patch("httpx.AsyncClient") as mock_client_cls:
             mock_client = AsyncMock()
