@@ -90,6 +90,28 @@ async def test_crear_cuenta_cobro_sin_autenticacion(client: AsyncClient, contrat
 
 
 @pytest.mark.asyncio
+async def test_crear_y_obtener_cuenta_cobro_incluye_campos_cuota_position(
+    client: AsyncClient, test_user: dict[str, Any], contrato: Contrato
+) -> None:
+    """Task 3.13 (billing-resilience-templates slice #3): create + fetch responses
+    include `numero_cuota`/`posicion`/`informe_final`."""
+    payload = {"contrato_id": str(contrato.id), "mes": 1, "anio": 2024, "valor": "3000000.00"}
+    resp = await client.post("/api/v1/cuentas-cobro/", json=payload, headers=test_user["headers"])
+    assert resp.status_code == 201, resp.text
+    data = resp.json()
+    assert data["numero_cuota"] == 1
+    assert data["posicion"] == "primera"
+    assert data["informe_final"] is False
+
+    get_resp = await client.get(f"/api/v1/cuentas-cobro/{data['id']}", headers=test_user["headers"])
+    assert get_resp.status_code == 200, get_resp.text
+    get_data = get_resp.json()
+    assert get_data["numero_cuota"] == 1
+    assert get_data["posicion"] == "primera"
+    assert get_data["informe_final"] is False
+
+
+@pytest.mark.asyncio
 async def test_crear_cuenta_cobro_contrato_inexistente(client: AsyncClient, test_user: dict[str, Any]) -> None:
     payload = {"contrato_id": str(uuid.uuid4()), "mes": 1, "anio": 2024, "valor": "3000000.00"}
     resp = await client.post("/api/v1/cuentas-cobro/", json=payload, headers=test_user["headers"])
@@ -210,9 +232,7 @@ async def test_listar_cuentas_cobro_filtra_por_contrato(
     db.add(cuenta_otro)
     await db.commit()
 
-    resp = await client.get(
-        f"/api/v1/cuentas-cobro/?contrato_id={contrato.id}", headers=test_user["headers"]
-    )
+    resp = await client.get(f"/api/v1/cuentas-cobro/?contrato_id={contrato.id}", headers=test_user["headers"])
     assert resp.status_code == 200
     data = resp.json()
     ids = {item["id"] for item in data}
@@ -441,9 +461,7 @@ async def test_cambiar_estado_valor_invalido_422(
 
 
 @pytest.mark.asyncio
-async def test_generar_pdf_200(
-    client: AsyncClient, test_user: dict[str, Any], cuenta_borrador: CuentaCobro
-) -> None:
+async def test_generar_pdf_200(client: AsyncClient, test_user: dict[str, Any], cuenta_borrador: CuentaCobro) -> None:
     fastapi_app.dependency_overrides[get_pdf_storage] = _mock_pdf_storage
 
     try:

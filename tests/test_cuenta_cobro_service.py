@@ -106,6 +106,60 @@ async def test_crear_cuenta_cobro_ok(db: AsyncSession) -> None:
 
 
 @pytest.mark.asyncio
+async def test_crear_cuenta_cobro_first_cuota_deriva_primera_y_numero_1(db: AsyncSession) -> None:
+    """Task 3.7/3.8 (billing-resilience-templates slice #3): the first cuota of a
+    contrato derives and persists `posicion=primera`, `numero_cuota=1`."""
+    from app.models.cuenta_cobro import PosicionCuota
+
+    user = await _make_user(db, creditos=100)
+    contrato = await _make_contrato(db, user.id)
+    await db.commit()
+
+    data = CuentaCobroCreate(contrato_id=contrato.id, mes=1, anio=2024, valor=Decimal("3000000.00"))
+    resp = await cuenta_cobro_service.crear_cuenta_cobro(db, user.id, data)
+
+    assert resp.numero_cuota == 1
+    assert resp.posicion == PosicionCuota.PRIMERA
+    assert resp.informe_final is False
+
+
+@pytest.mark.asyncio
+async def test_crear_cuenta_cobro_second_cuota_deriva_recurrente_y_numero_2(db: AsyncSession) -> None:
+    from app.models.cuenta_cobro import PosicionCuota
+
+    user = await _make_user(db, creditos=100)
+    contrato = await _make_contrato(db, user.id)
+    await db.commit()
+
+    data1 = CuentaCobroCreate(contrato_id=contrato.id, mes=1, anio=2024, valor=Decimal("3000000.00"))
+    await cuenta_cobro_service.crear_cuenta_cobro(db, user.id, data1)
+    await db.commit()
+
+    data2 = CuentaCobroCreate(contrato_id=contrato.id, mes=2, anio=2024, valor=Decimal("3000000.00"))
+    resp2 = await cuenta_cobro_service.crear_cuenta_cobro(db, user.id, data2)
+
+    assert resp2.numero_cuota == 2
+    assert resp2.posicion == PosicionCuota.RECURRENTE
+
+
+@pytest.mark.asyncio
+async def test_obtener_cuenta_cobro_incluye_campos_cuota_position(db: AsyncSession) -> None:
+    """Task 3.13: `obtener_cuenta_cobro` output includes the new cuota-position fields."""
+    user = await _make_user(db, creditos=100)
+    contrato = await _make_contrato(db, user.id)
+    await db.commit()
+
+    data = CuentaCobroCreate(contrato_id=contrato.id, mes=1, anio=2024, valor=Decimal("3000000.00"))
+    created = await cuenta_cobro_service.crear_cuenta_cobro(db, user.id, data)
+    await db.commit()
+
+    fetched = await cuenta_cobro_service.obtener_cuenta_cobro(db, user.id, created.id)
+    assert fetched.numero_cuota == 1
+    assert fetched.posicion == created.posicion
+    assert fetched.informe_final is False
+
+
+@pytest.mark.asyncio
 async def test_crear_cuenta_cobro_insufficient_credits(db: AsyncSession) -> None:
     user = await _make_user(db, creditos=5)
     contrato = await _make_contrato(db, user.id)

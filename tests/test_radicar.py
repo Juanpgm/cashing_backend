@@ -24,6 +24,12 @@ pytestmark = pytest.mark.asyncio
 # Mandatory (obligatorio=True) codes in the standard catalog seed — see
 # checklist_service._CATALOGO_SEED. Marking all of these cumplido_manual
 # satisfies computar_resumen's radicacion_lista gate.
+#
+# NOTE: this is a checklist REQUISITO code list, not a structured error-`code`
+# mirror (billing-resilience-templates slices #1/#2/#3, tasks 1.22/2.18/3.14) —
+# `tests/test_error_codes.py` is the actual per-error-code mirror in this codebase
+# (COHERENCE_CHECK_FAILED, SECRET_DETECTED_IN_PACKAGE, PACKAGE_PENDIENTE,
+# CUOTA_POSITION_CONFLICT all live there).
 _CODIGOS_OBLIGATORIOS = [
     "CONTRATO",
     "RPC",
@@ -135,9 +141,7 @@ async def test_radicar_cuenta_ya_enviada_400(
     assert second.status_code in (400, 422)
 
 
-async def test_radicar_cuenta_de_otro_usuario_404(
-    client: AsyncClient, db: AsyncSession, cuenta: CuentaCobro
-) -> None:
+async def test_radicar_cuenta_de_otro_usuario_404(client: AsyncClient, db: AsyncSession, cuenta: CuentaCobro) -> None:
     from app.core.security import create_access_token, hash_password
     from app.models.usuario import Usuario
 

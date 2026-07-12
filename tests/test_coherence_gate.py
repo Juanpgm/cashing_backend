@@ -99,9 +99,7 @@ async def test_invoke_tool_validar_coherencia_cuenta_returns_no_findings(
     cuenta = await _make_cuenta(db, contrato, mes=1)
     ctx = ToolContext(db=db, usuario=test_user["user"])
 
-    result = await invoke_tool(
-        "validar_coherencia_cuenta", ctx, ValidarCoherenciaInput(cuenta_id=cuenta.id)
-    )
+    result = await invoke_tool("validar_coherencia_cuenta", ctx, ValidarCoherenciaInput(cuenta_id=cuenta.id))
 
     assert result.findings == []
     assert result.tiene_hard is False
@@ -142,7 +140,11 @@ async def test_radicar_blocked_by_hard_coherence_finding(
 async def test_radicar_proceeds_with_soft_only_finding(
     client: AsyncClient, db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
 ) -> None:
-    """A stale month name in a filename (R4, SOFT) never blocks radicación."""
+    """A stale month name in a filename (R4, SOFT) never blocks radicación.
+
+    Also covers task 3.12c: the response surfaces the SOFT finding in
+    `advertencias_coherencia` so callers see it without a second
+    `validar_coherencia_cuenta` call."""
     cuenta = await _make_cuenta(db, contrato, mes=3)
     doc = DocumentoFuente(
         usuario_id=contrato.usuario_id,
@@ -162,7 +164,28 @@ async def test_radicar_proceeds_with_soft_only_finding(
         headers=test_user["headers"],
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json()["estado"] == "enviada"
+    body = resp.json()
+    assert body["estado"] == "enviada"
+    assert body["advertencias_coherencia"] is not None
+    assert len(body["advertencias_coherencia"]) == 1
+    assert body["advertencias_coherencia"][0]["rule_id"] == "R4"
+    assert body["advertencias_coherencia"][0]["severity"] == "soft"
+
+
+async def test_radicar_no_advertencias_when_all_rules_pass(
+    client: AsyncClient, db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
+) -> None:
+    """Task 3.12c regression guard: `advertencias_coherencia` is absent/None when
+    the coherence validator finds nothing to warn about."""
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    await _completar_checklist(client, test_user["headers"], cuenta.id)
+
+    resp = await client.post(
+        f"/api/v1/cuentas-cobro/{cuenta.id}/radicar",
+        headers=test_user["headers"],
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["advertencias_coherencia"] is None
 
 
 async def test_radicar_bypasses_gate_when_flag_disabled(
@@ -198,5 +221,3 @@ async def test_radicar_bypasses_gate_when_flag_disabled(
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["estado"] == "enviada"
-
-

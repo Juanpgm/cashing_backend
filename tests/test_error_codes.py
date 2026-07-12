@@ -402,6 +402,40 @@ async def test_zip_evidencias_binary_extraction_leak_returns_code(
     assert exc_info.value.code == "SECRET_DETECTED_IN_PACKAGE"
 
 
+async def test_crear_cuenta_cobro_duplicate_final_returns_cuota_position_conflict_code(
+    client: AsyncClient, test_user: dict[str, Any], contrato: Contrato
+) -> None:
+    """Mirrors the other structured-code tests in this file for
+    `CUOTA_POSITION_CONFLICT` (billing-resilience-templates, slice #3, task 3.14).
+
+    DEVIATION (same as slice #1 task 1.22 and slice #2 task 2.18):
+    `tests/test_radicar.py::_CODIGOS_OBLIGATORIOS` is a list of checklist requisito
+    codes, not an error-code mirror — it has no error-code mirror concept. The
+    actual mirror pattern in this codebase is this file (per-code scenario tests),
+    so `CUOTA_POSITION_CONFLICT` is added here instead."""
+    payload1 = {
+        "contrato_id": str(contrato.id),
+        "mes": 1,
+        "anio": 2024,
+        "valor": "1000000.00",
+        "informe_final": True,
+    }
+    r1 = await client.post("/api/v1/cuentas-cobro/", json=payload1, headers=test_user["headers"])
+    assert r1.status_code == 201, r1.text
+
+    payload2 = {
+        "contrato_id": str(contrato.id),
+        "mes": 2,
+        "anio": 2024,
+        "valor": "1000000.00",
+        "informe_final": True,
+    }
+    r2 = await client.post("/api/v1/cuentas-cobro/", json=payload2, headers=test_user["headers"])
+    assert r2.status_code == 422, r2.text
+    body = r2.json()
+    assert body["code"] == "CUOTA_POSITION_CONFLICT"
+
+
 async def test_unrelated_error_keeps_unchanged_envelope_shape(client: AsyncClient, test_user: dict[str, Any]) -> None:
     """Regression guard: an error without an assigned code has an unchanged envelope.
 

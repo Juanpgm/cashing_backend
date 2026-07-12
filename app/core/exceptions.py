@@ -19,6 +19,10 @@ SECRET_DETECTED_IN_PACKAGE = "SECRET_DETECTED_IN_PACKAGE"
 # `generar_zip_evidencias(modo="final")` was attempted with one or more obligaciones
 # still PENDIENTE (no evidence) — the packager refuses to finalize an incomplete package.
 PACKAGE_PENDIENTE = "PACKAGE_PENDIENTE"
+# Cuota position model (billing-resilience-templates, slice #3): a write would produce
+# an inconsistent position for a contract (two cuotas both `informe_final=true`, or a
+# second `posicion=primera` for the same contrato).
+CUOTA_POSITION_CONFLICT = "CUOTA_POSITION_CONFLICT"
 
 
 class DomainError(Exception):

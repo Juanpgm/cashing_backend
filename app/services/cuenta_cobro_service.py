@@ -8,8 +8,8 @@ from datetime import UTC, date, datetime
 
 import structlog
 from jinja2 import BaseLoader, Environment
+from sqlalchemy import ColumnElement, func, or_, select
 from sqlalchemy import delete as sa_delete
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -19,6 +19,7 @@ from app.core.config import settings
 from app.core.exceptions import (
     CHECKLIST_INCOMPLETE,
     COHERENCE_CHECK_FAILED,
+    CUOTA_POSITION_CONFLICT,
     AlreadyExistsError,
     ForbiddenError,
     InsufficientCreditsError,
@@ -28,9 +29,10 @@ from app.core.exceptions import (
 from app.models.actividad import Actividad
 from app.models.contrato import Contrato
 from app.models.credito import Credito, TipoCredito
-from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
+from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro, PosicionCuota
 from app.models.plantilla import Plantilla, TipoPlantilla
 from app.models.usuario import Usuario
+from app.schemas.coherence import FindingOut
 from app.schemas.cuenta_cobro import (
     ActividadCreate,
     ActividadesBulkResponse,
@@ -182,6 +184,59 @@ async def _reload_cuenta_response(db: AsyncSession, cuenta_id: uuid.UUID) -> Cue
     return CuentaCobroResponse.model_validate(cuenta)
 
 
+async def _numero_cuota_siguiente(db: AsyncSession, contrato_id: uuid.UUID) -> int:
+    """1-based `numero_cuota` for a NEW cuota of this contrato — count of active
+    (non-deleted) existing cuotas + 1 (billing-resilience-templates slice #3, D3).
+
+    Derived and persisted once at creation time — never re-derived at read time.
+    """
+    result = await db.execute(
+        select(func.count())
+        .select_from(CuentaCobro)
+        .where(CuentaCobro.contrato_id == contrato_id, CuentaCobro.deleted_at.is_(None))
+    )
+    return (result.scalar_one() or 0) + 1
+
+
+async def _verificar_conflicto_posicion(
+    db: AsyncSession,
+    contrato_id: uuid.UUID,
+    *,
+    informe_final: bool = False,
+    posicion_primera: bool = False,
+    excluir_cuenta_id: uuid.UUID | None = None,
+) -> None:
+    """Reject a write that would produce an inconsistent cuota position for a
+    contrato: a second cuota with `informe_final=true`, or a second cuota with
+    `posicion=primera` (billing-resilience-templates slice #3, D3). Raises
+    `ValidationError(code=CUOTA_POSITION_CONFLICT)` when an existing, active cuota
+    of the SAME contrato already claims the position being requested.
+    """
+    condiciones: list[ColumnElement[bool]] = []
+    if informe_final:
+        condiciones.append(CuentaCobro.informe_final.is_(True))
+    if posicion_primera:
+        condiciones.append(CuentaCobro.posicion == PosicionCuota.PRIMERA)
+    if not condiciones:
+        return
+
+    stmt = select(CuentaCobro.id).where(
+        CuentaCobro.contrato_id == contrato_id,
+        CuentaCobro.deleted_at.is_(None),
+        or_(*condiciones),
+    )
+    if excluir_cuenta_id is not None:
+        stmt = stmt.where(CuentaCobro.id != excluir_cuenta_id)
+
+    existente = await db.execute(stmt)
+    if existente.scalar_one_or_none() is not None:
+        detalle = "informe_final=true" if informe_final else "posicion=primera"
+        raise ValidationError(
+            f"Ya existe otra cuota de este contrato con {detalle}. Solo puede haber una.",
+            code=CUOTA_POSITION_CONFLICT,
+        )
+
+
 async def crear_cuenta_cobro(
     db: AsyncSession,
     usuario_id: uuid.UUID,
@@ -239,6 +294,17 @@ async def crear_cuenta_cobro(
         )
     )
 
+    # Cuota position (billing-resilience-templates slice #3, D3): derive numero_cuota
+    # from the count of existing active cuotas, promote to posicion=primera when it's
+    # the contrato's first. informe_final is NEVER inferred — only ever set explicitly
+    # via `data.informe_final`. Both invariants are checked BEFORE the insert.
+    numero_cuota = await _numero_cuota_siguiente(db, data.contrato_id)
+    posicion = PosicionCuota.PRIMERA if numero_cuota == 1 else PosicionCuota.RECURRENTE
+    if posicion == PosicionCuota.PRIMERA:
+        await _verificar_conflicto_posicion(db, data.contrato_id, posicion_primera=True)
+    if data.informe_final:
+        await _verificar_conflicto_posicion(db, data.contrato_id, informe_final=True)
+
     # Deduct credits
     usuario.creditos_disponibles -= costo
     db.add(
@@ -256,6 +322,9 @@ async def crear_cuenta_cobro(
         anio=data.anio,
         valor=float(valor),
         estado=EstadoCuentaCobro.BORRADOR,
+        numero_cuota=numero_cuota,
+        posicion=posicion,
+        informe_final=data.informe_final,
     )
     db.add(cuenta)
     await db.flush()
@@ -736,10 +805,10 @@ async def radicar_cuenta(
 
     if cuenta.estado not in (EstadoCuentaCobro.BORRADOR, EstadoCuentaCobro.RECHAZADA):
         raise ValidationError(
-            f"No se puede radicar una cuenta en estado '{cuenta.estado}'. "
-            "Solo se permite en borrador o rechazada."
+            f"No se puede radicar una cuenta en estado '{cuenta.estado}'. Solo se permite en borrador o rechazada."
         )
 
+    advertencias: list[FindingOut] = []
     if settings.COHERENCE_GATE_ENABLED:
         findings = await coherence_validator_service.validar_coherencia(db, usuario_id, cuenta_id)
         hallazgos_duros = [f for f in findings if f.severity == Severity.HARD]
@@ -750,6 +819,17 @@ async def radicar_cuenta(
                 code=COHERENCE_CHECK_FAILED,
             )
         if findings:
+            # Only SOFT findings survive past the HARD-finding raise above.
+            advertencias = [
+                FindingOut(
+                    rule_id=f.rule_id,
+                    severity=f.severity,
+                    codigo=f.codigo,
+                    mensaje=f.mensaje,
+                    contexto=f.contexto,
+                )
+                for f in findings
+            ]
             await logger.awarning(
                 "radicar_cuenta.coherencia_advertencias",
                 cuenta_id=str(cuenta_id),
@@ -766,7 +846,12 @@ async def radicar_cuenta(
             code=CHECKLIST_INCOMPLETE,
         )
 
-    return await cambiar_estado(db, usuario_id, cuenta_id, EstadoCuentaCobro.ENVIADA)
+    resultado = await cambiar_estado(db, usuario_id, cuenta_id, EstadoCuentaCobro.ENVIADA)
+    if advertencias:
+        # `advertencias_coherencia` (task 3.12c) lets callers see the SOFT findings that
+        # let radicación proceed without a second `validar_coherencia_cuenta` call.
+        resultado.advertencias_coherencia = advertencias
+    return resultado
 
 
 async def generar_pdf(
@@ -915,6 +1000,11 @@ async def actualizar_cuenta_cobro(
 
     if data.valor is not None:
         cuenta.valor = float(data.valor)
+
+    if data.informe_final is not None and data.informe_final != cuenta.informe_final:
+        if data.informe_final:
+            await _verificar_conflicto_posicion(db, cuenta.contrato_id, informe_final=True, excluir_cuenta_id=cuenta.id)
+        cuenta.informe_final = data.informe_final
 
     await db.flush()
     await logger.ainfo(
