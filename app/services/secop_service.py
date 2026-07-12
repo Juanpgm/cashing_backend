@@ -243,7 +243,9 @@ async def _query_dataset_guarded(
 _VALOR_ADICION_RE = re.compile(r"\$\s?(\d{1,3}(?:[.,]\d{3})+)")
 
 
-def _extraer_valor_adicion_texto(descripcion: str | None) -> float | None:
+def _extraer_valor_adicion_texto(descripcion: str | None) -> Decimal | None:
+    # Money never crosses this boundary as float — the accessor feeds
+    # billing's contract-addition-events invoice math (CLAUDE.md anti-pattern).
     if not descripcion:
         return None
     match = _VALOR_ADICION_RE.search(descripcion)
@@ -251,8 +253,8 @@ def _extraer_valor_adicion_texto(descripcion: str | None) -> float | None:
         return None
     digits = match.group(1).replace(".", "").replace(",", "")
     try:
-        return float(digits)
-    except ValueError:
+        return Decimal(digits)
+    except ArithmeticError:
         return None
 
 

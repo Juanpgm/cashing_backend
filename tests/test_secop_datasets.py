@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -220,6 +221,9 @@ class TestObtenerAdicionesContrato:
         assert len(result) == 1
         assert result[0]["id_contrato_secop"] == "CO1.PCCNTR.999"
         assert result[0]["valor_adicion"] == 4_500_000
+        # Money crosses the accessor boundary as Decimal, never float
+        # (consumed by billing contract-addition-events for invoice math).
+        assert isinstance(result[0]["valor_adicion"], Decimal)
         assert result[0]["fecha_efectiva"] is not None
 
     @pytest.mark.asyncio
