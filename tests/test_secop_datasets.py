@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from app.core.exceptions import ExternalServiceError
-from app.models.secop import SecopContrato
+from app.models.secop import SecopContrato, SecopProceso
 from app.services import secop_service
 from app.services.secop_service import _ALL_DOCS_DATASETS, _DS_DOCS_2022, _DS_DOCS_2025
 from sqlalchemy import select
@@ -280,6 +280,22 @@ class TestObtenerAdicionesContrato:
         result = await obtener_adiciones_contrato(db, "CO1.PCCNTR.888")
         assert result[0]["valor_adicion"] is None
 
+    def test_decimal_comma_cents_rejected_not_truncated(self) -> None:
+        """Task 4.5c: "$1.234,56" (Colombian decimal-comma notation for
+        1234.56 pesos) must NOT be silently truncated to 1234 — the trailing
+        ",56" fragment is an ambiguous/unusual input for whole-peso contract
+        additions, so we reject (None) rather than misreport a wrong value."""
+        from app.services.secop_service import _extraer_valor_adicion_texto
+
+        assert _extraer_valor_adicion_texto("SE ADICIONA EN LA SUMA DE ($1.234,56) M/CTE") is None
+
+    def test_whole_peso_amount_still_parses(self) -> None:
+        """Sanity: the decimal-comma guard must not regress the common,
+        whole-peso case already covered by TestObtenerAdicionesContrato."""
+        from app.services.secop_service import _extraer_valor_adicion_texto
+
+        assert _extraer_valor_adicion_texto("SE ADICIONA EN LA SUMA DE ($1.234.567) M/CTE") == Decimal("1234567")
+
 
 class TestNuevosDatasetsNonDestructiveUpsert:
     """Slice 2 task 2.8 — D1: cached rows for the 3 new datasets survive a
@@ -307,6 +323,111 @@ class TestNuevosDatasetsNonDestructiveUpsert:
         result = await db.execute(select(SecopContrato).where(SecopContrato.numero_contrato == "CO-010"))
         refreshed = result.scalar_one()
         assert refreshed.datos_raw.get("_adiciones") == existing_adiciones
+
+    @pytest.mark.asyncio
+    async def test_sincronizar_preserves_cached_ubicaciones_on_empty_refetch(self, db: AsyncSession) -> None:
+        """Task 4.5b carry-over: the non-destructive upsert guarantee (D1) is
+        dataset-agnostic — verify `_ubicaciones` too, not only `_adiciones`."""
+        from app.services.secop_service import sincronizar_documentos_secop
+
+        existing_ubicaciones = [{"referencia_del_contrato": "CO-011", "departamento": "VALLE"}]
+        db.add(
+            SecopContrato(
+                id_contrato_secop="SECOP-CO-011",
+                cedula_contratista="123456789",
+                numero_contrato="CO-011",
+                referencia_del_contrato="CO-011",
+                datos_raw={"_ubicaciones": existing_ubicaciones},
+            )
+        )
+        await db.commit()
+
+        with patch.object(secop_service, "_query_socrata", new_callable=AsyncMock, return_value=[]):
+            await sincronizar_documentos_secop(db, "123456789", confirmar=True)
+
+        result = await db.execute(select(SecopContrato).where(SecopContrato.numero_contrato == "CO-011"))
+        refreshed = result.scalar_one()
+        assert refreshed.datos_raw.get("_ubicaciones") == existing_ubicaciones
+
+    @pytest.mark.asyncio
+    async def test_sincronizar_preserves_cached_modif_procesos_on_empty_refetch(self, db: AsyncSession) -> None:
+        """Task 4.5b carry-over: `_modif_procesos` lives on `SecopProceso.datos_raw`
+        (D1) — verify it also survives an empty/failed refresh untouched."""
+        from app.services.secop_service import sincronizar_documentos_secop
+
+        existing_modif = [{"portafolio": "CO1.BDOS.777", "proceso": "CO1.REQ.1"}]
+        db.add(
+            SecopContrato(
+                id_contrato_secop="SECOP-CO-012",
+                cedula_contratista="123456789",
+                numero_contrato="CO-012",
+                referencia_del_contrato="CO-012",
+                proceso_de_compra="CO1.BDOS.777",
+                datos_raw={},
+            )
+        )
+        db.add(
+            SecopProceso(
+                id_proceso_secop="CO1.BDOS.777",
+                datos_raw={"_modif_procesos": existing_modif},
+            )
+        )
+        await db.commit()
+
+        with patch.object(secop_service, "_query_socrata", new_callable=AsyncMock, return_value=[]):
+            await sincronizar_documentos_secop(db, "123456789", confirmar=True)
+
+        result = await db.execute(select(SecopProceso).where(SecopProceso.id_proceso_secop == "CO1.BDOS.777"))
+        refreshed = result.scalar_one()
+        assert refreshed.datos_raw.get("_modif_procesos") == existing_modif
+
+
+class TestDocumentIndexUpsert:
+    """Slice 4 task 4.4b — non-destructive DocumentId → RetrieveFile URL cache,
+    same philosophy as `_upsert_nuevos_datasets_raw` (D1)."""
+
+    def test_new_entries_are_added(self) -> None:
+        from app.services.secop_service import upsert_document_index
+
+        raw, changed = upsert_document_index(
+            {}, {"DOC1": {"url": "https://x/RetrieveFile?DocumentId=DOC1", "source": "socrata_archive"}}
+        )
+        assert changed is True
+        assert raw["_document_index"]["DOC1"]["url"] == "https://x/RetrieveFile?DocumentId=DOC1"
+        assert raw["_document_index"]["DOC1"]["source"] == "socrata_archive"
+
+    def test_no_change_when_entries_already_identical(self) -> None:
+        from app.services.secop_service import upsert_document_index
+
+        existing = {"_document_index": {"DOC1": {"url": "https://x/1", "source": "scraper"}}}
+        raw, changed = upsert_document_index(existing, {"DOC1": {"url": "https://x/1", "source": "scraper"}})
+        assert changed is False
+        assert raw["_document_index"] == existing["_document_index"]
+
+    def test_known_url_never_downgraded_to_none(self) -> None:
+        """A Marketplace-internal doc later re-seen with no URL must not erase
+        a previously-known real URL (D1 non-destructive philosophy)."""
+        from app.services.secop_service import upsert_document_index
+
+        existing = {"_document_index": {"DOC1": {"url": "https://x/1", "source": "socrata_archive"}}}
+        raw, changed = upsert_document_index(existing, {"DOC1": {"url": None, "source": "socrata_archive"}})
+        assert changed is False
+        assert raw["_document_index"]["DOC1"]["url"] == "https://x/1"
+
+    def test_sha256_merges_alongside_existing_url_source(self) -> None:
+        from app.services.secop_service import upsert_document_index
+
+        existing = {"_document_index": {"DOC1": {"url": "https://x/1", "source": "scraper"}}}
+        raw, changed = upsert_document_index(existing, {"DOC1": {"sha256": "abc123"}})
+        assert changed is True
+        assert raw["_document_index"]["DOC1"] == {"url": "https://x/1", "source": "scraper", "sha256": "abc123"}
+
+    def test_empty_doc_id_ignored(self) -> None:
+        from app.services.secop_service import upsert_document_index
+
+        raw, changed = upsert_document_index({}, {"": {"url": "https://x/1"}})
+        assert changed is False
+        assert "_document_index" not in raw
 
 
 class TestObtenerDocumentosConCobertura:

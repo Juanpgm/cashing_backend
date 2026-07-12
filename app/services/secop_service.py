@@ -251,6 +251,20 @@ def _extraer_valor_adicion_texto(descripcion: str | None) -> Decimal | None:
     match = _VALOR_ADICION_RE.search(descripcion)
     if not match:
         return None
+    # Decimal-comma cents guard (task 4.5c): `_VALOR_ADICION_RE` only matches
+    # complete thousands-separator groups (each exactly 3 digits). A value
+    # written in Colombian decimal-comma notation, e.g. "$1.234,56" (=
+    # 1234.56 pesos), has its trailing ",56" fragment (2 digits, not 3) left
+    # UNCONSUMED right after the match — silently truncating to "1234" would
+    # misreport the addition's value by dropping real cents. We choose to
+    # REJECT (return None) rather than guess: in practice Colombian peso
+    # contract additions are always whole-peso amounts, so a trailing decimal
+    # fragment signals an unusual/ambiguous input better left for manual
+    # review, consistent with this function's existing best-effort philosophy
+    # ("valor_adicion is None rather than guessed").
+    tail = descripcion[match.end() : match.end() + 3]
+    if re.match(r"[.,]\d{1,2}(?!\d)", tail):
+        return None
     digits = match.group(1).replace(".", "").replace(",", "")
     try:
         return Decimal(digits)
@@ -328,6 +342,52 @@ def _upsert_nuevos_datasets_raw(
             raw[key] = rows
             changed = True
     return raw, changed
+
+
+def upsert_document_index(
+    datos_raw: dict[str, Any] | None,
+    entries: dict[str, dict[str, str | None]],
+) -> tuple[dict[str, Any], bool]:
+    """Non-destructive DocumentId → RetrieveFile URL cache (Slice 4, task 4.4b).
+
+    Persists every SECOP DocumentId seen from ANY source (Socrata archive doc
+    rows, modification stubs, the manual scraper fallback) into the reserved
+    ``datos_raw["_document_index"]`` key, so a captcha-free direct fetch of
+    ``/Public/Archive/RetrieveFile/Index?DocumentId={id}`` can be tried before
+    invoking the fragile/quota-limited scraper (live-verified 2026-07-11: this
+    endpoint never triggers a captcha once a document is known).
+
+    ``entries`` maps a DocumentId to a partial dict with any of ``url``,
+    ``source`` (``"socrata_archive"`` | ``"modificacion"`` | ``"scraper"``),
+    ``sha256``. Mirrors the ``_upsert_nuevos_datasets_raw`` non-destructive
+    philosophy: a field is only overwritten when the new entry provides a
+    non-empty value — a document seen once is never "un-seen", and a known
+    URL/hash is never downgraded back to unknown.
+    """
+    raw = dict(datos_raw or {})
+    index = {k: dict(v) for k, v in (raw.get("_document_index") or {}).items()}
+    changed = False
+    for doc_id, fields in entries.items():
+        if not doc_id:
+            continue
+        current = index.get(doc_id, {})
+        for field_name, value in fields.items():
+            if value and current.get(field_name) != value:
+                current[field_name] = value
+                changed = True
+        index[doc_id] = current
+    if changed:
+        raw["_document_index"] = index
+    return raw, changed
+
+
+def _extract_url_descarga(row: dict[str, Any]) -> str | None:
+    """Normalize Socrata's `url_descarga_documento` field (dict-with-`url` or
+    plain string) into a single optional URL string."""
+    val = row.get("url_descarga_documento")
+    if isinstance(val, dict):
+        return val.get("url")
+    return val
 
 
 async def _query_docs_datasets(where_clause: str, failed_out: list[str] | None = None) -> list[dict[str, Any]]:
@@ -541,9 +601,7 @@ async def _upsert_documento(
         "fecha_carga": _parse_date(row.get("fecha_carga")),
         "entidad": row.get("entidad"),
         "nit_entidad": row.get("nit_entidad"),
-        "url_descarga": (row.get("url_descarga_documento") or {}).get("url")
-        if isinstance(row.get("url_descarga_documento"), dict)
-        else row.get("url_descarga_documento"),
+        "url_descarga": _extract_url_descarga(row),
         "datos_raw": row,
     }
 
@@ -798,18 +856,31 @@ async def buscar_documentos_contrato(
                     ),
                 )
 
+        # Task 4.4b: collect every DocumentId + RetrieveFile URL seen this
+        # refresh (regardless of `seen`-dedup for the upsert itself) into the
+        # reserved `_document_index` cache on the parent SecopContrato.
+        index_entries: dict[str, dict[str, str | None]] = {}
         for row in docs_rows:
             id_doc = str(row.get("id_documento") or "").strip()
             if id_doc and id_doc not in seen:
                 seen.add(id_doc)
                 row["_tipo_origen"] = "proceso" if row.get("proceso") else "contrato"
                 await _upsert_documento(db, row, secop_contrato_id=contrato_id, secop_proceso_id=proceso_id)
+            if id_doc:
+                index_entries[id_doc] = {"url": _extract_url_descarga(row), "source": "socrata_archive"}
         for row in mod_rows:
             id_doc = str(row.get("id_documento") or "").strip()
             if id_doc and id_doc not in seen:
                 seen.add(id_doc)
                 row["_tipo_origen"] = "modificacion"
                 await _upsert_documento(db, row, secop_contrato_id=contrato_id, secop_proceso_id=proceso_id)
+            if id_doc:
+                index_entries[id_doc] = {"url": _extract_url_descarga(row), "source": "modificacion"}
+
+        if secop_contrato is not None and index_entries:
+            new_raw, index_changed = upsert_document_index(secop_contrato.datos_raw, index_entries)
+            if index_changed:
+                secop_contrato.datos_raw = new_raw
 
         if seen:
             await db.commit()

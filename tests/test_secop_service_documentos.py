@@ -67,9 +67,9 @@ class TestBuscarDocumentosContrato:
 
         mock_db = AsyncMock()
         mock_db.execute.side_effect = [
-            _contrato_execute_result([secop_contrato]),   # contrato lookup
-            _proceso_execute_result(None),                # proceso FK lookup
-            _cached_execute_result([fake_doc]),           # cache check
+            _contrato_execute_result([secop_contrato]),  # contrato lookup
+            _proceso_execute_result(None),  # proceso FK lookup
+            _cached_execute_result([fake_doc]),  # cache check
         ]
 
         with patch(
@@ -91,10 +91,10 @@ class TestBuscarDocumentosContrato:
 
         mock_db = AsyncMock()
         mock_db.execute.side_effect = [
-            _contrato_execute_result([secop_contrato]),   # contrato lookup
-            _proceso_execute_result(None),                # proceso FK lookup
-            _cached_execute_result([]),                   # cache check: empty
-            _cached_execute_result([fake_doc]),           # post-refresh re-read
+            _contrato_execute_result([secop_contrato]),  # contrato lookup
+            _proceso_execute_result(None),  # proceso FK lookup
+            _cached_execute_result([]),  # cache check: empty
+            _cached_execute_result([fake_doc]),  # post-refresh re-read
         ]
 
         secop_row = {"id_documento": "DOC001", "titulo": "Minuta", "n_mero_de_contrato": "CON-001"}
@@ -124,9 +124,9 @@ class TestBuscarDocumentosContrato:
 
         mock_db = AsyncMock()
         mock_db.execute.side_effect = [
-            _contrato_execute_result([]),                 # contrato lookup: none
-            _cached_execute_result([]),                   # cache check: empty
-            _cached_execute_result([]),                   # post-refresh re-read
+            _contrato_execute_result([]),  # contrato lookup: none
+            _cached_execute_result([]),  # cache check: empty
+            _cached_execute_result([]),  # post-refresh re-read
         ]
 
         with patch(
@@ -154,14 +154,24 @@ class TestBuscarDocumentosContrato:
         mock_db = AsyncMock()
         mock_db.execute.side_effect = [
             _contrato_execute_result([contrato_original, contrato_adicion]),  # two rows
-            _proceso_execute_result(None),                                    # proceso FK
-            _cached_execute_result([]),                                       # cache: empty
-            _cached_execute_result([doc_original, doc_adicion]),              # post-refresh
+            _proceso_execute_result(None),  # proceso FK
+            _cached_execute_result([]),  # cache: empty
+            _cached_execute_result([doc_original, doc_adicion]),  # post-refresh
         ]
 
         # _query_docs_datasets called 3 times: CON-001 ref + proceso.111 + proceso.222
-        doc_row_1 = {"id_documento": "DOC1", "n_mero_de_contrato": "", "proceso": "CO1.BDOS.111", "_secop_dataset": "dmgg-8hin"}
-        doc_row_2 = {"id_documento": "DOC2", "n_mero_de_contrato": "", "proceso": "CO1.BDOS.222", "_secop_dataset": "dmgg-8hin"}
+        doc_row_1 = {
+            "id_documento": "DOC1",
+            "n_mero_de_contrato": "",
+            "proceso": "CO1.BDOS.111",
+            "_secop_dataset": "dmgg-8hin",
+        }
+        doc_row_2 = {
+            "id_documento": "DOC2",
+            "n_mero_de_contrato": "",
+            "proceso": "CO1.BDOS.222",
+            "_secop_dataset": "dmgg-8hin",
+        }
 
         # Single combined OR query: n_mero_de_contrato = 'CON-001' OR proceso = 'CO1.BDOS.111' OR proceso = 'CO1.BDOS.222'
         combined_docs = [doc_row_1, doc_row_2]
@@ -203,10 +213,10 @@ class TestBuscarDocumentosContrato:
 
         mock_db = AsyncMock()
         mock_db.execute.side_effect = [
-            _contrato_execute_result([secop_contrato]),   # contrato lookup
-            _proceso_execute_result(None),                # proceso FK lookup
-            _cached_execute_result([fresh_doc]),          # cache: has fresh docs
-            _cached_execute_result([fresh_doc]),          # post-refresh re-read
+            _contrato_execute_result([secop_contrato]),  # contrato lookup
+            _proceso_execute_result(None),  # proceso FK lookup
+            _cached_execute_result([fresh_doc]),  # cache: has fresh docs
+            _cached_execute_result([fresh_doc]),  # post-refresh re-read
         ]
 
         new_secop_row = {"id_documento": "DOC999", "n_mero_de_contrato": "CON-001"}
@@ -237,16 +247,26 @@ class TestBuscarDocumentosContrato:
 
         mock_db = AsyncMock()
         mock_db.execute.side_effect = [
-            _contrato_execute_result([contrato]),         # lookup by both num + referencia
-            _proceso_execute_result(None),                # proceso FK
-            _cached_execute_result([]),                   # cache: empty
+            _contrato_execute_result([contrato]),  # lookup by both num + referencia
+            _proceso_execute_result(None),  # proceso FK
+            _cached_execute_result([]),  # cache: empty
             _cached_execute_result([_make_secop_documento("CO1.PCCNTR.456")]),  # post-refresh
         ]
 
         # Single combined OR query covering all refs and proceso
         combined_docs = [
-            {"id_documento": "DOC_REF", "n_mero_de_contrato": "CO1.PCCNTR.456", "proceso": None, "_secop_dataset": "dmgg-8hin"},
-            {"id_documento": "DOC_PROC", "n_mero_de_contrato": None, "proceso": "CO1.BDOS.789", "_secop_dataset": "dmgg-8hin"},
+            {
+                "id_documento": "DOC_REF",
+                "n_mero_de_contrato": "CO1.PCCNTR.456",
+                "proceso": None,
+                "_secop_dataset": "dmgg-8hin",
+            },
+            {
+                "id_documento": "DOC_PROC",
+                "n_mero_de_contrato": None,
+                "proceso": "CO1.BDOS.789",
+                "_secop_dataset": "dmgg-8hin",
+            },
         ]
 
         with patch(
@@ -292,7 +312,7 @@ class TestBuscarDocumentosContrato:
         mock_db.execute.side_effect = [
             _contrato_execute_result([secop_contrato]),
             _proceso_execute_result(None),
-            _cached_execute_result([]),       # empty cache → triggers refresh
+            _cached_execute_result([]),  # empty cache → triggers refresh
             _cached_execute_result(fake_docs),  # post-refresh re-read: 3 docs
         ]
 
@@ -323,6 +343,60 @@ class TestBuscarDocumentosContrato:
         assert len(result) == 3
 
     @pytest.mark.asyncio
+    async def test_document_index_populated_from_archive_and_modification_rows(self) -> None:
+        """Slice 4 task 4.4b: every DocumentId + RetrieveFile URL seen this
+        refresh (archive docs AND modification stubs) lands in the parent
+        SecopContrato's `datos_raw["_document_index"]`."""
+        from app.services.secop_service import buscar_documentos_contrato
+
+        secop_contrato = _make_secop_contrato("CON-IDX", proceso="CO1.BDOS.555")
+
+        archive_doc = {
+            "id_documento": "DOCIDX1",
+            "n_mero_de_contrato": "CON-IDX",
+            "proceso": None,
+            "url_descarga_documento": "https://x/RetrieveFile?DocumentId=DOCIDX1",
+            "_secop_dataset": "dmgg-8hin",
+        }
+        mod_doc = {
+            "id_documento": "MOD-ABC",
+            "n_mero_de_contrato": "CON-IDX",
+            "proceso": None,
+            "url_descarga_documento": None,
+            "_secop_dataset": "u8cx-r425",
+        }
+
+        fake_docs = [_make_secop_documento("CON-IDX") for _ in range(2)]
+        mock_db = AsyncMock()
+        mock_db.execute.side_effect = [
+            _contrato_execute_result([secop_contrato]),
+            _proceso_execute_result(None),
+            _cached_execute_result([]),
+            _cached_execute_result(fake_docs),
+        ]
+
+        with patch(
+            "app.services.secop_service._query_docs_datasets",
+            new_callable=AsyncMock,
+            return_value=[archive_doc],
+        ):
+            with patch(
+                "app.services.secop_service._query_modificaciones_docs",
+                new_callable=AsyncMock,
+                return_value=[mod_doc],
+            ):
+                with patch("app.services.secop_service._upsert_documento", new_callable=AsyncMock):
+                    with patch(
+                        "app.services.secop_service.SecopDocumentoResponse.model_validate",
+                        side_effect=lambda d: MagicMock(),
+                    ):
+                        await buscar_documentos_contrato(mock_db, "CON-IDX", refresh=False)
+
+        index = secop_contrato.datos_raw["_document_index"]
+        assert index["DOCIDX1"] == {"url": "https://x/RetrieveFile?DocumentId=DOCIDX1", "source": "socrata_archive"}
+        assert index["MOD-ABC"]["source"] == "modificacion"
+
+    @pytest.mark.asyncio
     async def test_buscar_documentos_consulta_modificaciones(self) -> None:
         """u8cx-r425 is queried and synthetic modification PDFs are upserted."""
         from app.services.secop_service import buscar_documentos_contrato
@@ -348,8 +422,8 @@ class TestBuscarDocumentosContrato:
         mock_db.execute.side_effect = [
             _contrato_execute_result([secop_contrato]),
             _proceso_execute_result(None),
-            _cached_execute_result([]),             # cache: empty
-            _cached_execute_result([fake_mod_doc]), # post-refresh: 1 doc
+            _cached_execute_result([]),  # cache: empty
+            _cached_execute_result([fake_mod_doc]),  # post-refresh: 1 doc
         ]
 
         with patch(
