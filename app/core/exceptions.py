@@ -10,6 +10,9 @@ from fastapi import HTTPException, status
 ACTIVIDADES_MISSING = "ACTIVIDADES_MISSING"
 GOOGLE_NOT_CONNECTED = "GOOGLE_NOT_CONNECTED"
 CHECKLIST_INCOMPLETE = "CHECKLIST_INCOMPLETE"
+# Pre-radicación coherence validator (billing-resilience-templates, slice #1): one or
+# more HARD findings from `coherence_validator_service` block `radicar_cuenta`.
+COHERENCE_CHECK_FAILED = "COHERENCE_CHECK_FAILED"
 
 
 class DomainError(Exception):

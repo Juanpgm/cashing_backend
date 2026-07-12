@@ -182,6 +182,12 @@ class Settings(BaseSettings):
     # Google sign-in) requires a valid, active, non-exhausted invite code.
     WAITLIST_ENABLED: bool = False
 
+    # Pre-radicación coherence gate (billing-resilience-templates): when True (default),
+    # `radicar_cuenta` runs `coherence_validator_service.validar_coherencia` and blocks
+    # submission on any HARD finding (raises ValidationError code=COHERENCE_CHECK_FAILED).
+    # Emergency disable only — SOFT findings never block regardless of this flag.
+    COHERENCE_GATE_ENABLED: bool = True
+
     # Outbound notifications: pluggable channel, off by default. Fail-open — a
     # delivery failure never breaks the triggering operation.
     NOTIFICATIONS_ENABLED: bool = False
