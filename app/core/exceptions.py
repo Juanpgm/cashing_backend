@@ -13,6 +13,12 @@ CHECKLIST_INCOMPLETE = "CHECKLIST_INCOMPLETE"
 # Pre-radicación coherence validator (billing-resilience-templates, slice #1): one or
 # more HARD findings from `coherence_validator_service` block `radicar_cuenta`.
 COHERENCE_CHECK_FAILED = "COHERENCE_CHECK_FAILED"
+# Evidence packager hardening (billing-resilience-templates, slice #2): the mandatory
+# fail-closed secret scan found a hit in `generar_zip_evidencias` — no zip is emitted.
+SECRET_DETECTED_IN_PACKAGE = "SECRET_DETECTED_IN_PACKAGE"
+# `generar_zip_evidencias(modo="final")` was attempted with one or more obligaciones
+# still PENDIENTE (no evidence) — the packager refuses to finalize an incomplete package.
+PACKAGE_PENDIENTE = "PACKAGE_PENDIENTE"
 
 
 class DomainError(Exception):
@@ -80,18 +86,14 @@ class RateLimitExceededError(DomainError):
 class InviteRequiredError(DomainError):
     """Waitlist gate is enabled and a valid invite code was not provided."""
 
-    def __init__(
-        self, detail: str = "Se requiere un código de invitación válido para registrarse."
-    ) -> None:
+    def __init__(self, detail: str = "Se requiere un código de invitación válido para registrarse.") -> None:
         super().__init__(detail)
 
 
 class ExternalServiceError(DomainError):
     """External API call failed."""
 
-    def __init__(
-        self, service: str = "External service", detail: str = "unavailable", code: str | None = None
-    ) -> None:
+    def __init__(self, service: str = "External service", detail: str = "unavailable", code: str | None = None) -> None:
         super().__init__(f"{service}: {detail}", code=code)
 
 

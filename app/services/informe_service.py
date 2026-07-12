@@ -11,7 +11,9 @@ from __future__ import annotations
 import io
 import uuid
 import zipfile
+from dataclasses import dataclass
 from datetime import date
+from typing import Literal
 
 import structlog
 from docx import Document
@@ -21,18 +23,28 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.adapters.llm import get_llm
+from app.adapters.storage import get_storage as _get_storage
 from app.agent.prompts.supervision_tercera_persona import (
     TERCERA_PERSONA_SYSTEM_PROMPT,
     build_tercera_persona_prompt,
     parse_tercera_persona,
 )
-from app.core.exceptions import ACTIVIDADES_MISSING, ForbiddenError, NotFoundError, ValidationError
+from app.core.config import settings
+from app.core.exceptions import (
+    ACTIVIDADES_MISSING,
+    PACKAGE_PENDIENTE,
+    SECRET_DETECTED_IN_PACKAGE,
+    ForbiddenError,
+    NotFoundError,
+    ValidationError,
+)
 from app.models.actividad import Actividad
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro
 from app.models.obligacion import Obligacion
 from app.models.usuario import Usuario
 from app.schemas.agent import LLMMessage
+from app.services import document_service, secret_scan_service
 
 logger = structlog.get_logger("service.informe")
 
@@ -363,12 +375,108 @@ def _safe_dirname(text: str, max_len: int = 80) -> str:
     return cleaned or "obligacion"
 
 
-async def generar_zip_evidencias(db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: uuid.UUID) -> tuple[bytes, str]:
-    """Build a ZIP with one folder per obligation containing a README.txt placeholder.
+async def _resolver_estructura_organismo(db: AsyncSession, contrato: Contrato) -> None:
+    """Look up a per-organism ingested template structure to number/name folders.
 
-    The structure helps the contractor organize physical evidence files by
-    obligation. Each folder holds:
-      - README.txt (description of obligation + activities + checklist)
+    STUB in this slice (billing-resilience-templates, tasks 2.8/2.9): the
+    `PlantillaOrganismo` model doesn't exist until slice #5 (migration `027`,
+    `template-ingestion`). Always returns None so the packager falls back to the
+    default numbered folder structure below; slice #5 task 5.15 replaces this stub
+    with a real lookup without changing the fallback path.
+    """
+    return None
+
+
+@dataclass(frozen=True)
+class ObligacionEstado:
+    """LISTO/PENDIENTE state of a single obligación within the evidence package."""
+
+    obligacion_id: uuid.UUID
+    descripcion: str
+    listo: bool
+
+
+@dataclass(frozen=True)
+class EstadoListoPendiente:
+    cuenta_cobro_id: uuid.UUID
+    obligaciones: list[ObligacionEstado]
+    pendientes: int
+    listo_para_radicar: bool
+
+
+def _calcular_estado_obligaciones(
+    obligaciones: list[Obligacion],
+    actividades_por_ob: dict[uuid.UUID | None, list[Actividad]],
+) -> list[ObligacionEstado]:
+    """An obligación is LISTO when at least one of its actividades in this cuenta
+    carries at least one evidencia (uploaded file or external link); PENDIENTE
+    otherwise. Mirrors the human LEEME workflow this packager has always shown."""
+    estados: list[ObligacionEstado] = []
+    for ob in obligaciones:
+        acts = actividades_por_ob.get(ob.id, [])
+        listo = any(act.evidencias for act in acts)
+        estados.append(ObligacionEstado(obligacion_id=ob.id, descripcion=ob.descripcion, listo=listo))
+    return estados
+
+
+async def obtener_estado_listo_pendiente(
+    db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: uuid.UUID
+) -> EstadoListoPendiente:
+    """Read-only LISTO/PENDIENTE split — the same computation `generar_zip_evidencias`
+    uses internally, without producing a package."""
+    _cuenta, _contrato, _usuario, obligaciones, actividades = await _load_context(db, usuario_id, cuenta_id)
+    actividades_por_ob: dict[uuid.UUID | None, list[Actividad]] = {}
+    for act in actividades:
+        actividades_por_ob.setdefault(act.obligacion_id, []).append(act)
+
+    estados = _calcular_estado_obligaciones(obligaciones, actividades_por_ob)
+    pendientes = sum(1 for e in estados if not e.listo)
+    return EstadoListoPendiente(
+        cuenta_cobro_id=cuenta_id,
+        obligaciones=estados,
+        pendientes=pendientes,
+        listo_para_radicar=pendientes == 0,
+    )
+
+
+async def _texto_para_scan(contenido: bytes, nombre_archivo: str) -> str | None:
+    """Best-effort text recovery for the secret scan ONLY — the real bytes still go
+    into the zip untouched. Tries a direct UTF-8 decode first (covers the common
+    case: text documents, exported emails), then falls back to the same extraction
+    ladder used elsewhere (`document_service.extraer_texto_documento`) for binary
+    formats (PDF/DOCX/images), per design decision D2. Fails open on extraction
+    error or when nothing readable is recovered — a single unreadable file must
+    never sink the whole package; only ITS scan coverage is skipped, its real bytes
+    are still packaged."""
+    try:
+        return contenido.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    try:
+        texto, _avisos = await document_service.extraer_texto_documento(contenido, nombre_archivo)
+    except Exception as exc:  # one bad file must not sink the whole scan
+        await logger.awarning("zip_evidencias_scan_extract_failed", nombre_archivo=nombre_archivo, error=str(exc))
+        return None
+    return texto
+
+
+async def generar_zip_evidencias(
+    db: AsyncSession,
+    usuario_id: uuid.UUID,
+    cuenta_id: uuid.UUID,
+    modo: Literal["standard", "final"] = "standard",
+) -> tuple[bytes, str]:
+    """Build a ZIP with real evidence bytes in numbered per-obligación folders (the
+    default fallback structure — per-organism structures arrive in slice #5).
+
+    Runs a mandatory fail-closed secret scan before emitting the zip
+    (`SECRET_SCAN_GATE_ENABLED`, default True) and computes a LISTO/PENDIENTE split
+    mirroring the human LEEME workflow:
+
+    - ``modo="standard"`` (default, manual/tool-driven packaging): emits the
+      package even with PENDIENTE obligaciones, listing them in the manifest.
+    - ``modo="final"`` (used by the slice #7 radicación orchestrator): raises
+      `PACKAGE_PENDIENTE` instead of emitting a partial package.
     """
     cuenta, contrato, _usuario, obligaciones, actividades = await _load_context(db, usuario_id, cuenta_id)
 
@@ -376,79 +484,151 @@ async def generar_zip_evidencias(db: AsyncSession, usuario_id: uuid.UUID, cuenta
     for act in actividades:
         actividades_por_ob.setdefault(act.obligacion_id, []).append(act)
 
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        # Root README
-        root_readme = (
-            f"Carpeta de evidencias\n"
-            f"=====================\n\n"
-            f"Contrato: {contrato.numero_contrato}\n"
-            f"Objeto: {contrato.objeto}\n"
-            f"Período: {_periodo_str(cuenta)}\n"
-            f"Obligaciones: {len(obligaciones)}\n"
-            f"Actividades reportadas: {len(actividades)}\n\n"
-            f"Estructura:\n"
-            f"  - Una subcarpeta por obligación contractual.\n"
-            f"  - Cada subcarpeta contiene un README.txt con las actividades\n"
-            f"    asociadas y el listado de evidencias esperadas.\n"
-            f"  - Coloque dentro de cada subcarpeta los archivos de soporte\n"
-            f"    (PDF, fotos, capturas, correos exportados, etc.).\n"
-        )
-        zf.writestr("LEEME.txt", root_readme)
+    await _resolver_estructura_organismo(db, contrato)  # stub this slice — always None
 
-        if not obligaciones:
-            zf.writestr(
-                "00_sin_obligaciones/LEEME.txt",
-                "El contrato no tiene obligaciones registradas. Cargue el contrato y extraiga obligaciones primero.\n",
+    estados = _calcular_estado_obligaciones(obligaciones, actividades_por_ob)
+    pendientes_desc = [e.descripcion for e in estados if not e.listo]
+
+    storage = _get_storage(settings.S3_BUCKET_EVIDENCIAS)
+
+    miembros_zip: list[tuple[str, bytes]] = []
+    miembros_scan: list[tuple[str, bytes]] = []
+
+    def _agregar_texto(nombre: str, texto: str) -> None:
+        contenido = texto.encode("utf-8")
+        miembros_zip.append((nombre, contenido))
+        miembros_scan.append((nombre, contenido))
+
+    root_readme_lines = [
+        "Carpeta de evidencias",
+        "=====================",
+        "",
+        f"Contrato: {contrato.numero_contrato}",
+        f"Objeto: {contrato.objeto}",
+        f"Período: {_periodo_str(cuenta)}",
+        f"Obligaciones: {len(obligaciones)}",
+        f"Actividades reportadas: {len(actividades)}",
+        "",
+        "Estructura:",
+        "  - Una subcarpeta por obligación contractual.",
+        "  - Cada subcarpeta contiene un README.txt con las actividades",
+        "    asociadas y el listado de evidencias esperadas.",
+        "  - Coloque dentro de cada subcarpeta los archivos de soporte",
+        "    (PDF, fotos, capturas, correos exportados, etc.).",
+        "",
+        "Estado de completitud (LISTO/PENDIENTE)",
+        "========================================",
+        "",
+        f"Obligaciones con evidencia (LISTO): {len(obligaciones) - len(pendientes_desc)}/{len(obligaciones)}",
+    ]
+    if pendientes_desc:
+        root_readme_lines.append("Obligaciones SIN evidencia (PENDIENTE):")
+        root_readme_lines += [f"  - {d}" for d in pendientes_desc]
+    else:
+        root_readme_lines.append("Obligaciones SIN evidencia (PENDIENTE): (ninguna)")
+    root_readme_lines.append("")
+    _agregar_texto("LEEME.txt", "\n".join(root_readme_lines))
+
+    if not obligaciones:
+        _agregar_texto(
+            "00_sin_obligaciones/LEEME.txt",
+            "El contrato no tiene obligaciones registradas. Cargue el contrato y extraiga obligaciones primero.\n",
+        )
+
+    for idx, ob in enumerate(obligaciones, start=1):
+        folder = f"{idx:02d}_{_safe_dirname(ob.descripcion)}"
+        acts = actividades_por_ob.get(ob.id, [])
+        lines = [
+            f"Obligación #{idx} ({ob.tipo.value if ob.tipo else 'general'})",
+            "=" * 60,
+            "",
+            ob.descripcion,
+            "",
+            f"Período: {_periodo_str(cuenta)}",
+            "",
+            "Actividades reportadas en este período:",
+            "-" * 40,
+        ]
+        if acts:
+            for j, act in enumerate(acts, start=1):
+                lines.append(f"{j}. {act.descripcion}")
+                if act.justificacion:
+                    lines.append(f"   Justificación: {act.justificacion}")
+                lines.append(f"   Fecha: {_formato_fecha(act.fecha_realizacion)}")
+                if act.evidencias:
+                    lines.append(f"   Evidencias adjuntas: {len(act.evidencias)}")
+                    for ev in act.evidencias:
+                        lines.append(f"     - {ev.nombre_archivo}")
+                lines.append("")
+        else:
+            lines.append("(sin actividades reportadas)")
+            lines.append("")
+        lines += [
+            "Coloque aquí los archivos de soporte (correos, capturas, PDFs,",
+            "fotografías, etc.) que evidencien el cumplimiento de esta obligación.",
+        ]
+        _agregar_texto(f"{folder}/LEEME.txt", "\n".join(lines))
+
+        for act in acts:
+            for ev in act.evidencias:
+                if ev.storage_key is None:
+                    continue  # external-link evidence — no real bytes to fetch (no new StoragePort methods this change)
+                try:
+                    contenido = await storage.download(ev.storage_key)
+                except Exception as exc:  # one missing file must not sink the whole package
+                    await logger.awarning(
+                        "zip_evidencias_download_failed",
+                        evidencia_id=str(ev.id),
+                        storage_key=ev.storage_key,
+                        error=str(exc),
+                    )
+                    continue
+                arcname = f"{folder}/evidencias/{_safe_dirname(ev.nombre_archivo, max_len=150)}"
+                miembros_zip.append((arcname, contenido))
+                texto_scan = await _texto_para_scan(contenido, ev.nombre_archivo)
+                if texto_scan:
+                    miembros_scan.append((arcname, texto_scan.encode("utf-8")))
+
+    # Activities not linked to any obligation
+    sueltas = actividades_por_ob.get(None, [])
+    if sueltas:
+        lines = [
+            "Actividades sin obligación vinculada",
+            "=" * 60,
+            "",
+        ]
+        for j, act in enumerate(sueltas, start=1):
+            lines.append(f"{j}. {act.descripcion}")
+            lines.append(f"   Fecha: {_formato_fecha(act.fecha_realizacion)}")
+            lines.append("")
+        _agregar_texto("99_otras_actividades/LEEME.txt", "\n".join(lines))
+
+    if settings.SECRET_SCAN_GATE_ENABLED:
+        hallazgos = await secret_scan_service.escanear_paquete(miembros_scan)
+        if hallazgos:
+            archivos = sorted({h.archivo for h in hallazgos})
+            await logger.aerror(
+                "zip_evidencias_secreto_detectado",
+                cuenta_id=str(cuenta_id),
+                archivos=archivos,
+                tipos=sorted({h.tipo for h in hallazgos}),
+            )
+            raise ValidationError(
+                "Se detectaron posibles credenciales/secretos dentro del paquete de evidencias — "
+                "no se generó el zip. Revise los archivos: " + ", ".join(archivos),
+                code=SECRET_DETECTED_IN_PACKAGE,
             )
 
-        for idx, ob in enumerate(obligaciones, start=1):
-            folder = f"{idx:02d}_{_safe_dirname(ob.descripcion)}"
-            acts = actividades_por_ob.get(ob.id, [])
-            lines = [
-                f"Obligación #{idx} ({ob.tipo.value if ob.tipo else 'general'})",
-                "=" * 60,
-                "",
-                ob.descripcion,
-                "",
-                f"Período: {_periodo_str(cuenta)}",
-                "",
-                "Actividades reportadas en este período:",
-                "-" * 40,
-            ]
-            if acts:
-                for j, act in enumerate(acts, start=1):
-                    lines.append(f"{j}. {act.descripcion}")
-                    if act.justificacion:
-                        lines.append(f"   Justificación: {act.justificacion}")
-                    lines.append(f"   Fecha: {_formato_fecha(act.fecha_realizacion)}")
-                    if act.evidencias:
-                        lines.append(f"   Evidencias adjuntas: {len(act.evidencias)}")
-                        for ev in act.evidencias:
-                            lines.append(f"     - {ev.nombre_archivo}")
-                    lines.append("")
-            else:
-                lines.append("(sin actividades reportadas)")
-                lines.append("")
-            lines += [
-                "Coloque aquí los archivos de soporte (correos, capturas, PDFs,",
-                "fotografías, etc.) que evidencien el cumplimiento de esta obligación.",
-            ]
-            zf.writestr(f"{folder}/LEEME.txt", "\n".join(lines))
+    if modo == "final" and pendientes_desc:
+        raise ValidationError(
+            f"No se puede finalizar la radicación: {len(pendientes_desc)} obligación(es) sin evidencia.",
+            code=PACKAGE_PENDIENTE,
+        )
 
-        # Activities not linked to any obligation
-        sueltas = actividades_por_ob.get(None, [])
-        if sueltas:
-            lines = [
-                "Actividades sin obligación vinculada",
-                "=" * 60,
-                "",
-            ]
-            for j, act in enumerate(sueltas, start=1):
-                lines.append(f"{j}. {act.descripcion}")
-                lines.append(f"   Fecha: {_formato_fecha(act.fecha_realizacion)}")
-                lines.append("")
-            zf.writestr("99_otras_actividades/LEEME.txt", "\n".join(lines))
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for arcname, contenido in miembros_zip:
+            zf.writestr(arcname, contenido)
 
     filename = f"evidencias-{contrato.numero_contrato}-{cuenta.anio}-{cuenta.mes:02d}.zip"
     await logger.ainfo(
@@ -456,5 +636,7 @@ async def generar_zip_evidencias(db: AsyncSession, usuario_id: uuid.UUID, cuenta
         cuenta_id=str(cuenta_id),
         usuario_id=str(usuario_id),
         size=len(buf.getvalue()),
+        modo=modo,
+        pendientes=len(pendientes_desc),
     )
     return buf.getvalue(), filename

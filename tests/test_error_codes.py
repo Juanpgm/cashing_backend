@@ -18,9 +18,13 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from app.core.exceptions import ValidationError
+from app.models.actividad import Actividad
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
 from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
+from app.models.obligacion import Obligacion, TipoObligacion
+from app.services import informe_service
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -159,12 +163,20 @@ async def test_radicar_coherence_hard_finding_returns_coherence_check_failed_cod
     a copied seguridad-social block (R2, HARD) between consecutive cuentas blocks
     radicación with the structured code, even once the checklist itself is complete."""
     cuenta1 = CuentaCobro(
-        contrato_id=contrato.id, mes=1, anio=2024, estado=EstadoCuentaCobro.BORRADOR,
-        valor=1_000_000, requisitos_modo="estandar",
+        contrato_id=contrato.id,
+        mes=1,
+        anio=2024,
+        estado=EstadoCuentaCobro.BORRADOR,
+        valor=1_000_000,
+        requisitos_modo="estandar",
     )
     cuenta2 = CuentaCobro(
-        contrato_id=contrato.id, mes=2, anio=2024, estado=EstadoCuentaCobro.BORRADOR,
-        valor=1_000_000, requisitos_modo="estandar",
+        contrato_id=contrato.id,
+        mes=2,
+        anio=2024,
+        estado=EstadoCuentaCobro.BORRADOR,
+        valor=1_000_000,
+        requisitos_modo="estandar",
     )
     db.add_all([cuenta1, cuenta2])
     await db.commit()
@@ -202,9 +214,121 @@ async def test_radicar_coherence_hard_finding_returns_coherence_check_failed_cod
     assert body["code"] == "COHERENCE_CHECK_FAILED"
 
 
-async def test_unrelated_error_keeps_unchanged_envelope_shape(
-    client: AsyncClient, test_user: dict[str, Any]
+_LEAK_CORPUS_TEXTO = (
+    "Notas internas\n"
+    "DATABASE_URL=postgresql://fake_user:fake_pass_123@ep-fake-000000"
+    ".us-east-1.aws.neon.tech/neondb\n"
+    "NEON_API_KEY=napi_a8K3mXpQ9rZtL2wVbN7cJhF4sYdE1oIu\n"
+)
+
+
+def _fake_storage_con_bytes(por_key: dict[str, bytes]) -> AsyncMock:
+    storage = AsyncMock()
+
+    async def _download(key: str) -> bytes:
+        return por_key.get(key, b"contenido de evidencia de prueba")
+
+    storage.download = AsyncMock(side_effect=_download)
+    return storage
+
+
+async def test_zip_evidencias_secreto_detectado_returns_code(
+    db: AsyncSession,
+    test_user: dict[str, Any],
+    contrato: Contrato,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Mirrors the other structured-code tests in this file for
+    `SECRET_DETECTED_IN_PACKAGE` (billing-resilience-templates, slice #2). No HTTP
+    surface exists for this code yet in this slice — asserted directly against
+    `informe_service.generar_zip_evidencias`, same "mirror" purpose as the HTTP-level
+    tests above. Uses a SYNTHETIC real-leak-shaped corpus only (fake values)."""
+    from app.models.evidencia import Evidencia
+
+    user = test_user["user"]
+    ob = Obligacion(
+        contrato_id=contrato.id,
+        descripcion="Obligación de prueba con texto razonable",
+        tipo=TipoObligacion.GENERAL,
+        orden=0,
+    )
+    db.add(ob)
+    await db.commit()
+    await db.refresh(ob)
+    contrato.obligaciones = [ob]
+
+    cc = CuentaCobro(contrato_id=contrato.id, mes=1, anio=2024, estado=EstadoCuentaCobro.BORRADOR, valor=1_000_000)
+    db.add(cc)
+    await db.commit()
+    await db.refresh(cc)
+
+    act = Actividad(
+        cuenta_cobro_id=cc.id, obligacion_id=ob.id, descripcion="Actividad", fecha_realizacion=date(2024, 1, 5)
+    )
+    db.add(act)
+    await db.commit()
+    await db.refresh(act)
+
+    ev = Evidencia(
+        actividad_id=act.id,
+        storage_key=f"evidencias/{act.id}/leak.txt",
+        nombre_archivo="leak.txt",
+        tipo_archivo="text/plain",
+        tamano_bytes=len(_LEAK_CORPUS_TEXTO),
+    )
+    db.add(ev)
+    await db.commit()
+    await db.refresh(ev)
+    act.evidencias = [ev]
+    # `CuentaCobro.actividades` is `lazy="selectin"` — refreshing `cc` again NOW
+    # (after `act` was inserted) forces a fresh reload of the collection instead
+    # of the stale-empty one cached by the earlier `db.refresh(cc)`.
+    await db.refresh(cc)
+
+    monkeypatch.setattr(
+        informe_service,
+        "_get_storage",
+        lambda *_a, **_k: _fake_storage_con_bytes({ev.storage_key: _LEAK_CORPUS_TEXTO.encode("utf-8")}),
+    )
+
+    with pytest.raises(ValidationError) as exc_info:
+        await informe_service.generar_zip_evidencias(db, user.id, cc.id)
+    assert exc_info.value.code == "SECRET_DETECTED_IN_PACKAGE"
+
+
+async def test_zip_evidencias_modo_final_pendiente_returns_code(
+    db: AsyncSession,
+    test_user: dict[str, Any],
+    contrato: Contrato,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mirrors the other structured-code tests in this file for `PACKAGE_PENDIENTE`
+    (billing-resilience-templates, slice #2) — no evidence uploaded, modo="final"."""
+    user = test_user["user"]
+    ob = Obligacion(
+        contrato_id=contrato.id,
+        descripcion="Obligación sin evidencia",
+        tipo=TipoObligacion.GENERAL,
+        orden=0,
+    )
+    db.add(ob)
+    await db.commit()
+    await db.refresh(ob)
+    contrato.obligaciones = [ob]
+
+    cc = CuentaCobro(contrato_id=contrato.id, mes=2, anio=2024, estado=EstadoCuentaCobro.BORRADOR, valor=1_000_000)
+    db.add(cc)
+    await db.commit()
+    await db.refresh(cc)
+
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: _fake_storage_con_bytes({}))
+
+    with pytest.raises(ValidationError) as exc_info:
+        await informe_service.generar_zip_evidencias(db, user.id, cc.id, modo="final")
+    assert exc_info.value.code == "PACKAGE_PENDIENTE"
+
+
+async def test_unrelated_error_keeps_unchanged_envelope_shape(client: AsyncClient, test_user: dict[str, Any]) -> None:
     """Regression guard: an error without an assigned code has an unchanged envelope.
 
     `code` is additive and `None` when not set; `detail` and `trace_id` keep

@@ -208,6 +208,15 @@ class Settings(BaseSettings):
     # Emergency disable only — SOFT findings never block regardless of this flag.
     COHERENCE_GATE_ENABLED: bool = True
 
+    # Mandatory fail-closed secret scan before the evidence packager emits a zip
+    # (billing-resilience-templates, slice #2): when True (default),
+    # `informe_service.generar_zip_evidencias` scans every text-decodable package
+    # member for accidentally-embedded credentials and raises
+    # `SECRET_DETECTED_IN_PACKAGE` on any hit — no zip is emitted. Emergency
+    # disable only: turning this off re-opens the exact credential-leak class this
+    # feature exists to close.
+    SECRET_SCAN_GATE_ENABLED: bool = True
+
     # Outbound notifications: pluggable channel, off by default. Fail-open — a
     # delivery failure never breaks the triggering operation.
     NOTIFICATIONS_ENABLED: bool = False
