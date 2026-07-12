@@ -65,6 +65,14 @@ class _TimeoutScraper:
         raise TimeoutError()
 
 
+class _ExplodingScraper:
+    """Simulates a non-enumerated adapter failure (e.g. json.JSONDecodeError
+    from a gateway error page) — must degrade fail-soft, never surface a 500."""
+
+    async def fetch_contract_docs(self, notice_uid: str, ref_contrato: str | None = None) -> ScrapeResult:
+        raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+
 class _OkScraper:
     async def fetch_contract_docs(self, notice_uid: str, ref_contrato: str | None = None) -> ScrapeResult:
         return ScrapeResult(
@@ -111,6 +119,15 @@ class TestExplorarDocumentosAgentico:
             db, _OkScraper(), uuid.uuid4(), "CO1.PCCNTR.NOURL"
         )
         assert result.estado == "unavailable"
+        assert result.notas
+
+    async def test_unexpected_adapter_error_is_fail_soft(self, db: AsyncSession) -> None:
+        await _seed_contrato(db)
+        result = await secop_scraper_service.explorar_documentos_agentico(
+            db, _ExplodingScraper(), uuid.uuid4(), _NUMERO
+        )
+        assert result.estado == "unavailable"
+        assert result.documentos == []
         assert result.notas
 
     async def test_success_returns_doc_metadata_no_persistence(self, db: AsyncSession) -> None:

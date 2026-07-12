@@ -85,6 +85,16 @@ async def explorar_documentos_agentico(
             documentos=[],
             notas="El servicio de scraping SECOP no está disponible en este momento.",
         )
+    except Exception:
+        # Fail-soft boundary: a non-enumerated adapter failure (malformed JSON
+        # from a gateway, unexpected DTO shape, etc.) must degrade exactly like
+        # an unavailable scraper — this manual trigger may never surface a 500.
+        await log.aexception("secop_scraper_unexpected_error", numero_contrato=numero_contrato, notice_uid=notice_uid)
+        return ScraperFallbackResult(
+            estado="unavailable",
+            documentos=[],
+            notas="El servicio de scraping SECOP devolvió una respuesta inesperada.",
+        )
 
     documentos = [_to_documento_response(dto, numero_contrato) for dto in result.docs]
     return ScraperFallbackResult(estado="ok", documentos=documentos)
