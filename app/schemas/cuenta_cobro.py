@@ -6,7 +6,8 @@ from decimal import Decimal
 
 from pydantic import BaseModel, Field
 
-from app.models.cuenta_cobro import EstadoCuentaCobro
+from app.models.cuenta_cobro import EstadoCuentaCobro, PosicionCuota
+from app.schemas.coherence import FindingOut
 
 
 class ActividadCreate(BaseModel):
@@ -48,6 +49,14 @@ class CuentaCobroCreate(BaseModel):
         decimal_places=2,
         description="Optional. Defaults to contrato.valor_mensual when not provided.",
     )
+    informe_final: bool = Field(
+        default=False,
+        description=(
+            "Marks this cuota as the contract's final one (billing-resilience-templates "
+            "slice #3). Never inferred — only one cuota per contrato may have this set; "
+            "a second attempt raises CUOTA_POSITION_CONFLICT."
+        ),
+    )
 
     model_config = {
         "json_schema_extra": {
@@ -56,6 +65,7 @@ class CuentaCobroCreate(BaseModel):
                 "mes": 3,
                 "anio": 2025,
                 "valor": "2000000.00",
+                "informe_final": False,
             }
         }
     }
@@ -67,12 +77,16 @@ class CuentaCobroUpdate(BaseModel):
     mes: int | None = Field(default=None, ge=1, le=12)
     anio: int | None = Field(default=None, ge=2020, le=2099)
     valor: Decimal | None = Field(default=None, gt=0, decimal_places=2)
+    informe_final: bool | None = Field(
+        default=None,
+        description=(
+            "Set/unset the explicit final-cuota flag (billing-resilience-templates "
+            "slice #3). Setting `true` when another cuota of this contrato already has "
+            "it set raises CUOTA_POSITION_CONFLICT."
+        ),
+    )
 
-    model_config = {
-        "json_schema_extra": {
-            "example": {"mes": 4, "anio": 2026, "valor": "2500000.00"}
-        }
-    }
+    model_config = {"json_schema_extra": {"example": {"mes": 4, "anio": 2026, "valor": "2500000.00"}}}
 
 
 class CuentaCobroResponse(BaseModel):
@@ -84,9 +98,21 @@ class CuentaCobroResponse(BaseModel):
     valor: Decimal
     pdf_storage_key: str | None
     fecha_envio: datetime | None
+    numero_cuota: int | None
+    posicion: PosicionCuota
+    informe_final: bool
     actividades: list[ActividadResponse]
     created_at: datetime
     updated_at: datetime
+    advertencias_coherencia: list[FindingOut] | None = Field(
+        default=None,
+        description=(
+            "SOFT coherence findings surfaced at radicar time (billing-resilience-"
+            "templates slice #3, task 3.12c) — only populated on the response returned "
+            "by POST /radicar when the coherence validator found non-blocking warnings. "
+            "None/absent in every other response."
+        ),
+    )
 
     model_config = {"from_attributes": True}
 
@@ -100,6 +126,9 @@ class CuentaCobroListItem(BaseModel):
     valor: Decimal
     pdf_storage_key: str | None
     fecha_envio: datetime | None
+    numero_cuota: int | None
+    posicion: PosicionCuota
+    informe_final: bool
     created_at: datetime
     updated_at: datetime
 
@@ -198,11 +227,7 @@ class ActividadesBulkResponse(BaseModel):
 class CambiarEstadoRequest(BaseModel):
     estado: EstadoCuentaCobro
 
-    model_config = {
-        "json_schema_extra": {
-            "example": {"estado": "enviada"}
-        }
-    }
+    model_config = {"json_schema_extra": {"example": {"estado": "enviada"}}}
 
 
 class GenerarPDFResponse(BaseModel):

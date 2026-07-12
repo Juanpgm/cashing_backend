@@ -4,7 +4,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Integer, Numeric, String, UniqueConstraint, Uuid
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, Numeric, String, UniqueConstraint, Uuid
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -17,6 +17,16 @@ class EstadoCuentaCobro(enum.StrEnum):
     APROBADA = "aprobada"
     RECHAZADA = "rechazada"
     PAGADA = "pagada"
+
+
+class PosicionCuota(enum.StrEnum):
+    """Where a cuota sits in its contrato's sequence (billing-resilience-templates,
+    slice #3). Stored, never inferred at read time — replaces the previous
+    `checklist_service._is_first_cuenta` positional heuristic."""
+
+    PRIMERA = "primera"
+    RECURRENTE = "recurrente"
+    FINAL = "final"
 
 
 class CuentaCobro(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
@@ -38,6 +48,22 @@ class CuentaCobro(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
     # (the post-creation gate must be resolved first). Once chosen: 'estandar',
     # 'augment' (standard + inferred) or 'reemplazar' (inferred + EVIDENCIAS only).
     requisitos_modo: Mapped[str | None] = mapped_column(String(20), nullable=True)
+
+    # Cuota position model (billing-resilience-templates, slice #3, migration 025).
+    # `numero_cuota` is the 1-based ordinal among the contrato's cuotas, derived and
+    # persisted at creation time (`cuenta_cobro_service.crear_cuenta_cobro`) — nullable
+    # only as a type-level safety net (`int | None`); every cuota created through the
+    # service (and every legacy row, via the migration's backfill) has a value.
+    # `posicion` defaults to RECURRENTE; `crear_cuenta_cobro` promotes it to PRIMERA for
+    # the contrato's first cuota. `final` is NEVER inferred — it is only ever set
+    # explicitly via `informe_final`.
+    numero_cuota: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    posicion: Mapped[PosicionCuota] = mapped_column(
+        Enum(PosicionCuota, name="posicion_cuota"),
+        nullable=False,
+        default=PosicionCuota.RECURRENTE,
+    )
+    informe_final: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     # Relationships
     contrato: Mapped["Contrato"] = relationship(back_populates="cuentas_cobro")  # type: ignore[name-defined]  # noqa: F821
