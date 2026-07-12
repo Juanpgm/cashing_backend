@@ -24,12 +24,10 @@ def _set_keys(monkeypatch: pytest.MonkeyPatch, *, gemini: str = "", groq: str = 
 
 def test_chain_skips_decommissioned_model(monkeypatch: pytest.MonkeyPatch) -> None:
     """A configured-but-decommissioned model is dropped; fallbacks remain."""
-    monkeypatch.setattr(
-        document_service.settings, "LLM_MULTIMODAL_MODEL", "groq/llama-3.2-11b-vision-preview"
-    )
+    monkeypatch.setattr(document_service.settings, "LLM_MULTIMODAL_MODEL", "groq/llama-3.2-11b-vision-preview")
     _set_keys(monkeypatch, gemini="g", groq="k")
 
-    chain = document_service._vision_model_chain()
+    chain = document_service.vision_model_chain()
 
     assert "groq/llama-3.2-11b-vision-preview" not in chain
     assert "gemini/gemini-2.5-flash-lite" in chain
@@ -43,7 +41,7 @@ def test_chain_filters_models_without_credentials(monkeypatch: pytest.MonkeyPatc
     )
     _set_keys(monkeypatch, gemini="", groq="k")  # no Gemini key
 
-    chain = document_service._vision_model_chain()
+    chain = document_service.vision_model_chain()
 
     assert chain == ["groq/meta-llama/llama-4-scout-17b-16e-instruct"]
     assert all(not m.startswith("gemini/") for m in chain)
@@ -54,7 +52,7 @@ def test_chain_empty_when_no_credentials(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(document_service.settings, "LLM_MULTIMODAL_MODEL", "gemini/gemini-2.5-flash-lite")
     _set_keys(monkeypatch, gemini="", groq="")
 
-    assert document_service._vision_model_chain() == []
+    assert document_service.vision_model_chain() == []
 
 
 def test_chain_dedupes_configured_equal_to_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -62,7 +60,7 @@ def test_chain_dedupes_configured_equal_to_fallback(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(document_service.settings, "LLM_MULTIMODAL_MODEL", "gemini/gemini-2.5-flash-lite")
     _set_keys(monkeypatch, gemini="g", groq="k")
 
-    chain = document_service._vision_model_chain()
+    chain = document_service.vision_model_chain()
 
     assert chain.count("gemini/gemini-2.5-flash-lite") == 1
 
@@ -84,9 +82,7 @@ class _FakeLLM:
 @pytest.mark.asyncio
 async def test_multimodal_recovers_when_first_model_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     """First model raises → loop falls through to the next and returns its result."""
-    monkeypatch.setattr(
-        document_service.settings, "LLM_MULTIMODAL_MODEL", "gemini/gemini-2.5-flash-lite"
-    )
+    monkeypatch.setattr(document_service.settings, "LLM_MULTIMODAL_MODEL", "gemini/gemini-2.5-flash-lite")
     _set_keys(monkeypatch, gemini="g", groq="k")
 
     payload = ContratoExtractionResult(
@@ -116,9 +112,7 @@ async def test_multimodal_recovers_when_first_model_fails(monkeypatch: pytest.Mo
 @pytest.mark.asyncio
 async def test_multimodal_returns_none_when_all_models_fail(monkeypatch: pytest.MonkeyPatch) -> None:
     """Every model failing returns None so the caller can add an aviso."""
-    monkeypatch.setattr(
-        document_service.settings, "LLM_MULTIMODAL_MODEL", "gemini/gemini-2.5-flash-lite"
-    )
+    monkeypatch.setattr(document_service.settings, "LLM_MULTIMODAL_MODEL", "gemini/gemini-2.5-flash-lite")
     _set_keys(monkeypatch, gemini="g", groq="k")
 
     payload = ContratoExtractionResult()

@@ -10,14 +10,22 @@ before applying.
 from __future__ import annotations
 
 import re
+import uuid
 from decimal import Decimal
 
 import structlog
 from pydantic import ValidationError
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.text_match import keyword_score, strip_accents
+from app.core.exceptions import ForbiddenError, NotFoundError
+from app.core.exceptions import ValidationError as DomainValidationError
+from app.core.text_match import keyword_score, normalize, strip_accents
+from app.models.contrato import Contrato
+from app.models.documento_fuente import DocumentoFuente
+from app.models.plantilla_organismo import PlantillaOrganismo
 from app.models.requisito_documento import RequisitoDocumento
+from app.schemas.plantilla_organismo import EstructuraPlantillaLLM
 from app.schemas.requisito_cuenta import (
     RequisitoCuentaItem,
     RequisitoInferidoLLM,
@@ -185,3 +193,275 @@ async def inferir_requisitos_desde_archivo(
     # Surface extraction avisos (e.g. OCR notes) ahead of inference avisos.
     preview.avisos = [*avisos, *preview.avisos]
     return preview
+
+
+# ── Template structure extraction (billing-resilience-templates, slice #5) ───
+#
+# Ingests an institutional informe template (DOCX/PDF) per organism, extracts
+# its STRUCTURE (column layout, section list, literal anexo references) via
+# the LLM, and persists it keyed to the organism (`PlantillaOrganismo`,
+# migration 027). Degrades gracefully: any extraction failure returns `None`
+# instead of raising — this is never a hard error, it just means
+# `adaptive-informe-generation` (slice #6) and the packager fall back to their
+# default flat layout for that organism.
+#
+# NOTE on `estructura_json` shape: design D5's shorthand lists
+# `anexo_refs: bool`. This implementation stores `anexo_refs: list[str]` — the
+# literal anexo-reference strings themselves — because the spec's explicit
+# acceptance criterion is "Anexo reference preserved verbatim" (a boolean flag
+# cannot satisfy that). `estructura_json` is an unconstrained JSON blob (no DB
+# schema enforces its shape), so this is an additive superset of the design's
+# intent, not a contradiction: `bool(anexo_refs)` recovers the flag design
+# describes, if a consumer ever needs it.
+
+_ESTRUCTURA_PLANTILLA_SYSTEM = """\
+Eres un experto en informes institucionales de supervisión y de actividades de \
+contratistas del Estado colombiano. Se te entrega una plantilla oficial (informe \
+de actividades o de supervisión) emitida por una entidad contratante.
+
+Extrae ÚNICAMENTE la ESTRUCTURA del documento, nunca contenido específico de un \
+periodo o contratista:
+- `columnas`: encabezados de la tabla principal de seguimiento de obligaciones, \
+en el orden en que aparecen (ej: ["obligación", "avance del periodo"] o \
+["obligación", "avance del periodo", "evidencia"]).
+- `secciones`: títulos de las secciones del informe, en el orden en que aparecen \
+(ej: ["INFORME JURÍDICO", "INFORME CONTABLE", "INFORME DE APORTES", "INFORME TÉCNICO"]).
+- `anexo_refs`: toda referencia literal a anexos o carpetas de evidencia tal como \
+aparece en el texto (ej: "Ver Anexo: Carpeta /5. EVIDENCIAS/A1"), preservada \
+EXACTAMENTE como está escrita. Si no hay ninguna, deja la lista vacía.
+- `notas`: cualquier observación breve relevante para replicar el formato.
+
+Responde ÚNICAMENTE el JSON del esquema, sin texto adicional.
+"""
+
+_ESTRUCTURA_PLANTILLA_VISION_USER = (
+    "Analiza esta plantilla institucional (imagen o PDF escaneado) y extrae su estructura según el esquema indicado."
+)
+
+
+def _construir_user_prompt_estructura(texto: str) -> str:
+    return f"PLANTILLA INSTITUCIONAL (extracto):\n---\n{texto}\n---\nExtrae la estructura de esta plantilla."
+
+
+async def _extraer_estructura_via_texto(texto: str) -> EstructuraPlantillaLLM | None:
+    """LLM structured-output extraction over already-extracted plain text."""
+    from app.adapters.llm import get_llm
+    from app.core.config import settings
+    from app.schemas.agent import LLMMessage
+
+    messages = [
+        LLMMessage(role="system", content=_ESTRUCTURA_PLANTILLA_SYSTEM),
+        LLMMessage(role="user", content=_construir_user_prompt_estructura(texto)),
+    ]
+    llm = get_llm(model=settings.LLM_EXTRACTION_MODEL or None)
+    try:
+        resp = await llm.complete(
+            messages,
+            temperature=0.0,
+            max_tokens=2048,
+            response_format=EstructuraPlantillaLLM,
+        )
+    except Exception as exc:
+        await logger.awarning("inferir_estructura_plantilla_llm_error", error=str(exc)[:200])
+        return None
+
+    try:
+        return EstructuraPlantillaLLM.model_validate_json(resp.content)
+    except ValidationError as exc:
+        await logger.awarning("inferir_estructura_plantilla_parse_failed", error=str(exc)[:200], raw=resp.content[:300])
+        return None
+
+
+async def _extraer_estructura_via_vision(content: bytes, filename: str) -> EstructuraPlantillaLLM | None:
+    """Vision-model fallback, retried through the same resilient chain CONTRATO
+    extraction uses (`document_service.vision_model_chain`) before giving up —
+    for scanned/degraded templates the text ladder cannot read."""
+    from app.adapters.llm import get_llm
+    from app.agent.tools.multimodal_parser import (
+        build_multimodal_content_parts,
+        guess_mime_type,
+        is_multimodal_supported,
+    )
+    from app.core.config import settings
+    from app.schemas.agent import LLMMessage
+    from app.services import document_service
+
+    mime = guess_mime_type(filename)
+    if not is_multimodal_supported(mime):
+        return None
+
+    chain = document_service.vision_model_chain()
+    for model in chain:
+        try:
+            parts = build_multimodal_content_parts(
+                content,
+                mime,
+                model,
+                max_pdf_pages=settings.MULTIMODAL_MAX_PDF_PAGES,
+                dpi=settings.MULTIMODAL_RASTER_DPI,
+            )
+            messages = [
+                LLMMessage(role="system", content=_ESTRUCTURA_PLANTILLA_SYSTEM),
+                LLMMessage(
+                    role="user",
+                    content=[{"type": "text", "text": _ESTRUCTURA_PLANTILLA_VISION_USER}, *parts],
+                ),
+            ]
+            # fallback=False: this function manages its own vision-aware chain instead
+            # of the generic text-only fallback (same rationale as
+            # `document_service._extraer_contrato_multimodal`).
+            resp = await get_llm(model=model).complete(
+                messages,
+                temperature=0.0,
+                max_tokens=2048,
+                response_format=EstructuraPlantillaLLM,
+                fallback=False,
+            )
+        except Exception as exc:
+            await logger.awarning("inferir_estructura_plantilla_vision_model_failed", model=model, error=str(exc)[:200])
+            continue
+
+        try:
+            return EstructuraPlantillaLLM.model_validate_json(resp.content)
+        except ValidationError as exc:
+            await logger.awarning("inferir_estructura_plantilla_vision_parse_failed", model=model, error=str(exc)[:200])
+            continue
+
+    return None
+
+
+async def inferir_estructura_plantilla(filename: str, content: bytes) -> EstructuraPlantillaLLM | None:
+    """Best-effort structure extraction from an institutional informe template.
+
+    Text-first: extracts text via the standard ladder (`document_service.
+    extraer_texto_documento`, which already includes local OCR), then LLM-
+    completes a structured extraction over it. If no usable text was
+    recovered — or the text-path extraction failed — retries through the
+    resilient vision-model fallback chain before giving up. Returns `None` on
+    any failure; this is a graceful-degradation path, never an error (spec:
+    "No new error code; extraction failure is a graceful-degradation path").
+    """
+    from app.services import document_service
+
+    texto, _avisos = await document_service.extraer_texto_documento(content, filename)
+    if texto and texto.strip():
+        estructura = await _extraer_estructura_via_texto(texto[:_MAX_TEXT_CHARS])
+        if estructura is not None:
+            return estructura
+
+    return await _extraer_estructura_via_vision(content, filename)
+
+
+async def _get_contrato_con_ownership(db: AsyncSession, usuario_id: uuid.UUID, contrato_id: uuid.UUID) -> Contrato:
+    contrato = await db.get(Contrato, contrato_id)
+    if contrato is None:
+        raise NotFoundError("Contrato", str(contrato_id))
+    if contrato.usuario_id != usuario_id:
+        raise ForbiddenError()
+    return contrato
+
+
+async def ingerir_plantilla_organismo(
+    db: AsyncSession,
+    usuario_id: uuid.UUID,
+    contrato_id: uuid.UUID,
+    documento_fuente_id: uuid.UUID,
+) -> tuple[PlantillaOrganismo | None, list[str]]:
+    """Extract and persist a per-organism template structure from an
+    already-uploaded document (`DocumentoFuente`).
+
+    Graceful degradation (spec): if extraction fails, returns ``(None,
+    avisos)`` — nothing is persisted and nothing is raised. Ingestion of the
+    underlying contrato/documento record already happened separately (via the
+    normal upload flow) and is never blocked by this call.
+
+    Re-ingesting for the same organism/tipo_documento UPDATES the existing row
+    (unique on `usuario_id, entidad_normalizada, tipo_documento`) rather than
+    accumulating duplicates.
+    """
+    from app.adapters.storage import get_storage
+    from app.core.config import settings
+
+    contrato = await _get_contrato_con_ownership(db, usuario_id, contrato_id)
+    if not contrato.entidad or not contrato.entidad.strip():
+        raise DomainValidationError(
+            "El contrato no tiene una entidad contratante definida; no se puede asociar la plantilla a un organismo."
+        )
+
+    doc = await db.get(DocumentoFuente, documento_fuente_id)
+    if doc is None:
+        raise NotFoundError("Documento", str(documento_fuente_id))
+    if doc.usuario_id != usuario_id:
+        raise ForbiddenError()
+
+    storage = get_storage(settings.S3_BUCKET_DOCUMENTOS)
+    content = await storage.download(doc.storage_key)
+
+    estructura = await inferir_estructura_plantilla(doc.nombre, content)
+    if estructura is None:
+        await logger.awarning(
+            "ingerir_plantilla_organismo_degradado", contrato_id=str(contrato_id), documento_id=str(documento_fuente_id)
+        )
+        return None, [
+            "No se pudo extraer la estructura de la plantilla institucional. "
+            "Se usará el formato de informe por defecto para este organismo."
+        ]
+
+    entidad_normalizada = normalize(contrato.entidad)
+    tipo_documento = doc.tipo.value if doc.tipo else "informe_actividades"
+    formato = "docx" if doc.nombre.lower().endswith(".docx") else "pdf"
+
+    result = await db.execute(
+        select(PlantillaOrganismo).where(
+            PlantillaOrganismo.usuario_id == usuario_id,
+            PlantillaOrganismo.entidad_normalizada == entidad_normalizada,
+            PlantillaOrganismo.tipo_documento == tipo_documento,
+        )
+    )
+    plantilla = result.scalar_one_or_none()
+    estructura_dict = estructura.model_dump()
+    if plantilla is not None:
+        plantilla.entidad = contrato.entidad
+        plantilla.formato = formato
+        plantilla.estructura_json = estructura_dict
+        plantilla.fuente_documento_id = documento_fuente_id
+    else:
+        plantilla = PlantillaOrganismo(
+            usuario_id=usuario_id,
+            entidad=contrato.entidad,
+            entidad_normalizada=entidad_normalizada,
+            tipo_documento=tipo_documento,
+            formato=formato,
+            estructura_json=estructura_dict,
+            fuente_documento_id=documento_fuente_id,
+        )
+        db.add(plantilla)
+
+    await db.flush()
+    await db.refresh(plantilla)
+    await logger.ainfo("ingerir_plantilla_organismo_ok", contrato_id=str(contrato_id), entidad=entidad_normalizada)
+    return plantilla, []
+
+
+async def obtener_plantilla_organismo(
+    db: AsyncSession,
+    usuario_id: uuid.UUID,
+    contrato_id: uuid.UUID,
+    tipo_documento: str = "informe_actividades",
+) -> PlantillaOrganismo | None:
+    """Read-only lookup of the persisted template structure for a contract's
+    organism (normalized `Contrato.entidad` match). Returns `None` when no
+    template has ever been ingested for that organism/tipo_documento."""
+    contrato = await _get_contrato_con_ownership(db, usuario_id, contrato_id)
+    if not contrato.entidad or not contrato.entidad.strip():
+        return None
+
+    entidad_normalizada = normalize(contrato.entidad)
+    result = await db.execute(
+        select(PlantillaOrganismo).where(
+            PlantillaOrganismo.usuario_id == usuario_id,
+            PlantillaOrganismo.entidad_normalizada == entidad_normalizada,
+            PlantillaOrganismo.tipo_documento == tipo_documento,
+        )
+    )
+    return result.scalar_one_or_none()

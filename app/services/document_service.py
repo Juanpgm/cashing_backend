@@ -404,12 +404,17 @@ def _vision_model_has_credentials(model: str) -> bool:
     return True
 
 
-def _vision_model_chain() -> list[str]:
+def vision_model_chain() -> list[str]:
     """Ordered, de-duplicated list of usable vision models to try.
 
     Starts with the configured ``LLM_MULTIMODAL_MODEL``, then appends curated
     current fallbacks. Skips decommissioned models and any whose provider key is
     missing, so we never waste a call on a model that cannot possibly succeed.
+
+    Public (billing-resilience-templates, slice #5): reused by
+    ``requisito_inference_service`` for template-structure vision extraction, so
+    both CONTRATO extraction and template ingestion share one resilient chain
+    instead of two divergent implementations.
     """
     candidates = [settings.LLM_MULTIMODAL_MODEL, *_VISION_FALLBACK_MODELS]
     chain: list[str] = []
@@ -452,7 +457,7 @@ async def _extraer_contrato_multimodal(
         MULTIMODAL_EXTRACTION_USER,
     )
 
-    chain = _vision_model_chain()
+    chain = vision_model_chain()
     if not chain:
         await logger.awarning(
             "multimodal_no_usable_model",
