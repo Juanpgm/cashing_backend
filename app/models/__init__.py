@@ -22,6 +22,7 @@ from app.models.invite_code import InviteCode  # noqa: F401
 from app.models.obligacion import Obligacion  # noqa: F401
 from app.models.pago import Pago  # noqa: F401
 from app.models.plantilla import Plantilla  # noqa: F401
+from app.models.plantilla_organismo import PlantillaOrganismo  # noqa: F401
 from app.models.preferencia_usuario import PreferenciaUsuario  # noqa: F401
 from app.models.requisito_cuenta import RequisitoCuenta  # noqa: F401
 from app.models.requisito_documento import RequisitoDocumento  # noqa: F401
