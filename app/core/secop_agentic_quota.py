@@ -23,11 +23,16 @@ from app.core.exceptions import RateLimitExceededError
 
 _WINDOW_SECONDS = 3600  # 1 hour
 _HITS: dict[str, deque[float]] = defaultdict(deque)
+# Separate, namespaced bucket for the SECOP II scraper trigger (design D7):
+# the scraper is heavier/fragile than the lighter Socrata-only agentic
+# trigger above, so it gets its own tighter limit (SECOP_SCRAPER_HOURLY_LIMIT)
+# and must never share counters with `_HITS`.
+_SCRAPER_HITS: dict[str, deque[float]] = defaultdict(deque)
 _LOCK = threading.Lock()
 
 
-def _prune(user_id: str, now: float) -> deque[float]:
-    dq = _HITS[user_id]
+def _prune(hits: dict[str, deque[float]], user_id: str, now: float) -> deque[float]:
+    dq = hits[user_id]
     cutoff = now - _WINDOW_SECONDS
     while dq and dq[0] < cutoff:
         dq.popleft()
@@ -42,12 +47,32 @@ def enforce_agentic_quota(user_id: str) -> None:
     limit = settings.SECOP_AGENTIC_HOURLY_LIMIT
     now = time.time()
     with _LOCK:
-        dq = _prune(user_id, now)
+        dq = _prune(_HITS, user_id, now)
         if len(dq) >= limit:
             retry_in = int(_WINDOW_SECONDS - (now - dq[0]))
             raise RateLimitExceededError(
                 f"Has alcanzado el límite de {limit} exploraciones agénticas por hora. "
-                f"Inténtalo de nuevo en ~{max(retry_in, 60)//60} min."
+                f"Inténtalo de nuevo en ~{max(retry_in, 60) // 60} min."
+            )
+        dq.append(now)
+
+
+def enforce_scraper_quota(user_id: str) -> None:
+    """Raise :class:`RateLimitExceededError` if the user exceeded the scraper quota.
+
+    Uses a bucket namespaced from :func:`enforce_agentic_quota` — the scraper
+    trigger (SECOP_SCRAPER_HOURLY_LIMIT, default 5/hour) is independent of the
+    lighter agentic trigger (SECOP_AGENTIC_HOURLY_LIMIT, default 20/hour).
+    """
+    limit = settings.SECOP_SCRAPER_HOURLY_LIMIT
+    now = time.time()
+    with _LOCK:
+        dq = _prune(_SCRAPER_HITS, user_id, now)
+        if len(dq) >= limit:
+            retry_in = int(_WINDOW_SECONDS - (now - dq[0]))
+            raise RateLimitExceededError(
+                f"Has alcanzado el límite de {limit} exploraciones de scraper por hora. "
+                f"Inténtalo de nuevo en ~{max(retry_in, 60) // 60} min."
             )
         dq.append(now)
 
@@ -56,11 +81,12 @@ def remaining(user_id: str) -> int:
     """Return how many agentic calls the user has left in the current window."""
     limit = settings.SECOP_AGENTIC_HOURLY_LIMIT
     with _LOCK:
-        dq = _prune(user_id, time.time())
+        dq = _prune(_HITS, user_id, time.time())
         return max(limit - len(dq), 0)
 
 
 def _reset() -> None:
-    """Test helper — clear all counters."""
+    """Test helper — clear all counters (both buckets)."""
     with _LOCK:
         _HITS.clear()
+        _SCRAPER_HITS.clear()

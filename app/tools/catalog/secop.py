@@ -9,8 +9,14 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from app.schemas.secop import SecopConfiguracionResponse, SecopContratoResponse, SecopImportResult
-from app.services import secop_service
+from app.adapters.secop_scraper import get_secop_scraper_gated
+from app.schemas.secop import (
+    ScraperFallbackResult,
+    SecopConfiguracionResponse,
+    SecopContratoResponse,
+    SecopImportResult,
+)
+from app.services import secop_scraper_service, secop_service
 from app.tools.context import ToolContext
 from app.tools.registry import tool
 
@@ -102,3 +108,36 @@ async def verificar_configuracion_secop(
     ctx: ToolContext, params: VerificarConfiguracionSecopInput
 ) -> SecopConfiguracionResponse:
     return await secop_service.verificar_configuracion_secop()
+
+
+class ExplorarDocumentosSecopAgenticoInput(BaseModel):
+    numero_contrato: str = Field(
+        description="Número/referencia de contrato SECOP (formato CO1.PCCNTR.xxxxxxx) para el que se buscarán "
+        "documentos adicionales en la plataforma SECOP II (fuera de los datasets abiertos de Socrata)."
+    )
+
+
+@tool(
+    name="explorar_documentos_secop_agentico",
+    description=(
+        "Manually trigger the SECOP II scraper fallback to look for platform-only documents "
+        "(pliegos, anexos, contrato firmado) for one contract, when the open-data (Socrata) "
+        "datasets don't carry them. Write tool: it consumes a per-user hourly quota "
+        "(SECOP_SCRAPER_HOURLY_LIMIT) before invoking the scraper. Gated behind "
+        "SECOP_SCRAPER_ENABLED (default off) — with the flag off this is a safe no-op. "
+        "Fail-soft: captcha or scraper-unavailable outcomes come back as a normal result with "
+        "estado='captcha_required'/'unavailable', never as an error; only quota exhaustion "
+        "raises. Does NOT persist documents (metadata only in this version). "
+        "Args: numero_contrato (contract reference, e.g. CO1.PCCNTR.xxxxxxx)."
+    ),
+    input_model=ExplorarDocumentosSecopAgenticoInput,
+    output_model=ScraperFallbackResult,
+    tags=("write",),
+)
+async def explorar_documentos_secop_agentico(
+    ctx: ToolContext, params: ExplorarDocumentosSecopAgenticoInput
+) -> ScraperFallbackResult:
+    scraper = get_secop_scraper_gated()
+    return await secop_scraper_service.explorar_documentos_agentico(
+        ctx.db, scraper, ctx.usuario_id, params.numero_contrato
+    )

@@ -185,6 +185,14 @@ class Settings(BaseSettings):
     SECOP_SCRAPER_INTERNAL_TOKEN: str = ""
     # Sliding-window quota for the manual "Exploración Agéntica" trigger.
     SECOP_AGENTIC_HOURLY_LIMIT: int = 20
+    # Master switch for the SECOP II scraper fallback (secop-document-scraper,
+    # Slice 3). Off by default: even with URL/token configured, the manual
+    # trigger stays fully inert (NullSecopScraperAdapter) until explicitly
+    # enabled, e.g. once the scraper microservice is verified reachable.
+    SECOP_SCRAPER_ENABLED: bool = False
+    # Separate, tighter quota bucket for the scraper trigger (heavier/fragile
+    # than the lighter Socrata-only agentic trigger above) — design D7.
+    SECOP_SCRAPER_HOURLY_LIMIT: int = 5
 
     # Langfuse — LLM observability (Phase 7)
     # Set LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY to enable tracing.

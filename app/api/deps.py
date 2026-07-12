@@ -8,8 +8,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.drive.drive_adapter import DriveAdapter
 from app.adapters.email.gmail_adapter import GmailAdapter
+from app.adapters.secop_scraper import get_secop_scraper_gated
+from app.adapters.secop_scraper.port import SecopScraperPort
 from app.adapters.storage import get_storage as _get_storage
-from app.adapters.storage.s3_adapter import S3StorageAdapter
 from app.core.auth import authenticate_bearer
 from app.core.config import settings
 from app.core.database import get_db
@@ -78,3 +79,11 @@ async def get_email_adapter(db: AsyncSession = Depends(get_db)) -> GmailAdapter:
 async def get_drive_adapter(db: AsyncSession = Depends(get_db)) -> DriveAdapter:
     """Drive adapter — requires user to have connected their Google account."""
     return DriveAdapter(db=db)
+
+
+def get_secop_scraper() -> SecopScraperPort:
+    """SECOP II scraper adapter, gated by `SECOP_SCRAPER_ENABLED` (D-adapter-selection rule).
+
+    Thin FastAPI DI wrapper around `app.adapters.secop_scraper.get_secop_scraper_gated`.
+    """
+    return get_secop_scraper_gated()

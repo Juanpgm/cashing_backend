@@ -5,7 +5,8 @@ from __future__ import annotations
 import uuid
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Literal
+
 from pydantic import BaseModel, Field, model_validator
 
 from app.models.categoria_documento import CategoriaDocumento
@@ -62,7 +63,7 @@ class SecopContratoResponse(BaseModel):
     datos_raw: dict | None = Field(None, exclude=True)
 
     @model_validator(mode="after")
-    def _populate_from_raw(self) -> "SecopContratoResponse":
+    def _populate_from_raw(self) -> SecopContratoResponse:
         raw = self.datos_raw or {}
         if not raw:
             return self
@@ -208,6 +209,30 @@ class SecopConfiguracionResponse(BaseModel):
     status: str  # "ok" | "degraded"
     token_configured: bool
     warning: str | None = None
+
+
+class ScraperFallbackResult(BaseModel):
+    """Result of the manual SECOP II scraper fallback trigger.
+
+    Fail-soft by construction (secop-document-scraper spec, design D6):
+    `estado` communicates degraded outcomes (`captcha_required`,
+    `unavailable`) as domain data returned with HTTP 200, never as an
+    exception. The one exception path is the quota check
+    (`RateLimitExceededError` → HTTP 429, design D7), which happens BEFORE
+    this result is constructed — `estado="quota_exceeded"` is declared here
+    for schema completeness but is never actually returned in a 200 body.
+    """
+
+    estado: Literal["ok", "captcha_required", "unavailable", "quota_exceeded"]
+    documentos: list[SecopDocumentoResponse] = []
+    manual_action_url: str | None = None
+    # Mirrors SecopSincronizarDocumentosResult.datasets_con_error for parity
+    # with the Socrata-side partial-result contract (design "Interfaces" table).
+    datasets_con_error: list[str] = []
+    # Human-readable reason for non-"ok" states that aren't captcha (e.g. no
+    # notice_uid could be derived) — additive beyond the design table, needed
+    # so the caller isn't left with an unexplained "unavailable".
+    notas: str | None = None
 
 
 class SecopImportResult(BaseModel):

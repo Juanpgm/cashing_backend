@@ -7,11 +7,13 @@ import uuid
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import CurrentUser
+from app.adapters.secop_scraper.port import SecopScraperPort
+from app.api.deps import CurrentUser, get_secop_scraper
 from app.core.database import get_db
 from app.schemas.checklist import CategoriaUpdateBody
 from app.schemas.secop import (
     ArchivoComprimidoResponse,
+    ScraperFallbackResult,
     SecopConsultaCompletaResponse,
     SecopContratoResponse,
     SecopDocumentoResponse,
@@ -19,7 +21,7 @@ from app.schemas.secop import (
     SecopProcesoResponse,
     SecopSincronizarDocumentosResult,
 )
-from app.services import secop_service
+from app.services import secop_scraper_service, secop_service
 
 router = APIRouter(prefix="/secop", tags=["secop"])
 
@@ -170,3 +172,28 @@ async def actualizar_categoria_documento(
     await db.commit()
     await db.refresh(doc)
     return SecopDocumentoResponse.model_validate(doc)
+
+
+@router.post("/explorar-agentico", response_model=ScraperFallbackResult)
+async def explorar_agentico(
+    user: CurrentUser,
+    numero_contrato: str = Query(
+        ...,
+        description="Número/referencia de contrato SECOP (formato CO1.PCCNTR.xxxxxxx)",
+    ),
+    scraper: SecopScraperPort = Depends(get_secop_scraper),
+    db: AsyncSession = Depends(get_db),
+) -> ScraperFallbackResult:
+    """Dispara manualmente el fallback de scraping de SECOP II para un contrato.
+
+    Manual únicamente: NUNCA se invoca desde `sincronizar-documentos` ni desde
+    la evaluación del checklist. Gateado por `SECOP_SCRAPER_ENABLED` (default
+    False) — con la bandera apagada, este endpoint responde 200 sin efecto
+    (adaptador nulo). Aplica una cuota horaria por usuario
+    (`SECOP_SCRAPER_HOURLY_LIMIT`) antes de invocar el scraper.
+
+    Fail-soft: un captcha o una falla del microservicio de scraping se
+    reportan como `estado="captcha_required"`/`"unavailable"` en un 200, no
+    como error — el único camino de excepción es la cuota agotada (429).
+    """
+    return await secop_scraper_service.explorar_documentos_agentico(db, scraper, user.id, numero_contrato)
