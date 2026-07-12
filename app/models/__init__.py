@@ -1,6 +1,7 @@
 """Import all models so SQLAlchemy mappers resolve forward references."""
 
 from app.models.actividad import Actividad  # noqa: F401
+from app.models.adicion_contrato import AdicionContrato  # noqa: F401
 from app.models.agent_checkpoint import AgentCheckpoint  # noqa: F401
 from app.models.agent_run import AgentRun  # noqa: F401
 from app.models.audit_log import AuditLog  # noqa: F401

@@ -3,7 +3,7 @@
 import enum
 import uuid
 
-from sqlalchemy import Enum, ForeignKey, Integer, String, Text, Uuid
+from sqlalchemy import Boolean, Enum, ForeignKey, Integer, String, Text, Uuid
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -18,15 +18,15 @@ class TipoObligacion(enum.StrEnum):
 class Obligacion(UUIDMixin, TimestampMixin, Base):
     __tablename__ = "obligaciones"
 
-    contrato_id: Mapped[uuid.UUID] = mapped_column(
-        Uuid, ForeignKey("contratos.id"), nullable=False, index=True
-    )
+    contrato_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("contratos.id"), nullable=False, index=True)
     descripcion: Mapped[str] = mapped_column(Text, nullable=False)
-    tipo: Mapped[TipoObligacion] = mapped_column(
-        Enum(TipoObligacion, name="tipo_obligacion"), nullable=False
-    )
+    tipo: Mapped[TipoObligacion] = mapped_column(Enum(TipoObligacion, name="tipo_obligacion"), nullable=False)
     orden: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     etiqueta: Mapped[str] = mapped_column(String(8), nullable=False, default="")
+    # One-time obligation (billing-resilience-templates, slice #4, migration 026):
+    # only expected to be reported once, then blank in every subsequent cuota's
+    # informe (`posicion != PRIMERA`) — wired into generation in slice #6 (task 6.10).
+    una_vez: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     # Semantic search embedding (text-embedding-004, 1536 dims, stored as Text JSON)
     # Use app.agent.tools.vector_search.encode/decode helpers to convert to/from list[float]
