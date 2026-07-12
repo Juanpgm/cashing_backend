@@ -129,26 +129,26 @@ Chain strategy: stacked-to-main
 
 ## Slice 3 — Cuota position model (P1a) · PR 3 · migration `025` · ~320 lines · depends on #1
 
-- [ ] 3.0a Carry-over from slice #2 verify (WARNING 1): add RED+GREEN test covering the binary-extraction scan path — a non-UTF8 payload whose `extraer_texto_documento`-extracted text contains a leak-shaped secret must trigger `SECRET_DETECTED_IN_PACKAGE` (mock the extractor; no real credentials).
-- [ ] 3.0b Carry-over from slice #2 verify (WARNING 2): add a clarifying note to `specs/cuota-packager/spec.md` + `design.md` distinguishing "obligación-level packaging completeness" (PACKAGE_PENDIENTE) from "requisito/checklist completeness" (CHECKLIST_INCOMPLETE) — slice #7's `preparar_radicacion` orchestrates BOTH gates.
-- [ ] 3.1 Checkpoint: confirm migration number `025` still free (rebase if `backend-local-first-sync` merged with different numbering)
-- [ ] 3.2 RED: model test — `CuentaCobro` accepts `numero_cuota: int|None`, `posicion: enum(primera|recurrente|final)`, `informe_final: bool = False`
-- [ ] 3.3 GREEN: add fields to `app/models/cuenta_cobro.py`
-- [ ] 3.4 RED+GREEN: `alembic/versions/025_*` — explicit `op.add_column` x3 (create_all no-ops column adds) + backfill window (per-contrato chronological anio/mes order)
-- [ ] 3.5 Neon verification: apply `025` on Neon dev branch; verify columns exist and backfill assigns correct `posicion`/`numero_cuota` to legacy rows
-- [ ] 3.6 RED+GREEN: `schemas/cuenta_cobro.py` — include new fields in `CuentaCobroOut`
-- [ ] 3.7 RED: test create first cuota → `posicion=primera`, `numero_cuota=1`
-- [ ] 3.8 GREEN: derive/persist `numero_cuota`/`posicion` at creation in `cuenta_cobro_service.py`
-- [ ] 3.9 RED: test duplicate `informe_final=True` and duplicate `posicion=primera` for same contract both raise `CUOTA_POSITION_CONFLICT`
-- [ ] 3.10 GREEN: add `CUOTA_POSITION_CONFLICT` to `core/exceptions.py`; enforce write-time invariant in `cuenta_cobro_service.py` (Reconciliation Note 1)
-- [ ] 3.11 RED: test one-time obligation required when `posicion=primera`, blank for `recurrente`/`final`
-- [ ] 3.12 GREEN: replace `_is_first_cuenta()` (L266-278) with `posicion == PRIMERA` in `checklist_service.py`
-- [ ] 3.12b RED+GREEN: rewire coherence R1 — replace `_derive_numero_cuota()` interim chronological derivation in `coherence_validator_service.py` with the stored `numero_cuota`/`posicion` fields, keeping the rule's external shape (slice #1 verify-report WARNING 1)
-- [ ] 3.12c RED+GREEN: surface SOFT coherence findings in the radicar response — add an `advertencias_coherencia` field to the radicar response schema so callers see SOFT findings without a second `validar_coherencia_cuenta` call (slice #1 verify-report WARNING 2)
-- [ ] 3.13 Integration test: `crear_cuenta_cobro`/`obtener_cuenta_cobro` outputs include new fields
-- [ ] 3.14 Update `tests/test_radicar.py::_CODIGOS_OBLIGATORIOS` mirror with `CUOTA_POSITION_CONFLICT`
-- [ ] 3.15 Local verification gate: `make format && make lint && uv run python -m pytest` green
-- [ ] 3.16 **No push to remote without explicit user OK**
+- [x] 3.0a Carry-over from slice #2 verify (WARNING 1): add RED+GREEN test covering the binary-extraction scan path — a non-UTF8 payload whose `extraer_texto_documento`-extracted text contains a leak-shaped secret must trigger `SECRET_DETECTED_IN_PACKAGE` (mock the extractor; no real credentials).
+- [x] 3.0b Carry-over from slice #2 verify (WARNING 2): add a clarifying note to `specs/cuota-packager/spec.md` + `design.md` distinguishing "obligación-level packaging completeness" (PACKAGE_PENDIENTE) from "requisito/checklist completeness" (CHECKLIST_INCOMPLETE) — slice #7's `preparar_radicacion` orchestrates BOTH gates.
+- [x] 3.1 Checkpoint: confirm migration number `025` still free (rebase if `backend-local-first-sync` merged with different numbering) — confirmed via `alembic heads` (023 head, 024 reserved/unmerged by `backend-local-first-sync`); used 025.
+- [x] 3.2 RED: model test — `CuentaCobro` accepts `numero_cuota: int|None`, `posicion: enum(primera|recurrente|final)`, `informe_final: bool = False`
+- [x] 3.3 GREEN: add fields to `app/models/cuenta_cobro.py`
+- [x] 3.4 RED+GREEN: `alembic/versions/025_*` — explicit `op.add_column` x3 (create_all no-ops column adds) + backfill window (per-contrato chronological anio/mes order)
+- [x] 3.5 Neon verification: **BLOCKED** — no reachable Neon connection in this session (DATABASE_URL not readable/no live branch). Verified instead via (a) `alembic heads`/history parses cleanly with 025 as sole head, and (b) a dry-inspection script binding `alembic.operations.Operations` to a throwaway sqlite DB and calling `upgrade()`/`downgrade()` directly — confirmed correct per-contrato chronological backfill (out-of-insertion-order rows numbered correctly: 1/primera, 2/recurrente, 3/recurrente per contrato) and clean column removal on downgrade. Real Postgres/Neon apply still required before merge.
+- [x] 3.6 RED+GREEN: `schemas/cuenta_cobro.py` — include new fields in `CuentaCobroOut`
+- [x] 3.7 RED: test create first cuota → `posicion=primera`, `numero_cuota=1`
+- [x] 3.8 GREEN: derive/persist `numero_cuota`/`posicion` at creation in `cuenta_cobro_service.py`
+- [x] 3.9 RED: test duplicate `informe_final=True` and duplicate `posicion=primera` for same contract both raise `CUOTA_POSITION_CONFLICT` — **DEVIATION**: `posicion=primera` duplication is tested directly against the private `_verificar_conflicto_posicion` guard (not through `crear_cuenta_cobro`), since normal creation always DERIVES `posicion` from a live count and can never naturally collide with an existing PRIMERA cuota — the guard is a defensive backstop, not a user-triggerable path via the public service call. `informe_final` duplication IS reachable through the public service/API and is tested end-to-end (unit + API level).
+- [x] 3.10 GREEN: add `CUOTA_POSITION_CONFLICT` to `core/exceptions.py`; enforce write-time invariant in `cuenta_cobro_service.py` (Reconciliation Note 1)
+- [x] 3.11 RED: test one-time obligation required when `posicion=primera`, blank for `recurrente`/`final`
+- [x] 3.12 GREEN: replace `_is_first_cuenta()` (L266-278) with `posicion == PRIMERA` in `checklist_service.py` — simplified to a pure sync helper (no DB round-trip needed anymore, consistent with the project's round-trip-reduction convention)
+- [x] 3.12b RED+GREEN: rewire coherence R1 — replace `_derive_numero_cuota()` interim chronological derivation in `coherence_validator_service.py` with the stored `numero_cuota`/`posicion` fields, keeping the rule's external shape (slice #1 verify-report WARNING 1). `_derive_numero_cuota` is KEPT as a documented defensive fallback for a cuota somehow missing the persisted field, not deleted.
+- [x] 3.12c RED+GREEN: surface SOFT coherence findings in the radicar response — add an `advertencias_coherencia` field to the radicar response schema so callers see SOFT findings without a second `validar_coherencia_cuenta` call (slice #1 verify-report WARNING 2)
+- [x] 3.13 Integration test: `crear_cuenta_cobro`/`obtener_cuenta_cobro` outputs include new fields (service-level + API-level)
+- [x] 3.14 Update `tests/test_radicar.py::_CODIGOS_OBLIGATORIOS` mirror with `CUOTA_POSITION_CONFLICT` — **DEVIATION** (same as slices #1/#2 tasks 1.22/2.18): confirmed `_CODIGOS_OBLIGATORIOS` is a checklist requisito-code list, not an error-code mirror; added a permanent NOTE comment there pointing to the real mirror, and added `test_crear_cuenta_cobro_duplicate_final_returns_cuota_position_conflict_code` to `tests/test_error_codes.py` instead.
+- [x] 3.15 Local verification gate: `make format && make lint && uv run python -m pytest` green — `ruff check`/`ruff format --check` clean on all new/changed files (baseline-only pre-existing issues elsewhere, confirmed via `git stash` diff); mypy: 0 new errors (266 before and after, confirmed via `git stash` diff on `mypy app/`); full suite: 1258 passed / 14 deselected (baseline 1239 passed + 19 new tests, 0 regressions).
+- [x] 3.16 **No push to remote without explicit user OK** — not pushed; commits are local only.
 
 **Work-unit commits**: (a) 3.2-3.6 model+migration → `feat(cuota-position): add numero_cuota/posicion/informe_final fields`; (b) 3.7-3.10 write-time invariant → `feat(cuota-position): enforce CUOTA_POSITION_CONFLICT at creation`; (c) 3.11-3.12c → `fix(checklist): replace _is_first_cuenta heuristic with stored posicion` + `feat(coherence): rewire R1 to stored position and surface SOFT findings`.
 
@@ -163,7 +163,7 @@ Chain strategy: stacked-to-main
 - [ ] 4.5 Neon verification: apply `026` on Neon dev branch; verify table + column exist
 - [ ] 4.6 RED+GREEN: `schemas/adicion.py` — `AdicionCreate`, `AdicionOut`
 - [ ] 4.7 RED: test recording an Adición with new RPC/CDP persists and is queryable; two events preserved in order (second doesn't overwrite first)
-- [ ] 4.8 GREEN: implement `registrar_adicion`/`listar_adiciones` in new `app/services/adicion_contrato_service.py`
+- [ ] 4.8 GREEN: implement `registrar_adicion`/`listar_adiciones` in new `app/services/adicion_contrato_service.py`. CROSS-CHANGE NOTE (2026-07-11): `secop_service.obtener_adiciones_contrato()` (landed in secop-full-acquisition slice 2) is the SECOP-side source — its `valor_adicion` is best-effort regex-parsed from free-text `descripcion` and MAY BE None (cb9c-h8sn has no structured value field); rows with `tipo="ADICION EN EL VALOR"` are the real additions. Handle None gracefully when materializing events.
 - [ ] 4.9 GREEN: wire `ValidationContext.adiciones` in `coherence_validator_service.py` to query real `adiciones_contrato` (completes R6, deferred from slice #1 per Reconciliation Note 4)
 - [ ] 4.10 RED: test R6 flags stale clause using real Adición event data (replaces slice #1's stub)
 - [ ] 4.11 RED: test new SOFT rule — prórroga present + `informe_final=True` on an earlier cuota emits a warning, does not auto-unflag (Reconciliation Note 3)
