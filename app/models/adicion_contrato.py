@@ -28,7 +28,12 @@ class AdicionContrato(UUIDMixin, TimestampMixin, Base):
     __tablename__ = "adiciones_contrato"
 
     contrato_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("contratos.id"), nullable=False, index=True)
-    tipo: Mapped[TipoAdicion] = mapped_column(Enum(TipoAdicion, name="tipo_adicion"), nullable=False)
+    tipo: Mapped[TipoAdicion] = mapped_column(
+        # values_callable → lowercase `.value` labels matching migration 026's
+        # enum type (same Postgres-enum-label gotcha as PosicionCuota).
+        Enum(TipoAdicion, name="tipo_adicion", values_callable=lambda x: [e.value for e in x]),
+        nullable=False,
+    )
     numero: Mapped[int] = mapped_column(Integer, nullable=False)
     rpc_nuevo: Mapped[str | None] = mapped_column(String(50), nullable=True)
     cdp_nuevo: Mapped[str | None] = mapped_column(String(50), nullable=True)

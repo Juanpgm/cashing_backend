@@ -59,7 +59,11 @@ class CuentaCobro(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
     # explicitly via `informe_final`.
     numero_cuota: Mapped[int | None] = mapped_column(Integer, nullable=True)
     posicion: Mapped[PosicionCuota] = mapped_column(
-        Enum(PosicionCuota, name="posicion_cuota"),
+        # values_callable → store the lowercase `.value`s (matching migration
+        # 025's enum labels), NOT the uppercase member names. Postgres enum
+        # labels must agree with what the migration created (see documento_fuente
+        # CategoriaDocumento precedent). Without this, INSERT/read break on Neon.
+        Enum(PosicionCuota, name="posicion_cuota", values_callable=lambda x: [e.value for e in x]),
         nullable=False,
         default=PosicionCuota.RECURRENTE,
     )

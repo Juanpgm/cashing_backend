@@ -20,6 +20,18 @@ from app.schemas.cuenta_cobro import CuentaCobroCreate, CuentaCobroUpdate
 from app.services import checklist_service, cuenta_cobro_service
 from sqlalchemy.ext.asyncio import AsyncSession
 
+
+def test_posicion_enum_column_labels_match_lowercase_values() -> None:
+    """Regression for the Postgres enum-label mismatch (slice #3 verify C1):
+    the ORM column MUST emit the lowercase `.value` labels that migration 025
+    created, not the uppercase member names. This catches the break WITHOUT a
+    live Postgres — SQLite tests hide it because create_all builds the CHECK
+    from the model itself. See app/models/documento_fuente.py CategoriaDocumento."""
+    col_type = CuentaCobro.__table__.c.posicion.type
+    assert set(col_type.enums) == {e.value for e in PosicionCuota}  # {"primera","recurrente","final"}
+    assert set(col_type.enums) != {e.name for e in PosicionCuota}  # NOT {"PRIMERA",...}
+
+
 # Note: `asyncio_mode = "auto"` (pyproject.toml) — async tests need no marker. This
 # module deliberately mixes sync (pure dataclass/HTTP-mapping) and async (DB-backed)
 # tests, so no module-level `pytestmark` is set (it would misfire warnings on the

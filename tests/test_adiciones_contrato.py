@@ -21,6 +21,16 @@ from app.models.contrato import Contrato
 from app.models.obligacion import Obligacion, TipoObligacion
 from sqlalchemy.ext.asyncio import AsyncSession
 
+
+def test_tipo_adicion_enum_column_labels_match_lowercase_values() -> None:
+    """Regression for the Postgres enum-label mismatch (same class of bug as
+    slice #3's PosicionCuota C1): the ORM column MUST emit migration 026's
+    lowercase `.value` labels, not the uppercase member names."""
+    col_type = AdicionContrato.__table__.c.tipo.type
+    assert set(col_type.enums) == {e.value for e in TipoAdicion}  # {"adicion","prorroga","otrosi"}
+    assert set(col_type.enums) != {e.name for e in TipoAdicion}
+
+
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
 
