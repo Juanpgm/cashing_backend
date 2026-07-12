@@ -75,8 +75,9 @@ testpaths = ["tests"]
 filterwarnings = ["ignore::DeprecationWarning"]
 markers = [
     "live_llm: hits a real local Ollama server (opt-in: -m live_llm)",
+    "live: hits a real external network API (opt-in: -m live), e.g. datos.gov.co Socrata",
 ]
-addopts = "-m \"not live_llm\""
+addopts = "-m \"not live_llm and not live\""
 
 [tool.coverage.run]
 source = ["app"]

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import date
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -377,6 +377,89 @@ class TestBuscarDocumentosContrato:
         # The modification doc was upserted
         assert mock_upsert.call_count == 1
         assert len(result) == 1
+
+
+class TestGap2024Warning:
+    """2024 archive gap (Slice 1, task 1.3): the live probe (tasks.md 1.2) found that
+    `dmgg-8hin` only covers a single 2024-12-31 bulk-load batch, not full-year 2024 —
+    so the `secop_docs_gap_2024` warning is preserved rather than removed."""
+
+    @pytest.mark.asyncio
+    async def test_gap_warning_logged_for_2024_contract_with_no_docs(self) -> None:
+        """Asserts on `secop_service.log` directly (instead of
+        `structlog.testing.capture_logs()`): the module logger is cached by
+        `cache_logger_on_first_use=True` (app/main.py) the first time any test
+        anywhere in the suite triggers a real log call on it, which makes
+        `capture_logs()` order-dependent/flaky for this specific logger across
+        the full suite."""
+        from app.services.secop_service import buscar_documentos_contrato
+
+        contrato = _make_secop_contrato("CON-2024", proceso=None)
+        contrato.fecha_inicio = date(2024, 3, 1)
+        contrato.id_contrato_secop = None
+
+        mock_db = AsyncMock()
+        mock_db.execute.side_effect = [
+            _contrato_execute_result([contrato]),  # contrato lookup
+            _cached_execute_result([]),  # cache check: empty
+            _cached_execute_result([]),  # post-refresh re-read: still empty
+        ]
+
+        with (
+            patch(
+                "app.services.secop_service._query_docs_datasets",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+            patch(
+                "app.services.secop_service._query_modificaciones_docs",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+            patch("app.services.secop_service.log") as mock_log,
+        ):
+            result = await buscar_documentos_contrato(mock_db, "CON-2024", refresh=False)
+
+        assert result == []
+        mock_log.warning.assert_any_call(
+            "secop_docs_gap_2024",
+            numero_contrato="CON-2024",
+            note="gap_2024_partial_dataset",
+            detail=ANY,
+        )
+
+    @pytest.mark.asyncio
+    async def test_gap_warning_not_logged_for_non_2024_contract(self) -> None:
+        from app.services.secop_service import buscar_documentos_contrato
+
+        contrato = _make_secop_contrato("CON-2025", proceso=None)
+        contrato.fecha_inicio = date(2025, 3, 1)
+        contrato.id_contrato_secop = None
+
+        mock_db = AsyncMock()
+        mock_db.execute.side_effect = [
+            _contrato_execute_result([contrato]),
+            _cached_execute_result([]),
+            _cached_execute_result([]),
+        ]
+
+        with (
+            patch(
+                "app.services.secop_service._query_docs_datasets",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+            patch(
+                "app.services.secop_service._query_modificaciones_docs",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+            patch("app.services.secop_service.log") as mock_log,
+        ):
+            await buscar_documentos_contrato(mock_db, "CON-2025", refresh=False)
+
+        gap_calls = [c for c in mock_log.warning.call_args_list if c.args and c.args[0] == "secop_docs_gap_2024"]
+        assert not gap_calls
 
 
 class TestImportarContratosSecopPreview:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import random
 import re
 import uuid
 import zipfile
@@ -27,6 +28,7 @@ from app.schemas.contrato import ContratoCreate, ContratoResponse, ObligacionCre
 from app.schemas.secop import (
     ArchivoComprimidoResponse,
     ArchivoInternoItem,
+    SecopConfiguracionResponse,
     SecopConsultaCompletaResponse,
     SecopContratoDetalleResponse,
     SecopContratoImportado,
@@ -46,13 +48,26 @@ _DS_PROCESOS = "p6dx-8zbt"
 _DS_DOCS_HIST = "f8va-cf4m"  # hasta 31/12/2021 (cubre 2018-2021)
 _DS_DOCS_2022 = "kgcd-kt7i"
 _DS_DOCS_2023 = "3skv-9na7"
-_DS_DOCS_2025 = "dmgg-8hin"  # desde 01/01/2025 (2024 gap: no public dataset exists)
+# dmgg-8hin's bulk coverage starts 01/01/2025, BUT it is NOT gap-free for 2024:
+# a live probe (2026-07-11, see openspec/changes/secop-full-acquisition/tasks.md
+# Slice 1 task 1.2) found it also holds a single 2024-12-31 bulk-load batch
+# (~24.5k rows, all sharing that exact fecha_carga), not full-year 2024
+# coverage. _DS_DOCS_2023 (3skv-9na7) returned 0 rows for 2024 in the same
+# probe. Net effect: most of 2024 (Jan-Nov) still has no covering dataset —
+# the secop_docs_gap_2024 warning below stays in place for that reason.
+_DS_DOCS_2025 = "dmgg-8hin"  # desde 01/01/2025 + one 2024-12-31 bulk-load batch (not full 2024 coverage)
 _DS_DOCUMENTOS = _DS_DOCS_2025  # backward-compat alias used by sincronizar_documentos
 _DS_MODIFICACIONES = "u8cx-r425"  # SECOP II Modificaciones a contratos
 _ALL_DOCS_DATASETS = (_DS_DOCS_HIST, _DS_DOCS_2022, _DS_DOCS_2023, _DS_DOCS_2025)
 _CACHE_TTL = timedelta(hours=24)
 _CACHE_TTL_DOCS = timedelta(hours=2)  # Documents refresh more frequently
 _PRESTACION = "prestaci"  # substring present in all "Prestación de Servicios" variants
+
+# Bounded retry/backoff for _query_socrata (secop-acquisition-resilience spec,
+# design D5): Socrata throttles hard on 429 and occasionally 5xx under load.
+# Full jitter keeps concurrent fan-out callers from retrying in lockstep.
+_SOCRATA_RETRY_MAX_ATTEMPTS = 3
+_SOCRATA_RETRY_BASE_DELAY_S = 0.5
 
 # The per-contract LLM obligaciones fallback (see importar_contratos_secop) can
 # take minutes across retries and the fallback chain. Bound it so a bulk SECOP
@@ -98,27 +113,50 @@ def _is_fresh(updated_at: datetime, ttl: timedelta = _CACHE_TTL) -> bool:
 
 
 async def _query_socrata(dataset_id: str, where_clause: str, limit: int = 500) -> list[dict[str, Any]]:
-    """Execute a Socrata REST query against a datos.gov.co dataset."""
+    """Execute a Socrata REST query against a datos.gov.co dataset.
+
+    Retries on HTTP 429 and 5xx with bounded exponential backoff and full
+    jitter (max `_SOCRATA_RETRY_MAX_ATTEMPTS` attempts) before giving up —
+    Socrata throttles aggressively without an app token (see
+    `SECOP_APP_TOKEN`) and transient 5xx responses happen under load. Other
+    errors (4xx besides 429, connection errors) fail immediately, unchanged.
+    """
     url = f"{_SECOP_BASE}/{dataset_id}.json"
     headers = {"X-App-Token": settings.SECOP_APP_TOKEN}
     params = {"$where": where_clause, "$limit": str(limit)}
 
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(url, params=params, headers=headers)
-            response.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        log.error("secop_api_http_error", dataset=dataset_id, status=exc.response.status_code)
-        raise ExternalServiceError("SECOP API", f"HTTP {exc.response.status_code}") from exc
-    except httpx.RequestError as exc:
-        log.error("secop_api_request_error", dataset=dataset_id, error=str(exc))
-        raise ExternalServiceError("SECOP API", "connection error") from exc
+    for attempt in range(1, _SOCRATA_RETRY_MAX_ATTEMPTS + 1):
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(url, params=params, headers=headers)
+                response.raise_for_status()
+            data: Any = response.json()
+            if isinstance(data, list):
+                return data
+            results: list[dict[str, Any]] = data.get("results", [])
+            return results
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code
+            retryable = status_code == 429 or status_code >= 500
+            if retryable and attempt < _SOCRATA_RETRY_MAX_ATTEMPTS:
+                delay = _SOCRATA_RETRY_BASE_DELAY_S * (2 ** (attempt - 1)) * random.random()  # noqa: S311 — jitter, not crypto
+                log.warning(
+                    "secop_api_retry",
+                    dataset=dataset_id,
+                    status=status_code,
+                    attempt=attempt,
+                    delay_s=round(delay, 3),
+                )
+                await asyncio.sleep(delay)
+                continue
+            log.error("secop_api_http_error", dataset=dataset_id, status=status_code)
+            raise ExternalServiceError("SECOP API", f"HTTP {status_code}") from exc
+        except httpx.RequestError as exc:
+            log.error("secop_api_request_error", dataset=dataset_id, error=str(exc))
+            raise ExternalServiceError("SECOP API", "connection error") from exc
 
-    data: Any = response.json()
-    if isinstance(data, list):
-        return data
-    results: list[dict[str, Any]] = data.get("results", [])
-    return results
+    # Unreachable: every loop iteration above either returns or raises.
+    raise ExternalServiceError("SECOP API", "retry loop exhausted unexpectedly")
 
 
 async def _query_docs_datasets(
@@ -563,7 +601,11 @@ async def buscar_documentos_contrato(
             docs_rows = []
             mod_rows = mod_result if not isinstance(mod_result, Exception) else []
 
-        # Gap detection: SECOP has no public dataset for 2024 documents.
+        # Gap detection: no SECOP document dataset covers 2024 as a whole. A live
+        # probe (2026-07-11, tasks.md Slice 1 task 1.2) confirmed dmgg-8hin only
+        # holds a single 2024-12-31 bulk-load batch (not full-year 2024 coverage)
+        # and 3skv-9na7 returns zero 2024 rows — so the gap is real for most of
+        # 2024, even though it is already included in _ALL_DOCS_DATASETS above.
         # Log a warning when the contract's start date falls in 2024 and no documents
         # were found — avoids silently returning empty results without explanation.
         if not docs_rows and not mod_rows and secop_contrato is not None:
@@ -572,10 +614,11 @@ async def buscar_documentos_contrato(
                 log.warning(
                     "secop_docs_gap_2024",
                     numero_contrato=numero_contrato,
-                    note="gap_2024_no_dataset",
+                    note="gap_2024_partial_dataset",
                     detail=(
-                        "No SECOP document dataset exists for 2024. "
-                        "Documents for contracts starting in 2024 may not be available via the public API."
+                        "No SECOP document dataset fully covers 2024 (dmgg-8hin only holds a "
+                        "2024-12-31 bulk-load batch). Documents for contracts starting in 2024 "
+                        "may not be available via the public API."
                     ),
                 )
 
@@ -1329,3 +1372,30 @@ async def actualizar_categoria_documento(
     doc.categoria_override = True
     await db.flush()
     return doc
+
+
+# ---------------------------------------------------------------------------
+# Configuration diagnostics
+# ---------------------------------------------------------------------------
+
+
+async def verificar_configuracion_secop() -> SecopConfiguracionResponse:
+    """Report whether the SECOP Socrata integration is configured, for
+    support/diagnostics — mirrors the `/health/llm` diagnostic pattern.
+
+    Read-only, no network call: surfaces the same `SECOP_APP_TOKEN` presence
+    signal as the non-blocking startup warning in `Settings`
+    (`_warn_if_secop_token_missing`), queryable on demand instead of only
+    visible in startup logs.
+    """
+    token_configured = bool(settings.SECOP_APP_TOKEN)
+    if token_configured:
+        return SecopConfiguracionResponse(status="ok", token_configured=True)
+    return SecopConfiguracionResponse(
+        status="degraded",
+        token_configured=False,
+        warning=(
+            "SECOP_APP_TOKEN is empty — Socrata will throttle unauthenticated requests; "
+            "SECOP imports may be partial or fail."
+        ),
+    )

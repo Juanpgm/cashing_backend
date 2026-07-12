@@ -190,3 +190,61 @@ class TestQuerySocrata:
 
             with pytest.raises(ExternalServiceError):
                 await _query_socrata("jbjy-vk9h", "cedula='12345'")
+
+    @pytest.mark.asyncio
+    async def test_retries_on_429_then_succeeds(self) -> None:
+        """429 on the first attempt, 200 on the second — retry recovers with no error."""
+        from app.services.secop_service import _query_socrata
+
+        mock_request = MagicMock()
+
+        resp_429 = MagicMock()
+        resp_429.status_code = 429
+        resp_429.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "429", request=mock_request, response=resp_429
+        )
+
+        resp_200 = MagicMock()
+        resp_200.raise_for_status = MagicMock()
+        resp_200.json.return_value = [{"id_contrato": "OK"}]
+
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.get.side_effect = [resp_429, resp_200]
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=None)
+
+            with patch("app.services.secop_service.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+                result = await _query_socrata("jbjy-vk9h", "cedula='12345'")
+
+        assert result == [{"id_contrato": "OK"}]
+        assert mock_client.get.call_count == 2
+        mock_sleep.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_exhausts_retries_and_raises_after_bounded_attempts(self) -> None:
+        """429/5xx on every attempt: bounded retries, then raises — never hangs."""
+        from app.services.secop_service import _query_socrata
+
+        mock_request = MagicMock()
+        resp_500 = MagicMock()
+        resp_500.status_code = 500
+        resp_500.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "500", request=mock_request, response=resp_500
+        )
+
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.get.return_value = resp_500
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=None)
+
+            with (
+                patch("app.services.secop_service.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+                pytest.raises(ExternalServiceError),
+            ):
+                await _query_socrata("jbjy-vk9h", "cedula='12345'")
+
+        # Bounded attempts (max 3): 3 calls total, 2 sleeps in between — no hang.
+        assert mock_client.get.call_count == 3
+        assert mock_sleep.call_count == 2
