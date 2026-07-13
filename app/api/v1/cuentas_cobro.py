@@ -424,7 +424,12 @@ async def descargar_informe_actividades(
     return Response(
         content=content,
         media_type=_DOCX_MEDIA_TYPE,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            # Machine-readable draft flag (task 7.5d) — avoids requiring callers to
+            # parse the DOCX body just to detect the BORRADOR header.
+            "X-Es-Borrador": str(informe_service.ES_BORRADOR).lower(),
+        },
     )
 
 
@@ -439,7 +444,10 @@ async def descargar_informe_supervision(
     return Response(
         content=content,
         media_type=_DOCX_MEDIA_TYPE,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Es-Borrador": str(informe_service.ES_BORRADOR).lower(),
+        },
     )
 
 

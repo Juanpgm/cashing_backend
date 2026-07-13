@@ -27,6 +27,7 @@ from app.models.obligacion import Obligacion, TipoObligacion
 from app.models.plantilla_organismo import PlantillaOrganismo
 from app.services import informe_service
 from docx import Document
+from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -145,6 +146,31 @@ async def test_informe_actividades_genera_docx_valido(
     assert "CTR-INF-001" in full_text or any(
         "CTR-INF-001" in cell.text for t in doc.tables for r in t.rows for cell in r.cells
     )
+
+
+# ── es_borrador machine-readable field (slice #7, task 7.5d) ────────────────
+
+
+async def test_es_borrador_is_a_public_constant_true() -> None:
+    """`ES_BORRADOR` is the machine-readable counterpart of `_BORRADOR_HEADER` —
+    every generated informe is currently ALWAYS a draft (no approval workflow)."""
+    assert informe_service.ES_BORRADOR is True
+
+
+async def test_descargar_informe_actividades_incluye_header_es_borrador(
+    client: AsyncClient, test_user: dict[str, Any], cuenta: CuentaCobro
+) -> None:
+    resp = await client.get(f"/api/v1/cuentas-cobro/{cuenta.id}/informe-actividades.docx", headers=test_user["headers"])
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["X-Es-Borrador"] == "true"
+
+
+async def test_descargar_informe_supervision_incluye_header_es_borrador(
+    client: AsyncClient, test_user: dict[str, Any], cuenta: CuentaCobro
+) -> None:
+    resp = await client.get(f"/api/v1/cuentas-cobro/{cuenta.id}/informe-supervision.docx", headers=test_user["headers"])
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["X-Es-Borrador"] == "true"
 
 
 async def test_informe_actividades_sin_actividades_falla(

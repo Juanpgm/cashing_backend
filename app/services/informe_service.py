@@ -70,6 +70,17 @@ _MESES = [
 # (billing-resilience-templates, slice #6, design D6, tasks 6.7-6.8).
 _BORRADOR_HEADER = "BORRADOR — sujeto a revisión"
 
+# Machine-readable counterpart of `_BORRADOR_HEADER` (billing-resilience-templates,
+# slice #7, task 7.5d — carry-over from slice #6 verify-report WARNING 1): design
+# D6's `es_borrador: bool = True` existed ONLY as a DOCX text header, so no API/tool
+# caller could detect draft status without parsing the DOCX. Every informe this
+# service generates is currently ALWAYS a draft (no review/approval workflow exists
+# yet), so this is a constant — never derived, never an LLM decision — exposed for
+# callers that need a programmatic flag: the direct-download endpoints surface it as
+# an `X-Es-Borrador` response header, and `radicacion_prep_service.preparar_radicacion`
+# surfaces it on its result.
+ES_BORRADOR = True
+
 # Progressive narrative bounds (slice #6, design D6) — mirrors the char-budget
 # guard already proven in `requisito_inference_service._MAX_TEXT_CHARS`.
 _MAX_TEXT_CHARS = 14_000
@@ -670,14 +681,18 @@ async def _resolver_estructura_organismo(db: AsyncSession, contrato: Contrato) -
 
     Real lookup (billing-resilience-templates, slice #5, task 5.15 — completes
     the slice #2 stub): delegates to `requisito_inference_service.
-    obtener_plantilla_organismo` (normalized `Contrato.entidad` match). Returns
-    `None` when no template has been ingested for this organism — the packager
-    then falls back to the default numbered folder structure below, exactly as
-    the slice #2 stub always did (zero regression when nothing was ingested).
+    obtener_plantilla_organismo_por_contrato` (normalized `Contrato.entidad`
+    match), passing the `contrato` this function already received — already
+    loaded+ownership-validated by `_load_context` in `generar_zip_evidencias`,
+    so no redundant ownership round-trip (slice #7, task 7.5c; carry-over from
+    slice #5 verify-report SUGGESTION a). Returns `None` when no template has
+    been ingested for this organism — the packager then falls back to the
+    default numbered folder structure below, exactly as the slice #2 stub
+    always did (zero regression when nothing was ingested).
     """
     from app.services import requisito_inference_service
 
-    return await requisito_inference_service.obtener_plantilla_organismo(db, contrato.usuario_id, contrato.id)
+    return await requisito_inference_service.obtener_plantilla_organismo_por_contrato(db, contrato.usuario_id, contrato)
 
 
 @dataclass(frozen=True)
