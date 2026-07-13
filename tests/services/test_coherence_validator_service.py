@@ -555,6 +555,42 @@ async def test_r7_no_finding_when_prior_cuota_not_marked_final(db: AsyncSession,
     assert findings == []
 
 
+async def test_r7_no_finding_when_prorroga_is_before_final_cuota(db: AsyncSession, contrato: Contrato) -> None:
+    """Carry-over fix (slice #4 verify WARNING 1, task 6.10b): design D4 says warn
+    only when a prórroga is LATER than the final cuota's period. A prórroga
+    recorded BEFORE the final cuota's period was already accounted for when that
+    cuota was marked final — it must not produce a stale warning."""
+    await _make_adicion(db, contrato, TipoAdicion.PRORROGA, numero=1, fecha_evento=date(2024, 1, 15))
+    cuenta1 = await _make_cuenta(db, contrato, mes=3, numero_cuota=1, posicion=PosicionCuota.FINAL)
+    cuenta1.informe_final = True
+    db.add(cuenta1)
+    await db.commit()
+    cuenta2 = await _make_cuenta(db, contrato, mes=4, numero_cuota=2, posicion=PosicionCuota.RECURRENTE)
+
+    ctx = await cvs._build_context(db, contrato.usuario_id, cuenta2.id)
+    assert ctx.tiene_prorroga is True
+    findings = cvs.stale_final_after_prorroga(ctx)
+    assert findings == []
+
+
+async def test_r7_soft_finding_when_prorroga_is_after_final_cuota_same_year_different_month(
+    db: AsyncSession, contrato: Contrato
+) -> None:
+    """A prórroga recorded in a LATER month than the final cuota's period still
+    fires the SOFT warning, regardless of exact day within the month."""
+    cuenta1 = await _make_cuenta(db, contrato, mes=1, numero_cuota=1, posicion=PosicionCuota.FINAL)
+    cuenta1.informe_final = True
+    db.add(cuenta1)
+    await db.commit()
+    await _make_adicion(db, contrato, TipoAdicion.PRORROGA, numero=1, fecha_evento=date(2024, 3, 1))
+    cuenta2 = await _make_cuenta(db, contrato, mes=4, numero_cuota=2, posicion=PosicionCuota.RECURRENTE)
+
+    ctx = await cvs._build_context(db, contrato.usuario_id, cuenta2.id)
+    findings = cvs.stale_final_after_prorroga(ctx)
+    assert len(findings) == 1
+    assert findings[0].rule_id == "R7"
+
+
 # ── validar_coherencia entrypoint ─────────────────────────────────────────────
 
 

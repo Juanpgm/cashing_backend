@@ -20,7 +20,10 @@ R7 (`stale_final_after_prorroga`, SOFT, task 4.11-4.12) warns when a recorded
 prórroga event exists and the immediately-preceding cuota is flagged
 `informe_final=True` — it NEVER auto-unflags `informe_final` (design D4,
 Reconciliation Note 3, tasks.md): only a human decides whether that cuota is still
-truly final.
+truly final. Temporal ordering fix (slice #6, task 6.10b): R7 only fires when the
+MOST RECENT prórroga's `fecha_evento` is genuinely LATER (by año/mes) than the
+flagged cuota's own period — a prórroga recorded before that cuota was already
+accounted for when it was marked final, so it must not produce a stale warning.
 
 R1 reads the persisted `CuentaCobro.numero_cuota` field (migration 025, slice #3)
 instead of deriving it from chronological (anio, mes) ordering at read time — the
@@ -35,6 +38,7 @@ import re
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import date
 from decimal import Decimal
 from enum import StrEnum
 from typing import Any
@@ -103,6 +107,11 @@ class ValidationContext:
     adiciones: list[dict[str, Any]] = field(default_factory=list)
     # Whether the contrato has ANY recorded prórroga event (R7, task 4.11).
     tiene_prorroga: bool = False
+    # `fecha_evento` of the MOST RECENT recorded prórroga, if any (R7 temporal
+    # ordering fix, task 6.10b) — used to compare against the prior cuota's own
+    # period so R7 only fires when the prórroga is genuinely LATER than the
+    # cuota it would flag as stale, per design D4.
+    ultima_fecha_prorroga: date | None = None
 
 
 CoherenceRule = Callable[[ValidationContext], list[Finding]]
@@ -344,9 +353,16 @@ def stale_clause_after_adicion(ctx: ValidationContext) -> list[Finding]:
 
 @_register
 def stale_final_after_prorroga(ctx: ValidationContext) -> list[Finding]:
-    """SOFT: a recorded prórroga event extends the contract's term after a cuota
+    """SOFT: a recorded prórroga event extends the contract's term AFTER a cuota
     was already marked `informe_final=True` — that cuota is no longer necessarily
     the contract's last one (spec: "Prórroga extends expected cuota count").
+
+    Temporal ordering (fix, task 6.10b): only fires when the most recent
+    prórroga's `fecha_evento` is genuinely LATER (by year/month) than the
+    flagged cuota's own period — a prórroga recorded BEFORE that cuota was
+    already accounted for when the cuota was marked final, so it must not
+    produce a stale warning (design D4). Comparison is by (año, mes) rather
+    than exact day: the cuota's period IS a month, not a single date.
 
     NEVER auto-unflags `informe_final` (design D4, Reconciliation Note 3,
     tasks.md) — this rule only surfaces a warning; a human decides whether the
@@ -355,6 +371,12 @@ def stale_final_after_prorroga(ctx: ValidationContext) -> list[Finding]:
     if not ctx.tiene_prorroga:
         return []
     if ctx.prior_cuenta is None or not ctx.prior_cuenta.informe_final:
+        return []
+    if ctx.ultima_fecha_prorroga is None:
+        return []
+    prorroga_periodo = (ctx.ultima_fecha_prorroga.year, ctx.ultima_fecha_prorroga.month)
+    final_periodo = (ctx.prior_cuenta.anio, ctx.prior_cuenta.mes)
+    if prorroga_periodo <= final_periodo:
         return []
     return [
         Finding(
@@ -456,7 +478,9 @@ async def _load_documentos(db: AsyncSession, cuenta_id: uuid.UUID) -> list[Docum
     return list(result.scalars().all())
 
 
-async def _load_adiciones_contexto(db: AsyncSession, contrato_id: uuid.UUID) -> tuple[list[dict[str, Any]], bool]:
+async def _load_adiciones_contexto(
+    db: AsyncSession, contrato_id: uuid.UUID
+) -> tuple[list[dict[str, Any]], bool, date | None]:
     """Real `adiciones_contrato` wiring (slice #4, task 4.9 — completes R6, replaces
     the slice #1 stub). Chains each event's `rpc_nuevo`/`cdp_nuevo` against the
     closest EARLIER event that set that same field to build R6's expected
@@ -466,7 +490,8 @@ async def _load_adiciones_contexto(db: AsyncSession, contrato_id: uuid.UUID) -> 
 
     Also returns whether the contrato has ANY recorded prórroga event (R7, task
     4.11) — deliberately independent of the rpc/cdp chain, since a prórroga event
-    need not carry either identifier.
+    need not carry either identifier — and the `fecha_evento` of the MOST RECENT
+    recorded prórroga (R7 temporal ordering fix, task 6.10b), or `None` if none.
     """
     result = await db.execute(
         select(AdicionContrato)
@@ -479,9 +504,12 @@ async def _load_adiciones_contexto(db: AsyncSession, contrato_id: uuid.UUID) -> 
     rpc_anterior: str | None = None
     cdp_anterior: str | None = None
     tiene_prorroga = False
+    ultima_fecha_prorroga: date | None = None
     for evento in eventos:
         if evento.tipo == TipoAdicion.PRORROGA:
             tiene_prorroga = True
+            if ultima_fecha_prorroga is None or evento.fecha_evento > ultima_fecha_prorroga:
+                ultima_fecha_prorroga = evento.fecha_evento
         if evento.rpc_nuevo and rpc_anterior:
             adiciones.append({"rpc_anterior": rpc_anterior, "rpc_nuevo": evento.rpc_nuevo})
         if evento.cdp_nuevo and cdp_anterior:
@@ -490,7 +518,7 @@ async def _load_adiciones_contexto(db: AsyncSession, contrato_id: uuid.UUID) -> 
             rpc_anterior = evento.rpc_nuevo
         if evento.cdp_nuevo:
             cdp_anterior = evento.cdp_nuevo
-    return adiciones, tiene_prorroga
+    return adiciones, tiene_prorroga, ultima_fecha_prorroga
 
 
 async def _build_context(db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: uuid.UUID) -> ValidationContext:
@@ -505,7 +533,7 @@ async def _build_context(db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: uui
     prior_cuenta = await _load_prior_cuenta(db, cuenta)
     documentos = await _load_documentos(db, cuenta.id)
     documentos_prior = await _load_documentos(db, prior_cuenta.id) if prior_cuenta is not None else []
-    adiciones, tiene_prorroga = await _load_adiciones_contexto(db, contrato.id)
+    adiciones, tiene_prorroga, ultima_fecha_prorroga = await _load_adiciones_contexto(db, contrato.id)
 
     return ValidationContext(
         cuenta=cuenta,
@@ -518,6 +546,7 @@ async def _build_context(db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: uui
         numero_cuota_derivado=numero_cuota,
         adiciones=adiciones,
         tiene_prorroga=tiene_prorroga,
+        ultima_fecha_prorroga=ultima_fecha_prorroga,
     )
 
 
