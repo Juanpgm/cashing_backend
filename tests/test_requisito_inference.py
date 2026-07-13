@@ -14,9 +14,7 @@ class _FakeLLM:
     def __init__(self, content: str) -> None:
         self._content = content
 
-    async def complete(
-        self, messages, temperature=0.0, max_tokens=4096, response_format=None, **kwargs
-    ) -> LLMResponse:
+    async def complete(self, messages, temperature=0.0, max_tokens=4096, response_format=None, **kwargs) -> LLMResponse:
         return LLMResponse(
             content=self._content,
             model="fake/test-model",
@@ -130,5 +128,51 @@ async def test_desde_archivo_sin_texto_devuelve_avisos(db: AsyncSession, monkeyp
         db, filename="scan.png", content=b"fake", content_type="image/png"
     )
 
+    assert preview.requisitos == []
+    assert preview.avisos
+
+
+# ── Structured extraction (billing-resilience-templates, slice #7, tasks 7.2-7.3) ──
+
+
+async def test_inferir_requisitos_estructurados_returns_name_category_solo_primera_autogen(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A requirement document listing one-time (first-cuenta) and recurring
+    obligations must yield structured fields: name (etiqueta), category, the
+    `solo_primera_cuenta` flag, and whether autogeneration is supported —
+    not a flat unstructured list."""
+    _patch_llm(
+        monkeypatch,
+        '{"requisitos": ['
+        '{"codigo": "CEDULA", "etiqueta": "Cédula de ciudadanía", "categoria": "identificacion",'
+        ' "solo_primera_cuenta": true, "permite_autogen": false, "obligatorio": true},'
+        '{"codigo": "INFORME_ACTIVIDADES", "etiqueta": "Informe de actividades", "categoria": "informes",'
+        ' "solo_primera_cuenta": false, "permite_autogen": true, "obligatorio": true}'
+        "]}",
+    )
+
+    preview = await svc.inferir_requisitos_estructurados(
+        db, "Aporte cédula (solo primera cuenta) e informe de actividades (cada cuenta)."
+    )
+
+    assert len(preview.requisitos) == 2
+    by_codigo = {r.codigo: r for r in preview.requisitos}
+
+    cedula = by_codigo["CEDULA"]
+    assert cedula.etiqueta == "Cédula de ciudadanía"
+    assert cedula.categoria == "identificacion"
+    assert cedula.solo_primera_cuenta is True
+    assert cedula.permite_autogen is False
+
+    informe = by_codigo["INFORME_ACTIVIDADES"]
+    assert informe.etiqueta == "Informe de actividades"
+    assert informe.categoria == "informes"
+    assert informe.solo_primera_cuenta is False
+    assert informe.permite_autogen is True
+
+
+async def test_inferir_requisitos_estructurados_texto_vacio_no_llama_llm(db: AsyncSession) -> None:
+    preview = await svc.inferir_requisitos_estructurados(db, "   ")
     assert preview.requisitos == []
     assert preview.avisos

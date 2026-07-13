@@ -116,6 +116,68 @@ async def test_asegurar_checklist_is_idempotent(db: AsyncSession, contrato: Cont
     assert len(codigos) == len(set(codigos))
 
 
+async def test_previsualizar_checklist_reflects_structured_requisitos_without_persisting(
+    db: AsyncSession, contrato: Contrato
+) -> None:
+    """billing-resilience-templates, slice #7, tasks 7.4-7.5: given structured
+    (freshly-inferred, NOT YET persisted) requisitos, a checklist preview must
+    reflect them WITHOUT writing anything to the DB until confirmed via the
+    existing `POST /definir`."""
+    from app.schemas.requisito_cuenta import RequisitoEstructuradoItem
+    from sqlalchemy import select
+
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    catalogo = await checklist_service.listar_catalogo(db)
+
+    candidato = RequisitoEstructuradoItem(
+        id=None,
+        codigo="POLIZA_CUMPLIMIENTO",
+        etiqueta="Póliza de cumplimiento",
+        categoria="polizas",
+        obligatorio=True,
+        solo_primera_cuenta=False,
+        permite_autogen=False,
+        origen="inferido",
+    )
+
+    preview = checklist_service.previsualizar_checklist(cuenta, catalogo, [candidato], modo="augment")
+
+    codigos = {f["requisito_codigo"] for f in preview}
+    assert "CONTRATO" in codigos  # standard catalog still included (augment)
+    assert "POLIZA_CUMPLIMIENTO" in codigos  # the structured candidate is reflected
+
+    # Nothing was persisted: no DocumentoCuentaCobro / RequisitoCuenta rows exist.
+    filas = (
+        (await db.execute(select(DocumentoCuentaCobro).where(DocumentoCuentaCobro.cuenta_cobro_id == cuenta.id)))
+        .scalars()
+        .all()
+    )
+    assert list(filas) == []
+
+
+async def test_previsualizar_checklist_solo_primera_cuenta_hidden_on_later_cuenta(
+    db: AsyncSession, contrato: Contrato
+) -> None:
+    from app.schemas.requisito_cuenta import RequisitoEstructuradoItem
+
+    await _make_cuenta(db, contrato, mes=1)
+    cuenta2 = await _make_cuenta(db, contrato, mes=2)
+    catalogo = await checklist_service.listar_catalogo(db)
+
+    candidato = RequisitoEstructuradoItem(
+        id=None,
+        codigo="FICHA_TECNICA_CUSTOM",
+        etiqueta="Ficha técnica custom",
+        solo_primera_cuenta=True,
+        origen="inferido",
+    )
+
+    preview = checklist_service.previsualizar_checklist(cuenta2, catalogo, [candidato], modo="augment")
+
+    codigos = {f["requisito_codigo"] for f in preview}
+    assert "FICHA_TECNICA_CUSTOM" not in codigos
+
+
 async def test_new_cuenta_does_not_inherit_old_cuenta_links(
     db: AsyncSession, contrato: Contrato, test_user: dict[str, Any]
 ) -> None:

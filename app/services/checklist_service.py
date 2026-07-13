@@ -10,7 +10,9 @@ never copied from a previous cuenta.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from decimal import Decimal
+from typing import Protocol
 
 import structlog
 from sqlalchemy import ColumnElement, or_, select
@@ -274,10 +276,23 @@ def _is_first_cuenta(cuenta: CuentaCobro) -> bool:
     return cuenta.posicion == PosicionCuota.PRIMERA
 
 
+class _CustomLike(Protocol):
+    """Structural type: anything with `mapea_a_estandar` and `solo_primera_cuenta`
+    — satisfied by both the persisted `RequisitoCuenta` ORM model AND the
+    non-persisted `RequisitoCuentaItem`/`RequisitoEstructuradoItem` preview
+    schemas, so the same selection logic drives both `asegurar_checklist`
+    (persisting) and `previsualizar_checklist` (non-persisting, slice #7)."""
+
+    mapea_a_estandar: str | None
+    solo_primera_cuenta: bool
+    codigo: str
+    etiqueta: str
+
+
 def _codigos_estandar_a_crear(
     modo: str,
     catalogo: list[RequisitoDocumento],
-    custom: list[RequisitoCuenta],
+    custom: Sequence[_CustomLike],
 ) -> set[str]:
     """Standard catalog codes that apply under the given build mode.
 
@@ -363,6 +378,47 @@ async def asegurar_checklist(db: AsyncSession, cuenta: CuentaCobro) -> list[Docu
         await db.flush()
 
     return [*filas, *creadas]
+
+
+def previsualizar_checklist(
+    cuenta: CuentaCobro,
+    catalogo: list[RequisitoDocumento],
+    candidatos: Sequence[_CustomLike],
+    modo: str,
+) -> list[dict[str, str]]:
+    """Pure, non-persisting preview of which checklist rows `asegurar_checklist`
+    WOULD create for `candidatos` (freshly-inferred/structured, NOT YET
+    persisted `RequisitoCuenta`) under `modo` — mirrors `asegurar_checklist`'s
+    exact row-selection logic without touching the DB or requiring the
+    candidates to exist as rows yet (billing-resilience-templates, slice #7,
+    tasks 7.4-7.5: "checklist preview reflects structured requisitos without
+    persisting until confirmed"). Applying the reviewed set still goes through
+    the existing `POST /definir` -> `asegurar_checklist` (unchanged).
+    """
+    is_first = _is_first_cuenta(cuenta)
+    if modo == "estandar":
+        codigos_estandar = {req.codigo for req in catalogo}
+    else:
+        codigos_estandar = _codigos_estandar_a_crear(modo, catalogo, candidatos)
+
+    preview: list[dict[str, str]] = []
+
+    for req in catalogo:
+        if req.codigo not in codigos_estandar:
+            continue
+        if req.solo_primera_cuenta and not is_first and not es_nivel_contrato(req.codigo):
+            continue
+        preview.append({"requisito_codigo": req.codigo, "etiqueta": req.etiqueta, "origen": "estandar"})
+
+    if modo in ("augment", "reemplazar"):
+        for item in candidatos:
+            if item.mapea_a_estandar:
+                continue
+            if item.solo_primera_cuenta and not is_first:
+                continue
+            preview.append({"requisito_codigo": item.codigo, "etiqueta": item.etiqueta, "origen": "custom"})
+
+    return preview
 
 
 # ── SECOP detection ────────────────────────────────────────────────────────

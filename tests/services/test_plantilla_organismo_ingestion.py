@@ -255,6 +255,54 @@ async def test_ingerir_plantilla_organismo_raises_forbidden_for_other_user(
         await svc.ingerir_plantilla_organismo(db, uuid.uuid4(), contrato_dagma.id, documento_dagma.id)
 
 
+async def test_ingerir_plantilla_organismo_rejects_non_template_tipo(
+    db: AsyncSession, contrato_dagma: Contrato
+) -> None:
+    """Carry-over from slice #5 verify (WARNING + SUGGESTION b), task 7.5b: a
+    CEDULA/RUT DocumentoFuente is NOT a valid ingestion target — only
+    informe_actividades/informe_supervision are template types."""
+    doc = DocumentoFuente(
+        usuario_id=contrato_dagma.usuario_id,
+        contrato_id=contrato_dagma.id,
+        storage_key="documentos/cedula.pdf",
+        nombre="cedula.pdf",
+        tipo=TipoDocumentoFuente.CEDULA,
+    )
+    db.add(doc)
+    await db.commit()
+    await db.refresh(doc)
+
+    with pytest.raises(ValidationError):
+        await svc.ingerir_plantilla_organismo(db, contrato_dagma.usuario_id, contrato_dagma.id, doc.id)
+
+
+async def test_ingerir_plantilla_organismo_accepts_informe_supervision_tipo(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch, contrato_dagma: Contrato
+) -> None:
+    """`informe_supervision` is also a valid template type (not just
+    `informe_actividades`)."""
+    doc = DocumentoFuente(
+        usuario_id=contrato_dagma.usuario_id,
+        contrato_id=contrato_dagma.id,
+        storage_key="documentos/plantilla-supervision.docx",
+        nombre="plantilla-supervision.docx",
+        tipo=TipoDocumentoFuente.INFORME_SUPERVISION,
+    )
+    db.add(doc)
+    await db.commit()
+    await db.refresh(doc)
+
+    monkeypatch.setattr(document_service, "extraer_texto_documento", AsyncMock(return_value=("texto plantilla", [])))
+    monkeypatch.setattr("app.adapters.storage.get_storage", lambda *_a, **_k: _fake_storage(b"docx-bytes"))
+    _patch_llm(monkeypatch, _DAGMA_2COL_JSON)
+
+    plantilla, avisos = await svc.ingerir_plantilla_organismo(db, contrato_dagma.usuario_id, contrato_dagma.id, doc.id)
+    await db.commit()
+
+    assert plantilla is not None
+    assert avisos == []
+
+
 async def test_ingerir_plantilla_organismo_raises_validation_error_when_no_entidad(
     db: AsyncSession, test_user: dict[str, Any]
 ) -> None:

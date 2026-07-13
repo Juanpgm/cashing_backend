@@ -41,3 +41,31 @@ def construir_user_prompt(texto: str) -> str:
         "---\n"
         "Extrae la lista de requisitos/documentos que debe presentar el contratista."
     )
+
+
+# ── Structured extraction (billing-resilience-templates, slice #7) ──────────
+
+REQUISITOS_ESTRUCTURADOS_SYSTEM = (
+    REQUISITOS_SYSTEM
+    + """
+CAMPOS ADICIONALES (extracción estructurada):
+- `categoria`: agrupa el requisito en una categoría corta en minúscula (ej: \
+"identificacion", "seguridad_social", "polizas", "informes", "certificados", "otros").
+- `permite_autogen`: true SOLO si el documento podría generarse automáticamente a \
+partir de datos que el sistema ya tiene (ej: informes de actividades/supervisión); \
+false para cualquier documento que deba aportar un tercero o una entidad externa \
+(pólizas, certificados, RUT, cédula, etc.).
+"""
+)
+
+
+def construir_user_prompt_estructurado(texto: str) -> str:
+    """User message for the structured-extraction variant (same source text,
+    richer schema)."""
+    return (
+        "DOCUMENTO DE LA ENTIDAD CONTRATANTE (extracto):\n"
+        "---\n"
+        f"{texto}\n"
+        "---\n"
+        "Extrae la lista ESTRUCTURADA de requisitos/documentos que debe presentar el contratista."
+    )

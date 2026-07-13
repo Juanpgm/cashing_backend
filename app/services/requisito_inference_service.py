@@ -22,13 +22,16 @@ from app.core.exceptions import ForbiddenError, NotFoundError
 from app.core.exceptions import ValidationError as DomainValidationError
 from app.core.text_match import keyword_score, normalize, strip_accents
 from app.models.contrato import Contrato
-from app.models.documento_fuente import DocumentoFuente
+from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
 from app.models.plantilla_organismo import PlantillaOrganismo
 from app.models.requisito_documento import RequisitoDocumento
 from app.schemas.plantilla_organismo import EstructuraPlantillaLLM
 from app.schemas.requisito_cuenta import (
     RequisitoCuentaItem,
+    RequisitoEstructuradoItem,
     RequisitoInferidoLLM,
+    RequisitosEstructuradosLLM,
+    RequisitosEstructuradosPreview,
     RequisitosInferidosLLM,
     RequisitosInferidosPreview,
 )
@@ -195,6 +198,109 @@ async def inferir_requisitos_desde_archivo(
     return preview
 
 
+# ── Structured requisito extraction (billing-resilience-templates, slice #7) ─
+#
+# Extends `inferir_requisitos`: reuses the exact same catalog-mapping pipeline
+# (`_slug`, `_map_a_estandar`, `_normalizar_keywords`) but requests + returns a
+# RICHER structured output — `categoria` and `permite_autogen` on top of the
+# existing `solo_primera_cuenta` flag — instead of a flat list. Non-persisted
+# preview, same as `inferir_requisitos`: `categoria`/`permite_autogen` are NOT
+# columns on `RequisitoCuenta` (no migration in this slice); applying a
+# reviewed subset still goes through the existing `POST /definir`.
+
+
+async def inferir_requisitos_estructurados(db: AsyncSession, texto: str) -> RequisitosEstructuradosPreview:
+    """Structured variant of `inferir_requisitos`. Does NOT persist anything."""
+    from app.adapters.llm import get_llm
+    from app.agent.prompts.requisitos import (
+        REQUISITOS_ESTRUCTURADOS_SYSTEM,
+        construir_user_prompt_estructurado,
+    )
+    from app.core.config import settings
+    from app.schemas.agent import LLMMessage
+    from app.services import checklist_service
+
+    avisos: list[str] = []
+    texto_limpio = (texto or "").strip()
+    if not texto_limpio:
+        return RequisitosEstructuradosPreview(requisitos=[], avisos=["El texto está vacío."])
+
+    catalogo = await checklist_service.listar_catalogo(db)
+    catalogo_str = "\n".join(f"- {c.codigo}: {c.etiqueta}" for c in catalogo)
+    system = REQUISITOS_ESTRUCTURADOS_SYSTEM.format(catalogo=catalogo_str)
+
+    messages = [
+        LLMMessage(role="system", content=system),
+        LLMMessage(role="user", content=construir_user_prompt_estructurado(texto_limpio[:_MAX_TEXT_CHARS])),
+    ]
+
+    llm = get_llm(model=settings.LLM_EXTRACTION_MODEL or None)
+    try:
+        resp = await llm.complete(
+            messages,
+            temperature=0.0,
+            max_tokens=4096,
+            response_format=RequisitosEstructuradosLLM,
+        )
+    except Exception as exc:
+        await logger.awarning("inferir_requisitos_estructurados_llm_error", error=str(exc)[:200])
+        return RequisitosEstructuradosPreview(
+            requisitos=[],
+            avisos=["No se pudo procesar el documento con el modelo. Intentá de nuevo o pegá el texto."],
+        )
+
+    try:
+        parsed = RequisitosEstructuradosLLM.model_validate_json(resp.content)
+    except ValidationError as exc:
+        await logger.awarning(
+            "inferir_requisitos_estructurados_parse_failed", error=str(exc)[:200], raw=resp.content[:300]
+        )
+        return RequisitosEstructuradosPreview(
+            requisitos=[],
+            avisos=["El modelo no devolvió una lista de requisitos válida. Revisá el documento."],
+        )
+
+    items: list[RequisitoEstructuradoItem] = []
+    vistos: set[str] = set()
+    orden = 500
+    for raw in parsed.requisitos:
+        etiqueta = (raw.etiqueta or "").strip()
+        codigo = _slug(raw.codigo or etiqueta)
+        if not codigo or not etiqueta:
+            continue
+        if codigo in vistos:
+            continue
+        vistos.add(codigo)
+
+        # `_map_a_estandar` only reads `mapea_a_estandar`/`etiqueta`/`descripcion`/
+        # `keywords_deteccion` — `RequisitoEstructuradoLLM` carries all of them.
+        mapea = await _map_a_estandar(raw, codigo, catalogo)
+        items.append(
+            RequisitoEstructuradoItem(
+                id=None,
+                codigo=codigo,
+                etiqueta=etiqueta[:200],
+                categoria=(raw.categoria or "").strip().lower(),
+                descripcion=(raw.descripcion or "").strip() or None,
+                obligatorio=raw.obligatorio,
+                solo_primera_cuenta=raw.solo_primera_cuenta,
+                permite_autogen=raw.permite_autogen,
+                tipo_documento_fuente=None,
+                keywords_deteccion=_normalizar_keywords(raw.keywords_deteccion),
+                orden=orden,
+                mapea_a_estandar=mapea,
+                origen="inferido",
+            )
+        )
+        orden += 10
+
+    if not items:
+        avisos.append("No se detectaron requisitos en el documento.")
+
+    await logger.ainfo("inferir_requisitos_estructurados_ok", detectados=len(items))
+    return RequisitosEstructuradosPreview(requisitos=items, avisos=avisos)
+
+
 # ── Template structure extraction (billing-resilience-templates, slice #5) ───
 #
 # Ingests an institutional informe template (DOCX/PDF) per organism, extracts
@@ -352,6 +458,13 @@ async def inferir_estructura_plantilla(filename: str, content: bytes) -> Estruct
     return await _extraer_estructura_via_vision(content, filename)
 
 
+# Only these DocumentoFuente types are valid ingestion targets for a per-organism
+# template structure — billing-resilience-templates, slice #7, task 7.5b (carry-over
+# from slice #5 verify-report WARNING + SUGGESTION b): a CEDULA/RUT/etc. must never
+# be storable as a plantilla outside this documented domain.
+_TIPOS_PLANTILLA_VALIDOS = {TipoDocumentoFuente.INFORME_ACTIVIDADES, TipoDocumentoFuente.INFORME_SUPERVISION}
+
+
 async def _get_contrato_con_ownership(db: AsyncSession, usuario_id: uuid.UUID, contrato_id: uuid.UUID) -> Contrato:
     contrato = await db.get(Contrato, contrato_id)
     if contrato is None:
@@ -393,6 +506,12 @@ async def ingerir_plantilla_organismo(
         raise NotFoundError("Documento", str(documento_fuente_id))
     if doc.usuario_id != usuario_id:
         raise ForbiddenError()
+    if doc.tipo not in _TIPOS_PLANTILLA_VALIDOS:
+        raise DomainValidationError(
+            "El documento indicado no es un tipo de plantilla institucional válido "
+            "(se esperaba informe_actividades o informe_supervision); no se puede "
+            "ingerir como plantilla de organismo."
+        )
 
     storage = get_storage(settings.S3_BUCKET_DOCUMENTOS)
     content = await storage.download(doc.storage_key)
@@ -443,16 +562,24 @@ async def ingerir_plantilla_organismo(
     return plantilla, []
 
 
-async def obtener_plantilla_organismo(
+async def obtener_plantilla_organismo_por_contrato(
     db: AsyncSession,
     usuario_id: uuid.UUID,
-    contrato_id: uuid.UUID,
+    contrato: Contrato,
     tipo_documento: str = "informe_actividades",
 ) -> PlantillaOrganismo | None:
-    """Read-only lookup of the persisted template structure for a contract's
-    organism (normalized `Contrato.entidad` match). Returns `None` when no
-    template has ever been ingested for that organism/tipo_documento."""
-    contrato = await _get_contrato_con_ownership(db, usuario_id, contrato_id)
+    """Core lookup given an ALREADY loaded+ownership-validated `Contrato`.
+
+    Public (not underscore-prefixed) so a caller that already holds the
+    `Contrato` object — e.g. `informe_service._resolver_estructura_organismo`,
+    which loads+validates it via its own `_load_context` — can skip the
+    redundant ownership round-trip `obtener_plantilla_organismo` performs for
+    callers who only have IDs (billing-resilience-templates, slice #7, task
+    7.5c; carry-over from slice #5 verify-report SUGGESTION a). Mirrors the
+    `document_service.vision_model_chain()` precedent (slice #5, task 5.12) of
+    promoting an internal helper to a public cross-module seam instead of
+    duplicating logic.
+    """
     if not contrato.entidad or not contrato.entidad.strip():
         return None
 
@@ -465,3 +592,16 @@ async def obtener_plantilla_organismo(
         )
     )
     return result.scalar_one_or_none()
+
+
+async def obtener_plantilla_organismo(
+    db: AsyncSession,
+    usuario_id: uuid.UUID,
+    contrato_id: uuid.UUID,
+    tipo_documento: str = "informe_actividades",
+) -> PlantillaOrganismo | None:
+    """Read-only lookup of the persisted template structure for a contract's
+    organism (normalized `Contrato.entidad` match). Returns `None` when no
+    template has ever been ingested for that organism/tipo_documento."""
+    contrato = await _get_contrato_con_ownership(db, usuario_id, contrato_id)
+    return await obtener_plantilla_organismo_por_contrato(db, usuario_id, contrato, tipo_documento)
