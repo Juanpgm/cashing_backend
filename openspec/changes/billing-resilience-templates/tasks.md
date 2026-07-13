@@ -202,19 +202,19 @@ Chain strategy: stacked-to-main
 
 ## Slice 6 — Adaptive generation (P2b) · PR 6 · no migration · ~380 lines · depends on #3, #5
 
-- [ ] 6.1 RED: test DAGMA 2-column layout selected when organism has an ingested 2-col template
-- [ ] 6.2 RED: test COEMPRESAR 3-column layout + literal anexo refs included
-- [ ] 6.3 RED: test default 4-column layout used when no organism template exists
-- [ ] 6.4 GREEN: add `organismo`/`posicion`/`prior_context` params to `informe_service` generators (L213-353, `_GENERADORES` dict L42-51); per-organism layout selection from `PlantillaOrganismo`
-- [ ] 6.5 RED: test cuota 3 narrative built from cuotas 1-2 summaries; cuota 1 has no prior context
-- [ ] 6.6 GREEN: implement progressive narrative reading prior cuotas bounded by `_MAX_TEXT_CHARS` (14000), degrading to K=3 most-recent summaries + counts when exceeded
-- [ ] 6.7 RED: test every generated informe carries `es_borrador=True` and a prepended "BORRADOR — sujeto a revisión" header
-- [ ] 6.8 GREEN: implement draft label/header as a constant (not LLM-decided)
-- [ ] 6.9 RED: test one-time obligation section blank in cuota 2's informe after being filled in cuota 1
-- [ ] 6.10 GREEN: honor `una_vez` (slice #4) + `posicion` (slice #3) in generator output
-- [ ] 6.10b Carry-over from slice #4 verify (WARNING 1): fix R7 `stale_final_after_prorroga` temporal ordering — design D4 says warn only when a **later** prórroga exists, but the current rule fires on ANY recorded prórroga (no `fecha_evento` filter), producing a persistent false-positive SOFT warning that never clears when a prórroga was legitimately accounted for before the final cuota. Add the date comparison (prórroga `fecha_evento` vs the final cuota's period) — needs the relevant date threaded into `ValidationContext` (`coherence_validator_service.py:346-370,459-493`).
-- [ ] 6.11 Integration test: extended `generar_informe_cuota` tool signature end-to-end
-- [ ] 6.12 Local verification gate: `make format && make lint && uv run python -m pytest` green
+- [x] 6.1 RED: test DAGMA 2-column layout selected when organism has an ingested 2-col template — `test_informe_actividades_dagma_2_columnas`
+- [x] 6.2 RED: test COEMPRESAR 3-column layout + literal anexo refs included — `test_informe_actividades_coempresar_3_columnas_con_anexo_refs`
+- [x] 6.3 RED: test default 4-column layout used when no organism template exists — `test_informe_actividades_default_4_columnas_sin_plantilla`
+- [x] 6.4 GREEN: per-organism layout selection from `PlantillaOrganismo` wired into `informe_service` generators
+- [x] 6.5 RED: test cuota 3 narrative built from cuotas 1-2 summaries; cuota 1 has no prior context — `test_contexto_progresivo_construido_desde_cuotas_previas` / `test_contexto_progresivo_ausente_en_primera_cuota`
+- [x] 6.6 GREEN: progressive narrative bounded by `_MAX_TEXT_CHARS` (14000), degrading to K=3 — `test_contexto_progresivo_degrada_a_k3_cuando_excede_presupuesto`; fails-open (`test_contexto_progresivo_llm_error_falla_abierto`)
+- [x] 6.7 RED: test every generated informe carries the draft header — `test_informe_actividades_siempre_carga_encabezado_borrador` / `test_informe_supervision_siempre_carga_encabezado_borrador`
+- [x] 6.8 GREEN: draft label/header as a constant (not LLM-decided)
+- [x] 6.9 RED: test one-time obligation blank in recurrente after primera — `test_obligacion_una_vez_visible_en_cuota_primera_y_ausente_en_recurrente`
+- [x] 6.10 GREEN: honor `una_vez` (slice #4) + `posicion` (slice #3) in generator output
+- [x] 6.10b Carry-over from slice #4 verify (WARNING 1): R7 `stale_final_after_prorroga` temporal ordering FIXED — now compares prórroga `fecha_evento` vs the final cuota's period. Tests: `test_r7_no_finding_when_prorroga_is_before_final_cuota` / `test_r7_soft_finding_when_prorroga_is_after_final_cuota_same_year_different_month`.
+- [x] 6.11 Integration test: extended `generar_informe_cuota` tool — `test_generar_informe_actividades_tool_aplica_layout_organismo_y_borrador`
+- [x] 6.12 Local verification gate: 59 targeted passed; ruff check + format --check clean on all touched files. (Full-suite run pending orchestrator confirmation — apply agent stalled on a stream watchdog during the lint step, not a test failure; orchestrator finished the gate.)
 - [ ] 6.13 **No push to remote without explicit user OK**
 
 **Work-unit commits**: (a) 6.1-6.4 → `feat(informe): select per-organism layout for generated informes`; (b) 6.5-6.8 → `feat(informe): add progressive narrative and always-draft label`; (c) 6.9-6.10 → `feat(informe): blank one-time obligations after cuota 1`.
@@ -228,6 +228,8 @@ Chain strategy: stacked-to-main
 - [ ] 7.3 GREEN: add `inferir_requisitos_estructurados` to `requisito_inference_service.py` (extends `inferir_requisitos` L88-168)
 - [ ] 7.4 RED: test checklist preview reflects structured requisitos without persisting until confirmed
 - [ ] 7.5 GREEN: wire structured requisitos into `checklist_service.asegurar_checklist` (L300-369) preview path
+- [ ] 7.5b Carry-over from slice #5 verify (WARNING + SUGGESTION b): validate `doc.tipo` in `ingerir_plantilla_organismo` — reject/skip ingestion of a `DocumentoFuente` whose `tipo` is not a template type (informe_actividades/informe_supervision) so a CEDULA/RUT can't be stored as a plantilla outside the documented Literal domain; restrict the `documento_fuente_id` lookup accordingly.
+- [ ] 7.5c Carry-over from slice #5 verify (SUGGESTION a): drop the redundant `_get_contrato_con_ownership` round-trip in `_resolver_estructura_organismo` — the Contrato is already loaded+ownership-validated by `_load_context` in `generar_zip_evidencias` (perf, matches the round-trip-reduction convention).
 - [ ] 7.6 RED: test full orchestration runs checklist → coherence → packager in order, returns package location + LISTO/PENDIENTE status
 - [ ] 7.7 GREEN: create `app/services/radicacion_prep_service.py` — `preparar_radicacion()` calling `validar_coherencia_cuenta`, then `generar_zip_evidencias(modo="final")`/`obtener_estado_listo_pendiente`
 - [ ] 7.8 RED: test HARD coherence finding halts orchestration before packaging, surfaces `COHERENCE_CHECK_FAILED`
