@@ -309,11 +309,7 @@ async def test_full_radicacion_journey(
     r = await client.post(f"/api/v1/cuentas-cobro/{cuenta_id}/checklist/refresh-secop", headers=headers)
     assert r.status_code == 200, r.text
     checklist_body = r.json()
-    detectados = {
-        i["requisito"]["codigo"]
-        for i in checklist_body["items"]
-        if i["estado"] in ("detectado", "cargado")
-    }
+    detectados = {i["requisito"]["codigo"] for i in checklist_body["items"] if i["estado"] in ("detectado", "cargado")}
     assert detectados >= _CODIGOS_AUTO_SECOP, f"esperaba auto-detección SECOP, obtuve: {detectados}"
     for codigo in sorted(_CODIGOS_AUTO_SECOP):
         ledger.auto(f"SECOP auto-detectó y vinculó el requisito {codigo}")
@@ -443,6 +439,37 @@ async def test_full_radicacion_journey(
         assert r.json()["estado"] == "cargado"
         ledger.auto("autogen del INFORME_SUPERVISION (DOCX generado desde las actividades)")
 
+    # ── 9b. preparar_radicacion orchestration (billing-resilience-templates, ──
+    # slice #7): collapses what would otherwise be THREE separate agent tool
+    # calls — checklist check, validar_coherencia_cuenta, and
+    # generar_paquete_evidencias — into ONE. This HTTP-driven journey still
+    # calls POST /radicar directly for the actual state transition (step 10
+    # below) — `preparar_radicacion` is the pre-flight readiness+packaging
+    # step an AGENT-DRIVEN flow would run INSTEAD of those 3 separate tool
+    # calls before handing off to `radicar_cuenta`. Logged as ONE auto item —
+    # it does not remove a manual step from THIS HTTP journey (radicar itself
+    # is unavoidable either way), but demonstrates the friction reduction the
+    # new orchestration tool provides for an agent caller.
+    import app.tools.catalog  # noqa: F401 — import-for-side-effect: registers every catalog tool
+    from app.services import informe_service as _informe_service
+    from app.services import radicacion_prep_service
+    from app.tools.catalog.radicacion import PreparaRadicacionInput
+    from app.tools.context import ToolContext
+    from app.tools.invoke import invoke_tool
+
+    with (
+        patch.object(_informe_service, "_get_storage", return_value=_fake_storage()),
+        patch.object(radicacion_prep_service, "_get_storage", return_value=_fake_storage()),
+    ):
+        ctx = ToolContext(db=db, usuario=test_user["user"])
+        prep_result = await invoke_tool("preparar_radicacion", ctx, PreparaRadicacionInput(cuenta_id=cuenta_id))
+    assert prep_result.listo_para_radicar is True
+    assert prep_result.storage_key.startswith("paquetes/")
+    ledger.auto(
+        "preparar_radicacion orquestó checklist + coherencia + empaquetado en UNA sola "
+        "llamada de agente (equivalente manual: 3 llamadas/tools separados)"
+    )
+
     # ── 10. Radicar — now the checklist is complete ─────────────────────────
     final = await client.post(f"/api/v1/cuentas-cobro/{cuenta_id}/radicar", headers=headers)
     assert final.status_code == 200, final.text
@@ -452,11 +479,7 @@ async def test_full_radicacion_journey(
 
     # ── Ledger assertions (the usability regression guard) ──────────────────
     report = ledger.render()
-    assert ledger.manual_count <= 6, (
-        f"Manual input ceiling exceeded ({ledger.manual_count} > 6).{report}"
-    )
-    assert ledger.auto_count >= 8, (
-        f"Auto-resolution floor not met ({ledger.auto_count} < 8).{report}"
-    )
+    assert ledger.manual_count <= 6, f"Manual input ceiling exceeded ({ledger.manual_count} > 6).{report}"
+    assert ledger.auto_count >= 8, f"Auto-resolution floor not met ({ledger.auto_count} < 8).{report}"
 
     print(report)  # noqa: T201 — intentional: -s shows the tally for docs/usability-findings.md
