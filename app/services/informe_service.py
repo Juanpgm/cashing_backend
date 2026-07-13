@@ -17,6 +17,7 @@ from typing import Literal
 
 import structlog
 from docx import Document
+from docx.document import Document as DocxDocument  # real class for type hints; `Document` above is a factory
 from docx.shared import Pt
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -125,7 +126,7 @@ def _formato_valor(v: float) -> str:
     return f"$ {float(v):,.2f}"
 
 
-def _add_kv_table(doc: Document, rows: list[tuple[str, str]]) -> None:
+def _add_kv_table(doc: DocxDocument, rows: list[tuple[str, str]]) -> None:
     """Add a 2-column key/value table for header info."""
     table = doc.add_table(rows=len(rows), cols=2)
     table.style = "Table Grid"
@@ -139,7 +140,7 @@ def _add_kv_table(doc: Document, rows: list[tuple[str, str]]) -> None:
 
 
 def _add_actividades_table(
-    doc: Document,
+    doc: DocxDocument,
     actividades: list[Actividad],
     obligaciones_by_id: dict[uuid.UUID, Obligacion],
     overrides: dict[uuid.UUID, tuple[str, str]] | None = None,
@@ -198,7 +199,7 @@ def _mapear_columna(nombre_columna: str) -> str:
 
 
 def _add_actividades_table_adaptativa(
-    doc: Document,
+    doc: DocxDocument,
     columnas: list[str],
     actividades: list[Actividad],
     obligaciones_by_id: dict[uuid.UUID, Obligacion],
@@ -243,7 +244,7 @@ def _add_actividades_table_adaptativa(
             row.cells[col_idx].text = texto
 
 
-def _add_anexo_refs(doc: Document, anexo_refs: list[str]) -> None:
+def _add_anexo_refs(doc: DocxDocument, anexo_refs: list[str]) -> None:
     """Append the ORGANISM'S OWN literal anexo-reference strings verbatim
     (spec: "Anexo reference preserved verbatim") — never paraphrased."""
     if not anexo_refs:
@@ -254,7 +255,7 @@ def _add_anexo_refs(doc: Document, anexo_refs: list[str]) -> None:
         doc.add_paragraph(ref)
 
 
-def _add_borrador_header(doc: Document) -> None:
+def _add_borrador_header(doc: DocxDocument) -> None:
     """Every generated informe carries this label as its very first paragraph
     (design D6, tasks 6.7-6.8) — a CONSTANT, never an LLM decision."""
     p = doc.add_paragraph(_BORRADOR_HEADER)

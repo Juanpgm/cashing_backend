@@ -215,7 +215,7 @@ Chain strategy: stacked-to-main
 - [x] 6.10b Carry-over from slice #4 verify (WARNING 1): R7 `stale_final_after_prorroga` temporal ordering FIXED — now compares prórroga `fecha_evento` vs the final cuota's period. Tests: `test_r7_no_finding_when_prorroga_is_before_final_cuota` / `test_r7_soft_finding_when_prorroga_is_after_final_cuota_same_year_different_month`.
 - [x] 6.11 Integration test: extended `generar_informe_cuota` tool — `test_generar_informe_actividades_tool_aplica_layout_organismo_y_borrador`
 - [x] 6.12 Local verification gate: 59 targeted passed; ruff check + format --check clean on all touched files. (Full-suite run pending orchestrator confirmation — apply agent stalled on a stream watchdog during the lint step, not a test failure; orchestrator finished the gate.)
-- [ ] 6.13 **No push to remote without explicit user OK**
+- [x] 6.13 **No push to remote without explicit user OK** — not pushed; local commits only (verified `git log origin/master..HEAD` non-empty). Post-verify cleanup (orchestrator): fixed the 7 new mypy `Document`-annotation errors via a `DocxDocument` type alias (informe_service.py now BELOW its pre-slice-6 mypy baseline), ruff+tests still green.
 
 **Work-unit commits**: (a) 6.1-6.4 → `feat(informe): select per-organism layout for generated informes`; (b) 6.5-6.8 → `feat(informe): add progressive narrative and always-draft label`; (c) 6.9-6.10 → `feat(informe): blank one-time obligations after cuota 1`.
 
@@ -230,6 +230,7 @@ Chain strategy: stacked-to-main
 - [ ] 7.5 GREEN: wire structured requisitos into `checklist_service.asegurar_checklist` (L300-369) preview path
 - [ ] 7.5b Carry-over from slice #5 verify (WARNING + SUGGESTION b): validate `doc.tipo` in `ingerir_plantilla_organismo` — reject/skip ingestion of a `DocumentoFuente` whose `tipo` is not a template type (informe_actividades/informe_supervision) so a CEDULA/RUT can't be stored as a plantilla outside the documented Literal domain; restrict the `documento_fuente_id` lookup accordingly.
 - [ ] 7.5c Carry-over from slice #5 verify (SUGGESTION a): drop the redundant `_get_contrato_con_ownership` round-trip in `_resolver_estructura_organismo` — the Contrato is already loaded+ownership-validated by `_load_context` in `generar_zip_evidencias` (perf, matches the round-trip-reduction convention).
+- [ ] 7.5d Carry-over from slice #6 verify (WARNING 1): implement design D6's `es_borrador: bool = True` as a machine-readable field on the informe generation output/tool response (currently only the DOCX text header exists — no API/tool caller can detect draft status without parsing the DOCX). Surface it through `preparar_radicacion`'s result so the orchestration reports draft status programmatically.
 - [ ] 7.6 RED: test full orchestration runs checklist → coherence → packager in order, returns package location + LISTO/PENDIENTE status
 - [ ] 7.7 GREEN: create `app/services/radicacion_prep_service.py` — `preparar_radicacion()` calling `validar_coherencia_cuenta`, then `generar_zip_evidencias(modo="final")`/`obtener_estado_listo_pendiente`
 - [ ] 7.8 RED: test HARD coherence finding halts orchestration before packaging, surfaces `COHERENCE_CHECK_FAILED`
