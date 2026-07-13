@@ -223,24 +223,24 @@ Chain strategy: stacked-to-main
 
 ## Slice 7 — Requisito comprehension + e2e prep (P2c) · PR 7 · no migration · ~300 lines · depends on #1, #2, #5
 
-- [ ] 7.1 **Checkpoint (mandatory): confirm `backend-local-first-sync` merge status / rebase migration numbers** before starting — this slice touches document-reading paths
-- [ ] 7.2 RED: test structured extraction returns name/category/`solo_primera_cuenta`/autogen-support fields from a requirement document
-- [ ] 7.3 GREEN: add `inferir_requisitos_estructurados` to `requisito_inference_service.py` (extends `inferir_requisitos` L88-168)
-- [ ] 7.4 RED: test checklist preview reflects structured requisitos without persisting until confirmed
-- [ ] 7.5 GREEN: wire structured requisitos into `checklist_service.asegurar_checklist` (L300-369) preview path
-- [ ] 7.5b Carry-over from slice #5 verify (WARNING + SUGGESTION b): validate `doc.tipo` in `ingerir_plantilla_organismo` — reject/skip ingestion of a `DocumentoFuente` whose `tipo` is not a template type (informe_actividades/informe_supervision) so a CEDULA/RUT can't be stored as a plantilla outside the documented Literal domain; restrict the `documento_fuente_id` lookup accordingly.
-- [ ] 7.5c Carry-over from slice #5 verify (SUGGESTION a): drop the redundant `_get_contrato_con_ownership` round-trip in `_resolver_estructura_organismo` — the Contrato is already loaded+ownership-validated by `_load_context` in `generar_zip_evidencias` (perf, matches the round-trip-reduction convention).
-- [ ] 7.5d Carry-over from slice #6 verify (WARNING 1): implement design D6's `es_borrador: bool = True` as a machine-readable field on the informe generation output/tool response (currently only the DOCX text header exists — no API/tool caller can detect draft status without parsing the DOCX). Surface it through `preparar_radicacion`'s result so the orchestration reports draft status programmatically.
-- [ ] 7.6 RED: test full orchestration runs checklist → coherence → packager in order, returns package location + LISTO/PENDIENTE status
-- [ ] 7.7 GREEN: create `app/services/radicacion_prep_service.py` — `preparar_radicacion()` calling `validar_coherencia_cuenta`, then `generar_zip_evidencias(modo="final")`/`obtener_estado_listo_pendiente`
-- [ ] 7.8 RED: test HARD coherence finding halts orchestration before packaging, surfaces `COHERENCE_CHECK_FAILED`
-- [ ] 7.9 GREEN: implement halt-before-packaging branch
-- [ ] 7.10 RED: test secret detection halts orchestration, surfaces `SECRET_DETECTED_IN_PACKAGE`
-- [ ] 7.11 GREEN: propagate packager exception through orchestration
-- [ ] 7.12 RED+GREEN: `app/tools/catalog/` — `inferir_requisitos_estructurados` (read), `preparar_radicacion` (write)
-- [ ] 7.13 Update `tests/journey/test_full_radicacion_journey.py` JourneyLedger — deliberately add the new orchestration step(s); confirm UX friction is acceptable
-- [ ] 7.14 Local verification gate: `make format && make lint && uv run python -m pytest` green
-- [ ] 7.15 **No push to remote without explicit user OK**
+- [x] 7.1 **Checkpoint (mandatory): confirm `backend-local-first-sync` merge status / rebase migration numbers** before starting — this slice touches document-reading paths — confirmed `_process_uploaded_document` absent from `document_service.py` (branch not merged); this slice adds NO migration, so no rebase/renumbering is needed.
+- [x] 7.2 RED: test structured extraction returns name/category/`solo_primera_cuenta`/autogen-support fields from a requirement document
+- [x] 7.3 GREEN: add `inferir_requisitos_estructurados` to `requisito_inference_service.py` (extends `inferir_requisitos` L88-168) — new `RequisitoEstructuradoLLM(RequisitoInferidoLLM)` schema (adds `categoria`/`permite_autogen`) + `REQUISITOS_ESTRUCTURADOS_SYSTEM` prompt; reuses `_slug`/`_map_a_estandar`/`_normalizar_keywords` unchanged.
+- [x] 7.4 RED: test checklist preview reflects structured requisitos without persisting until confirmed
+- [x] 7.5 GREEN: wire structured requisitos into `checklist_service.asegurar_checklist` (L300-369) preview path — new PURE `previsualizar_checklist()` (no DB writes) reusing `_codigos_estandar_a_crear` (generalized to a `_CustomLike` Protocol so it accepts both persisted `RequisitoCuenta` and non-persisted preview items) and `_is_first_cuenta`'s exact selection logic.
+- [x] 7.5b Carry-over from slice #5 verify (WARNING + SUGGESTION b): validate `doc.tipo` in `ingerir_plantilla_organismo` — reject/skip ingestion of a `DocumentoFuente` whose `tipo` is not a template type (informe_actividades/informe_supervision) so a CEDULA/RUT can't be stored as a plantilla outside the documented Literal domain; restrict the `documento_fuente_id` lookup accordingly. — Raises `ValidationError` (matches the existing "sin entidad" pattern) via new `_TIPOS_PLANTILLA_VALIDOS` set.
+- [x] 7.5c Carry-over from slice #5 verify (SUGGESTION a): drop the redundant `_get_contrato_con_ownership` round-trip in `_resolver_estructura_organismo` — the Contrato is already loaded+ownership-validated by `_load_context` in `generar_zip_evidencias` (perf, matches the round-trip-reduction convention). — New public `obtener_plantilla_organismo_por_contrato(db, usuario_id, contrato, tipo_documento)` (mirrors the `document_service.vision_model_chain()` public-promotion precedent, slice #5 task 5.12); `obtener_plantilla_organismo` now delegates to it.
+- [x] 7.5d Carry-over from slice #6 verify (WARNING 1): implement design D6's `es_borrador: bool = True` as a machine-readable field on the informe generation output/tool response (currently only the DOCX text header exists — no API/tool caller can detect draft status without parsing the DOCX). Surface it through `preparar_radicacion`'s result so the orchestration reports draft status programmatically. — New public `informe_service.ES_BORRADOR = True` constant; surfaced as an `X-Es-Borrador` response header on the two direct DOCX download endpoints AND as `es_borrador` on `PreparaRadicacionResponse`.
+- [x] 7.6 RED: test full orchestration runs checklist → coherence → packager in order, returns package location + LISTO/PENDIENTE status
+- [x] 7.7 GREEN: create `app/services/radicacion_prep_service.py` — `preparar_radicacion()` calling `validar_coherencia_cuenta`, then `generar_zip_evidencias(modo="final")`/`obtener_estado_listo_pendiente`
+- [x] 7.8 RED: test HARD coherence finding halts orchestration before packaging, surfaces `COHERENCE_CHECK_FAILED`
+- [x] 7.9 GREEN: implement halt-before-packaging branch
+- [x] 7.10 RED: test secret detection halts orchestration, surfaces `SECRET_DETECTED_IN_PACKAGE`
+- [x] 7.11 GREEN: propagate packager exception through orchestration — both `SECRET_DETECTED_IN_PACKAGE` and `PACKAGE_PENDIENTE` propagate unchanged (no try/except wrapping the packager call).
+- [x] 7.12 RED+GREEN: `app/tools/catalog/` — `inferir_requisitos_estructurados` (read, new `requisitos.py`), `preparar_radicacion` (write, new `radicacion.py`); new `app/schemas/radicacion_prep.py` (`PreparaRadicacionResponse`).
+- [x] 7.13 Update `tests/journey/test_full_radicacion_journey.py` JourneyLedger — added step 9b: `invoke_tool("preparar_radicacion", ...)` demonstrating the 3-tool-calls-into-1 collapse for an agent-driven flow, logged as 1 new auto item (auto_count 14→15). Manual count UNCHANGED at 6 (still at the ceiling) — this HTTP-driven journey still calls `POST /radicar` directly for the actual state transition; `preparar_radicacion` doesn't remove that call, it's the pre-flight readiness+packaging step an AGENT would run INSTEAD of 3 separate tool calls before handing off to `radicar_cuenta`. UX friction confirmed acceptable: no regression, net-new capability demonstrated inline.
+- [x] 7.14 Local verification gate: `make format && make lint && uv run python -m pytest` green — see slice verification note below.
+- [x] 7.15 **No push to remote without explicit user OK** — not pushed; commits are local only.
 
 **Work-unit commits**: (a) 7.2-7.5 → `feat(requisitos): extract structured requisitos and drive checklist preview`; (b) 7.6-7.12 → `feat(radicacion): orchestrate checklist, coherence, and packaging in preparar_radicacion`; (c) 7.13 → `test(journey): update ledger for radicacion-prep orchestration step`.
 
