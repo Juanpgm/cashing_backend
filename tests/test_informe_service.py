@@ -13,16 +13,18 @@ import uuid
 import zipfile
 from datetime import date
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from app.core.config import settings
 from app.core.exceptions import ForbiddenError, ValidationError
+from app.core.text_match import normalize
 from app.models.actividad import Actividad
 from app.models.contrato import Contrato
-from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
+from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro, PosicionCuota
 from app.models.evidencia import Evidencia
 from app.models.obligacion import Obligacion, TipoObligacion
+from app.models.plantilla_organismo import PlantillaOrganismo
 from app.services import informe_service
 from docx import Document
 from sqlalchemy import select
@@ -452,3 +454,342 @@ async def test_obtener_estado_listo_pendiente_sin_zip(
     assert len(listos) == 1
     assert estado.pendientes == 2
     assert estado.listo_para_radicar is False
+
+
+# ── Adaptive generation (billing-resilience-templates, slice #6) ───────────
+#
+# Per-organism layout selection, always-draft header, progressive narrative,
+# and one-time obligation blanking. `generar_informe_actividades_docx`/
+# `generar_informe_supervision_docx` keep their exact `(db, usuario_id,
+# cuenta_id) -> (bytes, filename)` public signature — organismo/posicion/
+# prior_context are resolved INTERNALLY from the already-loaded contrato/cuenta
+# rather than added as new required params (design mentions adding params to
+# the generators; every existing call site — `checklist_autogen_service.
+# _GENERADORES`, `app/api/v1/cuentas_cobro.py`, the two informe tools — calls
+# them positionally with exactly 3 args, so widening the signature would be a
+# breaking, undeclared change to 3+ call sites for no behavioral benefit).
+
+
+@pytest.fixture
+async def contrato_dagma(db: AsyncSession, test_user: dict[str, Any]) -> Contrato:
+    user = test_user["user"]
+    c = Contrato(
+        usuario_id=user.id,
+        numero_contrato="CTR-DAGMA-001",
+        objeto="Servicios profesionales ambientales",
+        valor_total=24_000_000,
+        valor_mensual=2_000_000,
+        fecha_inicio=date(2024, 1, 1),
+        fecha_fin=date(2024, 12, 31),
+        entidad="DAGMA",
+        dependencia="Ambiental",
+        supervisor_nombre="Sup DAGMA",
+    )
+    db.add(c)
+    await db.commit()
+    await db.refresh(c)
+    return c
+
+
+@pytest.fixture
+async def contrato_coempresar(db: AsyncSession, test_user: dict[str, Any]) -> Contrato:
+    user = test_user["user"]
+    c = Contrato(
+        usuario_id=user.id,
+        numero_contrato="CTR-COEMPRESAR-001",
+        objeto="Servicios profesionales de saneamiento",
+        valor_total=24_000_000,
+        valor_mensual=2_000_000,
+        fecha_inicio=date(2024, 1, 1),
+        fecha_fin=date(2024, 12, 31),
+        entidad="COEMPRESAR",
+        dependencia="Operaciones",
+        supervisor_nombre="Sup Coempresar",
+    )
+    db.add(c)
+    await db.commit()
+    await db.refresh(c)
+    return c
+
+
+async def _make_obligaciones(db: AsyncSession, contrato: Contrato, n: int = 2) -> list[Obligacion]:
+    obs = [
+        Obligacion(
+            contrato_id=contrato.id,
+            descripcion=f"Obligación contractual #{i + 1} con texto suficientemente largo",
+            tipo=TipoObligacion.GENERAL,
+            orden=i,
+        )
+        for i in range(n)
+    ]
+    db.add_all(obs)
+    await db.commit()
+    for o in obs:
+        await db.refresh(o)
+    contrato.obligaciones = list(obs)
+    return obs
+
+
+async def _make_cuenta_con_actividades(
+    db: AsyncSession,
+    contrato: Contrato,
+    obligaciones: list[Obligacion],
+    mes: int,
+    anio: int = 2024,
+    numero_cuota: int | None = None,
+    posicion: PosicionCuota = PosicionCuota.RECURRENTE,
+) -> CuentaCobro:
+    cc = CuentaCobro(
+        contrato_id=contrato.id,
+        mes=mes,
+        anio=anio,
+        estado=EstadoCuentaCobro.BORRADOR,
+        valor=2_000_000,
+        numero_cuota=numero_cuota,
+        posicion=posicion,
+    )
+    db.add(cc)
+    await db.commit()
+    await db.refresh(cc)
+    for i, ob in enumerate(obligaciones):
+        db.add(
+            Actividad(
+                cuenta_cobro_id=cc.id,
+                obligacion_id=ob.id,
+                descripcion=f"Actividad realizada {i + 1} en {mes}/{anio}",
+                justificacion=f"Justificación detallada {i + 1} en {mes}/{anio}",
+                fecha_realizacion=date(anio, mes, 10),
+            )
+        )
+    await db.commit()
+    await db.refresh(cc)
+    return cc
+
+
+async def _ingerir_plantilla(
+    db: AsyncSession,
+    contrato: Contrato,
+    columnas: list[str],
+    anexo_refs: list[str] | None = None,
+    tipo_documento: str = "informe_actividades",
+) -> PlantillaOrganismo:
+    plantilla = PlantillaOrganismo(
+        usuario_id=contrato.usuario_id,
+        entidad=contrato.entidad,
+        entidad_normalizada=normalize(contrato.entidad),
+        tipo_documento=tipo_documento,
+        formato="docx",
+        estructura_json={
+            "columnas": columnas,
+            "secciones": [],
+            "anexo_refs": anexo_refs or [],
+            "notas": "",
+        },
+    )
+    db.add(plantilla)
+    await db.commit()
+    await db.refresh(plantilla)
+    return plantilla
+
+
+# ── Per-organism layout selection (6.1-6.4) ─────────────────────────────────
+
+
+async def test_informe_actividades_dagma_2_columnas(
+    db: AsyncSession, test_user: dict[str, Any], contrato_dagma: Contrato
+) -> None:
+    """DAGMA-style organism: 2-column layout (obligación | avance), no evidence
+    column — scenario spec `adaptive-informe-generation`."""
+    user = test_user["user"]
+    obligaciones = await _make_obligaciones(db, contrato_dagma)
+    await _ingerir_plantilla(db, contrato_dagma, columnas=["Obligación", "Avance del periodo"])
+    cuenta = await _make_cuenta_con_actividades(db, contrato_dagma, obligaciones, mes=1, numero_cuota=1)
+
+    content, _filename = await informe_service.generar_informe_actividades_docx(db, user.id, cuenta.id)
+    doc = Document(io.BytesIO(content))
+    tabla = doc.tables[1]
+    headers = [c.text for c in tabla.rows[0].cells]
+    assert headers == ["Obligación", "Avance del periodo"]
+    assert len(tabla.columns) == 2
+    assert not any("evidenc" in h.lower() for h in headers)
+
+
+async def test_informe_actividades_coempresar_3_columnas_con_anexo_refs(
+    db: AsyncSession, test_user: dict[str, Any], contrato_coempresar: Contrato
+) -> None:
+    """COEMPRESAR-style organism: 3-column layout (+ evidencia) and the literal
+    anexo reference from the ingested template appears verbatim in the DOCX."""
+    user = test_user["user"]
+    obligaciones = await _make_obligaciones(db, contrato_coempresar)
+    anexo_ref = "Ver Anexo: Carpeta /5. EVIDENCIAS/A1"
+    await _ingerir_plantilla(
+        db,
+        contrato_coempresar,
+        columnas=["Obligación", "Avance del periodo", "Evidencia"],
+        anexo_refs=[anexo_ref],
+    )
+    cuenta = await _make_cuenta_con_actividades(db, contrato_coempresar, obligaciones, mes=1, numero_cuota=1)
+
+    content, _filename = await informe_service.generar_informe_actividades_docx(db, user.id, cuenta.id)
+    doc = Document(io.BytesIO(content))
+    tabla = doc.tables[1]
+    headers = [c.text for c in tabla.rows[0].cells]
+    assert headers == ["Obligación", "Avance del periodo", "Evidencia"]
+    full_text = "\n".join(p.text for p in doc.paragraphs)
+    assert anexo_ref in full_text
+
+
+async def test_informe_actividades_default_4_columnas_sin_plantilla(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro
+) -> None:
+    """No organism template ingested — the current default 4-column layout is
+    used unchanged (zero regression)."""
+    user = test_user["user"]
+    content, _filename = await informe_service.generar_informe_actividades_docx(db, user.id, cuenta.id)
+    doc = Document(io.BytesIO(content))
+    tabla = doc.tables[1]
+    headers = [c.text for c in tabla.rows[0].cells]
+    assert headers == ["#", "Obligación", "Actividad realizada", "Justificación"]
+
+
+# ── Always-draft header (6.7-6.8) ───────────────────────────────────────────
+
+
+async def test_informe_actividades_siempre_carga_encabezado_borrador(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro
+) -> None:
+    user = test_user["user"]
+    content, _filename = await informe_service.generar_informe_actividades_docx(db, user.id, cuenta.id)
+    doc = Document(io.BytesIO(content))
+    full_text = "\n".join(p.text for p in doc.paragraphs)
+    assert "BORRADOR" in full_text
+    assert "sujeto a revisión" in full_text
+
+
+async def test_informe_supervision_siempre_carga_encabezado_borrador(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro
+) -> None:
+    user = test_user["user"]
+    content, _filename = await informe_service.generar_informe_supervision_docx(db, user.id, cuenta.id)
+    doc = Document(io.BytesIO(content))
+    full_text = "\n".join(p.text for p in doc.paragraphs)
+    assert "BORRADOR" in full_text
+
+
+# ── Progressive narrative (6.5-6.6) ─────────────────────────────────────────
+
+
+async def test_contexto_progresivo_ausente_en_primera_cuota(db: AsyncSession, contrato_dagma: Contrato) -> None:
+    obligaciones = await _make_obligaciones(db, contrato_dagma)
+    cuenta1 = await _make_cuenta_con_actividades(
+        db, contrato_dagma, obligaciones, mes=1, numero_cuota=1, posicion=PosicionCuota.PRIMERA
+    )
+    contexto = await informe_service._construir_contexto_progresivo(db, contrato_dagma.id, cuenta1)
+    assert contexto is None
+
+
+async def test_contexto_progresivo_construido_desde_cuotas_previas(db: AsyncSession, contrato_dagma: Contrato) -> None:
+    """Cuota 3's narrative is built from cuotas 1 and 2's recorded activity text."""
+    obligaciones = await _make_obligaciones(db, contrato_dagma)
+    await _make_cuenta_con_actividades(
+        db, contrato_dagma, obligaciones, mes=1, numero_cuota=1, posicion=PosicionCuota.PRIMERA
+    )
+    await _make_cuenta_con_actividades(db, contrato_dagma, obligaciones, mes=2, numero_cuota=2)
+    cuenta3 = await _make_cuenta_con_actividades(db, contrato_dagma, obligaciones, mes=3, numero_cuota=3)
+
+    fake_resp = MagicMock()
+    fake_resp.content = "Narrativa progresiva sintetizada."
+    mock_llm = AsyncMock()
+    mock_llm.complete = AsyncMock(return_value=fake_resp)
+
+    with patch.object(informe_service, "get_llm", return_value=mock_llm):
+        contexto = await informe_service._construir_contexto_progresivo(db, contrato_dagma.id, cuenta3)
+
+    assert contexto == "Narrativa progresiva sintetizada."
+    mock_llm.complete.assert_awaited_once()
+    prompt_sent = str(mock_llm.complete.call_args)
+    assert "1/2024" in prompt_sent
+    assert "2/2024" in prompt_sent
+
+
+async def test_contexto_progresivo_llm_error_falla_abierto(db: AsyncSession, contrato_dagma: Contrato) -> None:
+    """A narrative-synthesis LLM failure degrades to the raw joined summaries —
+    it never blocks or raises (mirrors `_convertir_actividades_tercera_persona`)."""
+    obligaciones = await _make_obligaciones(db, contrato_dagma)
+    await _make_cuenta_con_actividades(
+        db, contrato_dagma, obligaciones, mes=1, numero_cuota=1, posicion=PosicionCuota.PRIMERA
+    )
+    cuenta2 = await _make_cuenta_con_actividades(db, contrato_dagma, obligaciones, mes=2, numero_cuota=2)
+
+    mock_llm = AsyncMock()
+    mock_llm.complete = AsyncMock(side_effect=RuntimeError("llm down"))
+
+    with patch.object(informe_service, "get_llm", return_value=mock_llm):
+        contexto = await informe_service._construir_contexto_progresivo(db, contrato_dagma.id, cuenta2)
+
+    assert contexto is not None
+    assert "Actividad realizada 1 en 1/2024" in contexto
+
+
+async def test_contexto_progresivo_degrada_a_k3_cuando_excede_presupuesto(
+    db: AsyncSession, contrato_dagma: Contrato, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the bounded char budget is exceeded, degrade to the K=3 most recent
+    summaries + a note about how many were omitted."""
+    monkeypatch.setattr(informe_service, "_MAX_TEXT_CHARS", 10)
+    obligaciones = await _make_obligaciones(db, contrato_dagma, n=1)
+    for mes in range(1, 5):
+        await _make_cuenta_con_actividades(db, contrato_dagma, obligaciones, mes=mes, numero_cuota=mes)
+    cuenta5 = await _make_cuenta_con_actividades(db, contrato_dagma, obligaciones, mes=5, numero_cuota=5)
+
+    mock_llm = AsyncMock()
+    mock_llm.complete = AsyncMock(side_effect=RuntimeError("skip llm, inspect raw block"))
+
+    with patch.object(informe_service, "get_llm", return_value=mock_llm):
+        contexto = await informe_service._construir_contexto_progresivo(db, contrato_dagma.id, cuenta5)
+
+    assert contexto is not None
+    assert "1/2024" not in contexto  # oldest cuota omitted
+    assert "2/2024" in contexto
+    assert "3/2024" in contexto
+    assert "4/2024" in contexto
+    assert "se omiten" in contexto.lower()
+
+
+# ── One-time obligation blanking (6.9-6.10) ─────────────────────────────────
+
+
+async def test_obligacion_una_vez_visible_en_cuota_primera_y_ausente_en_recurrente(
+    db: AsyncSession, test_user: dict[str, Any], contrato_dagma: Contrato
+) -> None:
+    user = test_user["user"]
+    obligaciones = await _make_obligaciones(db, contrato_dagma, n=2)
+    obligacion_unica = obligaciones[0]
+    obligacion_unica.una_vez = True
+    db.add(obligacion_unica)
+    await db.commit()
+
+    cuenta1 = await _make_cuenta_con_actividades(
+        db, contrato_dagma, obligaciones, mes=1, numero_cuota=1, posicion=PosicionCuota.PRIMERA
+    )
+    cuenta2 = await _make_cuenta_con_actividades(db, contrato_dagma, obligaciones, mes=2, numero_cuota=2)
+
+    content1, _f1 = await informe_service.generar_informe_actividades_docx(db, user.id, cuenta1.id)
+    doc1 = Document(io.BytesIO(content1))
+    tabla1 = doc1.tables[1]
+    body1 = "\n".join(cell.text for row in tabla1.rows for cell in row.cells)
+    assert obligacion_unica.descripcion in body1
+
+    # cuenta2 has a prior cuota, so `_construir_contexto_progresivo` would call
+    # the LLM to synthesize a narrative — mock it to keep this test offline and
+    # deterministic (fails open if unmocked, but must never hit the network).
+    mock_llm = AsyncMock()
+    mock_llm.complete = AsyncMock(return_value=MagicMock(content="Narrativa de prueba."))
+    with patch.object(informe_service, "get_llm", return_value=mock_llm):
+        content2, _f2 = await informe_service.generar_informe_actividades_docx(db, user.id, cuenta2.id)
+    doc2 = Document(io.BytesIO(content2))
+    tabla2 = doc2.tables[1]
+    body2 = "\n".join(cell.text for row in tabla2.rows for cell in row.cells)
+    assert obligacion_unica.descripcion not in body2
+    # The regular (not una_vez) obligación is still reported every cuota.
+    assert obligaciones[1].descripcion in body2

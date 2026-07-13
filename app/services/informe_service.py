@@ -29,6 +29,7 @@ from app.agent.prompts.supervision_tercera_persona import (
     build_tercera_persona_prompt,
     parse_tercera_persona,
 )
+from app.core import text_match
 from app.core.config import settings
 from app.core.exceptions import (
     ACTIVIDADES_MISSING,
@@ -40,7 +41,7 @@ from app.core.exceptions import (
 )
 from app.models.actividad import Actividad
 from app.models.contrato import Contrato
-from app.models.cuenta_cobro import CuentaCobro
+from app.models.cuenta_cobro import CuentaCobro, PosicionCuota
 from app.models.obligacion import Obligacion
 from app.models.plantilla_organismo import PlantillaOrganismo
 from app.models.usuario import Usuario
@@ -63,6 +64,22 @@ _MESES = [
     "Noviembre",
     "Diciembre",
 ]
+
+# Every generated informe carries this label — a CONSTANT, NEVER an LLM decision
+# (billing-resilience-templates, slice #6, design D6, tasks 6.7-6.8).
+_BORRADOR_HEADER = "BORRADOR — sujeto a revisión"
+
+# Progressive narrative bounds (slice #6, design D6) — mirrors the char-budget
+# guard already proven in `requisito_inference_service._MAX_TEXT_CHARS`.
+_MAX_TEXT_CHARS = 14_000
+_K_RESUMENES_RECIENTES = 3
+
+_NARRATIVA_SYSTEM_PROMPT = (
+    "Eres un asistente que redacta un párrafo breve (máximo 3-4 frases) resumiendo, "
+    "en tercera persona y en español neutro, el avance reportado en cuotas anteriores "
+    "de un contrato de prestación de servicios. Usa SOLO la información entregada, sin "
+    "inventar datos nuevos."
+)
 
 
 # ── Internal helpers ────────────────────────────────────────────────────────
@@ -158,6 +175,235 @@ def _add_actividades_table(
         row.cells[3].text = justificacion_text
 
 
+# ── Adaptive generation (billing-resilience-templates, slice #6) ────────────
+
+
+def _mapear_columna(nombre_columna: str) -> str:
+    """Classify an ORGANISM'S OWN ingested column name into a semantic render
+    slot. Unknown/unrecognized columns render blank rather than guessing —
+    zero risk of putting the wrong content in a column we can't confidently
+    identify."""
+    norm = text_match.normalize(nombre_columna)
+    if "oblig" in norm:
+        return "obligacion"
+    if "evidenc" in norm:
+        return "evidencia"
+    if "justific" in norm:
+        return "justificacion"
+    if "avance" in norm or "activ" in norm or "cumplim" in norm:
+        return "avance"
+    if norm in {"#", "no", "n", "num", "numero"}:
+        return "numero"
+    return "otro"
+
+
+def _add_actividades_table_adaptativa(
+    doc: Document,
+    columnas: list[str],
+    actividades: list[Actividad],
+    obligaciones_by_id: dict[uuid.UUID, Obligacion],
+    overrides: dict[uuid.UUID, tuple[str, str]] | None = None,
+) -> None:
+    """Render the activities table using the organism's OWN ingested column
+    layout instead of the fixed 4-column default (per-organism layout
+    selection, slice #6, tasks 6.1-6.4). Column CONTENT is classified by
+    `_mapear_columna`; a column this can't confidently classify renders blank
+    rather than risk misplacing content in the wrong slot.
+    """
+    table = doc.add_table(rows=1 + len(actividades), cols=len(columnas))
+    table.style = "Table Grid"
+    for i, h in enumerate(columnas):
+        cell = table.cell(0, i)
+        cell.text = h
+        for paragraph in cell.paragraphs:
+            for run in paragraph.runs:
+                run.bold = True
+
+    slots = [_mapear_columna(c) for c in columnas]
+    for idx, act in enumerate(actividades, start=1):
+        row = table.rows[idx]
+        ob = obligaciones_by_id.get(act.obligacion_id) if act.obligacion_id else None
+        override = overrides.get(act.id) if overrides else None
+        actividad_text = override[0] if override else act.descripcion
+        justificacion_text = override[1] if override else (act.justificacion or "—")
+        for col_idx, slot in enumerate(slots):
+            if slot == "numero":
+                texto = str(idx)
+            elif slot == "obligacion":
+                texto = ob.descripcion if ob else "—"
+            elif slot == "avance":
+                texto = actividad_text
+            elif slot == "justificacion":
+                texto = justificacion_text
+            elif slot == "evidencia":
+                count = len(act.evidencias) if act.evidencias else 0
+                texto = f"{count} archivo(s)" if count else "—"
+            else:
+                texto = "—"
+            row.cells[col_idx].text = texto
+
+
+def _add_anexo_refs(doc: Document, anexo_refs: list[str]) -> None:
+    """Append the ORGANISM'S OWN literal anexo-reference strings verbatim
+    (spec: "Anexo reference preserved verbatim") — never paraphrased."""
+    if not anexo_refs:
+        return
+    doc.add_paragraph()
+    doc.add_heading("Referencias a anexos", level=2)
+    for ref in anexo_refs:
+        doc.add_paragraph(ref)
+
+
+def _add_borrador_header(doc: Document) -> None:
+    """Every generated informe carries this label as its very first paragraph
+    (design D6, tasks 6.7-6.8) — a CONSTANT, never an LLM decision."""
+    p = doc.add_paragraph(_BORRADOR_HEADER)
+    p.alignment = 1  # center
+    for run in p.runs:
+        run.bold = True
+
+
+async def _resolver_layout_organismo(
+    db: AsyncSession, contrato: Contrato, tipo_documento: str
+) -> PlantillaOrganismo | None:
+    """Look up the ingested per-organism template structure for THIS document
+    type (informe_actividades / informe_supervision) to select the informe's
+    column layout (slice #6). Independent of `_resolver_estructura_organismo`
+    (slice #5), which always resolves the "informe_actividades" structure for
+    the evidence ZIP's folder naming regardless of which DOCX is generated.
+    Fails open (returns None) on any lookup error — a layout-selection failure
+    must never block informe generation; the caller falls back to the default
+    fixed layout exactly as when no template was ever ingested.
+    """
+    from app.services import requisito_inference_service
+
+    try:
+        return await requisito_inference_service.obtener_plantilla_organismo(
+            db, contrato.usuario_id, contrato.id, tipo_documento=tipo_documento
+        )
+    except Exception as exc:  # a lookup failure must not block generation
+        await logger.awarning("informe_layout_organismo_lookup_failed", contrato_id=str(contrato.id), error=str(exc))
+        return None
+
+
+def _filtrar_actividades_una_vez(
+    actividades: list[Actividad],
+    cuenta: CuentaCobro,
+    obligaciones_by_id: dict[uuid.UUID, Obligacion],
+) -> list[Actividad]:
+    """Omit content for one-time (`Obligacion.una_vez`) obligations in every
+    cuota AFTER the contrato's first one (spec: "One-time obligations blank
+    after cuota 1", tasks 6.9-6.10). The cuota's own `posicion` (slice #3,
+    persisted — never re-derived here) decides, NOT `numero_cuota`, since a
+    legacy/backfilled row's `numero_cuota` may be absent."""
+    if cuenta.posicion == PosicionCuota.PRIMERA:
+        return actividades
+    return [
+        act
+        for act in actividades
+        if not (
+            act.obligacion_id is not None
+            and (ob := obligaciones_by_id.get(act.obligacion_id)) is not None
+            and ob.una_vez
+        )
+    ]
+
+
+async def _resumen_cuota(db: AsyncSession, cuenta: CuentaCobro) -> str:
+    """Best-effort text summary of a prior cuota's reported activities, used ONLY
+    as progressive-narrative context (slice #6) — never persisted, never shown
+    to the caller directly (it's synthesized further by `_generar_narrativa_progresiva`)."""
+    result = await db.execute(select(Actividad).where(Actividad.cuenta_cobro_id == cuenta.id))
+    partes: list[str] = []
+    for act in result.scalars().all():
+        texto = (act.descripcion or "").strip()
+        if act.justificacion:
+            texto = f"{texto} — {act.justificacion.strip()}" if texto else act.justificacion.strip()
+        if texto:
+            partes.append(texto)
+    return "; ".join(partes)
+
+
+async def _cargar_cuotas_previas(
+    db: AsyncSession, contrato_id: uuid.UUID, cuenta_actual: CuentaCobro
+) -> list[CuentaCobro]:
+    """Every cuota of the SAME contrato with `numero_cuota < cuenta_actual.numero_cuota`,
+    chronologically ordered. Returns an empty list for the first cuota (or any cuota
+    missing `numero_cuota`) — no prior context can exist."""
+    if cuenta_actual.numero_cuota is None or cuenta_actual.numero_cuota <= 1:
+        return []
+    result = await db.execute(
+        select(CuentaCobro)
+        .where(
+            CuentaCobro.contrato_id == contrato_id,
+            CuentaCobro.deleted_at.is_(None),
+            CuentaCobro.numero_cuota.is_not(None),
+            CuentaCobro.numero_cuota < cuenta_actual.numero_cuota,
+        )
+        .order_by(CuentaCobro.numero_cuota.asc())
+    )
+    return list(result.scalars().all())
+
+
+async def _generar_narrativa_progresiva(bloque_contexto: str) -> str:
+    """LLM-synthesize a short narrative from the bounded prior-cuota context
+    block. Fails OPEN exactly like `_convertir_actividades_tercera_persona`:
+    any LLM error or empty response falls back to the raw `bloque_contexto`
+    itself, so a narrative-synthesis failure never blocks informe generation.
+    """
+    try:
+        llm = get_llm()
+        resp = await llm.complete(
+            [
+                LLMMessage(role="system", content=_NARRATIVA_SYSTEM_PROMPT),
+                LLMMessage(role="user", content=bloque_contexto),
+            ],
+            temperature=0.2,
+            max_tokens=400,
+        )
+        texto = (resp.content or "").strip()
+        return texto or bloque_contexto
+    except Exception as exc:
+        await logger.awarning("informe_narrativa_progresiva_llm_error", error=str(exc))
+        return bloque_contexto
+
+
+async def _construir_contexto_progresivo(
+    db: AsyncSession, contrato_id: uuid.UUID, cuenta_actual: CuentaCobro
+) -> str | None:
+    """Build the progressive-narrative context for cuota N from cuotas 1..N-1 of
+    the SAME contrato (billing-resilience-templates, slice #6, design D6).
+    Returns `None` for the first cuota (no prior context exists). Bounded by
+    `_MAX_TEXT_CHARS`; when the joined summaries exceed it, degrades to the
+    `_K_RESUMENES_RECIENTES` most-recent summaries + a note of how many were
+    omitted (design D6, mirrors `requisito_inference_service`'s char-budget
+    guard). Fails open — any loading error returns `None` rather than raising,
+    since a missing narrative must never block informe generation.
+    """
+    try:
+        previas = await _cargar_cuotas_previas(db, contrato_id, cuenta_actual)
+        if not previas:
+            return None
+        resumenes = [(pc.numero_cuota, _periodo_str(pc), await _resumen_cuota(db, pc)) for pc in previas]
+    except Exception as exc:
+        await logger.awarning("informe_contexto_progresivo_load_failed", error=str(exc))
+        return None
+
+    total_chars = sum(len(texto) for _n, _p, texto in resumenes)
+    if total_chars > _MAX_TEXT_CHARS:
+        recientes = resumenes[-_K_RESUMENES_RECIENTES:]
+        omitidas = len(resumenes) - len(recientes)
+        partes = [
+            f"(se omiten {omitidas} cuota(s) anteriores por longitud; se muestran las {len(recientes)} más recientes)"
+        ]
+        partes += [f"Cuota {n} ({periodo}): {texto}" for n, periodo, texto in recientes]
+    else:
+        partes = [f"Cuota {n} ({periodo}): {texto}" for n, periodo, texto in resumenes]
+
+    bloque = "\n".join(partes)
+    return await _generar_narrativa_progresiva(bloque)
+
+
 async def _convertir_actividades_tercera_persona(
     actividades: list[Actividad],
 ) -> dict[uuid.UUID, tuple[str, str]]:
@@ -226,7 +472,14 @@ async def _convertir_actividades_tercera_persona(
 async def generar_informe_actividades_docx(
     db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: uuid.UUID
 ) -> tuple[bytes, str]:
-    """Generate the contractor's activities report as DOCX. Returns (bytes, filename)."""
+    """Generate the contractor's activities report as DOCX. Returns (bytes, filename).
+
+    Adaptive generation (billing-resilience-templates, slice #6): organismo,
+    posicion, and prior-cuota context are resolved INTERNALLY from `contrato`/
+    `cuenta` (already loaded by `_load_context`) rather than accepted as extra
+    params — every existing call site keeps calling this with exactly 3
+    positional args.
+    """
     cuenta, contrato, usuario, obligaciones, actividades = await _load_context(db, usuario_id, cuenta_id)
     if not actividades:
         raise ValidationError(
@@ -235,11 +488,16 @@ async def generar_informe_actividades_docx(
         )
 
     obligaciones_by_id = {ob.id: ob for ob in obligaciones}
+    actividades_visibles = _filtrar_actividades_una_vez(actividades, cuenta, obligaciones_by_id)
+    layout = await _resolver_layout_organismo(db, contrato, "informe_actividades")
+    contexto_progresivo = await _construir_contexto_progresivo(db, contrato.id, cuenta)
 
     doc = Document()
     style = doc.styles["Normal"]
     style.font.name = "Calibri"
     style.font.size = Pt(11)
+
+    _add_borrador_header(doc)
 
     title = doc.add_heading("Informe de actividades del contratista", level=1)
     title.alignment = 1  # center
@@ -261,9 +519,19 @@ async def generar_informe_actividades_docx(
         ],
     )
 
+    if contexto_progresivo:
+        doc.add_paragraph()
+        doc.add_heading("Contexto de cuotas anteriores", level=2)
+        doc.add_paragraph(contexto_progresivo)
+
     doc.add_paragraph()
     doc.add_heading("Actividades realizadas", level=2)
-    _add_actividades_table(doc, actividades, obligaciones_by_id)
+    columnas = layout.estructura_json.get("columnas") if layout else None
+    if columnas:
+        _add_actividades_table_adaptativa(doc, columnas, actividades_visibles, obligaciones_by_id)
+        _add_anexo_refs(doc, layout.estructura_json.get("anexo_refs") or [])  # type: ignore[union-attr]
+    else:
+        _add_actividades_table(doc, actividades_visibles, obligaciones_by_id)
 
     doc.add_paragraph()
     doc.add_paragraph(
@@ -293,7 +561,12 @@ async def generar_informe_actividades_docx(
 async def generar_informe_supervision_docx(
     db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: uuid.UUID
 ) -> tuple[bytes, str]:
-    """Generate the supervisor's report as DOCX. Returns (bytes, filename)."""
+    """Generate the supervisor's report as DOCX. Returns (bytes, filename).
+
+    Adaptive generation (billing-resilience-templates, slice #6): see
+    `generar_informe_actividades_docx`'s docstring — organismo/posicion/prior
+    context are resolved internally, the public signature is unchanged.
+    """
     cuenta, contrato, usuario, obligaciones, actividades = await _load_context(db, usuario_id, cuenta_id)
     if not actividades:
         raise ValidationError(
@@ -302,12 +575,17 @@ async def generar_informe_supervision_docx(
         )
 
     obligaciones_by_id = {ob.id: ob for ob in obligaciones}
-    overrides = await _convertir_actividades_tercera_persona(actividades)
+    actividades_visibles = _filtrar_actividades_una_vez(actividades, cuenta, obligaciones_by_id)
+    overrides = await _convertir_actividades_tercera_persona(actividades_visibles)
+    layout = await _resolver_layout_organismo(db, contrato, "informe_supervision")
+    contexto_progresivo = await _construir_contexto_progresivo(db, contrato.id, cuenta)
 
     doc = Document()
     style = doc.styles["Normal"]
     style.font.name = "Calibri"
     style.font.size = Pt(11)
+
+    _add_borrador_header(doc)
 
     title = doc.add_heading("Informe de supervisión", level=1)
     title.alignment = 1
@@ -329,6 +607,11 @@ async def generar_informe_supervision_docx(
         ],
     )
 
+    if contexto_progresivo:
+        doc.add_paragraph()
+        doc.add_heading("Contexto de cuotas anteriores", level=2)
+        doc.add_paragraph(contexto_progresivo)
+
     doc.add_paragraph()
     doc.add_heading("Verificación del cumplimiento", level=2)
     doc.add_paragraph(
@@ -338,7 +621,12 @@ async def generar_informe_supervision_docx(
     )
 
     doc.add_heading("Actividades verificadas", level=2)
-    _add_actividades_table(doc, actividades, obligaciones_by_id, overrides=overrides)
+    columnas = layout.estructura_json.get("columnas") if layout else None
+    if columnas:
+        _add_actividades_table_adaptativa(doc, columnas, actividades_visibles, obligaciones_by_id, overrides=overrides)
+        _add_anexo_refs(doc, layout.estructura_json.get("anexo_refs") or [])  # type: ignore[union-attr]
+    else:
+        _add_actividades_table(doc, actividades_visibles, obligaciones_by_id, overrides=overrides)
 
     doc.add_paragraph()
     doc.add_heading("Concepto del supervisor", level=2)
