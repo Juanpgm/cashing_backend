@@ -251,6 +251,61 @@ async def test_crear_cuenta_cobro_sin_valor_ni_valor_mensual_falla(db: AsyncSess
 
 
 # ---------------------------------------------------------------------------
+# fecha_transaccion (radicacion-stepper, work unit B1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_crear_cuenta_cobro_persiste_fecha_transaccion(db: AsyncSession) -> None:
+    """CuentaCobroCreate.fecha_transaccion is stored on the created CuentaCobro row."""
+    user = await _make_user(db, creditos=100)
+    contrato = await _make_contrato(db, user.id)
+    await db.commit()
+
+    data = CuentaCobroCreate(
+        contrato_id=contrato.id,
+        mes=1,
+        anio=2024,
+        valor=Decimal("3000000.00"),
+        fecha_transaccion=date(2024, 1, 15),
+    )
+    resp = await cuenta_cobro_service.crear_cuenta_cobro(db, user.id, data)
+
+    assert resp.fecha_transaccion == date(2024, 1, 15)
+
+    persisted = await db.get(CuentaCobro, resp.id)
+    assert persisted is not None
+    assert persisted.fecha_transaccion == date(2024, 1, 15)
+
+
+@pytest.mark.asyncio
+async def test_crear_cuenta_cobro_sin_fecha_transaccion_queda_null(db: AsyncSession) -> None:
+    """Omitting fecha_transaccion leaves the column NULL (optional field)."""
+    user = await _make_user(db, creditos=100)
+    contrato = await _make_contrato(db, user.id)
+    await db.commit()
+
+    data = CuentaCobroCreate(contrato_id=contrato.id, mes=1, anio=2024, valor=Decimal("3000000.00"))
+    resp = await cuenta_cobro_service.crear_cuenta_cobro(db, user.id, data)
+
+    assert resp.fecha_transaccion is None
+
+
+@pytest.mark.asyncio
+async def test_cuenta_cobro_legacy_row_carga_fecha_transaccion_null(db: AsyncSession) -> None:
+    """Legacy rows created directly on the model (pre-existing, without the new
+    field set) load with fecha_transaccion=None — the column is additive and
+    non-breaking."""
+    user = await _make_user(db, creditos=100)
+    contrato = await _make_contrato(db, user.id)
+    cuenta = await _make_cuenta(db, contrato.id)
+    await db.commit()
+
+    fetched = await cuenta_cobro_service.obtener_cuenta_cobro(db, user.id, cuenta.id)
+    assert fetched.fecha_transaccion is None
+
+
+# ---------------------------------------------------------------------------
 # listar / obtener
 # ---------------------------------------------------------------------------
 

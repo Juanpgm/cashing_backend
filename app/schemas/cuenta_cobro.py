@@ -57,6 +57,14 @@ class CuentaCobroCreate(BaseModel):
             "a second attempt raises CUOTA_POSITION_CONFLICT."
         ),
     )
+    fecha_transaccion: date | None = Field(
+        default=None,
+        description=(
+            "Optional transaction/payment date (radicacion-stepper, work unit B1). "
+            "Captured at stepper step 2; used as the bounding date for month-scoped "
+            "pipelines when present, falling back to mes/anio when absent."
+        ),
+    )
 
     model_config = {
         "json_schema_extra": {
@@ -66,6 +74,7 @@ class CuentaCobroCreate(BaseModel):
                 "anio": 2025,
                 "valor": "2000000.00",
                 "informe_final": False,
+                "fecha_transaccion": "2025-03-31",
             }
         }
     }
@@ -101,6 +110,7 @@ class CuentaCobroResponse(BaseModel):
     numero_cuota: int | None
     posicion: PosicionCuota
     informe_final: bool
+    fecha_transaccion: date | None
     actividades: list[ActividadResponse]
     created_at: datetime
     updated_at: datetime
@@ -129,6 +139,7 @@ class CuentaCobroListItem(BaseModel):
     numero_cuota: int | None
     posicion: PosicionCuota
     informe_final: bool
+    fecha_transaccion: date | None
     created_at: datetime
     updated_at: datetime
 

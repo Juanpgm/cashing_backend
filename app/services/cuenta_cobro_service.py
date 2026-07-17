@@ -325,6 +325,7 @@ async def crear_cuenta_cobro(
         numero_cuota=numero_cuota,
         posicion=posicion,
         informe_final=data.informe_final,
+        fecha_transaccion=data.fecha_transaccion,
     )
     db.add(cuenta)
     await db.flush()

@@ -2,9 +2,9 @@
 
 import enum
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, Numeric, String, UniqueConstraint, Uuid
+from sqlalchemy import Boolean, Date, DateTime, Enum, ForeignKey, Integer, Numeric, String, UniqueConstraint, Uuid
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -68,6 +68,12 @@ class CuentaCobro(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
         default=PosicionCuota.RECURRENTE,
     )
     informe_final: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    # Transaction date (radicacion-stepper, work unit B1, migration 028). Nullable,
+    # additive, non-breaking — legacy rows load with NULL. Set at stepper step 2;
+    # used as the bounding date for month-scoped pipelines (evidence discovery,
+    # justification) when present, falling back to mes/anio when absent.
+    fecha_transaccion: Mapped[date | None] = mapped_column(Date, nullable=True)
 
     # Relationships
     contrato: Mapped["Contrato"] = relationship(back_populates="cuentas_cobro")  # type: ignore[name-defined]  # noqa: F821
