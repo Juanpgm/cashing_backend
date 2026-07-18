@@ -65,9 +65,7 @@ class LocalStorageAdapter:
                 pass
 
         raise FileNotFoundError(
-            f'Could not find "{key}" in local storage'
-            + (" or S3 fallback" if settings.S3_ACCESS_KEY else "")
-            + "."
+            f'Could not find "{key}" in local storage' + (" or S3 fallback" if settings.S3_ACCESS_KEY else "") + "."
         )
 
     async def presigned_url(self, key: str, expires_in: int = 3600) -> str:

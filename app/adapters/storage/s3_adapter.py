@@ -96,9 +96,7 @@ class S3StorageAdapter:
                 Prefix=prefix,
             ),
         )
-        return [
-            StorageObjectInfo(key=item["Key"], size_bytes=item["Size"]) for item in response.get("Contents", [])
-        ]
+        return [StorageObjectInfo(key=item["Key"], size_bytes=item["Size"]) for item in response.get("Contents", [])]
 
 
 def get_storage() -> S3StorageAdapter:

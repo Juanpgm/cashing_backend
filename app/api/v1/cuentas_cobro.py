@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from dataclasses import asdict
 from datetime import date
 from typing import cast
 
@@ -21,6 +22,7 @@ from app.models.borrador_cuenta_cobro import BorradorCuentaCobro
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
 from app.schemas.cobertura import CoberturaResponse
+from app.schemas.coherence import FindingOut
 from app.schemas.cuenta_cobro import (
     ActividadCreate,
     ActividadesBulkCreate,
@@ -36,6 +38,8 @@ from app.schemas.cuenta_cobro import (
     PDFUrlResponse,
 )
 from app.schemas.google_workspace import EvidencePersistRequest, EvidencePersistSummary
+from app.schemas.paquete import PaqueteInfoResponse
+from app.schemas.radicacion_prep import PreparaRadicacionResponse
 from app.schemas.stepper_state import StepperStateResponse
 from app.services import (
     cobertura_service,
@@ -44,6 +48,7 @@ from app.services import (
     cuenta_cobro_service,
     evidence_persist_service,
     informe_service,
+    paquete_service,
     pdf_signature_service,
     stepper_state_service,
 )
@@ -105,6 +110,50 @@ async def obtener_stepper_state(
     contiguous-prefix resume algorithm).
     """
     return await stepper_state_service.obtener_stepper_state(db, user.id, cuenta_id)
+
+
+@router.get("/{cuenta_id}/paquete", response_model=PaqueteInfoResponse)
+async def obtener_paquete(
+    cuenta_id: uuid.UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> PaqueteInfoResponse:
+    """Read-only package listing: current package metadata + LISTO/PENDIENTE
+    content summary, without regenerating anything.
+
+    `existe: false` when no package has been generated for this cuota yet.
+    Produces no storage writes and no packaging call — only a storage-prefix
+    read via `StoragePort` (radicacion-stepper, work unit B5).
+    """
+    return await paquete_service.listar_paquete(db, user.id, cuenta_id)
+
+
+@router.post("/{cuenta_id}/paquete/regenerar", response_model=PreparaRadicacionResponse)
+async def regenerar_paquete(
+    cuenta_id: uuid.UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> PreparaRadicacionResponse:
+    """Regenerate the evidence package: thin delegate to `radicacion_prep_
+    service.preparar_radicacion` — the single fail-closed readiness gate
+    (checklist -> coherence HARD-stop -> packager with secret scan).
+
+    Re-running against the same cuota overwrites the deterministic storage
+    key (radicacion-stepper, work unit B5 — design section 6). Never bypasses
+    the gate: `CHECKLIST_INCOMPLETE`, `COHERENCE_CHECK_FAILED`, `PACKAGE_
+    PENDIENTE`, and `SECRET_DETECTED_IN_PACKAGE` all still raise through here.
+    """
+    resultado = await paquete_service.regenerar_paquete(db, user.id, cuenta_id)
+    return PreparaRadicacionResponse(
+        cuenta_cobro_id=resultado.cuenta_cobro_id,
+        storage_key=resultado.storage_key,
+        filename=resultado.filename,
+        size_bytes=resultado.size_bytes,
+        listo_para_radicar=resultado.listo_para_radicar,
+        pendientes=resultado.pendientes,
+        advertencias_coherencia=[FindingOut(**asdict(f)) for f in resultado.advertencias_coherencia],
+        es_borrador=resultado.es_borrador,
+    )
 
 
 @router.delete("/{cuenta_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)

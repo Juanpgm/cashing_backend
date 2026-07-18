@@ -1,0 +1,81 @@
+"""Package listing + regenerate (radicacion-stepper, work unit B5).
+
+`listar_paquete` is a READ-ONLY preview of the current package state: reads
+package metadata from the deterministic storage prefix via `StoragePort.
+list_objects` and composes it with `informe_service.obtener_estado_listo_
+pendiente`. Zero storage writes, zero packaging calls, zero credit changes.
+
+`regenerar_paquete` is a thin delegate to `radicacion_prep_service.
+preparar_radicacion` — the single fail-closed readiness gate (checklist ->
+coherence HARD-stop -> packager with secret scan). It NEVER calls the lighter
+`informe_service.generar_zip_evidencias` directly, and it re-implements
+NONE of the gate logic: "regenerate" just means "re-run preparar_radicacion".
+Because the storage key is deterministic (`paquetes/{usuario_id}/{cuenta_id}/
+evidencias-{numero_contrato}-{anio}-{mes:02d}.zip`), regenerating overwrites
+the same object — exactly one current package per (cuota, contrato period),
+design section 6 ("storage-key lifecycle").
+"""
+
+from __future__ import annotations
+
+import uuid
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.adapters.storage import get_storage as _get_storage
+from app.core.config import settings
+from app.schemas.paquete import ObligacionEstadoOut, PaqueteInfoResponse
+from app.services import cuenta_cobro_service, informe_service, radicacion_prep_service
+from app.services.radicacion_prep_service import RadicacionPrepResultado
+
+
+def _clave_paquete(
+    usuario_id: uuid.UUID, cuenta_id: uuid.UUID, numero_contrato: str, anio: int, mes: int
+) -> tuple[str, str, str]:
+    """Mirrors `radicacion_prep_service.preparar_radicacion`'s own key
+    construction exactly (`{filename}` there comes from `informe_service.
+    generar_zip_evidencias`'s deterministic naming). Returns
+    ``(prefix, filename, storage_key)``."""
+    filename = f"evidencias-{numero_contrato}-{anio}-{mes:02d}.zip"
+    prefix = f"paquetes/{usuario_id}/{cuenta_id}/"
+    return prefix, filename, f"{prefix}{filename}"
+
+
+async def listar_paquete(db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: uuid.UUID) -> PaqueteInfoResponse:
+    """Read-only package listing. Never uploads, never packages, never charges
+    credits — only a storage-prefix read (`StoragePort.list_objects`) plus the
+    same read-only LISTO/PENDIENTE split `generar_zip_evidencias` uses
+    internally."""
+    cuenta = await cuenta_cobro_service._get_cuenta_con_ownership(db, usuario_id, cuenta_id)
+    contrato = cuenta.contrato
+    estado = await informe_service.obtener_estado_listo_pendiente(db, usuario_id, cuenta_id)
+
+    prefix, filename, storage_key = _clave_paquete(
+        usuario_id, cuenta_id, contrato.numero_contrato, cuenta.anio, cuenta.mes
+    )
+
+    storage = _get_storage(settings.S3_BUCKET_EVIDENCIAS)
+    objetos = await storage.list_objects(prefix)
+    objeto = next((o for o in objetos if o.key == storage_key), None)
+
+    return PaqueteInfoResponse(
+        cuenta_cobro_id=cuenta_id,
+        existe=objeto is not None,
+        storage_key=storage_key,
+        filename=filename,
+        size_bytes=objeto.size_bytes if objeto is not None else 0,
+        listo_para_radicar=estado.listo_para_radicar,
+        pendientes=estado.pendientes,
+        obligaciones=[
+            ObligacionEstadoOut(obligacion_id=o.obligacion_id, descripcion=o.descripcion, listo=o.listo)
+            for o in estado.obligaciones
+        ],
+    )
+
+
+async def regenerar_paquete(db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: uuid.UUID) -> RadicacionPrepResultado:
+    """Thin delegate — no gate re-implementation, no bypass. All fail-closed
+    codes (`CHECKLIST_INCOMPLETE`, `COHERENCE_CHECK_FAILED`, `PACKAGE_
+    PENDIENTE`, `SECRET_DETECTED_IN_PACKAGE`) propagate unchanged from
+    `preparar_radicacion`."""
+    return await radicacion_prep_service.preparar_radicacion(db, usuario_id, cuenta_id)
