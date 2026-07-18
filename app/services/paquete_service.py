@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.storage import get_storage as _get_storage
 from app.core.config import settings
+from app.core.exceptions import NotFoundError
 from app.schemas.paquete import ObligacionEstadoOut, PaqueteInfoResponse
 from app.services import cuenta_cobro_service, informe_service, radicacion_prep_service
 from app.services.radicacion_prep_service import RadicacionPrepResultado
@@ -48,6 +49,11 @@ async def listar_paquete(db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: uui
     internally."""
     cuenta = await cuenta_cobro_service._get_cuenta_con_ownership(db, usuario_id, cuenta_id)
     contrato = cuenta.contrato
+    # B7 Fix 4: `_get_cuenta_con_ownership` only filters `CuentaCobro.deleted_at`,
+    # not the joined `Contrato.deleted_at` — reject soft-deleted contracts here
+    # (new call site) rather than in the shared helper.
+    if contrato.deleted_at is not None:
+        raise NotFoundError("Contrato", str(contrato.id))
     estado = await informe_service.obtener_estado_listo_pendiente(db, usuario_id, cuenta_id)
 
     prefix, filename, storage_key = _clave_paquete(
@@ -77,5 +83,12 @@ async def regenerar_paquete(db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: 
     """Thin delegate — no gate re-implementation, no bypass. All fail-closed
     codes (`CHECKLIST_INCOMPLETE`, `COHERENCE_CHECK_FAILED`, `PACKAGE_
     PENDIENTE`, `SECRET_DETECTED_IN_PACKAGE`) propagate unchanged from
-    `preparar_radicacion`."""
+    `preparar_radicacion`.
+
+    B7 Fix 4: pre-checks contrato aliveness (see `listar_paquete`'s comment —
+    same rationale) before delegating, so a soft-deleted contract's cuota
+    cannot be regenerated/packaged."""
+    cuenta = await cuenta_cobro_service._get_cuenta_con_ownership(db, usuario_id, cuenta_id)
+    if cuenta.contrato.deleted_at is not None:
+        raise NotFoundError("Contrato", str(cuenta.contrato_id))
     return await radicacion_prep_service.preparar_radicacion(db, usuario_id, cuenta_id)

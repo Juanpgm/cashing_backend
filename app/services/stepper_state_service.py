@@ -31,6 +31,17 @@ exists/list capability yet; adding one is B5's job (`GET /paquete`). Until B5
 lands, steps 6 and 7 report the same boolean here — this does not affect the
 contiguous-prefix algorithm or the double-charge invariant, the two
 guarantees this unit is tested against.
+
+Batch B7 (post-review fixes, see apply-progress.md and design.md's
+"Amendments" section): (1) steps 1/4 no longer hard-require
+`obligaciones_count > 0` — a zero-obligation contract is now internally
+consistent with steps 6/7's pre-existing vacuous completion, mirroring the
+real gates. (2) the response now carries the server-computed month-scoping
+window (`ventana_inicio`/`ventana_fin`/`ventana_advertencia`, from
+`app.core.month_scoping.calcular_ventana_mes`), killing that helper's
+dead-code status and the cross-repo duplication risk. (3) a soft-deleted
+`Contrato` is now rejected with `NotFoundError` here, since the shared
+`_get_cuenta_con_ownership` helper only filters `CuentaCobro.deleted_at`.
 """
 
 from __future__ import annotations
@@ -40,7 +51,8 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import CHECKLIST_INCOMPLETE, PACKAGE_PENDIENTE
+from app.core.exceptions import CHECKLIST_INCOMPLETE, PACKAGE_PENDIENTE, NotFoundError
+from app.core.month_scoping import calcular_ventana_mes
 from app.models.actividad import Actividad
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, PosicionCuota
@@ -53,8 +65,15 @@ _TOTAL_STEPS = 7
 
 
 async def _step1_contrato(db: AsyncSession, cuenta: CuentaCobro, contrato: Contrato) -> StepState:
-    """contract exists AND nivel-contrato mandatory docs satisfied AND
-    contrato.obligaciones non-empty."""
+    """contract exists AND nivel-contrato mandatory docs satisfied.
+
+    B7 Fix 1: does NOT require `contrato.obligaciones` to be non-empty. The
+    real radicación gates (`construir_checklist_completo`,
+    `generar_zip_evidencias`, `generar_actividades_agente`'s "obligaciones OR
+    texto_contrato" branch) all permit a zero-obligation contract — gating
+    step 1 on obligaciones_count > 0 would permanently block a contract the
+    rest of the pipeline considers radicable. `obligaciones` is still
+    surfaced in `detail` as a count, just not used to gate completeness."""
     obligaciones_count = len(contrato.obligaciones)
 
     catalogo = await checklist_service.listar_catalogo(db)
@@ -85,7 +104,7 @@ async def _step1_contrato(db: AsyncSession, cuenta: CuentaCobro, contrato: Contr
         tipos_presentes = {row[0] for row in result.all()}
         docs_ok = all(tipo in tipos_presentes for tipo in codigos_necesarios)
 
-    complete = obligaciones_count > 0 and docs_ok
+    complete = docs_ok
     return StepState(
         step=1,
         key="contrato",
@@ -139,12 +158,17 @@ def _step3_checklist(cuenta: CuentaCobro) -> StepState:
 
 
 def _step4_justificaciones(contrato: Contrato, actividades: list[Actividad]) -> StepState:
-    """>= 1 Actividad per obligation."""
+    """>= 1 Actividad per obligation, OR vacuously complete when the contract
+    has zero obligaciones (B7 Fix 1 — mirrors `generar_actividades_agente`'s
+    "obligaciones OR texto_contrato" branch, which permits generating
+    activities for a zero-obligation contract from the contract text alone;
+    those activities simply carry `obligacion_id=None`, so this predicate
+    must not permanently block on total == 0)."""
     obligaciones = contrato.obligaciones
     obligacion_ids_con_actividad = {a.obligacion_id for a in actividades if a.obligacion_id is not None}
     total = len(obligaciones)
     cubiertas = sum(1 for o in obligaciones if o.id in obligacion_ids_con_actividad)
-    complete = total > 0 and cubiertas == total
+    complete = total == 0 or cubiertas == total
     return StepState(
         step=4,
         key="justificaciones",
@@ -216,6 +240,13 @@ async def obtener_stepper_state(
     cuenta = await cuenta_cobro_service._get_cuenta_con_ownership(db, usuario_id, cuenta_id)
     contrato = cuenta.contrato
 
+    # B7 Fix 4: `_get_cuenta_con_ownership` filters `CuentaCobro.deleted_at` but
+    # not the joined `Contrato.deleted_at` — a BORRADOR cuota whose contract was
+    # soft-deleted must not leak stepper-state data. Checked here (new call
+    # site) rather than in the shared helper, which many other callers reuse.
+    if contrato.deleted_at is not None:
+        raise NotFoundError("Contrato", str(contrato.id))
+
     estado = await informe_service.obtener_estado_listo_pendiente(db, usuario_id, cuenta_id)
 
     steps = [
@@ -230,6 +261,12 @@ async def obtener_stepper_state(
 
     furthest, current = _resumen(steps)
 
+    # B7 Fix 2: wire the previously-dead `calcular_ventana_mes` into the one
+    # response every consumer targets, killing both the dead code and the
+    # cross-repo duplication risk (frontend must consume these fields instead
+    # of re-deriving the window rule client-side).
+    ventana = calcular_ventana_mes(cuenta.mes, cuenta.anio, cuenta.fecha_transaccion)
+
     return StepperStateResponse(
         cuenta_cobro_id=cuenta.id,
         contrato_id=contrato.id,
@@ -241,4 +278,7 @@ async def obtener_stepper_state(
         current_step=current,
         furthest_completed_step=furthest,
         steps=steps,
+        ventana_inicio=ventana.fecha_inicio,
+        ventana_fin=ventana.fecha_fin,
+        ventana_advertencia=ventana.advertencia,
     )

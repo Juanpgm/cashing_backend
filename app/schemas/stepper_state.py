@@ -55,3 +55,11 @@ class StepperStateResponse(BaseModel):
     current_step: int
     furthest_completed_step: int
     steps: list[StepState]
+    # B7 Fix 2: server-computed month-scoping window (app.core.month_scoping.
+    # calcular_ventana_mes), replacing the dead-code/cross-repo-duplication risk
+    # of the frontend re-deriving this rule itself. `mes`/`anio` are NOT NULL on
+    # CuentaCobro and this endpoint only ever loads an existing row, so these are
+    # always computable — non-nullable by design (see design.md Amendments).
+    ventana_inicio: date
+    ventana_fin: date
+    ventana_advertencia: bool
