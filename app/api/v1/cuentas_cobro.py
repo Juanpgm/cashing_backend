@@ -36,6 +36,7 @@ from app.schemas.cuenta_cobro import (
     PDFUrlResponse,
 )
 from app.schemas.google_workspace import EvidencePersistRequest, EvidencePersistSummary
+from app.schemas.stepper_state import StepperStateResponse
 from app.services import (
     cobertura_service,
     constancia_service,
@@ -44,6 +45,7 @@ from app.services import (
     evidence_persist_service,
     informe_service,
     pdf_signature_service,
+    stepper_state_service,
 )
 from app.tools.context import ToolContext
 from app.tools.invoke import invoke_tool
@@ -85,6 +87,24 @@ async def obtener_cuenta_cobro(
 ) -> CuentaCobroResponse:
     """Get a single CuentaCobro with its activities."""
     return await cuenta_cobro_service.obtener_cuenta_cobro(db, user.id, cuenta_id)
+
+
+@router.get("/{cuenta_id}/stepper-state", response_model=StepperStateResponse)
+async def obtener_stepper_state(
+    cuenta_id: uuid.UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> StepperStateResponse:
+    """Aggregate, read-only readiness for the `/radicar` 7-step wizard.
+
+    Composes existing read-only services only (never `preparar_radicacion`):
+    no credits are consumed, no writes happen, no package is generated.
+    `numero_cuota != null` in the response is the idempotency signal the
+    frontend uses to avoid re-charging credits on resume (radicacion-stepper,
+    work unit B4 — see design section 1-2 for the full contract and the
+    contiguous-prefix resume algorithm).
+    """
+    return await stepper_state_service.obtener_stepper_state(db, user.id, cuenta_id)
 
 
 @router.delete("/{cuenta_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)

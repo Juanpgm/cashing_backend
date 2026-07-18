@@ -3,16 +3,18 @@ highest attention: the cross-repo `StepperStateResponse` contract + the
 contiguous-prefix resume algorithm + the double-charge invariant).
 
 Batch B4a: unit tests for the four step-1..4 `complete` predicates, calling
-the predicate functions directly (the aggregate `obtener_stepper_state`,
-steps 5-7, the resume algorithm, the double-charge guard, and the full
-contract-shape test all land in batch B4b — see apply-progress.md for the
-split rationale).
+the predicate functions directly.
+
+Batch B4b: the aggregate `obtener_stepper_state` (steps 5-7, contiguous-prefix
+resume, double-charge guard) + `GET /cuentas-cobro/{id}/stepper-state` + the
+full `StepperStateResponse` contract-shape test (SECOP-drift mitigation).
 """
 
 from __future__ import annotations
 
 from datetime import date
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from app.models.actividad import Actividad
@@ -21,8 +23,18 @@ from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro, PosicionCuot
 from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
 from app.models.evidencia import Evidencia
 from app.models.obligacion import Obligacion, TipoObligacion
+from app.schemas.stepper_state import StepperStateResponse
 from app.services import stepper_state_service
+from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
+
+_KNOWN_CODES = {
+    "CHECKLIST_INCOMPLETE",
+    "COHERENCE_CHECK_FAILED",
+    "PACKAGE_PENDIENTE",
+    "SECRET_DETECTED_IN_PACKAGE",
+    "CUOTA_POSITION_CONFLICT",
+}
 
 # No module-wide `pytestmark = pytest.mark.asyncio`: this file intentionally
 # mixes async tests (DB-backed) with plain sync tests (pure predicate
@@ -278,3 +290,243 @@ async def test_step4_predicate_complete_with_one_actividad_per_obligacion(
     result = stepper_state_service._step4_justificaciones(contrato, [act])
 
     assert result.complete is True
+
+
+# ── B4b — exact response shape (SECOP-drift mitigation) ────────────────────
+
+
+async def test_stepper_state_response_shape_exact_keys(
+    db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
+) -> None:
+    user = test_user["user"]
+    cuenta = await _make_cuenta(db, contrato)
+
+    result = await stepper_state_service.obtener_stepper_state(db, user.id, cuenta.id)
+
+    assert isinstance(result, StepperStateResponse)
+    payload = result.model_dump()
+    assert set(payload.keys()) == {
+        "cuenta_cobro_id",
+        "contrato_id",
+        "mes",
+        "anio",
+        "fecha_transaccion",
+        "numero_cuota",
+        "posicion_cuota",
+        "current_step",
+        "furthest_completed_step",
+        "steps",
+    }
+
+
+async def test_stepper_state_steps_length_7_ordered(
+    db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
+) -> None:
+    user = test_user["user"]
+    cuenta = await _make_cuenta(db, contrato)
+
+    result = await stepper_state_service.obtener_stepper_state(db, user.id, cuenta.id)
+
+    assert len(result.steps) == 7
+    assert [s.step for s in result.steps] == [1, 2, 3, 4, 5, 6, 7]
+    for step_state in result.steps:
+        payload = step_state.model_dump()
+        assert set(payload.keys()) == {"step", "key", "complete", "blocking", "code", "detail"}
+
+
+async def test_stepper_state_codes_are_known_domain_codes_or_null(
+    db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
+) -> None:
+    user = test_user["user"]
+    cuenta = await _make_cuenta(db, contrato)  # nothing satisfied — every step incomplete
+
+    result = await stepper_state_service.obtener_stepper_state(db, user.id, cuenta.id)
+
+    for step_state in result.steps:
+        assert step_state.code is None or step_state.code in _KNOWN_CODES
+
+
+async def test_stepper_state_numero_cuota_presence_signals_cuota_exists(
+    db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
+) -> None:
+    user = test_user["user"]
+    cuenta = await _make_cuenta(db, contrato, numero_cuota=1)
+
+    result = await stepper_state_service.obtener_stepper_state(db, user.id, cuenta.id)
+
+    assert result.numero_cuota == 1
+
+
+async def test_stepper_state_endpoint_returns_the_documented_shape(
+    client: AsyncClient, db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
+) -> None:
+    cuenta = await _make_cuenta(db, contrato)
+
+    r = await client.get(f"/api/v1/cuentas-cobro/{cuenta.id}/stepper-state", headers=test_user["headers"])
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["cuenta_cobro_id"] == str(cuenta.id)
+    assert body["contrato_id"] == str(contrato.id)
+    assert len(body["steps"]) == 7
+
+
+# ── B4b — steps 5-7 via the aggregate ───────────────────────────────────────
+
+
+async def test_step5_formato_always_non_blocking(
+    db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
+) -> None:
+    """Step 5 never hard-blocks — a standard-format fallback always exists."""
+    user = test_user["user"]
+    cuenta = await _make_cuenta(db, contrato)
+
+    result = await stepper_state_service.obtener_stepper_state(db, user.id, cuenta.id)
+
+    assert result.steps[4].key == "formato"
+    assert result.steps[4].blocking is False
+    assert result.steps[4].complete is True
+
+
+async def test_step6_evidencias_incomplete_when_pendientes_greater_than_zero(
+    db: AsyncSession, test_user: dict[str, Any], contrato: Contrato, obligacion: Obligacion
+) -> None:
+    user = test_user["user"]
+    cuenta = await _make_cuenta(db, contrato)
+    await _add_actividad_con_evidencia(db, cuenta, obligacion, con_evidencia=False)
+
+    result = await stepper_state_service.obtener_stepper_state(db, user.id, cuenta.id)
+
+    assert result.steps[5].key == "evidencias"
+    assert result.steps[5].complete is False
+
+
+async def test_step6_evidencias_complete_when_pendientes_is_zero(
+    db: AsyncSession, test_user: dict[str, Any], contrato: Contrato, obligacion: Obligacion
+) -> None:
+    user = test_user["user"]
+    cuenta = await _make_cuenta(db, contrato)
+    await _add_actividad_con_evidencia(db, cuenta, obligacion, con_evidencia=True)
+
+    result = await stepper_state_service.obtener_stepper_state(db, user.id, cuenta.id)
+
+    assert result.steps[5].complete is True
+
+
+async def test_step7_paquete_incomplete_when_not_listo_para_radicar(
+    db: AsyncSession, test_user: dict[str, Any], contrato: Contrato, obligacion: Obligacion
+) -> None:
+    user = test_user["user"]
+    cuenta = await _make_cuenta(db, contrato)
+    await _add_actividad_con_evidencia(db, cuenta, obligacion, con_evidencia=False)
+
+    result = await stepper_state_service.obtener_stepper_state(db, user.id, cuenta.id)
+
+    assert result.steps[6].key == "paquete"
+    assert result.steps[6].complete is False
+    assert result.steps[6].code == "PACKAGE_PENDIENTE"
+
+
+async def test_step7_paquete_complete_when_listo_para_radicar(
+    db: AsyncSession, test_user: dict[str, Any], contrato: Contrato, obligacion: Obligacion
+) -> None:
+    user = test_user["user"]
+    cuenta = await _make_cuenta(db, contrato)
+    await _add_actividad_con_evidencia(db, cuenta, obligacion, con_evidencia=True)
+
+    result = await stepper_state_service.obtener_stepper_state(db, user.id, cuenta.id)
+
+    assert result.steps[6].complete is True
+    assert result.steps[6].code is None
+
+
+# ── B4b — contiguous-prefix resume / current_step clamp ─────────────────────
+
+
+async def test_resume_non_contiguous_completion_does_not_advance_past_first_gap(
+    db: AsyncSession, test_user: dict[str, Any], contrato: Contrato, obligacion: Obligacion
+) -> None:
+    """Steps 1-2 complete, step 3 (checklist mode) NOT chosen, but step 4
+    (justificaciones) happens to already be satisfiable. furthest_completed_step
+    must stop at 2 — never skip the gap at step 3."""
+    user = test_user["user"]
+    await _contrato_completo(db, contrato, user.id)
+    cuenta = await _make_cuenta(db, contrato, requisitos_modo=None)
+    await _cuenta_completo(db, cuenta, user.id)
+    await _add_actividad_con_evidencia(db, cuenta, obligacion, con_evidencia=True)
+
+    result = await stepper_state_service.obtener_stepper_state(db, user.id, cuenta.id)
+
+    assert result.steps[0].complete is True
+    assert result.steps[1].complete is True
+    assert result.steps[2].complete is False  # the gap
+    assert result.furthest_completed_step == 2
+    assert result.current_step == 3
+
+
+async def test_resume_current_step_is_furthest_completed_plus_one(
+    db: AsyncSession, test_user: dict[str, Any], contrato: Contrato, obligacion: Obligacion
+) -> None:
+    user = test_user["user"]
+    await _contrato_completo(db, contrato, user.id)
+    cuenta = await _make_cuenta(db, contrato)
+    await _cuenta_completo(db, cuenta, user.id)
+
+    result = await stepper_state_service.obtener_stepper_state(db, user.id, cuenta.id)
+
+    assert result.furthest_completed_step == 2
+    assert result.current_step == 3
+
+
+async def test_resume_all_seven_complete_clamps_current_step_to_7(
+    db: AsyncSession, test_user: dict[str, Any], contrato: Contrato, obligacion: Obligacion
+) -> None:
+    user = test_user["user"]
+    await _contrato_completo(db, contrato, user.id)
+    cuenta = await _make_cuenta(db, contrato, requisitos_modo="estandar")
+    await _cuenta_completo(db, cuenta, user.id)
+    await _add_actividad_con_evidencia(db, cuenta, obligacion, con_evidencia=True)
+
+    result = await stepper_state_service.obtener_stepper_state(db, user.id, cuenta.id)
+
+    assert result.furthest_completed_step == 7
+    assert result.current_step == 7
+
+
+async def test_resume_no_progress_lands_on_step_1(
+    db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
+) -> None:
+    user = test_user["user"]
+    cuenta = await _make_cuenta(db, contrato)
+
+    result = await stepper_state_service.obtener_stepper_state(db, user.id, cuenta.id)
+
+    assert result.furthest_completed_step == 0
+    assert result.current_step == 1
+
+
+# ── B4b — double-charge guard (the critical invariant) ──────────────────────
+
+
+async def test_resume_with_existing_cuota_never_calls_crear_cuenta_cobro(
+    db: AsyncSession, test_user: dict[str, Any], contrato: Contrato, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Given a cuota already exists (numero_cuota != null, credits already
+    charged at creation), calling stepper-state — simulating a step-2 resume —
+    must issue ZERO crear_cuenta_cobro calls and leave the credit balance
+    unchanged. This is the backend half of the No-Double-Credit-Charge invariant
+    (frontend half is F3.3)."""
+    from app.services import cuenta_cobro_service
+
+    user = test_user["user"]
+    cuenta = await _make_cuenta(db, contrato, numero_cuota=1)
+    saldo_antes = user.creditos_disponibles
+
+    spy = AsyncMock(wraps=cuenta_cobro_service.crear_cuenta_cobro)
+    monkeypatch.setattr(cuenta_cobro_service, "crear_cuenta_cobro", spy)
+
+    await stepper_state_service.obtener_stepper_state(db, user.id, cuenta.id)
+
+    spy.assert_not_called()
+    await db.refresh(user)
+    assert user.creditos_disponibles == saldo_antes

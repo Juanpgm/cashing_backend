@@ -18,24 +18,38 @@ existing read-only services/queries only:
   see the "Deviations" note in apply-progress.md for why these two predicates
   do not depend on `DocumentoCuentaCobro` rows.
 
-Batch B4a: predicates 1-4 only (schema + the four step-1..4 predicate
-functions + their unit tests). The aggregate `obtener_stepper_state`, steps
-5-7, the contiguous-prefix resume algorithm, and the router land in batch B4b
-— see apply-progress.md.
+Batch B4b (this file's remainder): steps 5-7, the contiguous-prefix resume
+algorithm (`_resumen`), and the public `obtener_stepper_state` composition
+entrypoint the router delegates to. Batch B4a shipped the schema + the four
+step-1..4 predicate functions above — see apply-progress.md for the split
+rationale.
+
+Deliberate scope decision (documented in apply-progress.md, Batch B4b): step
+7's `complete` predicate is `EstadoListoPendiente.listo_para_radicar` ONLY —
+it does NOT check physical package existence in storage. `StoragePort` has no
+exists/list capability yet; adding one is B5's job (`GET /paquete`). Until B5
+lands, steps 6 and 7 report the same boolean here — this does not affect the
+contiguous-prefix algorithm or the double-charge invariant, the two
+guarantees this unit is tested against.
 """
 
 from __future__ import annotations
 
+import uuid
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import CHECKLIST_INCOMPLETE
+from app.core.exceptions import CHECKLIST_INCOMPLETE, PACKAGE_PENDIENTE
 from app.models.actividad import Actividad
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, PosicionCuota
 from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
-from app.schemas.stepper_state import StepState
-from app.services import checklist_service
+from app.schemas.stepper_state import StepperStateResponse, StepState
+from app.services import checklist_service, cuenta_cobro_service, informe_service, requisito_inference_service
+from app.services.informe_service import EstadoListoPendiente
+
+_TOTAL_STEPS = 7
 
 
 async def _step1_contrato(db: AsyncSession, cuenta: CuentaCobro, contrato: Contrato) -> StepState:
@@ -138,4 +152,93 @@ def _step4_justificaciones(contrato: Contrato, actividades: list[Actividad]) -> 
         blocking=not complete,
         code=None,
         detail={"obligaciones": total, "con_actividad": cubiertas},
+    )
+
+
+async def _step5_formato(db: AsyncSession, usuario_id: uuid.UUID, contrato: Contrato) -> StepState:
+    """organism structure OR standard fallback — always available, never blocks."""
+    plantilla = await requisito_inference_service.obtener_plantilla_organismo_por_contrato(db, usuario_id, contrato)
+    return StepState(
+        step=5,
+        key="formato",
+        complete=True,
+        blocking=False,
+        code=None,
+        detail={"plantilla_ingerida": plantilla is not None},
+    )
+
+
+def _step6_evidencias(estado: EstadoListoPendiente) -> StepState:
+    """checklist satisfied = every obligación has evidence (pendientes == 0)."""
+    complete = estado.pendientes == 0
+    return StepState(
+        step=6,
+        key="evidencias",
+        complete=complete,
+        blocking=not complete,
+        code=None,
+        detail={"pendientes": estado.pendientes},
+    )
+
+
+def _step7_paquete(estado: EstadoListoPendiente) -> StepState:
+    """package readiness — see module docstring for the storage-check deferral."""
+    complete = estado.listo_para_radicar
+    return StepState(
+        step=7,
+        key="paquete",
+        complete=complete,
+        blocking=not complete,
+        code=None if complete else PACKAGE_PENDIENTE,
+        detail={"pendientes": estado.pendientes},
+    )
+
+
+def _resumen(steps: list[StepState]) -> tuple[int, int]:
+    """Contiguous-prefix rule: furthest_completed_step = largest N such that
+    steps 1..N are ALL complete. current_step = furthest + 1, clamped to 7."""
+    furthest = 0
+    for step_state in steps:
+        if not step_state.complete:
+            break
+        furthest = step_state.step
+    current = min(furthest + 1, _TOTAL_STEPS)
+    return furthest, current
+
+
+async def obtener_stepper_state(
+    db: AsyncSession,
+    usuario_id: uuid.UUID,
+    cuenta_id: uuid.UUID,
+) -> StepperStateResponse:
+    """Read-only aggregate readiness for the 7-step stepper. Never mutates
+    anything, never charges credits, never calls `preparar_radicacion`."""
+    cuenta = await cuenta_cobro_service._get_cuenta_con_ownership(db, usuario_id, cuenta_id)
+    contrato = cuenta.contrato
+
+    estado = await informe_service.obtener_estado_listo_pendiente(db, usuario_id, cuenta_id)
+
+    steps = [
+        await _step1_contrato(db, cuenta, contrato),
+        await _step2_cuota(db, cuenta),
+        _step3_checklist(cuenta),
+        _step4_justificaciones(contrato, cuenta.actividades),
+        await _step5_formato(db, usuario_id, contrato),
+        _step6_evidencias(estado),
+        _step7_paquete(estado),
+    ]
+
+    furthest, current = _resumen(steps)
+
+    return StepperStateResponse(
+        cuenta_cobro_id=cuenta.id,
+        contrato_id=contrato.id,
+        mes=cuenta.mes,
+        anio=cuenta.anio,
+        fecha_transaccion=cuenta.fecha_transaccion,
+        numero_cuota=cuenta.numero_cuota,
+        posicion_cuota=cuenta.posicion.value,
+        current_step=current,
+        furthest_completed_step=furthest,
+        steps=steps,
     )
