@@ -8,6 +8,7 @@ from functools import partial
 import boto3
 from botocore.config import Config
 
+from app.adapters.storage.port import StorageObjectInfo
 from app.core.config import settings
 
 
@@ -84,6 +85,20 @@ class S3StorageAdapter:
                 Key=key,
             ),
         )
+
+    async def list_objects(self, prefix: str) -> list[StorageObjectInfo]:
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(
+            None,
+            partial(
+                self._client.list_objects_v2,
+                Bucket=self._bucket,
+                Prefix=prefix,
+            ),
+        )
+        return [
+            StorageObjectInfo(key=item["Key"], size_bytes=item["Size"]) for item in response.get("Contents", [])
+        ]
 
 
 def get_storage() -> S3StorageAdapter:

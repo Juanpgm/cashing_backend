@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+from app.adapters.storage.port import StorageObjectInfo
 from app.core.config import settings
 
 
@@ -78,3 +79,23 @@ class LocalStorageAdapter:
         if path.exists():
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, path.unlink)
+
+    async def list_objects(self, prefix: str) -> list[StorageObjectInfo]:
+        base = (self._root / prefix).resolve()
+        if not str(base).startswith(str(self._root)):
+            raise ValueError(f"Path traversal attempt blocked: {prefix}")
+        loop = asyncio.get_running_loop()
+
+        def _scan() -> list[StorageObjectInfo]:
+            if not base.exists():
+                return []
+            return [
+                StorageObjectInfo(
+                    key=str(path.relative_to(self._root)).replace("\\", "/"),
+                    size_bytes=path.stat().st_size,
+                )
+                for path in sorted(base.rglob("*"))
+                if path.is_file()
+            ]
+
+        return await loop.run_in_executor(None, _scan)

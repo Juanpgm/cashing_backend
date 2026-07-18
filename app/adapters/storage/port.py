@@ -1,6 +1,16 @@
 """Storage port (interface) for file persistence."""
 
+from dataclasses import dataclass
 from typing import Protocol
+
+
+@dataclass(frozen=True)
+class StorageObjectInfo:
+    """Metadata for a single object returned by `StoragePort.list_objects` —
+    no bytes are read, just the key and size (radicacion-stepper, work unit B5)."""
+
+    key: str
+    size_bytes: int
 
 
 class StoragePort(Protocol):
@@ -25,4 +35,12 @@ class StoragePort(Protocol):
 
     async def delete(self, key: str) -> None:
         """Delete a file by key."""
+        ...
+
+    async def list_objects(self, prefix: str) -> list[StorageObjectInfo]:
+        """List objects under a key prefix — key + size only, no data read.
+
+        Used for existence/metadata checks (e.g. `GET /paquete`) without
+        downloading or packaging anything.
+        """
         ...
