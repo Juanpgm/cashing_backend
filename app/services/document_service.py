@@ -10,7 +10,7 @@ from decimal import Decimal, InvalidOperation
 
 import structlog
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -717,7 +717,21 @@ async def upload_document(
         dup_conditions.append(DocumentoFuente.contrato_id == contrato_id)
     else:
         dup_conditions.append(DocumentoFuente.contrato_id.is_not(None))
-    dup_result = await db.execute(select(DocumentoFuente).where(*dup_conditions).limit(1))
+    # A matched document whose linked Contrato was soft-deleted must NOT count as
+    # "already exists" — otherwise the dedup fast path below returns a contrato_id
+    # pointing at a dead row (GET /contratos/{id} filters deleted_at.is_(None) and
+    # 404s). Outerjoin so documents with no contrato_id at all (doc_cuenta_cobro_id
+    # not None, contract-level requisito not yet linked) still match.
+    dup_query = (
+        select(DocumentoFuente)
+        .outerjoin(Contrato, Contrato.id == DocumentoFuente.contrato_id)
+        .where(
+            *dup_conditions,
+            or_(DocumentoFuente.contrato_id.is_(None), Contrato.deleted_at.is_(None)),
+        )
+        .limit(1)
+    )
+    dup_result = await db.execute(dup_query)
     existing_doc = dup_result.scalar_one_or_none()
 
     obligaciones_extraidas: list[ObligacionExtraida] = []

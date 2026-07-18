@@ -553,6 +553,98 @@ class TestUploadDocumentAutoCreate:
         assert result.contrato_creado is None
         assert len(result.obligaciones_extraidas) == 1
 
+    @pytest.mark.asyncio
+    async def test_reupload_after_contrato_soft_deleted_does_not_dedupe_to_dead_contrato(
+        self,
+        db: AsyncSession,
+        test_user: dict[str, Any],
+    ) -> None:
+        """Regression: re-uploading the same filename after the previously
+        auto-created contrato was soft-deleted must NOT short-circuit the
+        dedup fast path and return the deleted contrato's id (that produced
+        a 404 on 'Ver Contrato' since GET /contratos/{id} filters
+        deleted_at.is_(None)). It must fall through to normal extraction and
+        auto-create a fresh, live contrato."""
+        from app.services.contrato_service import eliminar_contrato, obtener_contrato
+        from app.services.document_service import upload_document
+
+        user = test_user["user"]
+
+        async def _upload(numero_contrato: str) -> Any:
+            mock_graph = AsyncMock()
+            mock_graph.ainvoke = AsyncMock(
+                return_value={
+                    "contrato_extraido": {
+                        "numero_contrato": numero_contrato,
+                        "objeto": "Prestación de servicios profesionales de desarrollo",
+                        "valor_total": "18000000.00",
+                        "valor_mensual": "3000000.00",
+                        "fecha_inicio": "2025-02-01",
+                        "fecha_fin": "2025-07-31",
+                        "entidad": "MinTIC",
+                    }
+                }
+            )
+            llm_obligaciones_response = LLMResponse(
+                content="OBLIGACION|especifica|Desarrollar módulos del sistema de información\n",
+                model="test",
+                total_tokens=40,
+            )
+
+            with (
+                patch(_PATCH_GET_GRAPH, return_value=mock_graph),
+                patch(_PATCH_GET_LLM) as mock_get_llm,
+                patch(
+                    _PATCH_PARSE_PDF,
+                    return_value=(
+                        "CONTRATO DE PRESTACIÓN DE SERVICIOS PROFESIONALES No. "
+                        f"{numero_contrato} celebrado entre el Ministerio de TIC y "
+                        "el contratista para el desarrollo de módulos de software. "
+                        "OBJETO: prestación de servicios profesionales de "
+                        "desarrollo. VALOR TOTAL: dieciocho millones de pesos. "
+                        "PLAZO: del 1 de febrero al 31 de julio de 2025."
+                    ),
+                ),
+                patch(_PATCH_S3) as mock_storage_cls,
+            ):
+                mock_llm = AsyncMock()
+                mock_llm.complete = AsyncMock(return_value=llm_obligaciones_response)
+                mock_get_llm.return_value = mock_llm
+
+                mock_storage = AsyncMock()
+                mock_storage.upload = AsyncMock()
+                mock_storage_cls.return_value = mock_storage
+
+                return await upload_document(
+                    db=db,
+                    user_id=user.id,
+                    filename="contrato.pdf",
+                    content=b"fake pdf content",
+                    content_type="application/pdf",
+                    tipo="contrato",
+                    contrato_id=None,
+                )
+
+        # 1) First upload auto-creates contrato A.
+        result_a = await _upload("CD-099-2025")
+        assert result_a.contrato_id is not None
+        contrato_a_id = result_a.contrato_id
+
+        # 2) Soft-delete contrato A the same way contract deletion does it.
+        await eliminar_contrato(db, user.id, contrato_a_id)
+
+        # 3) Re-upload the same filename. Must NOT dedup to the now-dead contrato.
+        result_b = await _upload("CD-100-2025")
+
+        assert result_b.contrato_id != contrato_a_id
+        assert result_b.contrato_creado is not None
+        assert result_b.contrato_creado.numero_contrato == "CD-100-2025"
+
+        # 4) The returned contrato_id must resolve via the ownership/get path
+        #    (the same path GET /contratos/{id} uses) without raising NotFoundError.
+        response = await obtener_contrato(db, user.id, result_b.contrato_id)
+        assert response.id == result_b.contrato_id
+
 
 # ── Document upload API integration tests ───────────────────────────
 
