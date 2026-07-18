@@ -62,7 +62,7 @@ _SECOP_FUZZY_SCAN_LIMIT = 1000
 # Two-tier document model. Contract-level requisitos are satisfied by a SINGLE
 # shared document (cuenta_cobro_id IS NULL) that auto-fulfils the requisito in
 # EVERY cuenta of the contract. Everything else is strictly per-cuenta.
-_NIVEL_CONTRATO = frozenset({"CONTRATO", "RPC", "CEDULA", "RUT", "FICHA_TECNICA", "ACTA_INICIO"})
+_NIVEL_CONTRATO = frozenset({"CONTRATO", "RPC", "CDP", "CEDULA", "RUT", "FICHA_TECNICA", "ACTA_INICIO"})
 
 
 def es_nivel_contrato(requisito_codigo: str | None) -> bool:
@@ -102,6 +102,25 @@ _CATALOGO_SEED: list[dict] = [
         "tipo_documento_fuente": "rpc",
         "keywords_deteccion": ["rpc", "registro presupuestal", "rp ", "compromiso presupuestal"],
         "orden": 20,
+    },
+    {
+        "codigo": "CDP",
+        "etiqueta": "Certificado de Disponibilidad Presupuestal (CDP)",
+        "descripcion": "Certificado de disponibilidad presupuestal del compromiso.",
+        # obligatorio=False: existing radicaciones were prepared without a
+        # first-class CDP requisito — making it mandatory would retroactively
+        # mark already-radicable cuotas as CHECKLIST_INCOMPLETE. CDP ships as
+        # detectable/nivel-contrato without becoming a new blocking gate in
+        # slice 1 (radicacion-stepper design section 3). Promotion to
+        # obligatorio=True is a later, separate product decision.
+        "obligatorio": False,
+        "solo_primera_cuenta": False,
+        "permite_autogen": False,
+        "tipo_documento_fuente": "cdp",
+        # Keyword-distinct from RPC ("compromiso presupuestal"): CDP keys on
+        # "disponibilidad presupuestal" so the fuzzy detector separates them.
+        "keywords_deteccion": ["cdp", "certificado de disponibilidad", "disponibilidad presupuestal", "cdp-"],
+        "orden": 25,
     },
     {
         "codigo": "SEGURIDAD_SOCIAL",
@@ -229,10 +248,29 @@ _CATALOGO_SEED: list[dict] = [
 
 
 async def _seed_catalogo_si_vacio(db: AsyncSession) -> None:
+    """Bootstrap the catalog table.
+
+    Empty table (fresh test DB or a deployment that never ran the seed
+    migration): insert the full seed.
+
+    Non-empty table (already seeded, possibly by an older deployment/migration
+    that predates a newer seed entry): additively insert-if-absent any
+    ``_CATALOGO_SEED`` codes not yet present — currently this covers CDP
+    (radicacion-stepper, additive backfill, design section 3). No existing row
+    is ever touched, updated, or removed.
+    """
     res = await db.execute(select(RequisitoDocumento).limit(1))
-    if res.scalar_one_or_none() is not None:
+    if res.scalar_one_or_none() is None:
+        for item in _CATALOGO_SEED:
+            db.add(RequisitoDocumento(**item))
+        await db.flush()
         return
-    for item in _CATALOGO_SEED:
+
+    existing_codigos = {row[0] for row in (await db.execute(select(RequisitoDocumento.codigo))).all()}
+    faltantes = [item for item in _CATALOGO_SEED if item["codigo"] not in existing_codigos]
+    if not faltantes:
+        return
+    for item in faltantes:
         db.add(RequisitoDocumento(**item))
     await db.flush()
 
@@ -377,7 +415,10 @@ async def asegurar_checklist(db: AsyncSession, cuenta: CuentaCobro) -> list[Docu
     if creadas:
         await db.flush()
 
-    return [*filas, *creadas]
+    todas = [*filas, *creadas]
+    await _detectar_alias_cdp(db, cuenta, todas, catalogo)
+
+    return todas
 
 
 def previsualizar_checklist(
@@ -419,6 +460,133 @@ def previsualizar_checklist(
             preview.append({"requisito_codigo": item.codigo, "etiqueta": item.etiqueta, "origen": "custom"})
 
     return preview
+
+
+def _matches_alias_keywords(keywords: list[str], *texts: str | None) -> bool:
+    """Whether any of ``texts`` mentions at least one of ``keywords`` (accent/case-insensitive)."""
+    return _keyword_score(list(texts), keywords) > Decimal("0.000")
+
+
+async def _detectar_alias_cdp(
+    db: AsyncSession,
+    cuenta: CuentaCobro,
+    filas: list[DocumentoCuentaCobro],
+    catalogo: list[RequisitoDocumento],
+) -> None:
+    """Lazy, link-only CDP alias detection (radicacion-stepper, design section 3).
+
+    Runs on every ``asegurar_checklist`` call — additive, non-destructive, and
+    idempotent. No existing document or link is ever moved or removed; only
+    NEW ``DocumentoRequisitoVinculo`` rows to the standard CDP requisito are
+    created when not already present.
+
+    Two cases:
+      1. RPC-folded: a document already linked to the RPC row whose name/text
+         also mentions CDP keywords gets an ADDITIONAL link to the CDP row.
+         The RPC link is untouched.
+      2. Custom-requisito alias: a custom ``RequisitoCuenta`` whose label or
+         own keywords mention CDP gets its linked documents ALSO linked to the
+         standard CDP row. The custom row and its links are left in place.
+
+    No-op when the cuenta's active checklist has no CDP row (e.g. ``reemplazar``
+    mode with no custom item mapped to it).
+    """
+    cdp_req = next((r for r in catalogo if r.codigo == "CDP"), None)
+    cdp_fila = next((f for f in filas if f.requisito_codigo == "CDP"), None)
+    if cdp_req is None or cdp_fila is None:
+        return
+
+    existentes = (
+        (
+            await db.execute(
+                select(DocumentoRequisitoVinculo).where(
+                    DocumentoRequisitoVinculo.documento_cuenta_cobro_id == cdp_fila.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    linked_fuente_ids = {v.documento_fuente_id for v in existentes if v.documento_fuente_id is not None}
+    linked_secop_ids = {v.secop_documento_id for v in existentes if v.secop_documento_id is not None}
+
+    def _enlazar(*, documento_fuente_id: uuid.UUID | None = None, secop_documento_id: uuid.UUID | None = None) -> None:
+        db.add(
+            DocumentoRequisitoVinculo(
+                documento_cuenta_cobro_id=cdp_fila.id,
+                documento_fuente_id=documento_fuente_id,
+                secop_documento_id=secop_documento_id,
+            )
+        )
+        if documento_fuente_id is not None:
+            linked_fuente_ids.add(documento_fuente_id)
+            if cdp_fila.documento_fuente_id is None:
+                cdp_fila.documento_fuente_id = documento_fuente_id
+        if secop_documento_id is not None:
+            linked_secop_ids.add(secop_documento_id)
+            if cdp_fila.secop_documento_id is None:
+                cdp_fila.secop_documento_id = secop_documento_id
+        if cdp_fila.estado in (EstadoRequisito.PENDIENTE, EstadoRequisito.CARGADO, EstadoRequisito.DETECTADO):
+            cdp_fila.estado = _estado_segun_vinculos(cdp_fila)
+
+    # 1. RPC-folded: documents already linked to the RPC row.
+    rpc_fila = next((f for f in filas if f.requisito_codigo == "RPC"), None)
+    if rpc_fila is not None:
+        rpc_vinculos = (
+            (
+                await db.execute(
+                    select(DocumentoRequisitoVinculo).where(
+                        DocumentoRequisitoVinculo.documento_cuenta_cobro_id == rpc_fila.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for v in rpc_vinculos:
+            if v.documento_fuente_id is not None:
+                if v.documento_fuente_id in linked_fuente_ids:
+                    continue
+                doc = await db.get(DocumentoFuente, v.documento_fuente_id)
+                if doc is not None and _matches_alias_keywords(
+                    cdp_req.keywords_deteccion, doc.nombre, doc.texto_extraido
+                ):
+                    _enlazar(documento_fuente_id=doc.id)
+            elif v.secop_documento_id is not None:
+                if v.secop_documento_id in linked_secop_ids:
+                    continue
+                sdoc = await db.get(SecopDocumento, v.secop_documento_id)
+                if sdoc is not None and _matches_alias_keywords(
+                    cdp_req.keywords_deteccion, sdoc.nombre_archivo, sdoc.descripcion
+                ):
+                    _enlazar(secop_documento_id=sdoc.id)
+
+    # 2. Custom-requisito alias: a custom item whose label/keywords mention CDP.
+    custom = await listar_requisitos_cuenta(db, cuenta.id)
+    for item in custom:
+        if not _matches_alias_keywords(cdp_req.keywords_deteccion, item.etiqueta, *(item.keywords_deteccion or [])):
+            continue
+        custom_fila = next((f for f in filas if f.requisito_cuenta_id == item.id), None)
+        if custom_fila is None:
+            continue
+        custom_vinculos = (
+            (
+                await db.execute(
+                    select(DocumentoRequisitoVinculo).where(
+                        DocumentoRequisitoVinculo.documento_cuenta_cobro_id == custom_fila.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for v in custom_vinculos:
+            if v.documento_fuente_id is not None and v.documento_fuente_id not in linked_fuente_ids:
+                _enlazar(documento_fuente_id=v.documento_fuente_id)
+            elif v.secop_documento_id is not None and v.secop_documento_id not in linked_secop_ids:
+                _enlazar(secop_documento_id=v.secop_documento_id)
+
+    await db.flush()
 
 
 # ── SECOP detection ────────────────────────────────────────────────────────
