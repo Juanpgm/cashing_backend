@@ -573,11 +573,19 @@ async def generar_actividades_agente(
     db: AsyncSession,
     usuario_id: uuid.UUID,
     cuenta_id: uuid.UUID,
+    periodo_inicio: date | None = None,
+    periodo_fin: date | None = None,
 ) -> ActividadesBulkResponse:
     """Use the LLM to generate and persist activities from contract obligations and document text.
 
     Requires the contract to have at least one obligation registered OR a contract document
     uploaded. If neither is available, raises ValidationError pointing to /desde-texto.
+
+    `periodo_inicio`/`periodo_fin` are optional month-scoping bounds (see
+    `app.core.month_scoping.calcular_ventana_mes`): when both are `None` (the default),
+    behavior is byte-identical to before this parameter existed. When both are set, they
+    are surfaced to the LLM as the bounded period to justify — this never changes which
+    obligations/documents are loaded, only what the prompt tells the agent about the window.
     """
     from app.adapters.llm import get_llm
     from app.agent.prompts.actividades import ACTIVIDADES_GENERATION_PROMPT
@@ -655,6 +663,12 @@ async def generar_actividades_agente(
     )
     if texto_contrato:
         user_content += f"\nTEXTO DEL CONTRATO (fragmento):\n{texto_contrato[:3000]}"
+
+    if periodo_inicio is not None and periodo_fin is not None:
+        user_content += (
+            f"\nVENTANA DE FECHAS ACOTADA (justifica solo dentro de este rango): "
+            f"{periodo_inicio.isoformat()} a {periodo_fin.isoformat()}\n"
+        )
 
     llm = get_llm()
     messages = [

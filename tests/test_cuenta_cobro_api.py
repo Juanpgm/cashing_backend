@@ -343,6 +343,54 @@ async def test_agregar_actividad_estado_invalido(
 
 
 # ---------------------------------------------------------------------------
+# POST /cuentas-cobro/{id}/actividades/generar — optional periodo_inicio/periodo_fin
+# query params (B3.4: month-scoping threaded through the endpoint, router holds no logic)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_generar_actividades_agente_sin_periodo_no_pasa_bounds(
+    client: AsyncClient, test_user: dict[str, Any], cuenta_borrador: CuentaCobro
+) -> None:
+    """Omitting periodo_inicio/periodo_fin must delegate with both as None (default-preserving)."""
+    from app.schemas.cuenta_cobro import ActividadesBulkResponse
+
+    fake = AsyncMock(return_value=ActividadesBulkResponse(creadas=0, actividades=[]))
+    with patch("app.services.cuenta_cobro_service.generar_actividades_agente", new=fake):
+        resp = await client.post(
+            f"/api/v1/cuentas-cobro/{cuenta_borrador.id}/actividades/generar",
+            headers=test_user["headers"],
+        )
+
+    assert resp.status_code == 201
+    _, kwargs = fake.call_args
+    assert kwargs["periodo_inicio"] is None
+    assert kwargs["periodo_fin"] is None
+
+
+@pytest.mark.asyncio
+async def test_generar_actividades_agente_con_periodo_los_pasa_como_date(
+    client: AsyncClient, test_user: dict[str, Any], cuenta_borrador: CuentaCobro
+) -> None:
+    """Explicit ?periodo_inicio=&periodo_fin= query params must be parsed to `date` and
+    threaded through to the service unchanged (router does no logic, per repo convention)."""
+    from app.schemas.cuenta_cobro import ActividadesBulkResponse
+
+    fake = AsyncMock(return_value=ActividadesBulkResponse(creadas=0, actividades=[]))
+    with patch("app.services.cuenta_cobro_service.generar_actividades_agente", new=fake):
+        resp = await client.post(
+            f"/api/v1/cuentas-cobro/{cuenta_borrador.id}/actividades/generar"
+            "?periodo_inicio=2024-03-01&periodo_fin=2024-03-15",
+            headers=test_user["headers"],
+        )
+
+    assert resp.status_code == 201
+    _, kwargs = fake.call_args
+    assert kwargs["periodo_inicio"] == date(2024, 3, 1)
+    assert kwargs["periodo_fin"] == date(2024, 3, 15)
+
+
+# ---------------------------------------------------------------------------
 # PATCH /cuentas-cobro/{id}/estado
 # ---------------------------------------------------------------------------
 

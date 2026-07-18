@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import uuid
+from datetime import date
 from typing import cast
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import HTMLResponse, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -169,6 +170,12 @@ async def generar_actividades_agente(
     cuenta_id: uuid.UUID,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
+    periodo_inicio: date | None = Query(
+        default=None, description="YYYY-MM-DD — inicio opcional del período acotado a justificar."
+    ),
+    periodo_fin: date | None = Query(
+        default=None, description="YYYY-MM-DD — fin opcional del período acotado a justificar."
+    ),
 ) -> ActividadesBulkResponse:
     """Use the AI agent to generate and persist activities for this CuentaCobro.
 
@@ -180,8 +187,13 @@ async def generar_actividades_agente(
     - A contract document has been uploaded (POST /documentos/upload?tipo=contrato).
 
     If neither is available, use POST /actividades/desde-texto to enter activities manually.
+
+    Optional `periodo_inicio`/`periodo_fin` bound the period surfaced to the agent
+    (month-scoping). Omitting both preserves the previous, unscoped behavior.
     """
-    return await cuenta_cobro_service.generar_actividades_agente(db, user.id, cuenta_id)
+    return await cuenta_cobro_service.generar_actividades_agente(
+        db, user.id, cuenta_id, periodo_inicio=periodo_inicio, periodo_fin=periodo_fin
+    )
 
 
 @router.post(

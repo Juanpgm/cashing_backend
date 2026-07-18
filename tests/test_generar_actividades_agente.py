@@ -13,9 +13,11 @@ from datetime import date
 from typing import Any
 
 import pytest
+from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import ValidationError
+from app.models.actividad import Actividad
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
 from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
@@ -140,8 +142,10 @@ async def _make_cuenta(db: AsyncSession, contrato: Contrato) -> CuentaCobro:
 class _FakeLLM:
     def __init__(self, response_content: str) -> None:
         self._content = response_content
+        self.captured_messages: list[Any] = []
 
     async def complete(self, messages, temperature=0.3, max_tokens=4096) -> LLMResponse:  # noqa: ARG002
+        self.captured_messages = list(messages)
         return LLMResponse(
             content=self._content,
             model="fake/test-model",
@@ -151,12 +155,17 @@ class _FakeLLM:
         )
 
 
-def _patch_llm(monkeypatch: pytest.MonkeyPatch, content: str) -> None:
-    """Monkeypatch the late-imported `get_llm` so the service uses _FakeLLM."""
+def _patch_llm(monkeypatch: pytest.MonkeyPatch, content: str) -> _FakeLLM:
+    """Monkeypatch the late-imported `get_llm` so the service uses _FakeLLM.
+
+    Returns the fake instance so callers can inspect `captured_messages` (e.g. to
+    assert what was sent to the LLM without changing the mocked response).
+    """
     fake = _FakeLLM(content)
     import app.adapters.llm as llm_pkg
 
     monkeypatch.setattr(llm_pkg, "get_llm", lambda model=None: fake, raising=True)
+    return fake
 
 
 # ── Tests ──────────────────────────────────────────────────────────────────
@@ -321,3 +330,97 @@ async def test_falla_si_estado_no_permite_edicion(
         await cuenta_cobro_service.generar_actividades_agente(
             db, user.id, cuenta.id
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# B3.3 — optional periodo_inicio/periodo_fin (month-scoping): default-preservation
+# is a hard requirement (spec: "Month-Scoping Parameter" — Backward compatibility).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def test_periodo_omitido_produce_comportamiento_identico_al_previo(
+    db: AsyncSession,
+    test_user: dict[str, Any],
+    contrato_con_obligaciones: tuple[Contrato, list[Obligacion]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Calling with periodo_inicio=None, periodo_fin=None (the default) must be
+    byte-identical to calling with no periodo_* args at all: same result AND no
+    extra "ventana"/period text injected into the LLM prompt."""
+    contrato, _obs = contrato_con_obligaciones
+    cuenta = await _make_cuenta(db, contrato)
+    user = test_user["user"]
+
+    llm_response = (
+        "ACTIVIDAD|Elaboré informe mensual completo y detallado|Cumplimiento ob. 1|1\n"
+        "ACTIVIDAD|Participé activamente en reuniones de coordinación|Cumplimiento ob. 2|2\n"
+        "ACTIVIDAD|Desarrollé y entregué los entregables solicitados|Cumplimiento ob. 3|3\n"
+    )
+    fake_sin_args = _patch_llm(monkeypatch, llm_response)
+    resp_sin_args = await cuenta_cobro_service.generar_actividades_agente(db, user.id, cuenta.id)
+    prompt_sin_args = fake_sin_args.captured_messages[-1].content
+
+    # Reset actividades so the second call starts from the same state.
+    await db.execute(delete(Actividad).where(Actividad.cuenta_cobro_id == cuenta.id))
+    await db.commit()
+
+    fake_con_none = _patch_llm(monkeypatch, llm_response)
+    resp_con_none = await cuenta_cobro_service.generar_actividades_agente(
+        db, user.id, cuenta.id, periodo_inicio=None, periodo_fin=None
+    )
+    prompt_con_none = fake_con_none.captured_messages[-1].content
+
+    assert resp_sin_args.creadas == resp_con_none.creadas == 3
+    assert prompt_sin_args == prompt_con_none, "omitting periodo_* must not alter the LLM prompt at all"
+    assert "ventana" not in prompt_con_none.lower()
+    assert "período acotado" not in prompt_con_none.lower()
+
+
+async def test_periodo_explicito_acota_el_periodo_señalado_al_agente(
+    db: AsyncSession,
+    test_user: dict[str, Any],
+    contrato_con_obligaciones: tuple[Contrato, list[Obligacion]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit periodo_inicio/periodo_fin must bound the period surfaced to the
+    LLM (design section 4: "they bound the period the agent labels/justifies")."""
+    contrato, _obs = contrato_con_obligaciones
+    cuenta = await _make_cuenta(db, contrato)
+    user = test_user["user"]
+
+    llm_response = (
+        "ACTIVIDAD|Elaboré informe mensual completo y detallado|Cumplimiento ob. 1|1\n"
+        "ACTIVIDAD|Participé activamente en reuniones de coordinación|Cumplimiento ob. 2|2\n"
+        "ACTIVIDAD|Desarrollé y entregué los entregables solicitados|Cumplimiento ob. 3|3\n"
+    )
+    fake = _patch_llm(monkeypatch, llm_response)
+
+    resp = await cuenta_cobro_service.generar_actividades_agente(
+        db, user.id, cuenta.id, periodo_inicio=date(2024, 5, 1), periodo_fin=date(2024, 5, 15)
+    )
+
+    prompt = fake.captured_messages[-1].content
+    assert resp.creadas == 3
+    assert "2024-05-01" in prompt
+    assert "2024-05-15" in prompt
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# B3.3 — regression guard: EvidenceDiscoveryRequest keeps its optional
+# fecha_inicio/fecha_fin defaults untouched by this change (no signature change
+# needed there per design section 4 — this asserts it stays that way).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_evidence_discovery_request_sigue_sin_requerir_fecha_inicio_fecha_fin() -> None:
+    """Regression guard for the 'Backward compatibility' scenario: adding
+    month-scoping to generar_actividades_agente must NOT touch
+    EvidenceDiscoveryRequest's own optional fecha_inicio/fecha_fin fields —
+    they keep defaulting to "" (which the service resolves to contract-start
+    -> today, see test_evidence_discovery.py::test_descubrir_evidencias_default_fechas_desde_contrato)."""
+    from app.schemas.google_workspace import EvidenceDiscoveryRequest
+
+    req = EvidenceDiscoveryRequest()
+
+    assert req.fecha_inicio == ""
+    assert req.fecha_fin == ""
