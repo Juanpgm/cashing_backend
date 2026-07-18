@@ -12,17 +12,20 @@ full `StepperStateResponse` contract-shape test (SECOP-drift mitigation).
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from app.core.month_scoping import calcular_ventana_mes
+from app.core.security import create_access_token, hash_password
 from app.models.actividad import Actividad
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro, PosicionCuota
 from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
 from app.models.evidencia import Evidencia
 from app.models.obligacion import Obligacion, TipoObligacion
+from app.models.usuario import Usuario
 from app.schemas.stepper_state import StepperStateResponse
 from app.services import stepper_state_service
 from httpx import AsyncClient
@@ -316,6 +319,9 @@ async def test_stepper_state_response_shape_exact_keys(
         "current_step",
         "furthest_completed_step",
         "steps",
+        "ventana_inicio",
+        "ventana_fin",
+        "ventana_advertencia",
     }
 
 
@@ -530,3 +536,116 @@ async def test_resume_with_existing_cuota_never_calls_crear_cuenta_cobro(
     spy.assert_not_called()
     await db.refresh(user)
     assert user.creditos_disponibles == saldo_antes
+
+
+# ── B7 Fix 1 — zero-obligation contract must not be permanently blocked ────
+
+
+async def test_zero_obligation_contract_aggregate_is_internally_consistent(
+    db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
+) -> None:
+    """A contract with zero Obligacion rows must not be permanently blocked at
+    steps 1/4 while steps 6/7 report complete=True vacuously for the same
+    reason (no obligaciones to satisfy). Predicates must mirror the real
+    radicación gates (`construir_checklist_completo`, `generar_zip_evidencias`,
+    `generar_actividades_agente`'s "obligaciones OR texto_contrato" branch),
+    none of which hard-require obligaciones_count > 0. `contrato` here has NO
+    `obligacion` fixture dependency — zero Obligacion rows by construction."""
+    user = test_user["user"]
+    await _contrato_completo(db, contrato, user.id)
+    cuenta = await _make_cuenta(db, contrato, requisitos_modo="estandar")
+    await _cuenta_completo(db, cuenta, user.id)
+
+    result = await stepper_state_service.obtener_stepper_state(db, user.id, cuenta.id)
+
+    assert result.steps[0].key == "contrato"
+    assert result.steps[0].complete is True
+    assert result.steps[0].detail == {"obligaciones": 0}
+    assert result.steps[3].key == "justificaciones"
+    assert result.steps[3].complete is True
+    assert result.steps[3].detail == {"obligaciones": 0, "con_actividad": 0}
+    assert result.steps[5].complete is True  # evidencias — already vacuous pre-fix
+    assert result.steps[6].complete is True  # paquete — already vacuous pre-fix
+    assert result.furthest_completed_step == 7
+    assert result.current_step == 7
+
+
+# ── B7 Fix 2 — wire calcular_ventana_mes into stepper-state ─────────────────
+
+
+async def test_stepper_state_includes_ventana_fields_from_month_scoping(
+    db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
+) -> None:
+    """`calcular_ventana_mes` had zero production callers before this fix — the
+    frontend must consume the server-computed window from stepper-state
+    instead of duplicating the rule client-side (the SECOP-drift precedent
+    this design was built to avoid)."""
+    user = test_user["user"]
+    cuenta = await _make_cuenta(db, contrato, mes=4, anio=2025, fecha_transaccion=date(2025, 4, 15))
+
+    result = await stepper_state_service.obtener_stepper_state(db, user.id, cuenta.id)
+
+    esperado = calcular_ventana_mes(4, 2025, date(2025, 4, 15))
+    assert result.ventana_inicio == esperado.fecha_inicio
+    assert result.ventana_fin == esperado.fecha_fin
+    assert result.ventana_advertencia == esperado.advertencia
+    assert result.ventana_advertencia is False
+
+
+async def test_stepper_state_ventana_advertencia_true_when_fecha_transaccion_before_month(
+    db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
+) -> None:
+    user = test_user["user"]
+    cuenta = await _make_cuenta(db, contrato, mes=4, anio=2025, fecha_transaccion=date(2025, 3, 1))
+
+    result = await stepper_state_service.obtener_stepper_state(db, user.id, cuenta.id)
+
+    assert result.ventana_advertencia is True
+    assert result.ventana_inicio == date(2025, 4, 1)
+    assert result.ventana_fin == date(2025, 4, 30)
+
+
+# ── B7 Fix 3 — cross-tenant negative test ────────────────────────────────────
+
+
+async def test_stepper_state_cross_tenant_returns_403(
+    client: AsyncClient, db: AsyncSession, contrato: Contrato
+) -> None:
+    cuenta = await _make_cuenta(db, contrato)
+
+    otro = Usuario(
+        email="otro-stepper-state@example.com",
+        nombre="Otro Usuario",
+        cedula="987654321",
+        password_hash=hash_password("OtroPass123!"),
+        rol="contratista",
+        activo=True,
+        creditos_disponibles=100,
+    )
+    db.add(otro)
+    await db.commit()
+    await db.refresh(otro)
+    token = create_access_token(subject=str(otro.id), role=otro.rol)
+
+    r = await client.get(
+        f"/api/v1/cuentas-cobro/{cuenta.id}/stepper-state",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert r.status_code == 403
+
+
+# ── B7 Fix 4 — soft-deleted Contrato must not leak through ──────────────────
+
+
+async def test_stepper_state_soft_deleted_contrato_returns_404(
+    client: AsyncClient, db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
+) -> None:
+    cuenta = await _make_cuenta(db, contrato)
+    contrato.deleted_at = datetime.now(UTC)
+    db.add(contrato)
+    await db.commit()
+
+    r = await client.get(f"/api/v1/cuentas-cobro/{cuenta.id}/stepper-state", headers=test_user["headers"])
+
+    assert r.status_code == 404

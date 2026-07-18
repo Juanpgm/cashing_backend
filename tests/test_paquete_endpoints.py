@@ -13,19 +13,21 @@ sequential `preparar_radicacion` runs.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 from app.adapters.storage.port import StorageObjectInfo
 from app.core.exceptions import ValidationError
+from app.core.security import create_access_token, hash_password
 from app.models.actividad import Actividad
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
 from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
 from app.models.evidencia import Evidencia
 from app.models.obligacion import Obligacion, TipoObligacion
+from app.models.usuario import Usuario
 from app.services import informe_service, radicacion_prep_service
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -363,3 +365,77 @@ async def test_post_regenerar_raises_secret_detected_through_the_gate(
 
     assert r.status_code == 422, r.text
     assert r.json()["code"] == "SECRET_DETECTED_IN_PACKAGE"
+
+
+# ── B7 Fix 3 — cross-tenant negative tests ───────────────────────────────
+
+
+async def _crear_otro_usuario_token(db: AsyncSession, *, email: str) -> str:
+    otro = Usuario(
+        email=email,
+        nombre="Otro Usuario",
+        cedula="987654321",
+        password_hash=hash_password("OtroPass123!"),
+        rol="contratista",
+        activo=True,
+        creditos_disponibles=100,
+    )
+    db.add(otro)
+    await db.commit()
+    await db.refresh(otro)
+    return create_access_token(subject=str(otro.id), role=otro.rol)
+
+
+async def test_get_paquete_cross_tenant_returns_403(client: AsyncClient, db: AsyncSession, contrato: Contrato) -> None:
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    token = await _crear_otro_usuario_token(db, email="otro-get-paquete@example.com")
+
+    r = await client.get(
+        f"/api/v1/cuentas-cobro/{cuenta.id}/paquete",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert r.status_code == 403
+
+
+async def test_post_regenerar_cross_tenant_returns_403(
+    client: AsyncClient, db: AsyncSession, contrato: Contrato
+) -> None:
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    token = await _crear_otro_usuario_token(db, email="otro-post-regenerar@example.com")
+
+    r = await client.post(
+        f"/api/v1/cuentas-cobro/{cuenta.id}/paquete/regenerar",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert r.status_code == 403
+
+
+# ── B7 Fix 4 — soft-deleted Contrato must not leak through ────────────────
+
+
+async def test_get_paquete_soft_deleted_contrato_returns_404(
+    client: AsyncClient, db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
+) -> None:
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    contrato.deleted_at = datetime.now(UTC)
+    db.add(contrato)
+    await db.commit()
+
+    r = await client.get(f"/api/v1/cuentas-cobro/{cuenta.id}/paquete", headers=test_user["headers"])
+
+    assert r.status_code == 404
+
+
+async def test_post_regenerar_soft_deleted_contrato_returns_404(
+    client: AsyncClient, db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
+) -> None:
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    contrato.deleted_at = datetime.now(UTC)
+    db.add(contrato)
+    await db.commit()
+
+    r = await client.post(f"/api/v1/cuentas-cobro/{cuenta.id}/paquete/regenerar", headers=test_user["headers"])
+
+    assert r.status_code == 404
