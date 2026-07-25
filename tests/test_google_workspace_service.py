@@ -127,6 +127,7 @@ class TestGetIntegrationStatus:
         fake_token = MagicMock()
         fake_token.scopes = "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/drive.file"
         fake_token.expires_at = None
+        fake_token.email = "user@example.com"
 
         mock_result = MagicMock()
         mock_result.scalar_one_or_none.return_value = fake_token
@@ -265,6 +266,7 @@ class TestHandleOAuthCallbackSuccess:
         status_result.scalar_one_or_none.return_value = MagicMock(
             scopes="https://www.googleapis.com/auth/gmail.readonly",
             expires_at=None,
+            email=None,
         )
 
         mock_db = AsyncMock()

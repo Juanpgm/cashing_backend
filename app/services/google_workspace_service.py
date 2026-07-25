@@ -149,10 +149,28 @@ async def handle_oauth_callback(
         access_token=creds.token,
         refresh_token=creds.refresh_token,
         scopes=creds.scopes or settings.GOOGLE_OAUTH_SCOPES,
+        email=_email_from_id_token(getattr(creds, "id_token", None)),
     )
     logger.info("google_oauth_connected", user_id=str(usuario_id))
 
     return await get_integration_status(db, usuario_id)
+
+
+def _email_from_id_token(id_token: str | None) -> str | None:
+    """Best-effort email claim from the OAuth id_token.
+
+    No signature verification needed: the token was obtained directly from Google's
+    token endpoint over TLS during the code exchange (not supplied by the client),
+    so its claims are trusted for display purposes.
+    """
+    if not id_token:
+        return None
+    try:
+        claims = jwt.get_unverified_claims(id_token)
+    except JWTError:
+        return None
+    email = claims.get("email")
+    return str(email) if email else None
 
 
 async def store_credentials(
@@ -163,6 +181,7 @@ async def store_credentials(
     refresh_token: str,
     scopes: list[str] | str,
     expires_in: int = 3600,
+    email: str | None = None,
 ) -> GoogleToken:
     """Encrypt and upsert a user's Google OAuth tokens.
 
@@ -181,6 +200,8 @@ async def store_credentials(
         record.refresh_token_encrypted = f.encrypt(refresh_token.encode()).decode()
         record.scopes = scope_str
         record.expires_at = expires_at
+        if email:
+            record.email = email
     else:
         record = GoogleToken(
             usuario_id=usuario_id,
@@ -188,6 +209,7 @@ async def store_credentials(
             refresh_token_encrypted=f.encrypt(refresh_token.encode()).decode(),
             scopes=scope_str,
             expires_at=expires_at,
+            email=email,
         )
         db.add(record)
 
@@ -218,9 +240,9 @@ async def get_integration_status(db: AsyncSession, usuario_id: uuid.UUID) -> Goo
     gmail_enabled = any(_GMAIL_SCOPE in s for s in scopes)
     drive_enabled = any(_DRIVE_SCOPE in s for s in scopes)
 
-    # Decrypt email from access token (via Google tokeninfo endpoint) only if needed
     return GoogleIntegrationStatus(
         connected=True,
+        email=record.email,
         scopes=scopes,
         expires_at=record.expires_at,
         gmail_enabled=gmail_enabled,
