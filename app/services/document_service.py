@@ -382,7 +382,7 @@ _DECOMMISSIONED_VISION_MODELS: frozenset[str] = frozenset(
 # model, so one unavailable provider (missing key, depleted quota, decommissioned
 # model) does not leave the user with no extraction at all.
 _VISION_FALLBACK_MODELS: tuple[str, ...] = (
-    "gemini/gemini-2.5-flash-lite",  # reads PDF natively, generous free tier
+    "gemini/gemini-flash-latest",  # reads PDF natively; replaces gemini-2.5-flash-lite (404 for new keys)
     "groq/meta-llama/llama-4-scout-17b-16e-instruct",  # current Groq vision model (rasterizes PDF, <=5 pages)
 )
 

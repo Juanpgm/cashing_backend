@@ -30,7 +30,7 @@ def test_chain_skips_decommissioned_model(monkeypatch: pytest.MonkeyPatch) -> No
     chain = document_service.vision_model_chain()
 
     assert "groq/llama-3.2-11b-vision-preview" not in chain
-    assert "gemini/gemini-2.5-flash-lite" in chain
+    assert "gemini/gemini-flash-latest" in chain
     assert "groq/meta-llama/llama-4-scout-17b-16e-instruct" in chain
 
 
@@ -57,12 +57,12 @@ def test_chain_empty_when_no_credentials(monkeypatch: pytest.MonkeyPatch) -> Non
 
 def test_chain_dedupes_configured_equal_to_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     """Configuring a model that is also a fallback must not duplicate it."""
-    monkeypatch.setattr(document_service.settings, "LLM_MULTIMODAL_MODEL", "gemini/gemini-2.5-flash-lite")
+    monkeypatch.setattr(document_service.settings, "LLM_MULTIMODAL_MODEL", "gemini/gemini-flash-latest")
     _set_keys(monkeypatch, gemini="g", groq="k")
 
     chain = document_service.vision_model_chain()
 
-    assert chain.count("gemini/gemini-2.5-flash-lite") == 1
+    assert chain.count("gemini/gemini-flash-latest") == 1
 
 
 class _FakeLLM:
@@ -112,12 +112,12 @@ async def test_multimodal_recovers_when_first_model_fails(monkeypatch: pytest.Mo
 @pytest.mark.asyncio
 async def test_multimodal_returns_none_when_all_models_fail(monkeypatch: pytest.MonkeyPatch) -> None:
     """Every model failing returns None so the caller can add an aviso."""
-    monkeypatch.setattr(document_service.settings, "LLM_MULTIMODAL_MODEL", "gemini/gemini-2.5-flash-lite")
+    monkeypatch.setattr(document_service.settings, "LLM_MULTIMODAL_MODEL", "gemini/gemini-flash-latest")
     _set_keys(monkeypatch, gemini="g", groq="k")
 
     payload = ContratoExtractionResult()
     all_models = {
-        "gemini/gemini-2.5-flash-lite",
+        "gemini/gemini-flash-latest",
         "groq/meta-llama/llama-4-scout-17b-16e-instruct",
     }
 
