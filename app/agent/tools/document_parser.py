@@ -41,7 +41,7 @@ _NON_TEXT_EXTENSIONS = {
     ".mp3", ".mp4", ".mov", ".avi", ".mkv", ".wav", ".flac",
 }
 
-_ARCHIVE_EXTENSIONS = {".zip", ".tar", ".gz", ".tgz"}
+_ARCHIVE_EXTENSIONS = {".zip", ".tar", ".gz", ".tgz", ".rar"}
 
 
 def parse_pdf(content: bytes) -> str:
@@ -139,6 +139,35 @@ def _iter_zip_members(content: bytes):
             yield info.filename, zf.read(info)
 
 
+def _iter_rar_members(content: bytes):
+    """Yield members of a .rar archive via `rarfile`.
+
+    `rarfile` needs an external unrar/bsdtar binary at runtime (bsdtar ships in the
+    Docker image via libarchive-tools). Without one — e.g. a bare local dev setup —
+    extraction degrades gracefully: we log and yield nothing, the upload still
+    succeeds with only the filename as signal.
+    """
+    import rarfile
+
+    try:
+        rf = rarfile.RarFile(io.BytesIO(content))
+    except Exception as exc:  # corrupt rar / missing backend
+        logger.warning("rar_open_failed", error=str(exc))
+        return
+    with rf:
+        for info in rf.infolist():
+            if info.is_dir():
+                continue
+            if info.file_size > _ARCHIVE_MAX_MEMBER_BYTES:
+                logger.warning("archive_member_too_large", member=info.filename, size=info.file_size)
+                continue
+            try:
+                yield info.filename, rf.read(info)
+            except Exception as exc:  # missing unrar tool, bad member
+                logger.warning("rar_member_read_failed", member=info.filename, error=str(exc))
+                return
+
+
 def _iter_tar_members(content: bytes):
     with tarfile.open(fileobj=io.BytesIO(content)) as tf:
         for member in tf.getmembers():
@@ -153,8 +182,18 @@ def _iter_tar_members(content: bytes):
             yield member.name, extracted.read()
 
 
+def _archive_member_iter(content: bytes, filename: str):
+    """Pick the right member iterator (rar/tar/zip) for an archive filename."""
+    ext = Path(filename).suffix.lower()
+    if ext == ".rar":
+        return _iter_rar_members(content)
+    if ext in (".tar", ".gz", ".tgz") or filename.lower().endswith(".tar.gz"):
+        return _iter_tar_members(content)
+    return _iter_zip_members(content)
+
+
 def is_archive_filename(filename: str) -> bool:
-    """True if `filename`'s extension marks it as a supported archive (zip/tar/gz/tgz).
+    """True if `filename`'s extension marks it as a supported archive (zip/tar/gz/tgz/rar).
 
     Shared by `parse_document` (text-preview expansion) and
     `agent_chat_service._expand_attachments_for_tools` (making archive members
@@ -173,9 +212,7 @@ def iter_archive_members(content: bytes, filename: str) -> Iterator[tuple[str, b
     (e.g. the agent chat's attachment expansion) can't be flooded by a zip-bomb-style
     archive with a huge member count.
     """
-    ext = Path(filename).suffix.lower()
-    is_tar = ext in (".tar", ".gz", ".tgz") or filename.lower().endswith(".tar.gz")
-    member_iter = _iter_tar_members(content) if is_tar else _iter_zip_members(content)
+    member_iter = _archive_member_iter(content, filename)
 
     count = 0
     for name, data in member_iter:
@@ -186,14 +223,12 @@ def iter_archive_members(content: bytes, filename: str) -> Iterator[tuple[str, b
 
 
 def parse_archive(content: bytes, filename: str) -> str:
-    """Expand a zip/tar/gz archive and concatenate the text of its members.
+    """Expand a zip/tar/gz/rar archive and concatenate the text of its members.
 
     Each member is prefixed with a `### <path>` header so the LLM can tell files apart.
     Bounded by member-count, per-member-size, total-size, and total-text caps.
     """
-    ext = Path(filename).suffix.lower()
-    is_tar = ext in (".tar", ".gz", ".tgz") or filename.lower().endswith(".tar.gz")
-    member_iter = _iter_tar_members(content) if is_tar else _iter_zip_members(content)
+    member_iter = _archive_member_iter(content, filename)
 
     parts: list[str] = []
     total_bytes = 0
@@ -220,9 +255,9 @@ def parse_archive(content: bytes, filename: str) -> str:
 def parse_document(content: bytes, filename: str) -> str:
     """Auto-detect format and extract text.
 
-    Supports rich formats (PDF/DOCX/XLSX), archives (zip/tar/gz — contents expanded
-    recursively), and a plain-text fallback for any other decodable format. Raises
-    ValueError only for genuinely non-textual binaries.
+    Supports rich formats (PDF/DOCX/XLSX), archives (zip/tar/gz/rar — contents
+    expanded recursively), and a plain-text fallback for any other decodable format.
+    Raises ValueError only for genuinely non-textual binaries.
     """
     ext = Path(filename).suffix.lower()
     if ext == ".pdf":

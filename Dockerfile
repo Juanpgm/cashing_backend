@@ -11,7 +11,8 @@ RUN apt-get update && \
     libpangocairo-1.0-0 \
     libgdk-pixbuf-2.0-0 \
     libffi-dev \
-    libcairo2 && \
+    libcairo2 \
+    libarchive-tools && \
     rm -rf /var/lib/apt/lists/*
 
 RUN groupadd -r cashin && useradd -r -g cashin -d /app -s /sbin/nologin cashin
