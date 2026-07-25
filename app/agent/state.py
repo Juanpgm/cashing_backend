@@ -57,6 +57,10 @@ class AgentState(TypedDict, total=False):
     # evita que evidence_justify repita literalmente la redacción previa)
     actividades_previas: list[str] | None
 
+    # Resumen libre del usuario sobre su mes (CuentaCobro.contexto_usuario) —
+    # guía principal de QUÉ se hizo para evidence_justify
+    contexto_usuario: str | None
+
     # Estado de envío de cuenta de cobro
     email_sent: bool | None
     email_sent_id: str | None

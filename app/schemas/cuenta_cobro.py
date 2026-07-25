@@ -94,6 +94,24 @@ class CuentaCobroUpdate(BaseModel):
             "it set raises CUOTA_POSITION_CONFLICT."
         ),
     )
+    fecha_transaccion: date | None = Field(
+        default=None,
+        description=(
+            "Transaction/payment date (radicacion-stepper, work unit B1). Editable in "
+            "stepper step-2 resume mode. Because null is a meaningful value (clears the "
+            "date), the service distinguishes 'omitted' from 'explicit null' via "
+            "model_fields_set — send the field to set/clear it, omit it to leave it untouched."
+        ),
+    )
+    contexto_usuario: str | None = Field(
+        default=None,
+        max_length=2000,
+        description=(
+            "Free-text summary of what the contractor did this month. Optional grounding "
+            "for LLM activity/justification generation. Null is meaningful (clears the "
+            "text): the service keys off model_fields_set, like fecha_transaccion."
+        ),
+    )
 
     model_config = {"json_schema_extra": {"example": {"mes": 4, "anio": 2026, "valor": "2500000.00"}}}
 
@@ -111,6 +129,7 @@ class CuentaCobroResponse(BaseModel):
     posicion: PosicionCuota
     informe_final: bool
     fecha_transaccion: date | None
+    contexto_usuario: str | None
     actividades: list[ActividadResponse]
     created_at: datetime
     updated_at: datetime

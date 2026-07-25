@@ -19,7 +19,7 @@ from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
 from app.models.obligacion import Obligacion, TipoObligacion
 from app.models.usuario import Usuario
-from app.schemas.cuenta_cobro import ActividadCreate, CuentaCobroCreate
+from app.schemas.cuenta_cobro import ActividadCreate, CuentaCobroCreate, CuentaCobroUpdate
 from app.services import cuenta_cobro_service
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -303,6 +303,65 @@ async def test_cuenta_cobro_legacy_row_carga_fecha_transaccion_null(db: AsyncSes
 
     fetched = await cuenta_cobro_service.obtener_cuenta_cobro(db, user.id, cuenta.id)
     assert fetched.fecha_transaccion is None
+
+
+@pytest.mark.asyncio
+async def test_actualizar_cuenta_cobro_persiste_fecha_transaccion(db: AsyncSession) -> None:
+    """PATCH with fecha_transaccion on a BORRADOR cuota persists the new date
+    (radicacion-stepper step-2 resume-mode edit, WARNING 6 follow-up)."""
+    user = await _make_user(db, creditos=100)
+    contrato = await _make_contrato(db, user.id)
+    cuenta = await _make_cuenta(db, contrato.id)
+    await db.commit()
+
+    resp = await cuenta_cobro_service.actualizar_cuenta_cobro(
+        db, user.id, cuenta.id, CuentaCobroUpdate(fecha_transaccion=date(2024, 3, 20))
+    )
+
+    assert resp.fecha_transaccion == date(2024, 3, 20)
+    persisted = await db.get(CuentaCobro, cuenta.id)
+    assert persisted is not None
+    assert persisted.fecha_transaccion == date(2024, 3, 20)
+
+
+@pytest.mark.asyncio
+async def test_actualizar_cuenta_cobro_limpia_fecha_transaccion_con_null(db: AsyncSession) -> None:
+    """PATCH sending fecha_transaccion=null on a cuota that already has a date
+    clears it — null is an explicit, meaningful value, not 'omitted'."""
+    user = await _make_user(db, creditos=100)
+    contrato = await _make_contrato(db, user.id)
+    cuenta = await _make_cuenta(db, contrato.id)
+    cuenta.fecha_transaccion = date(2024, 3, 20)
+    await db.commit()
+
+    resp = await cuenta_cobro_service.actualizar_cuenta_cobro(
+        db, user.id, cuenta.id, CuentaCobroUpdate(fecha_transaccion=None)
+    )
+
+    assert resp.fecha_transaccion is None
+    persisted = await db.get(CuentaCobro, cuenta.id)
+    assert persisted is not None
+    assert persisted.fecha_transaccion is None
+
+
+@pytest.mark.asyncio
+async def test_actualizar_cuenta_cobro_omitir_fecha_transaccion_no_la_toca(db: AsyncSession) -> None:
+    """PATCH that does NOT include fecha_transaccion leaves the existing date
+    untouched (distinguishes 'omitted' from 'explicit null' via model_fields_set)."""
+    user = await _make_user(db, creditos=100)
+    contrato = await _make_contrato(db, user.id)
+    cuenta = await _make_cuenta(db, contrato.id)
+    cuenta.fecha_transaccion = date(2024, 3, 20)
+    await db.commit()
+
+    resp = await cuenta_cobro_service.actualizar_cuenta_cobro(
+        db, user.id, cuenta.id, CuentaCobroUpdate(valor=Decimal("4000000.00"))
+    )
+
+    assert resp.fecha_transaccion == date(2024, 3, 20)
+    persisted = await db.get(CuentaCobro, cuenta.id)
+    assert persisted is not None
+    assert persisted.fecha_transaccion == date(2024, 3, 20)
 
 
 # ---------------------------------------------------------------------------

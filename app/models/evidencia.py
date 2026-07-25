@@ -2,7 +2,7 @@
 
 import uuid
 
-from sqlalchemy import BigInteger, ForeignKey, String, Uuid
+from sqlalchemy import BigInteger, ForeignKey, String, Text, Uuid
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -25,6 +25,11 @@ class Evidencia(UUIDMixin, TimestampMixin, Base):
     # stored file (storage_key set) OR an external link (url set).
     fuente: Mapped[str | None] = mapped_column(String(50), nullable=True)
     url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    # Extracted text content of the uploaded file (migration 029) — populated at
+    # upload time via document_service.extraer_texto_documento so the justification
+    # LLM can ground on what the evidence actually says, not just its filename.
+    # NULL for link evidence and for files where extraction yielded nothing.
+    texto_extraido: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Relationships
     actividad: Mapped["Actividad"] = relationship(back_populates="evidencias")  # type: ignore[name-defined]  # noqa: F821

@@ -4,7 +4,7 @@ import enum
 import uuid
 from datetime import date, datetime
 
-from sqlalchemy import Boolean, Date, DateTime, Enum, ForeignKey, Integer, Numeric, String, UniqueConstraint, Uuid
+from sqlalchemy import Boolean, Date, DateTime, Enum, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint, Uuid
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -74,6 +74,11 @@ class CuentaCobro(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
     # used as the bounding date for month-scoped pipelines (evidence discovery,
     # justification) when present, falling back to mes/anio when absent.
     fecha_transaccion: Mapped[date | None] = mapped_column(Date, nullable=True)
+
+    # Free-text user summary of what was done this month (migration 029). Optional
+    # grounding input for every LLM generation path (evidence discovery, obligations,
+    # cruzar) — never required, never blocks generation when absent.
+    contexto_usuario: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Relationships
     contrato: Mapped["Contrato"] = relationship(back_populates="cuentas_cobro")  # type: ignore[name-defined]  # noqa: F821

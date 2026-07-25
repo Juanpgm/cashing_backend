@@ -108,13 +108,28 @@ async def _llm_relevance_batch(
         return [False] * len(candidates)
 
 
-async def _llm_justification(obligation_text: str, candidate: dict, llm) -> str:
+def _contexto_usuario_bloque(contexto_usuario: str) -> str:
+    """Optional user-monthly-summary block for the cruzar writer prompts.
+
+    Writing guidance only — the anti-hallucination contract stays intact: quotes
+    must still come EXCLUSIVELY from the document fragments.
+    """
+    if not contexto_usuario:
+        return ""
+    return (
+        "\nContexto del contratista sobre su mes (SOLO como orientación de redacción; "
+        "NUNCA cites de aquí — las citas salen exclusivamente de los fragmentos):\n"
+        f"{contexto_usuario[:1000]}\n"
+    )
+
+
+async def _llm_justification(obligation_text: str, candidate: dict, llm, contexto_usuario: str = "") -> str:
     """Generate a grounded one-sentence justification from the matched evidence."""
     user_content = CRUZAR_JUSTIFICATION_USER.format(
         obligacion=obligation_text[:600],
         documento_fuente=candidate["source"],
         evidencias_texto=candidate["content"][:1500],
-    )
+    ) + _contexto_usuario_bloque(contexto_usuario)
     try:
         resp = await llm.complete(
             [
@@ -130,7 +145,7 @@ async def _llm_justification(obligation_text: str, candidate: dict, llm) -> str:
         return f"Evidencia documental referenciada en {candidate['source']}."
 
 
-async def _llm_actividad(obligation_text: str, candidate: dict, llm) -> str:
+async def _llm_actividad(obligation_text: str, candidate: dict, llm, contexto_usuario: str = "") -> str:
     """Generate a grounded one-sentence ACTIVIDAD (what was done) from the matched
     document — distinct from `_llm_justification` (why it satisfies the obligación).
 
@@ -142,7 +157,7 @@ async def _llm_actividad(obligation_text: str, candidate: dict, llm) -> str:
         obligacion=obligation_text[:600],
         documento_fuente=candidate["source"],
         evidencias_texto=candidate["content"][:1500],
-    )
+    ) + _contexto_usuario_bloque(contexto_usuario)
     try:
         resp = await llm.complete(
             [
@@ -292,8 +307,9 @@ async def cruzar_documentos(
                 continue
 
             # Step 4d: generate grounded actividad (what was done) + justificación (why it counts)
-            actividad_texto = await _llm_actividad(ob_text, candidate, llm_justification)
-            justificacion = await _llm_justification(ob_text, candidate, llm_justification)
+            contexto_usuario = (cuenta.contexto_usuario or "").strip()
+            actividad_texto = await _llm_actividad(ob_text, candidate, llm_justification, contexto_usuario)
+            justificacion = await _llm_justification(ob_text, candidate, llm_justification, contexto_usuario)
 
             if is_near_identical(actividad_texto, justificacion):
                 # Both texts collapsed to the same content — fall back to the

@@ -33,6 +33,7 @@ from app.core.exceptions import GOOGLE_NOT_CONNECTED, ExternalServiceError, NotF
 from app.models.actividad import Actividad
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro
+from app.models.evidencia import Evidencia
 from app.models.obligacion import Obligacion
 from app.schemas.google_workspace import (
     EvidenceDiscoveryRequest,
@@ -130,6 +131,65 @@ async def _actividades_previas(
 
     result = await db.execute(query)
     return [f"{mes:02d}/{anio}: {descripcion}" for descripcion, mes, anio in result.all()]
+
+
+async def _contexto_usuario(db: AsyncSession, cuenta_id: uuid.UUID | None) -> str:
+    """Free-text monthly summary the user wrote on the cuenta (may be empty)."""
+    if not cuenta_id:
+        return ""
+    result = await db.execute(select(CuentaCobro.contexto_usuario).where(CuentaCobro.id == cuenta_id))
+    row = result.first()
+    return (row[0] or "").strip() if row else ""
+
+
+async def _evidencias_subidas(db: AsyncSession, cuenta_id: uuid.UUID | None) -> list[dict]:
+    """Uploaded evidence files of this cuenta's actividades, as local_evidence dicts.
+
+    Ground truth for the justification LLM: the extracted text of each stored file
+    (`Evidencia.texto_extraido`, populated at upload time). Rows uploaded before that
+    column existed are backfilled on the fly by downloading the bytes and running the
+    same extraction ladder — best effort, a failure just leaves the filename as the
+    only signal (previous behavior).
+    """
+    if not cuenta_id:
+        return []
+    result = await db.execute(
+        select(Evidencia)
+        .join(Actividad, Evidencia.actividad_id == Actividad.id)
+        .where(Actividad.cuenta_cobro_id == cuenta_id, Evidencia.storage_key.is_not(None))
+        .order_by(Evidencia.created_at.asc())
+    )
+    rows = list(result.scalars().all())
+    if not rows:
+        return []
+
+    pendientes = [e for e in rows if not (e.texto_extraido or "").strip()]
+    if pendientes:
+        from app.adapters.storage import get_storage
+        from app.services.evidencia_service import _extraer_texto_seguro
+
+        storage = get_storage(settings.S3_BUCKET_PDFS)
+        for ev in pendientes:
+            try:
+                data = await storage.download(key=ev.storage_key)  # type: ignore[attr-defined]
+            except Exception as exc:
+                await logger.awarning("evidencia_backfill_download_failed", key=ev.storage_key, error=str(exc))
+                continue
+            ev.texto_extraido = await _extraer_texto_seguro(ev.nombre_archivo, data)
+        await db.commit()
+
+    return [
+        {
+            "source": "local_file",
+            "filename": ev.nombre_archivo,
+            "title": ev.nombre_archivo,
+            "text": (ev.texto_extraido or "")[:800],
+            "content": (ev.texto_extraido or "")[:800],
+            "link": "",
+            "date": ev.created_at.date().isoformat() if ev.created_at else "",
+        }
+        for ev in rows
+    ]
 
 
 async def _gather_gmail_evidence(
@@ -245,6 +305,11 @@ async def descubrir_evidencias(
     # Actividades de meses anteriores del mismo contrato (grounding para no repetir texto).
     actividades_previas = await _actividades_previas(db, contrato_id, req.cuenta_id)
 
+    # Contexto libre del usuario ("qué hice este mes") + evidencias subidas con su
+    # texto extraído — ambos alimentan la generación junto con lo descubierto en Google.
+    contexto_usuario = await _contexto_usuario(db, req.cuenta_id)
+    local_evidence = await _evidencias_subidas(db, req.cuenta_id)
+
     # Estado compartido por los nodos del agente.
     state: AgentState = {
         "user_id": usuario_id,
@@ -254,6 +319,8 @@ async def descubrir_evidencias(
         "obligaciones_extraidas": obligaciones,  # evidence_matcher lee esta key
         "email_evidencias": email_evidencias,
         "actividades_previas": actividades_previas,
+        "contexto_usuario": contexto_usuario,
+        "local_evidence": local_evidence,
     }
 
     # 2-3. Explorar Drive y Calendar.
@@ -273,6 +340,7 @@ async def descubrir_evidencias(
         "email": len(state.get("email_evidencias") or []),
         "drive": len(state.get("drive_evidencias") or []),
         "calendar": len(state.get("calendar_evidencias") or []),
+        "local_file": len(local_evidence),
     }
     total = sum(fuentes.values())
     descartadas = (state.get("evidencias_descartadas") or 0) + email_filtered
@@ -280,7 +348,8 @@ async def descubrir_evidencias(
         f"Exploré Gmail, Drive y Calendar para {len(obligaciones)} obligación(es) en el período "
         f"{fecha_inicio} a {fecha_fin}. Encontré {total} evidencia(s): "
         f"{fuentes['email']} correos, {fuentes['drive']} documentos de Drive, "
-        f"{fuentes['calendar']} eventos de Calendar."
+        f"{fuentes['calendar']} eventos de Calendar"
+        + (f", {fuentes['local_file']} archivo(s) subido(s)." if fuentes["local_file"] else ".")
         + (f" Se descartaron {descartadas} item(s) como ruido." if descartadas else "")
     )
 

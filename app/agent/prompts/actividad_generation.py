@@ -52,11 +52,19 @@ def build_actividad_justificacion_prompt(
     evidencias_texto: str,
     contrato_contexto: str = "",
     actividades_previas_texto: str = "",
+    contexto_usuario: str = "",
 ) -> str:
     """Construye el prompt de usuario para generar actividad + justificación."""
     parts = [f"## Obligación contractual\n{obligacion}"]
     if contrato_contexto:
         parts.append(f"## Contexto del contrato\n{contrato_contexto}")
+    if contexto_usuario:
+        parts.append(
+            "## Resumen del usuario (contexto del mes)\n"
+            "El contratista describió así lo que hizo este mes — úsalo como guía principal "
+            "de QUÉ se hizo; las evidencias son el soporte de CÓMO se demuestra:\n"
+            f"{contexto_usuario}"
+        )
     parts.append(f"## Evidencias recolectadas\n{evidencias_texto}")
     if actividades_previas_texto:
         parts.append(f"## Actividades de meses anteriores (NO las repitas literalmente)\n{actividades_previas_texto}")

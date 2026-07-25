@@ -116,13 +116,17 @@ async def evidence_filter_node(state: AgentState) -> AgentState:
         else:
             after_heuristics.append(item)
 
+    # Los archivos subidos por el usuario (local_file) nunca pasan por el
+    # clasificador de ruido: subirlos como evidencia YA es intención explícita.
+    kept: list[dict] = [it for it in after_heuristics if it.get("source") == "local_file"]
+    clasificables = [it for it in after_heuristics if it.get("source") != "local_file"]
+
     # Capa 2: clasificador LLM batch
     llm = get_llm(model="groq/llama-3.1-8b-instant")
-    kept: list[dict] = []
     llm_dropped = 0
 
-    for batch_start in range(0, len(after_heuristics), _LLM_BATCH_SIZE):
-        batch = after_heuristics[batch_start : batch_start + _LLM_BATCH_SIZE]
+    for batch_start in range(0, len(clasificables), _LLM_BATCH_SIZE):
+        batch = clasificables[batch_start : batch_start + _LLM_BATCH_SIZE]
         keep_flags = await _llm_classify_batch(batch, llm)
         for item, keep in zip(batch, keep_flags):
             if keep:

@@ -31,14 +31,22 @@ def _obligation_text(ob: dict | str) -> str:
 
 
 def _evidence_links(evidencias: list[dict]) -> list[dict]:
-    """Proyecta las evidencias a la forma de salida (titulo + link + fecha + fuente)."""
+    """Proyecta las evidencias a la forma de salida (titulo + link + fecha + fuente).
+
+    Solo evidencias con link http(s): las subidas por el usuario (local_file) ya
+    existen como filas Evidencia en la DB y no tienen URL — re-emitirlas rompería
+    el validador de EvidenceLink y las duplicaría al persistir.
+    """
     out = []
     for ev in evidencias:
+        link = str(ev.get("link") or "")
+        if not link.startswith("http"):
+            continue
         out.append(
             {
                 "source": ev.get("source", ""),
                 "titulo": ev.get("title") or ev.get("subject") or ev.get("filename") or "(sin título)",
-                "link": ev.get("link", ""),
+                "link": link,
                 "fecha": ev.get("date", ""),
             }
         )
@@ -78,6 +86,7 @@ async def _generate_actividad_justificacion(
     evidencias: list[dict],
     contrato_contexto: str = "",
     actividades_previas: list[str] | None = None,
+    contexto_usuario: str = "",
 ) -> tuple[str, str]:
     """Pide al LLM la ACTIVIDAD + JUSTIFICACION. Degrada con texto determinístico si falla.
 
@@ -89,6 +98,7 @@ async def _generate_actividad_justificacion(
         format_evidencias_for_prompt(evidencias),
         contrato_contexto=contrato_contexto,
         actividades_previas_texto=format_actividades_previas(actividades_previas or []),
+        contexto_usuario=contexto_usuario,
     )
     try:
         resp = await llm.complete(
@@ -124,7 +134,7 @@ async def evidence_justify_node(state: AgentState) -> AgentState:
     """Genera actividad + justificación por obligación a partir de matched_evidence.
 
     Reads: matched_evidence, obligaciones_contexto (u obligaciones_extraidas),
-           contrato_contexto, actividades_previas
+           contrato_contexto, actividades_previas, contexto_usuario
     Writes: justificaciones, current_phase
     """
     matched: dict[str, list[dict]] = state.get("matched_evidence") or {}
@@ -134,6 +144,7 @@ async def evidence_justify_node(state: AgentState) -> AgentState:
     if contrato:
         contrato_contexto = ", ".join(f"{k}: {v}" for k, v in contrato.items() if v)
     actividades_previas = state.get("actividades_previas") or []
+    contexto_usuario = str(state.get("contexto_usuario") or "")
 
     justificaciones: list[dict] = []
     for i, ob in enumerate(obligaciones):
@@ -142,7 +153,7 @@ async def evidence_justify_node(state: AgentState) -> AgentState:
         evidencias = matched.get(ob_id, [])
 
         actividad, justificacion = await _generate_actividad_justificacion(
-            ob_texto, evidencias, contrato_contexto, actividades_previas
+            ob_texto, evidencias, contrato_contexto, actividades_previas, contexto_usuario
         )
         justificaciones.append(
             {

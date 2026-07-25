@@ -20,3 +20,6 @@ class GoogleToken(UUIDMixin, TimestampMixin, Base):
     refresh_token_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
     scopes: Mapped[str] = mapped_column(String(500), nullable=False)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Connected Google account email (migration 029), captured once from the OAuth
+    # id_token/userinfo at connect time so /integraciones/google/status can display it.
+    email: Mapped[str | None] = mapped_column(String(320), nullable=True)

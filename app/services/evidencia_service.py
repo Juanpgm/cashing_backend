@@ -24,6 +24,26 @@ from app.schemas.evidencia import EvidenciaPresignedResponse, EvidenciaResponse,
 logger = structlog.get_logger("service.evidencia")
 
 _MAX_SIZE_BYTES = 20 * 1024 * 1024  # 20 MB
+_TEXTO_EXTRAIDO_MAX_CHARS = 20_000
+
+
+async def _extraer_texto_seguro(filename: str, data: bytes) -> str | None:
+    """Best-effort text extraction for an uploaded evidence file.
+
+    Reuses the document_service ladder (native text → OCR) so the justification
+    LLM can ground on the file's content. Extraction failure NEVER breaks the
+    upload — it just leaves texto_extraido as NULL.
+    """
+    from app.services.document_service import extraer_texto_documento
+
+    try:
+        texto, _avisos = await extraer_texto_documento(data, filename)
+    except Exception as exc:
+        logger.warning("evidencia_extraccion_failed", filename=filename, error=str(exc))
+        return None
+    if not texto or not texto.strip():
+        return None
+    return texto.strip()[:_TEXTO_EXTRAIDO_MAX_CHARS]
 
 
 async def _get_actividad_owned(
@@ -76,6 +96,7 @@ async def subir_evidencia(
         nombre_archivo=filename,
         tipo_archivo=content_type,
         tamano_bytes=len(data),
+        texto_extraido=await _extraer_texto_seguro(filename, data),
     )
     db.add(evidencia)
     await db.commit()
@@ -146,6 +167,7 @@ async def subir_evidencias(
             nombre_archivo=filename,
             tipo_archivo=content_type,
             tamano_bytes=len(data),
+            texto_extraido=await _extraer_texto_seguro(filename, data),
         )
         db.add(evidencia)
         await db.commit()

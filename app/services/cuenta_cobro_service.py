@@ -649,12 +649,45 @@ async def generar_actividades_agente(
         f"- {_MESES[mes - 1]} {anio}: {descripcion}" for descripcion, mes, anio in actividades_previas_result.all()
     )
 
+    # Evidencias subidas por el usuario en esta cuenta, con su texto extraído —
+    # grounding real para que "Generar todas con IA" no infiera en el vacío.
+    from app.models.evidencia import Evidencia
+
+    evidencias_result = await db.execute(
+        select(Evidencia.nombre_archivo, Evidencia.texto_extraido)
+        .join(Actividad, Evidencia.actividad_id == Actividad.id)
+        .where(
+            Actividad.cuenta_cobro_id == cuenta_id,
+            Evidencia.storage_key.is_not(None),
+            Evidencia.texto_extraido.is_not(None),
+        )
+        .order_by(Evidencia.created_at.asc())
+        .limit(10)
+    )
+    evidencias_str = "\n\n".join(
+        f"### {nombre}\n{(texto or '')[:1500]}" for nombre, texto in evidencias_result.all() if (texto or "").strip()
+    )
+
+    contexto_usuario = (cuenta.contexto_usuario or "").strip()
+
     user_content = (
         f"Contrato N° {contrato.numero_contrato}\n"
         f"Entidad: {contrato.entidad or '—'}\n"
         f"Objeto: {contrato.objeto}\n"
         f"Período a facturar: {_MESES[cuenta.mes - 1]} {cuenta.anio}\n\n"
         f"OBLIGACIONES CONTRACTUALES:\n{obligaciones_str}\n"
+        + (
+            f"\nRESUMEN DEL USUARIO (lo que dice haber hecho este mes — úsalo como guía "
+            f"principal de QUÉ se hizo):\n{contexto_usuario}\n"
+            if contexto_usuario
+            else ""
+        )
+        + (
+            f"\nEVIDENCIAS SUBIDAS (contenido extraído de los archivos del período — "
+            f"apóyate en ellas para concretar las actividades):\n{evidencias_str}\n"
+            if evidencias_str
+            else ""
+        )
         + (
             f"\nACTIVIDADES DE MESES ANTERIORES (NO repitas su redacción literal):\n{actividades_previas_str}\n"
             if actividades_previas_str
@@ -1020,6 +1053,15 @@ async def actualizar_cuenta_cobro(
         if data.informe_final:
             await _verificar_conflicto_posicion(db, cuenta.contrato_id, informe_final=True, excluir_cuenta_id=cuenta.id)
         cuenta.informe_final = data.informe_final
+
+    # fecha_transaccion is nullable: null is a meaningful value (clears the date),
+    # so we key off model_fields_set (was the field sent?) rather than `is not None`.
+    if "fecha_transaccion" in data.model_fields_set:
+        cuenta.fecha_transaccion = data.fecha_transaccion
+
+    # contexto_usuario follows the same omitted-vs-explicit-null contract.
+    if "contexto_usuario" in data.model_fields_set:
+        cuenta.contexto_usuario = data.contexto_usuario.strip() if data.contexto_usuario else None
 
     await db.flush()
     await logger.ainfo(
