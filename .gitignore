@@ -69,3 +69,13 @@ local_storage/
 tmp*.txt
 _tmp*.py
 _*.log
+
+# secop-scraper local runtime/debug artifacts (never commit or index — 120MB venv, screenshots, HTML dumps)
+secop-scraper/.venv-scraper/
+secop-scraper/.data/
+secop-scraper/debug_*.html
+secop-scraper/debug_*.png
+secop-scraper/debug_*.py
+
+# local tooling artifacts
+.atl/
