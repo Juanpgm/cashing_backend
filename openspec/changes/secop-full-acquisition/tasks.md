@@ -193,6 +193,8 @@ Est. lines: ~200 (folded into scope; adjust vs. proposal's Slice 4 "tools" line 
   `ruff check` + `ruff format --check` clean on all touched files (2 test files needed `ruff format` auto-fix, re-verified green after). `mypy` on touched files: 0 new errors introduced by this slice's edits (all reported errors in `secop_service.py`/`document_service.py` fall in pre-existing, untouched code ranges — e.g. the `asyncio.gather(..., return_exceptions=True)` `BaseException`-narrowing errors at lines ~413/827-828 predate this slice; `secop_scraper_service.py` itself: 0 mypy errors). Targeted: `tests/test_secop_scraper_service.py tests/test_secop_datasets.py tests/test_secop_service_documentos.py tests/test_secop_service.py tests/test_secop_sincronizar.py tests/test_secop_scraper_adapter.py tests/test_secop_scraper_tool.py tests/test_secop_scraper_deps.py tests/test_secop_api_scraper.py tests/test_tool_catalog.py` — 117 passed, 2 deselected. Full suite: **1221 → 1238 passed (+17 new), 0 regressions, 14 deselected (unchanged)**.
 - [ ] 4.8 **NO PUSH without explicit user OK.** Prepare PR #4 (📍PR4, base=main, rollback=revert; only reachable when `SECOP_SCRAPER_ENABLED=True`).
 
+  Commits prepared locally, NOT pushed: `1973af9` (feat: DocumentId index + decimal-comma fix), `5e4e000` (feat: scraper persistence, fallback path), `4ba5f43` (docs: testing-swagger.md + tasks.md). Awaiting explicit user OK before push — this is the FINAL slice of `secop-full-acquisition`; once pushed/merged, the whole change can move to `sdd-verify`/`sdd-archive`.
+
 ---
 
 ## Review Workload Forecast (Per-Slice Recap)
