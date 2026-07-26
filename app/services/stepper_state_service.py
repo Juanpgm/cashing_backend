@@ -160,7 +160,7 @@ def _step3_checklist(cuenta: CuentaCobro) -> StepState:
     )
 
 
-def _step4_justificaciones(contrato: Contrato, actividades: list[Actividad]) -> StepState:
+def _step6_justificaciones(contrato: Contrato, actividades: list[Actividad]) -> StepState:
     """>= 1 Actividad per obligation, OR vacuously complete when the contract
     has zero obligaciones (B7 Fix 1 — mirrors `generar_actividades_agente`'s
     "obligaciones OR texto_contrato" branch, which permits generating
@@ -173,7 +173,7 @@ def _step4_justificaciones(contrato: Contrato, actividades: list[Actividad]) -> 
     cubiertas = sum(1 for o in obligaciones if o.id in obligacion_ids_con_actividad)
     complete = total == 0 or cubiertas == total
     return StepState(
-        step=4,
+        step=6,
         key="justificaciones",
         complete=complete,
         blocking=not complete,
@@ -222,11 +222,11 @@ async def _step5_formato(db: AsyncSession, usuario_id: uuid.UUID, contrato: Cont
     )
 
 
-def _step6_evidencias(estado: EstadoListoPendiente) -> StepState:
+def _step4_evidencias(estado: EstadoListoPendiente) -> StepState:
     """checklist satisfied = every obligación has evidence (pendientes == 0)."""
     complete = estado.pendientes == 0
     return StepState(
-        step=6,
+        step=4,
         key="evidencias",
         complete=complete,
         blocking=not complete,
@@ -283,9 +283,9 @@ async def obtener_stepper_state(
         await _step1_contrato(db, cuenta, contrato),
         await _step2_cuota(db, cuenta),
         _step3_checklist(cuenta),
-        _step4_justificaciones(contrato, cuenta.actividades),
+        _step4_evidencias(estado),
         await _step5_formato(db, usuario_id, contrato),
-        _step6_evidencias(estado),
+        _step6_justificaciones(contrato, cuenta.actividades),
         _step7_paquete(estado),
     ]
 

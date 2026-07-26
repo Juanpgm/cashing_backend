@@ -36,6 +36,7 @@ from app.models.actividad import Actividad
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro
 from app.models.documento_fuente import DocumentoFuente
+from app.models.evidencia import Evidencia
 from app.schemas.agent import LLMMessage
 from app.schemas.cobertura import CoberturaResponse
 from app.services import cobertura_service
@@ -68,9 +69,7 @@ def _keyword_score(obligation_text: str, evidence_text: str) -> float:
 _RELEVANCE_JSON_RE = re.compile(r"\[.*\]", re.DOTALL)
 
 
-async def _llm_relevance_batch(
-    obligation_text: str, candidates: list[dict], llm
-) -> list[bool]:
+async def _llm_relevance_batch(obligation_text: str, candidates: list[dict], llm) -> list[bool]:
     """Classify ALL candidates for one obligation in a SINGLE LLM call.
 
     Returns a bool per candidate (same order). Fails closed (all False) on error or
@@ -80,9 +79,7 @@ async def _llm_relevance_batch(
     if not candidates:
         return []
 
-    listado = "\n".join(
-        f"{i + 1}. {c['content'][:1000]}" for i, c in enumerate(candidates)
-    )
+    listado = "\n".join(f"{i + 1}. {c['content'][:1000]}" for i, c in enumerate(candidates))
     user_content = (
         f"Obligación: {obligation_text[:500]}\n\n"
         f"Evidencias:\n{listado}\n\n"
@@ -245,8 +242,23 @@ async def cruzar_documentos(
     # 3. Delete existing Actividades for this cuenta (refresh from docs)
     # Deleting first ensures a clean, idempotent re-run — any previous
     # AI-generated activities are replaced with the current document set.
+    # Rows that carry uploaded Evidencia are kept out of the delete: they're
+    # the placeholder stubs `evidencia_service.subir_evidencias_cuenta` creates
+    # when evidence is uploaded ahead of this step, and Evidencia.actividad_id
+    # has no ON DELETE clause — deleting them would orphan the evidence (SQLite)
+    # or raise a FK violation (Postgres). They're reused/filled below instead.
     # ------------------------------------------------------------------
-    await db.execute(delete(Actividad).where(Actividad.cuenta_cobro_id == cuenta_id))
+    stubs_result = await db.execute(
+        select(Actividad)
+        .join(Evidencia, Evidencia.actividad_id == Actividad.id)
+        .where(Actividad.cuenta_cobro_id == cuenta_id)
+        .distinct()
+    )
+    stubs_con_evidencia: dict[UUID | None, Actividad] = {act.obligacion_id: act for act in stubs_result.scalars()}
+    delete_stmt = delete(Actividad).where(Actividad.cuenta_cobro_id == cuenta_id)
+    if stubs_con_evidencia:
+        delete_stmt = delete_stmt.where(Actividad.id.not_in([act.id for act in stubs_con_evidencia.values()]))
+    await db.execute(delete_stmt)
     await logger.ainfo("cruzar.deleted_existing_actividades", cuenta_id=str(cuenta_id))
 
     # ------------------------------------------------------------------
@@ -275,10 +287,7 @@ async def cruzar_documentos(
         ob_text = ob.descripcion or ""
 
         # Step 4a: keyword filter (threshold ≥ 0.15)
-        candidates = [
-            ev for ev in evidence_pool
-            if _keyword_score(ob_text, ev["content"]) >= 0.15
-        ]
+        candidates = [ev for ev in evidence_pool if _keyword_score(ob_text, ev["content"]) >= 0.15]
 
         if not candidates:
             await logger.ainfo(
@@ -316,15 +325,25 @@ async def cruzar_documentos(
                 # deterministic actividad text so the two fields stay distinct.
                 actividad_texto = f"Elaboración y entrega de {candidate['source']}."
 
-            # Step 4e: create Actividad record
-            actividad = Actividad(
-                cuenta_cobro_id=cuenta_id,
-                obligacion_id=ob.id,
-                descripcion=actividad_texto[:1000],
-                justificacion=justificacion[:1000],
-                fecha_realizacion=fecha_realizacion,
-            )
-            db.add(actividad)
+            # Step 4e: create the Actividad record — reusing this obligación's
+            # evidence-carrying stub (first match only) instead of inserting a
+            # fresh row, so the uploaded Evidencia stays linked to the row that
+            # now holds the real, generated text.
+            stub = stubs_con_evidencia.pop(ob.id, None)
+            if stub is not None:
+                stub.descripcion = actividad_texto[:1000]
+                stub.justificacion = justificacion[:1000]
+                stub.fecha_realizacion = fecha_realizacion
+            else:
+                db.add(
+                    Actividad(
+                        cuenta_cobro_id=cuenta_id,
+                        obligacion_id=ob.id,
+                        descripcion=actividad_texto[:1000],
+                        justificacion=justificacion[:1000],
+                        fecha_realizacion=fecha_realizacion,
+                    )
+                )
             actividades_creadas += 1
 
             await logger.ainfo(
@@ -353,8 +372,7 @@ async def cruzar_documentos(
     try:
         gate_state = {
             "obligaciones_extraidas": [
-                {"id": str(ob.id), "descripcion": ob.descripcion, "tipo": ob.tipo.value}
-                for ob in obligaciones
+                {"id": str(ob.id), "descripcion": ob.descripcion, "tipo": ob.tipo.value} for ob in obligaciones
             ],
             "contrato_extraido": {
                 "objeto": contrato.objeto or "",

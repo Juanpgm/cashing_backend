@@ -8,7 +8,7 @@ from datetime import date
 from typing import cast
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import HTMLResponse, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -37,6 +37,7 @@ from app.schemas.cuenta_cobro import (
     GenerarPDFResponse,
     PDFUrlResponse,
 )
+from app.schemas.evidencia import EvidenciaClasificadaResponse
 from app.schemas.google_workspace import EvidencePersistRequest, EvidencePersistSummary
 from app.schemas.paquete import PaqueteInfoResponse
 from app.schemas.plantilla_organismo import FormatoValoresResponse
@@ -48,6 +49,7 @@ from app.services import (
     cruzar_service,
     cuenta_cobro_service,
     evidence_persist_service,
+    evidencia_service,
     informe_service,
     paquete_service,
     pdf_signature_service,
@@ -333,6 +335,44 @@ async def persistir_evidencias(
     the same result does not duplicate rows.
     """
     return await evidence_persist_service.persistir_evidencias(db, current_user.id, cuenta_id, data.obligaciones)
+
+
+@router.post(
+    "/{cuenta_id}/evidencias/subir",
+    response_model=list[EvidenciaClasificadaResponse],
+    status_code=status.HTTP_201_CREATED,
+)
+async def subir_evidencias_cuenta(
+    cuenta_id: uuid.UUID,
+    user: CurrentUser,
+    files: list[UploadFile] = File(...),
+    db: AsyncSession = Depends(get_db),
+    storage: S3StorageAdapter = Depends(get_pdf_storage),
+) -> list[EvidenciaClasificadaResponse]:
+    """Sube uno o varios archivos de evidencia para una cuenta de cobro, ANTES de
+    que existan actividades (paso Evidencias, ahora anterior a Justificaciones).
+
+    Cada archivo se clasifica automáticamente contra las obligaciones del
+    contrato y se adjunta a una actividad "stub" (creada o reutilizada) para que
+    la generación de justificaciones y el paquete de radicación puedan usar esa
+    clasificación más adelante. Todos los archivos se validan antes de persistir
+    cualquiera; un archivo inválido rechaza el lote completo.
+    """
+    archivos = [
+        (
+            f.filename or "upload",
+            f.content_type or "application/octet-stream",
+            await f.read(),
+        )
+        for f in files
+    ]
+    return await evidencia_service.subir_evidencias_cuenta(
+        db=db,
+        storage=storage,
+        usuario_id=user.id,
+        cuenta_id=cuenta_id,
+        archivos=archivos,
+    )
 
 
 @router.get(

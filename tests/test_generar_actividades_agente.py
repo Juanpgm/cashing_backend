@@ -8,14 +8,10 @@ mismas que produjo el LLM.
 
 from __future__ import annotations
 
-import uuid
 from datetime import date
 from typing import Any
 
 import pytest
-from sqlalchemy import delete
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from app.core.exceptions import ValidationError
 from app.models.actividad import Actividad
 from app.models.contrato import Contrato
@@ -24,6 +20,8 @@ from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
 from app.models.obligacion import Obligacion, TipoObligacion
 from app.schemas.agent import LLMResponse
 from app.services import cuenta_cobro_service
+from sqlalchemy import delete, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 pytestmark = pytest.mark.asyncio
 
@@ -32,9 +30,7 @@ pytestmark = pytest.mark.asyncio
 
 
 @pytest.fixture
-async def contrato_con_doc(
-    db: AsyncSession, test_user: dict[str, Any]
-) -> Contrato:
+async def contrato_con_doc(db: AsyncSession, test_user: dict[str, Any]) -> Contrato:
     """Contrato SIN obligaciones pero CON documento de contrato (texto)."""
     user = test_user["user"]
     c = Contrato(
@@ -70,9 +66,7 @@ async def contrato_con_doc(
 
 
 @pytest.fixture
-async def contrato_vacio(
-    db: AsyncSession, test_user: dict[str, Any]
-) -> Contrato:
+async def contrato_vacio(db: AsyncSession, test_user: dict[str, Any]) -> Contrato:
     """Contrato sin obligaciones y sin documentos."""
     user = test_user["user"]
     c = Contrato(
@@ -91,9 +85,7 @@ async def contrato_vacio(
 
 
 @pytest.fixture
-async def contrato_con_obligaciones(
-    db: AsyncSession, test_user: dict[str, Any]
-) -> tuple[Contrato, list[Obligacion]]:
+async def contrato_con_obligaciones(db: AsyncSession, test_user: dict[str, Any]) -> tuple[Contrato, list[Obligacion]]:
     user = test_user["user"]
     c = Contrato(
         usuario_id=user.id,
@@ -144,7 +136,7 @@ class _FakeLLM:
         self._content = response_content
         self.captured_messages: list[Any] = []
 
-    async def complete(self, messages, temperature=0.3, max_tokens=4096) -> LLMResponse:  # noqa: ARG002
+    async def complete(self, messages, temperature=0.3, max_tokens=4096) -> LLMResponse:
         self.captured_messages = list(messages)
         return LLMResponse(
             content=self._content,
@@ -193,9 +185,7 @@ async def test_genera_actividades_sin_obligaciones_con_texto_contrato(
     )
     _patch_llm(monkeypatch, llm_response)
 
-    resp = await cuenta_cobro_service.generar_actividades_agente(
-        db, user.id, cuenta.id
-    )
+    resp = await cuenta_cobro_service.generar_actividades_agente(db, user.id, cuenta.id)
 
     assert resp.creadas == 4, f"esperaba 4 actividades, obtuve {resp.creadas}"
     assert len(resp.actividades) == 4
@@ -222,13 +212,56 @@ async def test_genera_actividades_vincula_a_obligaciones_por_numero(
     )
     _patch_llm(monkeypatch, llm_response)
 
-    resp = await cuenta_cobro_service.generar_actividades_agente(
-        db, user.id, cuenta.id
-    )
+    resp = await cuenta_cobro_service.generar_actividades_agente(db, user.id, cuenta.id)
 
     assert resp.creadas == 3
     obligacion_ids = [a.obligacion_id for a in resp.actividades]
     assert obligacion_ids == [obs[0].id, obs[1].id, obs[2].id]
+
+
+async def test_reutiliza_stub_con_evidencia_en_lugar_de_duplicar(
+    db: AsyncSession,
+    test_user: dict[str, Any],
+    contrato_con_obligaciones: tuple[Contrato, list[Obligacion]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regresión: una Actividad-molde creada por la subida de evidencia (Step 4,
+    antes de generar justificaciones) debe reutilizarse en el mismo registro en
+    vez de insertarse una nueva — de lo contrario la evidencia adjunta queda
+    huérfana en el molde placeholder mientras el texto real vive en otra fila."""
+    from app.models.evidencia import Evidencia
+
+    contrato, obs = contrato_con_obligaciones
+    cuenta = await _make_cuenta(db, contrato)
+    user = test_user["user"]
+
+    stub = Actividad(
+        cuenta_cobro_id=cuenta.id,
+        obligacion_id=obs[0].id,
+        descripcion="Pendiente de redactar — evidencia adjunta: soporte.pdf",
+    )
+    db.add(stub)
+    await db.flush()
+    stub_id = stub.id
+    db.add(Evidencia(actividad_id=stub.id, storage_key="evidencias/x/soporte.pdf", nombre_archivo="soporte.pdf"))
+    await db.commit()
+
+    llm_response = (
+        "ACTIVIDAD|Elaboré informe mensual completo y detallado|Cumplimiento ob. 1|1\n"
+        "ACTIVIDAD|Participé activamente en reuniones de coordinación|Cumplimiento ob. 2|2\n"
+        "ACTIVIDAD|Desarrollé y entregué los entregables solicitados|Cumplimiento ob. 3|3\n"
+    )
+    _patch_llm(monkeypatch, llm_response)
+
+    resp = await cuenta_cobro_service.generar_actividades_agente(db, user.id, cuenta.id)
+
+    assert resp.creadas == 3
+    generada_ob1 = next(a for a in resp.actividades if a.obligacion_id == obs[0].id)
+    assert generada_ob1.id == stub_id  # misma fila reutilizada, no duplicada
+    assert generada_ob1.descripcion == "Elaboré informe mensual completo y detallado"
+
+    ev_result = await db.execute(select(Evidencia).where(Evidencia.actividad_id == stub_id))
+    assert ev_result.scalar_one_or_none() is not None  # el enlace de evidencia sigue intacto
 
 
 async def test_falla_si_no_hay_obligaciones_ni_documento(
@@ -240,9 +273,7 @@ async def test_falla_si_no_hay_obligaciones_ni_documento(
     user = test_user["user"]
 
     with pytest.raises(ValidationError, match="obligaciones registradas"):
-        await cuenta_cobro_service.generar_actividades_agente(
-            db, user.id, cuenta.id
-        )
+        await cuenta_cobro_service.generar_actividades_agente(db, user.id, cuenta.id)
 
 
 async def test_falla_si_llm_devuelve_formato_invalido(
@@ -260,9 +291,7 @@ async def test_falla_si_llm_devuelve_formato_invalido(
     )
 
     with pytest.raises(ValidationError, match="formato esperado"):
-        await cuenta_cobro_service.generar_actividades_agente(
-            db, user.id, cuenta.id
-        )
+        await cuenta_cobro_service.generar_actividades_agente(db, user.id, cuenta.id)
 
 
 async def test_actividad_near_identica_a_justificacion_se_resetea_a_vacio(
@@ -327,9 +356,7 @@ async def test_falla_si_estado_no_permite_edicion(
     user = test_user["user"]
 
     with pytest.raises(ValidationError, match="estado"):
-        await cuenta_cobro_service.generar_actividades_agente(
-            db, user.id, cuenta.id
-        )
+        await cuenta_cobro_service.generar_actividades_agente(db, user.id, cuenta.id)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

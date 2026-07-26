@@ -11,9 +11,6 @@ from datetime import date
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from app.core.exceptions import ForbiddenError, NotFoundError
 from app.models.actividad import Actividad
 from app.models.contrato import Contrato
@@ -22,7 +19,8 @@ from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
 from app.models.obligacion import Obligacion, TipoObligacion
 from app.models.usuario import Usuario
 from app.services import cruzar_service
-
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 # ---------------------------------------------------------------------------
 # Shared test helpers (mirrors test_cobertura_service.py conventions)
@@ -382,3 +380,51 @@ async def test_cruzar_clears_existing_actividades_before_run(db: AsyncSession) -
     after_result = await db.execute(select(Actividad).where(Actividad.cuenta_cobro_id == cuenta.id))
     actividades_after = list(after_result.scalars().all())
     assert len(actividades_after) == 0
+
+
+@pytest.mark.asyncio
+async def test_cruzar_reuses_actividad_stub_with_evidencia_instead_of_deleting_it(db: AsyncSession) -> None:
+    """A stub Actividad created by the upload-first evidence flow (Evidencia
+    already attached) must survive the refresh-from-docs delete and be filled
+    with the generated text in place — deleting it would either orphan the
+    Evidencia row (SQLite, no FK enforcement) or raise a FK violation
+    (Postgres, no ON DELETE clause on Evidencia.actividad_id)."""
+    from app.models.evidencia import Evidencia
+
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+    ob = await _make_obligacion(db, contrato.id, 1, descripcion="Elaborar informes técnicos mensuales de avance")
+    cuenta = await _make_cuenta(db, contrato.id)
+    stub = await _make_actividad(db, cuenta.id, ob.id)
+    stub_id = stub.id
+    db.add(Evidencia(actividad_id=stub.id, storage_key="evidencias/x/y.pdf", nombre_archivo="y.pdf"))
+    await _make_documento(
+        db,
+        user.id,
+        contrato.id,
+        texto_extraido="Informe técnico de avance mensual con detalle de actividades realizadas.",
+    )
+    await db.commit()
+
+    mock_llm = AsyncMock()
+    mock_llm.complete = AsyncMock(
+        side_effect=[
+            _make_llm_response("[1]"),
+            _make_llm_response("Elaboración del informe técnico mensual."),
+            _make_llm_response("Cumple la obligación de reportar avances."),
+        ]
+    )
+
+    with patch("app.services.cruzar_service.get_llm", return_value=mock_llm):
+        with patch("app.services.cruzar_service.quality_gate_node", new_callable=AsyncMock) as mock_gate:
+            mock_gate.return_value = {"quality_gate_passed": True, "quality_issues": []}
+            await cruzar_service.cruzar_documentos(db, user.id, cuenta.id)
+
+    result = await db.execute(select(Actividad).where(Actividad.cuenta_cobro_id == cuenta.id))
+    actividades = list(result.scalars().all())
+    assert len(actividades) == 1
+    assert actividades[0].id == stub_id  # same row reused, not a duplicate
+    assert actividades[0].descripcion == "Elaboración del informe técnico mensual."
+
+    ev_result = await db.execute(select(Evidencia).where(Evidencia.actividad_id == stub_id))
+    assert ev_result.scalar_one_or_none() is not None  # evidence link intact

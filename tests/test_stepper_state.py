@@ -274,23 +274,23 @@ def test_step3_predicate_complete_when_mode_chosen() -> None:
     assert result.code is None
 
 
-async def test_step4_predicate_incomplete_without_actividad_per_obligacion(
+async def test_step6_predicate_incomplete_without_actividad_per_obligacion(
     contrato: Contrato, obligacion: Obligacion
 ) -> None:
-    result = stepper_state_service._step4_justificaciones(contrato, [])
+    result = stepper_state_service._step6_justificaciones(contrato, [])
 
-    assert result.step == 4
+    assert result.step == 6
     assert result.key == "justificaciones"
     assert result.complete is False
 
 
-async def test_step4_predicate_complete_with_one_actividad_per_obligacion(
+async def test_step6_predicate_complete_with_one_actividad_per_obligacion(
     db: AsyncSession, contrato: Contrato, obligacion: Obligacion
 ) -> None:
     cuenta = await _make_cuenta(db, contrato)
     act = await _add_actividad_con_evidencia(db, cuenta, obligacion, con_evidencia=False)
 
-    result = stepper_state_service._step4_justificaciones(contrato, [act])
+    result = stepper_state_service._step6_justificaciones(contrato, [act])
 
     assert result.complete is True
 
@@ -438,7 +438,7 @@ async def test_step5_formato_lists_every_plantilla_per_tipo(
     ]
 
 
-async def test_step6_evidencias_incomplete_when_pendientes_greater_than_zero(
+async def test_step4_evidencias_incomplete_when_pendientes_greater_than_zero(
     db: AsyncSession, test_user: dict[str, Any], contrato: Contrato, obligacion: Obligacion
 ) -> None:
     user = test_user["user"]
@@ -447,11 +447,11 @@ async def test_step6_evidencias_incomplete_when_pendientes_greater_than_zero(
 
     result = await stepper_state_service.obtener_stepper_state(db, user.id, cuenta.id)
 
-    assert result.steps[5].key == "evidencias"
-    assert result.steps[5].complete is False
+    assert result.steps[3].key == "evidencias"
+    assert result.steps[3].complete is False
 
 
-async def test_step6_evidencias_complete_when_pendientes_is_zero(
+async def test_step4_evidencias_complete_when_pendientes_is_zero(
     db: AsyncSession, test_user: dict[str, Any], contrato: Contrato, obligacion: Obligacion
 ) -> None:
     user = test_user["user"]
@@ -460,7 +460,7 @@ async def test_step6_evidencias_complete_when_pendientes_is_zero(
 
     result = await stepper_state_service.obtener_stepper_state(db, user.id, cuenta.id)
 
-    assert result.steps[5].complete is True
+    assert result.steps[3].complete is True
 
 
 async def test_step7_paquete_incomplete_when_not_listo_para_radicar(
@@ -497,7 +497,7 @@ async def test_resume_non_contiguous_completion_does_not_advance_past_first_gap(
     db: AsyncSession, test_user: dict[str, Any], contrato: Contrato, obligacion: Obligacion
 ) -> None:
     """Steps 1-2 complete, step 3 (checklist mode) NOT chosen, but step 4
-    (justificaciones) happens to already be satisfiable. furthest_completed_step
+    (evidencias) happens to already be satisfiable. furthest_completed_step
     must stop at 2 — never skip the gap at step 3."""
     user = test_user["user"]
     await _contrato_completo(db, contrato, user.id)
@@ -605,10 +605,11 @@ async def test_zero_obligation_contract_aggregate_is_internally_consistent(
     assert result.steps[0].key == "contrato"
     assert result.steps[0].complete is True
     assert result.steps[0].detail == {"obligaciones": 0}
-    assert result.steps[3].key == "justificaciones"
-    assert result.steps[3].complete is True
-    assert result.steps[3].detail == {"obligaciones": 0, "con_actividad": 0}
-    assert result.steps[5].complete is True  # evidencias — already vacuous pre-fix
+    assert result.steps[3].key == "evidencias"
+    assert result.steps[3].complete is True  # evidencias — already vacuous pre-fix
+    assert result.steps[5].key == "justificaciones"
+    assert result.steps[5].complete is True
+    assert result.steps[5].detail == {"obligaciones": 0, "con_actividad": 0}
     assert result.steps[6].complete is True  # paquete — already vacuous pre-fix
     assert result.furthest_completed_step == 7
     assert result.current_step == 7

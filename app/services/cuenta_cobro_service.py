@@ -723,8 +723,33 @@ async def generar_actividades_agente(
             "Use POST /actividades/desde-texto para ingresar las actividades manualmente."
         )
 
+    # Evidence uploaded ahead of generation (Evidencias step now runs before this
+    # one) already lives on a placeholder "stub" Actividad created by
+    # `evidencia_service.subir_evidencias_cuenta` (find-or-create by obligacion_id).
+    # Filling that same row in place — rather than always inserting a fresh one —
+    # keeps the Evidencia.actividad_id link intact, so the generated text ends up
+    # in the row the package/cobertura already read evidence from. Only rows that
+    # actually carry evidence are reused; obligaciones with no upload keep the
+    # original always-insert behavior unchanged.
+    stubs_result = await db.execute(
+        select(Actividad)
+        .join(Evidencia, Evidencia.actividad_id == Actividad.id)
+        .where(Actividad.cuenta_cobro_id == cuenta_id)
+        .distinct()
+    )
+    stubs_con_evidencia: dict[uuid.UUID | None, Actividad] = {act.obligacion_id: act for act in stubs_result.scalars()}
+
     created: list[ActividadResponse] = []
     for data in actividades_data:
+        stub = stubs_con_evidencia.pop(data.obligacion_id, None)
+        if stub is not None:
+            stub.descripcion = data.descripcion
+            stub.justificacion = data.justificacion
+            stub.fecha_realizacion = data.fecha_realizacion
+            await db.flush()
+            await db.refresh(stub)
+            created.append(ActividadResponse.model_validate(stub))
+            continue
         act = Actividad(
             cuenta_cobro_id=cuenta_id,
             obligacion_id=data.obligacion_id,

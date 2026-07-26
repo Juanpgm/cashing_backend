@@ -43,6 +43,28 @@ class EvidenciaResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class EvidenciaClasificadaResponse(BaseModel):
+    """Returned after uploading a cuenta-scoped evidence file (POST .../evidencias/subir).
+
+    Unlike `EvidenciaUploadResponse` (per-actividad upload, actividad already exists),
+    this reports the auto-classification outcome against the contract's obligaciones —
+    the upload endpoint find-or-creates a stub `Actividad` under the hood.
+    """
+
+    id: uuid.UUID
+    actividad_id: uuid.UUID
+    obligacion_id: uuid.UUID | None = None
+    obligacion_etiqueta: str | None = None
+    nombre_archivo: str
+    tipo_archivo: str
+    tamano_bytes: int
+    presigned_url: str | None = None
+    clasificado: bool
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
 class EvidenciaPresignedResponse(BaseModel):
     """Presigned download URL for a file."""
 

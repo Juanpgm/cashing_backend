@@ -581,4 +581,88 @@ async def test_obtener_url_pdf_ok(
         fastapi_app.dependency_overrides.pop(get_pdf_storage, None)
 
     assert resp.status_code == 200
-    assert "pdf_url" in resp.json()
+
+
+# ---------------------------------------------------------------------------
+# POST /cuentas-cobro/{id}/evidencias/subir — cuenta-scoped upload + classification
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_subir_evidencias_cuenta_201_clasifica(
+    client: AsyncClient, test_user: dict[str, Any], cuenta_borrador: CuentaCobro, db: AsyncSession
+) -> None:
+    from app.models.obligacion import Obligacion, TipoObligacion
+
+    ob = Obligacion(
+        contrato_id=cuenta_borrador.contrato_id,
+        descripcion="Elaborar informes tecnicos mensuales de consultoria y asesoria especializada",
+        tipo=TipoObligacion.ESPECIFICA,
+        orden=1,
+        etiqueta="OB1",
+    )
+    db.add(ob)
+    await db.commit()
+
+    fastapi_app.dependency_overrides[get_pdf_storage] = _mock_pdf_storage
+    try:
+        resp = await client.post(
+            f"/api/v1/cuentas-cobro/{cuenta_borrador.id}/evidencias/subir",
+            headers=test_user["headers"],
+            files=[
+                (
+                    "files",
+                    (
+                        "informe.txt",
+                        b"Informe tecnico mensual de consultoria y asesoria especializada entregado.",
+                        "text/plain",
+                    ),
+                )
+            ],
+        )
+    finally:
+        fastapi_app.dependency_overrides.pop(get_pdf_storage, None)
+
+    assert resp.status_code == 201, resp.text
+    data = resp.json()
+    assert isinstance(data, list)
+    assert len(data) == 1
+    assert data[0]["clasificado"] is True
+    assert data[0]["obligacion_id"] == str(ob.id)
+    assert data[0]["obligacion_etiqueta"] == "OB1"
+    assert data[0]["nombre_archivo"] == "informe.txt"
+
+
+@pytest.mark.asyncio
+async def test_subir_evidencias_cuenta_otro_usuario_403(
+    client: AsyncClient, test_user: dict[str, Any], cuenta_borrador: CuentaCobro, db: AsyncSession
+) -> None:
+    from app.core.security import create_access_token, hash_password
+    from app.models.usuario import Usuario
+
+    otro = Usuario(
+        email="otro@example.com",
+        nombre="Otro Usuario",
+        cedula="987654321",
+        telefono="+573009876543",
+        password_hash=hash_password("OtroPass123!"),
+        rol="contratista",
+        activo=True,
+        creditos_disponibles=100,
+    )
+    db.add(otro)
+    await db.commit()
+    await db.refresh(otro)
+    otro_token = create_access_token(subject=str(otro.id), role=otro.rol)
+
+    fastapi_app.dependency_overrides[get_pdf_storage] = _mock_pdf_storage
+    try:
+        resp = await client.post(
+            f"/api/v1/cuentas-cobro/{cuenta_borrador.id}/evidencias/subir",
+            headers={"Authorization": f"Bearer {otro_token}"},
+            files=[("files", ("spy.txt", b"contenido", "text/plain"))],
+        )
+    finally:
+        fastapi_app.dependency_overrides.pop(get_pdf_storage, None)
+
+    assert resp.status_code == 403

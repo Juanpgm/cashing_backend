@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from typing import TYPE_CHECKING
 
 import structlog
 
@@ -11,6 +12,9 @@ from app.adapters.llm import get_llm
 from app.agent.state import AgentState
 from app.core.config import settings
 from app.schemas.agent import LLMMessage
+
+if TYPE_CHECKING:
+    from app.models.obligacion import Obligacion
 
 logger = structlog.get_logger("agent.nodes.evidence_matcher")
 
@@ -29,6 +33,14 @@ Ejemplo: [1, 3]. Si ninguna es relevante, responde [].
 """
 
 _JSON_RE = re.compile(r"\[.*\]", re.DOTALL)
+
+_CLASIFICAR_SYSTEM = """\
+Eres un clasificador. Dada una evidencia y una lista numerada de obligaciones \
+contractuales candidatas, indica cuál obligación describe MEJOR esa evidencia.
+
+Responde SOLO con el número de la obligación. Ejemplo: 2.
+"""
+_NUMBER_RE = re.compile(r"\d+")
 
 
 def _keyword_score(obligation_text: str, evidence_text: str) -> float:
@@ -97,6 +109,59 @@ async def _llm_relevance_batch(
         return _fallback_flags(keyword_scores, len(evidences))
 
 
+async def clasificar_evidencia(texto_evidencia: str, obligaciones: list[Obligacion], llm=None) -> Obligacion | None:
+    """Best-matching obligación for one evidence text, or None if nothing clears the bar.
+
+    Scores every obligación's `descripcion` against `texto_evidencia` with the same
+    `_keyword_score` used by the batch matcher above, and keeps candidates that clear
+    `_KEYWORD_THRESHOLD`. Zero candidates -> None. Exactly one -> returned directly,
+    no LLM call needed. Two or more -> ONE LLM call picks the single best match,
+    falling back to the highest keyword-score candidate on LLM failure or
+    unparseable/out-of-range output (same conservative-fallback philosophy as
+    `_llm_relevance_batch`).
+    """
+    if not obligaciones or not texto_evidencia:
+        return None
+
+    candidates = [(ob, _keyword_score(ob.descripcion, texto_evidencia)) for ob in obligaciones]
+    candidates = [(ob, score) for ob, score in candidates if score >= _KEYWORD_THRESHOLD]
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0][0]
+
+    candidates.sort(key=lambda pair: pair[1], reverse=True)
+    fallback = candidates[0][0]
+
+    if llm is None:
+        llm = get_llm(model="groq/llama-3.1-8b-instant")
+
+    listado = "\n".join(f"{i + 1}. {ob.descripcion[:400]}" for i, (ob, _score) in enumerate(candidates))
+    prompt = (
+        f"Evidencia:\n{texto_evidencia[:800]}\n\n"
+        f"Obligaciones candidatas:\n{listado}\n\n"
+        "¿Cuál obligación describe mejor esta evidencia? Responde solo el número."
+    )
+    try:
+        resp = await llm.complete(
+            [
+                LLMMessage(role="system", content=_CLASIFICAR_SYSTEM),
+                LLMMessage(role="user", content=prompt),
+            ],
+            temperature=0.0,
+            max_tokens=8,
+        )
+        match = _NUMBER_RE.search(resp.content)
+        if not match:
+            return fallback
+        idx = int(match.group(0)) - 1
+        if 0 <= idx < len(candidates):
+            return candidates[idx][0]
+        return fallback
+    except Exception:
+        return fallback
+
+
 async def evidence_matcher_node(state: AgentState) -> AgentState:
     """Match evidence to obligations using keyword score + LLM refinement.
 
@@ -130,10 +195,7 @@ async def evidence_matcher_node(state: AgentState) -> AgentState:
             ob_id = str(i)
 
         # Step 1: keyword filter (≥0.15 threshold)
-        candidates = [
-            ev for ev in evidence_raw
-            if _keyword_score(ob_text, ev.get("content", "")) >= _KEYWORD_THRESHOLD
-        ]
+        candidates = [ev for ev in evidence_raw if _keyword_score(ob_text, ev.get("content", "")) >= _KEYWORD_THRESHOLD]
 
         # Max-effort fallback: an obligación with ZERO candidates above threshold
         # would otherwise stay silently empty. Instead, take its best candidates
@@ -141,10 +203,7 @@ async def evidence_matcher_node(state: AgentState) -> AgentState:
         # judge them — better an obligación gets a weak-but-checked candidate
         # than none at all.
         if not candidates:
-            scored = [
-                (ev, _keyword_score(ob_text, ev.get("content", "")))
-                for ev in evidence_raw
-            ]
+            scored = [(ev, _keyword_score(ob_text, ev.get("content", ""))) for ev in evidence_raw]
             positive = [(ev, s) for ev, s in scored if s > 0]
             positive.sort(key=lambda pair: pair[1], reverse=True)
             candidates = [ev for ev, _ in positive[:3]]
