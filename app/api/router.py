@@ -19,6 +19,7 @@ from app.api.v1.onboarding import router as onboarding_router
 from app.api.v1.pagos import creditos_router
 from app.api.v1.pagos import router as pagos_router
 from app.api.v1.plantillas import router as plantillas_router
+from app.api.v1.plantillas_organismo import router as plantillas_organismo_router
 from app.api.v1.requisitos_cuenta import router as requisitos_cuenta_router
 from app.api.v1.secop import router as secop_router
 from app.api.v1.usuarios import router as usuarios_router
@@ -39,6 +40,7 @@ api_v1_router.include_router(integraciones_router)
 api_v1_router.include_router(onboarding_router)
 api_v1_router.include_router(secop_router)
 api_v1_router.include_router(plantillas_router)
+api_v1_router.include_router(plantillas_organismo_router)
 api_v1_router.include_router(actividades_router)
 api_v1_router.include_router(evidencias_router)
 api_v1_router.include_router(pagos_router)

@@ -66,9 +66,9 @@ class Settings(BaseSettings):
     LLM_FALLBACK_MODEL: str = "ollama/llama3.1:8b"
     LLM_LOCAL_MODEL: str = "ollama/llama3.1:8b"
     # LLM_EXTRACTION_MODEL: dedicated model for document/obligation extraction.
-    # Gemini 2.5 Flash-Lite: 1M TPM/day, 1,500 RPD free — cheapest option for text extraction.
-    # Switch to "gemini/gemini-2.5-flash" for heavier reasoning on complex contracts.
-    LLM_EXTRACTION_MODEL: str = "gemini/gemini-2.5-flash-lite"
+    # Default is gemini-2.5-flash: flash-lite returns 404 for API keys created
+    # after mid-2026, so the cheaper tier is opt-in via .env only.
+    LLM_EXTRACTION_MODEL: str = "gemini/gemini-2.5-flash"
     # Multimodal (vision) fallback for scanned PDFs and images — the model reads
     # the file directly and acts as the OCR. Used only when text extraction yields
     # fewer than EXTRACTION_MIN_TEXT_CHARS characters.
@@ -82,7 +82,7 @@ class Settings(BaseSettings):
     # Resilience: the service tries this model first, then curated current fallbacks
     # (see _VISION_FALLBACK_MODELS in document_service). A decommissioned or
     # quota-exhausted model falls through instead of breaking extraction entirely.
-    LLM_MULTIMODAL_MODEL: str = "gemini/gemini-2.5-flash-lite"
+    LLM_MULTIMODAL_MODEL: str = "gemini/gemini-2.5-flash"
     EXTRACTION_MULTIMODAL_FALLBACK_ENABLED: bool = True
     EXTRACTION_MIN_TEXT_CHARS: int = 200
     # When a PDF is rasterized (for a local vision model or the OCR tier), cap

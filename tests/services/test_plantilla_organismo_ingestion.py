@@ -303,6 +303,141 @@ async def test_ingerir_plantilla_organismo_accepts_informe_supervision_tipo(
     assert avisos == []
 
 
+async def test_ingerir_plantilla_organismo_accepts_tipo_plantilla_as_cuenta_cobro(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch, contrato_dagma: Contrato
+) -> None:
+    """`plantilla` (the generic entity-template tipo) is a valid ingestion target
+    and maps to tipo_documento="cuenta_cobro" (docx clone, phase 2). The fake
+    storage bytes are not a real docx, so campo detection degrades gracefully —
+    clonable=False with avisos persisted inside estructura_json."""
+    doc = DocumentoFuente(
+        usuario_id=contrato_dagma.usuario_id,
+        contrato_id=contrato_dagma.id,
+        storage_key="documentos/plantilla-cuenta-cobro.docx",
+        nombre="plantilla-cuenta-cobro.docx",
+        tipo=TipoDocumentoFuente.PLANTILLA,
+    )
+    db.add(doc)
+    await db.commit()
+    await db.refresh(doc)
+
+    monkeypatch.setattr(document_service, "extraer_texto_documento", AsyncMock(return_value=("texto carta", [])))
+    monkeypatch.setattr("app.adapters.storage.get_storage", lambda *_a, **_k: _fake_storage(b"docx-bytes"))
+    _patch_llm(monkeypatch, _DAGMA_2COL_JSON)
+
+    plantilla, avisos = await svc.ingerir_plantilla_organismo(db, contrato_dagma.usuario_id, contrato_dagma.id, doc.id)
+    await db.commit()
+
+    assert plantilla is not None
+    assert avisos == []
+    assert plantilla.tipo_documento == "cuenta_cobro"
+    assert plantilla.estructura_json["campos"] == []
+    assert plantilla.estructura_json["clonable"] is False
+    assert plantilla.estructura_json["avisos"]
+
+
+def _build_xlsx_documento_soporte() -> bytes:
+    from io import BytesIO
+
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Documento Soporte"
+    ws["A1"] = "DISTRITO DE SANTIAGO DE CALI"
+    ws["C7"] = "ABC-123"
+    buf = BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+_CAMPOS_XLSX_JSON = json.dumps(
+    {
+        "campos": [
+            {
+                "direccion": "Documento Soporte!C7",
+                "etiqueta": "Contrato No.",
+                "campo": "contrato.numero_contrato",
+                "valor_ejemplo": "ABC-123",
+                "modo": "cell",
+            }
+        ]
+    }
+)
+
+
+async def test_ingerir_plantilla_xlsx_como_documento_soporte(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch, contrato_dagma: Contrato
+) -> None:
+    """An .xlsx PLANTILLA maps to tipo_documento="documento_soporte"/formato="xlsx"
+    (xlsx clone, phase 4) and persists the LLM-detected + validated campos."""
+    doc = DocumentoFuente(
+        usuario_id=contrato_dagma.usuario_id,
+        contrato_id=contrato_dagma.id,
+        storage_key="documentos/documento-soporte.xlsx",
+        nombre="documento-soporte.xlsx",
+        tipo=TipoDocumentoFuente.PLANTILLA,
+    )
+    db.add(doc)
+    await db.commit()
+    await db.refresh(doc)
+
+    monkeypatch.setattr(
+        "app.adapters.storage.get_storage", lambda *_a, **_k: _fake_storage(_build_xlsx_documento_soporte())
+    )
+    _patch_llm(monkeypatch, _CAMPOS_XLSX_JSON)
+
+    plantilla, avisos = await svc.ingerir_plantilla_organismo(db, contrato_dagma.usuario_id, contrato_dagma.id, doc.id)
+    await db.commit()
+
+    assert plantilla is not None
+    assert avisos == []
+    assert plantilla.tipo_documento == "documento_soporte"
+    assert plantilla.formato == "xlsx"
+    assert plantilla.estructura_json["clonable"] is True
+    assert plantilla.estructura_json["campos"] == [
+        {
+            "direccion": "Documento Soporte!C7",
+            "etiqueta": "Contrato No.",
+            "campo": "contrato.numero_contrato",
+            "valor_ejemplo": "ABC-123",
+            "modo": "cell",
+            "direccion_alternativa": "",
+            "valor_alternativo": "",
+        }
+    ]
+
+
+async def test_ingerir_plantilla_xlsx_ilegible_degrada_a_no_clonable(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch, contrato_dagma: Contrato
+) -> None:
+    """Bogus xlsx bytes degrade gracefully: campos [], clonable False, avisos —
+    the plantilla row itself is still persisted (never a hard error)."""
+    doc = DocumentoFuente(
+        usuario_id=contrato_dagma.usuario_id,
+        contrato_id=contrato_dagma.id,
+        storage_key="documentos/roto.xlsx",
+        nombre="roto.xlsx",
+        tipo=TipoDocumentoFuente.PLANTILLA,
+    )
+    db.add(doc)
+    await db.commit()
+    await db.refresh(doc)
+
+    monkeypatch.setattr("app.adapters.storage.get_storage", lambda *_a, **_k: _fake_storage(b"not-an-xlsx"))
+    _patch_llm(monkeypatch, _CAMPOS_XLSX_JSON)
+
+    plantilla, avisos = await svc.ingerir_plantilla_organismo(db, contrato_dagma.usuario_id, contrato_dagma.id, doc.id)
+    await db.commit()
+
+    assert plantilla is not None
+    assert avisos == []
+    assert plantilla.tipo_documento == "documento_soporte"
+    assert plantilla.estructura_json["campos"] == []
+    assert plantilla.estructura_json["clonable"] is False
+    assert plantilla.estructura_json["avisos"]
+
+
 async def test_ingerir_plantilla_organismo_raises_validation_error_when_no_entidad(
     db: AsyncSession, test_user: dict[str, Any]
 ) -> None:

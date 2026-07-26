@@ -10,8 +10,9 @@ existing read-only services/queries only:
 - `checklist_service.listar_catalogo` / `es_nivel_contrato` (catalog reads).
 - `informe_service.obtener_estado_listo_pendiente` (the same read-only
   LISTO/PENDIENTE split `generar_zip_evidencias` uses internally).
-- `requisito_inference_service.obtener_plantilla_organismo_por_contrato`
-  (read-only organism-template lookup).
+- Direct `PlantillaOrganismo` reads (same normalized-entidad + usuario key
+  `requisito_inference_service.listar_plantillas_organismo` uses, minus its
+  redundant ownership round-trip — the contrato is already loaded here).
 - Direct `DocumentoFuente` reads for the two predicates
   (contract-level mandatory docs, cuenta-level SS planilla) that must be
   derivable BEFORE the checklist gate (`asegurar_checklist`) has ever run —
@@ -53,12 +54,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import CHECKLIST_INCOMPLETE, PACKAGE_PENDIENTE, NotFoundError
 from app.core.month_scoping import calcular_ventana_mes
+from app.core.text_match import normalize
 from app.models.actividad import Actividad
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, PosicionCuota
 from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
+from app.models.plantilla_organismo import PlantillaOrganismo
 from app.schemas.stepper_state import StepperStateResponse, StepState
-from app.services import checklist_service, cuenta_cobro_service, informe_service, requisito_inference_service
+from app.services import checklist_service, cuenta_cobro_service, informe_service
 from app.services.informe_service import EstadoListoPendiente
 
 _TOTAL_STEPS = 7
@@ -180,15 +183,42 @@ def _step4_justificaciones(contrato: Contrato, actividades: list[Actividad]) -> 
 
 
 async def _step5_formato(db: AsyncSession, usuario_id: uuid.UUID, contrato: Contrato) -> StepState:
-    """organism structure OR standard fallback — always available, never blocks."""
-    plantilla = await requisito_inference_service.obtener_plantilla_organismo_por_contrato(db, usuario_id, contrato)
+    """organism structure OR standard fallback — always available, never blocks.
+
+    Lists EVERY ingested `PlantillaOrganismo` for the contrato's normalized
+    entidad (informe_actividades / informe_supervision / cuenta_cobro /
+    documento_soporte), so the frontend can render one card per tipo.
+    `plantilla_ingerida` (any row exists) stays for backwards compat.
+    """
+    plantillas: list[PlantillaOrganismo] = []
+    if contrato.entidad and contrato.entidad.strip():
+        result = await db.execute(
+            select(PlantillaOrganismo)
+            .where(
+                PlantillaOrganismo.usuario_id == usuario_id,
+                PlantillaOrganismo.entidad_normalizada == normalize(contrato.entidad),
+            )
+            .order_by(PlantillaOrganismo.tipo_documento)
+        )
+        plantillas = list(result.scalars().all())
     return StepState(
         step=5,
         key="formato",
         complete=True,
         blocking=False,
         code=None,
-        detail={"plantilla_ingerida": plantilla is not None},
+        detail={
+            "plantilla_ingerida": bool(plantillas),
+            "plantillas": [
+                {
+                    "tipo_documento": p.tipo_documento,
+                    "formato": p.formato,
+                    "clonable": bool((p.estructura_json or {}).get("clonable")),
+                    "campos_total": len((p.estructura_json or {}).get("campos") or []),
+                }
+                for p in plantillas
+            ],
+        },
     )
 
 

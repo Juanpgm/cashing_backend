@@ -25,7 +25,7 @@ from app.models.contrato import Contrato
 from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
 from app.models.plantilla_organismo import PlantillaOrganismo
 from app.models.requisito_documento import RequisitoDocumento
-from app.schemas.plantilla_organismo import EstructuraPlantillaLLM
+from app.schemas.plantilla_organismo import CamposPlantillaLLM, EstructuraPlantillaLLM
 from app.schemas.requisito_cuenta import (
     RequisitoCuentaItem,
     RequisitoEstructuradoItem,
@@ -458,11 +458,139 @@ async def inferir_estructura_plantilla(filename: str, content: bytes) -> Estruct
     return await _extraer_estructura_via_vision(content, filename)
 
 
+# ── Clonable-template campo detection (docx clone, phase 2) ──────────────────
+#
+# Given a FILLED example DOCX (an addressed skeleton from `docx_clone_service.
+# extraer_esqueleto`), the LLM identifies every VARIABLE value and maps it to
+# the closed canonical vocabulary below. `docx_clone_service.validar_campos`
+# then deterministically drops any campo whose address/valor_ejemplo doesn't
+# actually match the document — the LLM proposes, the validator disposes.
+
+_CAMPOS_PLANTILLA_SYSTEM = """\
+You are an expert in Colombian government contractor billing documents (cuentas \
+de cobro, informes de actividades/supervisión). You receive the SKELETON of a \
+FILLED example report from a contracting entity: one line per document node, \
+formatted as "direccion: text" (P{i} = body paragraph, T{t}.R{r}.C{c} = table \
+cell, nested tables chain addresses, all 0-based in body order). Spreadsheet \
+(xlsx) skeletons address lines as "{sheet_name}!{cell}" instead (e.g. \
+"Documento Soporte!C7") and ONLY modo "cell" applies to them.
+
+Identify every VARIABLE value — data that changes per contract, per installment \
+(cuota), or per period — and return it as a campo object. Static form text \
+(labels, headings, legal boilerplate) is NOT a campo.
+
+For each campo:
+- "direccion": the address of the line where the value appears, copied exactly.
+- "etiqueta": the label near the value (e.g. "Contrato No.", "Valor Cuota a \
+cancelar", "Cuota Número", "Nombre completo del contratista:").
+- "valor_ejemplo": the example value copied VERBATIM from the skeleton line — \
+never reformatted, never paraphrased.
+- "campo": one key from the closed vocabulary below. Never invent keys.
+- "modo":
+  - "cell": the node's text is ENTIRELY the value.
+  - "substring": the value is embedded in surrounding text ("Label: value") — \
+valor_ejemplo is only the value part.
+  - "checkbox": an X/☒ marker choosing between options such as INFORME PARCIAL \
+vs INFORME FINAL. "direccion" is the CURRENTLY MARKED option (valor_ejemplo = \
+the marker text), "direccion_alternativa" is the other option's address and \
+"valor_alternativo" the marker to write there. Use campo "computed.tipo_informe".
+  - "justificacion": the free-text narrative cell of an obligation/activity \
+row. Use campo "justificacion.{orden}", numbering rows top-to-bottom starting \
+at 1; "etiqueta" holds the literal row label (e.g. "A)" or "ACTIVIDAD 1").
+
+Closed campo vocabulary:
+- contrato.numero_contrato, contrato.objeto, contrato.entidad, \
+contrato.dependencia, contrato.valor_total, contrato.valor_mensual, \
+contrato.fecha_inicio, contrato.fecha_fin, contrato.supervisor_nombre, \
+contrato.cargo_supervisor
+- contratista.nombre, contratista.cedula
+- cuota.valor, cuota.numero, cuota.mes, cuota.anio, cuota.periodo, cuota.fecha, \
+cuota.consecutivo_ds (Documento Soporte consecutive number, user-supplied per cuota)
+- computed.acumulado, computed.saldo, computed.valor_total_con_adiciones, \
+computed.valor_letras, computed.cuota_ordinal_letras, computed.tipo_informe
+- justificacion.{orden}
+
+Respond ONLY with JSON matching the schema, no extra text.
+"""
+
+
+def _construir_user_prompt_campos(esqueleto: str) -> str:
+    return f"DOCUMENT SKELETON:\n---\n{esqueleto}\n---\nIdentify every variable campo in this filled template."
+
+
+async def detectar_campos_plantilla(docx_bytes: bytes, formato: str = "docx") -> tuple[list[dict], list[str]]:
+    """Detect fillable campos in a filled example DOCX or XLSX. Never raises.
+
+    extraer_esqueleto → LLM structured call → `validar_campos` deterministic
+    filter. On any failure returns ``([], [aviso])`` — graceful degradation,
+    same philosophy as `inferir_estructura_plantilla`. ``formato="xlsx"`` swaps
+    in the `xlsx_clone_service` twin (sheet!cell addresses, phase 4).
+    """
+    from app.adapters.llm import get_llm
+    from app.core.config import settings
+    from app.schemas.agent import LLMMessage
+
+    if formato == "xlsx":
+        from app.services.xlsx_clone_service import (
+            extraer_esqueleto_xlsx as extraer_esqueleto,
+        )
+        from app.services.xlsx_clone_service import (
+            validar_campos_xlsx as validar_campos,
+        )
+    else:
+        from app.services.docx_clone_service import extraer_esqueleto, validar_campos
+
+    aviso_fallo = "No se pudo detectar campos rellenables en la plantilla; no estará disponible la clonación."
+    try:
+        esqueleto = extraer_esqueleto(docx_bytes)
+    except Exception as exc:
+        await logger.awarning("detectar_campos_plantilla_esqueleto_error", error=str(exc)[:200])
+        return [], [aviso_fallo]
+    if not esqueleto.strip():
+        return [], [aviso_fallo]
+
+    messages = [
+        LLMMessage(role="system", content=_CAMPOS_PLANTILLA_SYSTEM),
+        LLMMessage(role="user", content=_construir_user_prompt_campos(esqueleto)),
+    ]
+    llm = get_llm(model=settings.LLM_EXTRACTION_MODEL or None)
+    try:
+        # 16384, not the 4096 the sibling extractions use: the response echoes every
+        # valor_ejemplo VERBATIM from a skeleton of up to 14k chars, so real templates
+        # (supervision informes with long justificacion rows) overflow 4096 and the
+        # truncated JSON fails validation → zero campos detected.
+        resp = await llm.complete(
+            messages,
+            temperature=0.0,
+            max_tokens=16384,
+            response_format=CamposPlantillaLLM,
+        )
+        parsed = CamposPlantillaLLM.model_validate_json(resp.content)
+    except Exception as exc:
+        await logger.awarning("detectar_campos_plantilla_llm_error", error=str(exc)[:200])
+        return [], [aviso_fallo]
+
+    try:
+        campos, avisos = validar_campos(docx_bytes, [c.model_dump() for c in parsed.campos])
+    except Exception as exc:
+        await logger.awarning("detectar_campos_plantilla_validar_error", error=str(exc)[:200])
+        return [], [aviso_fallo]
+
+    await logger.ainfo("detectar_campos_plantilla_ok", detectados=len(campos), descartados=len(avisos))
+    return campos, avisos
+
+
 # Only these DocumentoFuente types are valid ingestion targets for a per-organism
 # template structure — billing-resilience-templates, slice #7, task 7.5b (carry-over
 # from slice #5 verify-report WARNING + SUGGESTION b): a CEDULA/RUT/etc. must never
 # be storable as a plantilla outside this documented domain.
-_TIPOS_PLANTILLA_VALIDOS = {TipoDocumentoFuente.INFORME_ACTIVIDADES, TipoDocumentoFuente.INFORME_SUPERVISION}
+# `PLANTILLA` (the generic entity-template type) maps to the COEMPRESAR-style
+# cuenta-de-cobro letter family ("cuenta_cobro" tipo_documento) — docx clone, phase 2.
+_TIPOS_PLANTILLA_VALIDOS = {
+    TipoDocumentoFuente.INFORME_ACTIVIDADES,
+    TipoDocumentoFuente.INFORME_SUPERVISION,
+    TipoDocumentoFuente.PLANTILLA,
+}
 
 
 async def _get_contrato_con_ownership(db: AsyncSession, usuario_id: uuid.UUID, contrato_id: uuid.UUID) -> Contrato:
@@ -509,14 +637,21 @@ async def ingerir_plantilla_organismo(
     if doc.tipo not in _TIPOS_PLANTILLA_VALIDOS:
         raise DomainValidationError(
             "El documento indicado no es un tipo de plantilla institucional válido "
-            "(se esperaba informe_actividades o informe_supervision); no se puede "
-            "ingerir como plantilla de organismo."
+            "(se esperaba informe_actividades, informe_supervision o plantilla); "
+            "no se puede ingerir como plantilla de organismo."
         )
 
     storage = get_storage(settings.S3_BUCKET_DOCUMENTOS)
     content = await storage.download(doc.storage_key)
 
-    estructura = await inferir_estructura_plantilla(doc.nombre, content)
+    # An .xlsx generic template = the Documento Soporte spreadsheet family
+    # (xlsx clone, phase 4). No docx-structure extraction applies — a
+    # spreadsheet has no columnas/secciones/anexo_refs; only campo detection.
+    es_xlsx = doc.tipo == TipoDocumentoFuente.PLANTILLA and doc.nombre.lower().endswith(".xlsx")
+    if es_xlsx:
+        estructura = EstructuraPlantillaLLM()
+    else:
+        estructura = await inferir_estructura_plantilla(doc.nombre, content)
     if estructura is None:
         await logger.awarning(
             "ingerir_plantilla_organismo_degradado", contrato_id=str(contrato_id), documento_id=str(documento_fuente_id)
@@ -527,8 +662,20 @@ async def ingerir_plantilla_organismo(
         ]
 
     entidad_normalizada = normalize(contrato.entidad)
-    tipo_documento = doc.tipo.value if doc.tipo else "informe_actividades"
-    formato = "docx" if doc.nombre.lower().endswith(".docx") else "pdf"
+    if doc.tipo == TipoDocumentoFuente.PLANTILLA:
+        # Generic entity template: xlsx = Documento Soporte spreadsheet,
+        # docx = the COEMPRESAR cuenta-de-cobro letter family.
+        tipo_documento = "documento_soporte" if es_xlsx else "cuenta_cobro"
+    else:
+        tipo_documento = doc.tipo.value if doc.tipo else "informe_actividades"
+    formato = "xlsx" if es_xlsx else ("docx" if doc.nombre.lower().endswith(".docx") else "pdf")
+
+    # Clonable-campo detection (phases 2/4): only meaningful for DOCX/XLSX
+    # sources — `rellenar`/`rellenar_xlsx` clone the original bytes.
+    campos: list[dict] = []
+    avisos_campos: list[str] = []
+    if formato in ("docx", "xlsx"):
+        campos, avisos_campos = await detectar_campos_plantilla(content, formato=formato)
 
     result = await db.execute(
         select(PlantillaOrganismo).where(
@@ -538,7 +685,12 @@ async def ingerir_plantilla_organismo(
         )
     )
     plantilla = result.scalar_one_or_none()
-    estructura_dict = estructura.model_dump()
+    estructura_dict = {
+        **estructura.model_dump(),
+        "campos": campos,
+        "clonable": bool(campos),
+        "avisos": avisos_campos,
+    }
     if plantilla is not None:
         plantilla.entidad = contrato.entidad
         plantilla.formato = formato
@@ -605,3 +757,23 @@ async def obtener_plantilla_organismo(
     template has ever been ingested for that organism/tipo_documento."""
     contrato = await _get_contrato_con_ownership(db, usuario_id, contrato_id)
     return await obtener_plantilla_organismo_por_contrato(db, usuario_id, contrato, tipo_documento)
+
+
+async def listar_plantillas_organismo(
+    db: AsyncSession,
+    usuario_id: uuid.UUID,
+    contrato_id: uuid.UUID,
+) -> list[PlantillaOrganismo]:
+    """Every ingested plantilla for the contrato's organism, ownership-checked."""
+    contrato = await _get_contrato_con_ownership(db, usuario_id, contrato_id)
+    if not contrato.entidad or not contrato.entidad.strip():
+        return []
+    result = await db.execute(
+        select(PlantillaOrganismo)
+        .where(
+            PlantillaOrganismo.usuario_id == usuario_id,
+            PlantillaOrganismo.entidad_normalizada == normalize(contrato.entidad),
+        )
+        .order_by(PlantillaOrganismo.tipo_documento)
+    )
+    return list(result.scalars().all())

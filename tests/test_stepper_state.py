@@ -392,6 +392,50 @@ async def test_step5_formato_always_non_blocking(
     assert result.steps[4].key == "formato"
     assert result.steps[4].blocking is False
     assert result.steps[4].complete is True
+    assert result.steps[4].detail == {"plantilla_ingerida": False, "plantillas": []}
+
+
+async def test_step5_formato_lists_every_plantilla_per_tipo(
+    db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
+) -> None:
+    """Detail lists ALL ingested plantillas for the contrato's entidad (not
+    just informe_actividades) with tipo/formato/clonable/campos_total."""
+    from app.core.text_match import normalize
+    from app.models.plantilla_organismo import PlantillaOrganismo
+
+    user = test_user["user"]
+    cuenta = await _make_cuenta(db, contrato)
+    db.add(
+        PlantillaOrganismo(
+            usuario_id=user.id,
+            entidad=contrato.entidad,
+            entidad_normalizada=normalize(contrato.entidad),
+            tipo_documento="cuenta_cobro",
+            formato="docx",
+            estructura_json={"clonable": True, "campos": [{"campo": "cuota.valor"}, {"campo": "cuota.mes"}]},
+        )
+    )
+    db.add(
+        PlantillaOrganismo(
+            usuario_id=user.id,
+            entidad=contrato.entidad,
+            entidad_normalizada=normalize(contrato.entidad),
+            tipo_documento="informe_actividades",
+            formato="pdf",
+            estructura_json={"columnas": [], "secciones": []},
+        )
+    )
+    await db.commit()
+
+    result = await stepper_state_service.obtener_stepper_state(db, user.id, cuenta.id)
+
+    detail = result.steps[4].detail
+    assert detail is not None
+    assert detail["plantilla_ingerida"] is True
+    assert detail["plantillas"] == [
+        {"tipo_documento": "cuenta_cobro", "formato": "docx", "clonable": True, "campos_total": 2},
+        {"tipo_documento": "informe_actividades", "formato": "pdf", "clonable": False, "campos_total": 0},
+    ]
 
 
 async def test_step6_evidencias_incomplete_when_pendientes_greater_than_zero(

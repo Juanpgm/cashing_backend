@@ -59,3 +59,58 @@ class IngerirPlantillaOrganismoResponse(BaseModel):
 class ObtenerPlantillaOrganismoResponse(BaseModel):
     encontrada: bool
     plantilla: PlantillaOrganismoOut | None = None
+
+
+# ── Clonable-template campo detection (docx clone, phases 2-3) ───────────────
+
+
+class CampoPlantillaLLM(BaseModel):
+    """One variable field the LLM locates in a FILLED example template.
+
+    Mirrors the campo-dict contract consumed by `docx_clone_service` — see its
+    module docstring for the address scheme and modo semantics.
+    """
+
+    direccion: str
+    etiqueta: str = ""
+    campo: str
+    valor_ejemplo: str = ""
+    modo: Literal["cell", "substring", "checkbox", "justificacion"] = "cell"
+    # checkbox only: the OTHER (unmarked) option and its marker text.
+    direccion_alternativa: str = ""
+    valor_alternativo: str = ""
+
+
+class CamposPlantillaLLM(BaseModel):
+    campos: list[CampoPlantillaLLM] = Field(default_factory=list)
+
+
+class CampoResponse(BaseModel):
+    campo: str
+    etiqueta: str
+    modo: str
+
+
+class PlantillaOrganismoResponse(BaseModel):
+    """Clone-oriented view of a PlantillaOrganismo. `id=None` + `clonable=False`
+    means graceful degradation ran — nothing was persisted, only avisos."""
+
+    id: uuid.UUID | None = None
+    tipo_documento: str | None = None
+    formato: str | None = None
+    clonable: bool = False
+    avisos: list[str] = Field(default_factory=list)
+    fuente_documento_id: uuid.UUID | None = None
+    # Campos grouped by scope prefix: contrato / contratista / cuota / computed / justificacion.
+    campos: dict[str, list[CampoResponse]] = Field(default_factory=dict)
+
+
+class PlantillaOrganismoIngestRequest(BaseModel):
+    documento_fuente_id: uuid.UUID
+
+
+class FormatoValoresResponse(BaseModel):
+    """Resolved campo values + computed financials for the clone-fill preview."""
+
+    valores: dict[str, str]
+    avisos: list[str] = Field(default_factory=list)

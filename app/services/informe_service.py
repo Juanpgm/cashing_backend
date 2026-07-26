@@ -8,11 +8,13 @@ Produces three artifacts on demand for the contractor's billing package:
 
 from __future__ import annotations
 
+import calendar
 import io
 import uuid
 import zipfile
 from dataclasses import dataclass
 from datetime import date
+from decimal import Decimal
 from typing import Literal
 
 import structlog
@@ -40,9 +42,11 @@ from app.core.exceptions import (
     NotFoundError,
     ValidationError,
 )
+from app.core.numero_letras import ordinal_letras, valor_en_letras
 from app.models.actividad import Actividad
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, PosicionCuota
+from app.models.documento_fuente import DocumentoFuente
 from app.models.obligacion import Obligacion
 from app.models.plantilla_organismo import PlantillaOrganismo
 from app.models.usuario import Usuario
@@ -135,6 +139,16 @@ def _formato_fecha(d: date | None) -> str:
 
 def _formato_valor(v: float) -> str:
     return f"$ {float(v):,.2f}"
+
+
+def _dec(v: float | Decimal | None) -> Decimal:
+    """Lossless float/Numeric → Decimal (money must never be float math)."""
+    return Decimal(str(v)) if v is not None else Decimal(0)
+
+
+def _formato_valor_pesos(v: float | Decimal) -> str:
+    """Colombian whole-peso format used by entity templates: "$ 4.800.000"."""
+    return f"$ {int(_dec(v)):,}".replace(",", ".")
 
 
 def _add_kv_table(doc: DocxDocument, rows: list[tuple[str, str]]) -> None:
@@ -478,6 +492,257 @@ async def _convertir_actividades_tercera_persona(
     return overrides
 
 
+# ── Template cloning (docx clone, phase 3) ──────────────────────────────────
+
+
+async def _valores_plantilla(db: AsyncSession, cuenta: CuentaCobro, contrato: Contrato) -> dict[str, str]:
+    """Resolve the canonical campo vocabulary to concrete string values.
+
+    Money is Decimal all the way and rendered in the entity's whole-peso format
+    ("$ 4.800.000"). Keys whose source data is missing are omitted — `rellenar`
+    skips campos without a value.
+    """
+    from sqlalchemy import and_, or_
+
+    usuario = await db.get(Usuario, contrato.usuario_id)
+
+    result = await db.execute(
+        select(CuentaCobro)
+        .where(
+            CuentaCobro.contrato_id == contrato.id,
+            CuentaCobro.deleted_at.is_(None),
+            CuentaCobro.id != cuenta.id,
+            or_(
+                CuentaCobro.anio < cuenta.anio,
+                and_(CuentaCobro.anio == cuenta.anio, CuentaCobro.mes < cuenta.mes),
+            ),
+        )
+        .order_by(CuentaCobro.anio.asc(), CuentaCobro.mes.asc())
+    )
+    previas = list(result.scalars().all())
+    acumulado = sum((_dec(p.valor) for p in previas), Decimal(0))
+    total_con_adiciones = _dec(contrato.valor_total) + _dec(contrato.valor_adicion)
+    valor_cuota = _dec(cuenta.valor)
+    saldo = total_con_adiciones - acumulado - valor_cuota
+    numero_cuota = cuenta.numero_cuota or len(previas) + 1
+    fecha_cuota = cuenta.fecha_transaccion or date(
+        cuenta.anio, cuenta.mes, calendar.monthrange(cuenta.anio, cuenta.mes)[1]
+    )
+
+    valores: dict[str, str | None] = {
+        "contrato.numero_contrato": contrato.numero_contrato,
+        "contrato.objeto": contrato.objeto,
+        "contrato.entidad": contrato.entidad,
+        "contrato.dependencia": contrato.dependencia,
+        "contrato.valor_total": _formato_valor_pesos(contrato.valor_total),
+        "contrato.valor_mensual": _formato_valor_pesos(contrato.valor_mensual),
+        "contrato.fecha_inicio": _formato_fecha(contrato.fecha_inicio),
+        "contrato.fecha_fin": _formato_fecha(contrato.fecha_fin),
+        "contrato.supervisor_nombre": contrato.supervisor_nombre,
+        "contrato.cargo_supervisor": contrato.cargo_supervisor,
+        "contratista.nombre": usuario.nombre if usuario else None,
+        "contratista.cedula": (usuario.cedula if usuario else None) or contrato.documento_proveedor,
+        "cuota.valor": _formato_valor_pesos(valor_cuota),
+        "cuota.numero": str(numero_cuota),
+        "cuota.mes": _MESES[cuenta.mes - 1],
+        "cuota.anio": str(cuenta.anio),
+        "cuota.periodo": _periodo_str(cuenta),
+        "cuota.fecha": _formato_fecha(fecha_cuota),
+        "computed.acumulado": _formato_valor_pesos(acumulado),
+        "computed.saldo": _formato_valor_pesos(saldo),
+        "computed.valor_total_con_adiciones": _formato_valor_pesos(total_con_adiciones),
+        "computed.valor_letras": valor_en_letras(valor_cuota),
+        "computed.cuota_ordinal_letras": ordinal_letras(numero_cuota),
+        # Documento Soporte consecutive (xlsx clone, phase 4): user-supplied per
+        # cuota, no source field exists yet — always omitted so fill-time skips it.
+        "cuota.consecutivo_ds": None,
+    }
+    return {k: v for k, v in valores.items() if v}
+
+
+_AVISO_TIPO_INFORME_AMBIGUO = "No se pudo determinar la opción marcada del tipo de informe; marcar manualmente."
+
+
+def _resolver_tipo_informe(cuenta: CuentaCobro, texto_marcado: str | None, texto_alternativo: str | None) -> str | None:
+    """Checkbox resolution from the ACTUAL text of both option nodes in the
+    template (the campo contract's valor_ejemplo is only the marker glyph "X",
+    and the etiqueta is generic — neither identifies which option is which).
+
+    Returns "actual" when the currently-marked option matches the cuenta
+    (marked option mentions FINAL ⇔ the cuenta is final), "alternativa" when
+    the marker must move, and None when the options are ambiguous (neither or
+    both mention "final") — the campo must then be left untouched.
+    """
+    marcado_es_final = "final" in text_match.normalize(texto_marcado or "")
+    alt_es_final = "final" in text_match.normalize(texto_alternativo or "")
+    if marcado_es_final == alt_es_final:
+        return None
+    es_final = bool(cuenta.informe_final) or cuenta.posicion == PosicionCuota.FINAL
+    return "actual" if marcado_es_final == es_final else "alternativa"
+
+
+async def _tipo_informe_desde_plantilla(
+    db: AsyncSession, plantilla: PlantillaOrganismo, campo: dict, cuenta: CuentaCobro
+) -> str | None:
+    """Resolve the tipo-informe checkbox for the formato-valores preview by
+    downloading the original template bytes and reading both option texts
+    (minimal correct option: the preview endpoint doesn't otherwise have the
+    bytes, and resolving from campo metadata alone is impossible — see
+    `_resolver_tipo_informe`). Any failure returns None so the caller emits
+    the manual-marking aviso instead of guessing.
+    """
+    from app.services.docx_clone_service import texto_direccion
+
+    try:
+        if not plantilla.fuente_documento_id:
+            return None
+        doc_fuente = await db.get(DocumentoFuente, plantilla.fuente_documento_id)
+        if doc_fuente is None:
+            return None
+        storage = _get_storage(settings.S3_BUCKET_DOCUMENTOS)
+        original = await storage.download(doc_fuente.storage_key)
+        doc = Document(io.BytesIO(original))
+        return _resolver_tipo_informe(
+            cuenta,
+            texto_direccion(doc, campo.get("direccion", "")),
+            texto_direccion(doc, campo.get("direccion_alternativa", "")),
+        )
+    except Exception as exc:
+        await logger.awarning("formato_valores_tipo_informe_fallo", cuenta_id=str(cuenta.id), error=str(exc))
+        return None
+
+
+def _justificaciones_tercera_por_orden(
+    actividades_visibles: list[Actividad],
+    obligaciones_by_id: dict[uuid.UUID, Obligacion],
+    overrides: dict[uuid.UUID, tuple[str, str]],
+) -> dict[int, str]:
+    """Third-person justification text per obligación orden (1-based), from the
+    `_convertir_actividades_tercera_persona` overrides — for the cloned
+    supervisión path."""
+    actividades_por_ob: dict[uuid.UUID | None, list[Actividad]] = {}
+    for act in actividades_visibles:
+        actividades_por_ob.setdefault(act.obligacion_id, []).append(act)
+
+    por_orden: dict[int, str] = {}
+    for n, ob in enumerate(sorted(obligaciones_by_id.values(), key=lambda o: o.orden), start=1):
+        partes: list[str] = []
+        for act in actividades_por_ob.get(ob.id, []):
+            ov = overrides.get(act.id)
+            texto = (ov[1] if ov[1] and ov[1] != "—" else ov[0]) if ov else (act.justificacion or act.descripcion)
+            texto = (texto or "").strip()
+            if texto:
+                partes.append(texto)
+        if partes:
+            por_orden[n] = "\n\n".join(partes)
+    return por_orden
+
+
+async def _generar_docx_clonado(
+    db: AsyncSession,
+    plantilla: PlantillaOrganismo | None,
+    cuenta: CuentaCobro,
+    contrato: Contrato,
+    actividades_visibles: list[Actividad],
+    obligaciones_by_id: dict[uuid.UUID, Obligacion],
+    justificaciones_override: dict[int, str] | None = None,
+) -> bytes | None:
+    """Clone-and-fill the organism's original DOCX template. Fails open.
+
+    Guards: DOCX format, `clonable` flag, persisted campos, and a resolvable
+    source documento. ANY failure (missing fuente, storage error, fill error)
+    logs `informe_clonado_fallback` and returns None so the caller falls back
+    to the built-from-scratch legacy layout.
+    """
+    from app.services.docx_clone_service import rellenar, texto_direccion
+
+    try:
+        if plantilla is None or plantilla.formato != "docx":
+            return None
+        estructura = plantilla.estructura_json or {}
+        campos = estructura.get("campos") or []
+        if not (estructura.get("clonable") and campos and plantilla.fuente_documento_id):
+            return None
+        doc_fuente = await db.get(DocumentoFuente, plantilla.fuente_documento_id)
+        if doc_fuente is None:
+            return None
+
+        storage = _get_storage(settings.S3_BUCKET_DOCUMENTOS)
+        original = await storage.download(doc_fuente.storage_key)
+
+        valores = await _valores_plantilla(db, cuenta, contrato)
+        doc_original = Document(io.BytesIO(original))
+        for campo in campos:
+            if campo.get("campo") == "computed.tipo_informe" and campo.get("modo") == "checkbox":
+                tipo = _resolver_tipo_informe(
+                    cuenta,
+                    texto_direccion(doc_original, campo.get("direccion", "")),
+                    texto_direccion(doc_original, campo.get("direccion_alternativa", "")),
+                )
+                if tipo is not None:
+                    valores["computed.tipo_informe"] = tipo
+                else:
+                    # Ambiguous options — leave the template's marker untouched.
+                    await logger.awarning(
+                        "informe_clonado_tipo_informe_ambiguo",
+                        cuenta_id=str(cuenta.id),
+                        aviso=_AVISO_TIPO_INFORME_AMBIGUO,
+                    )
+
+        actividades_por_ob: dict[uuid.UUID | None, list[Actividad]] = {}
+        for act in actividades_visibles:
+            actividades_por_ob.setdefault(act.obligacion_id, []).append(act)
+        for n, ob in enumerate(sorted(obligaciones_by_id.values(), key=lambda o: o.orden), start=1):
+            if justificaciones_override is not None and n in justificaciones_override:
+                texto = justificaciones_override[n]
+            else:
+                partes = [
+                    (act.justificacion or act.descripcion or "").strip() for act in actividades_por_ob.get(ob.id, [])
+                ]
+                texto = "\n\n".join(p for p in partes if p)
+            if texto:
+                valores[f"justificacion.{n}"] = texto
+
+        # Blank example data for every campo without a resolved value: `rellenar`
+        # skips missing keys, which would silently keep the ORIGINAL example's
+        # real data (another submission's names, cédulas, narratives) in the
+        # generated official document. Checkbox campos are excluded — blanking a
+        # marker makes no sense; ambiguity is already logged above.
+        justificaciones_blanqueadas = 0
+        campos_blanqueados: list[str] = []
+        for campo in campos:
+            clave = campo.get("campo")
+            if not clave or clave in valores or campo.get("modo") == "checkbox":
+                continue
+            valores[clave] = ""
+            if campo.get("modo") == "justificacion":
+                justificaciones_blanqueadas += 1
+            else:
+                campos_blanqueados.append(campo.get("etiqueta") or clave)
+        if justificaciones_blanqueadas:
+            await logger.awarning(
+                "informe_clonado_justificaciones_blanqueadas",
+                cuenta_id=str(cuenta.id),
+                n=justificaciones_blanqueadas,
+            )
+        if campos_blanqueados:
+            await logger.awarning(
+                "informe_clonado_campos_blanqueados",
+                cuenta_id=str(cuenta.id),
+                campos=campos_blanqueados,
+            )
+
+        return rellenar(original, campos, valores)
+    except Exception:
+        await logger.awarning(
+            "informe_clonado_fallback",
+            cuenta_id=str(cuenta.id),
+            plantilla_id=str(plantilla.id) if plantilla is not None else None,
+            exc_info=True,
+        )
+        return None
+
+
 # ── Public API ──────────────────────────────────────────────────────────────
 
 
@@ -491,6 +756,12 @@ async def generar_informe_actividades_docx(
     `cuenta` (already loaded by `_load_context`) rather than accepted as extra
     params — every existing call site keeps calling this with exactly 3
     positional args.
+
+    Clone path (phase 3): when the organism's plantilla is clonable, the
+    original entity DOCX is cloned and filled instead of built from scratch.
+    The BORRADOR header is deliberately NOT injected into cloned bytes (it
+    would corrupt the entity's format) — draft status stays on the
+    `X-Es-Borrador` response header.
     """
     cuenta, contrato, usuario, obligaciones, actividades = await _load_context(db, usuario_id, cuenta_id)
     if not actividades:
@@ -502,6 +773,15 @@ async def generar_informe_actividades_docx(
     obligaciones_by_id = {ob.id: ob for ob in obligaciones}
     actividades_visibles = _filtrar_actividades_una_vez(actividades, cuenta, obligaciones_by_id)
     layout = await _resolver_layout_organismo(db, contrato, "informe_actividades")
+    filename = f"informe-actividades-{contrato.numero_contrato}-{cuenta.anio}-{cuenta.mes:02d}.docx"
+
+    clonado = await _generar_docx_clonado(db, layout, cuenta, contrato, actividades_visibles, obligaciones_by_id)
+    if clonado is not None:
+        await logger.ainfo(
+            "informe_actividades_clonado", cuenta_id=str(cuenta_id), usuario_id=str(usuario_id), size=len(clonado)
+        )
+        return clonado, filename
+
     contexto_progresivo = await _construir_contexto_progresivo(db, contrato.id, cuenta)
 
     doc = Document()
@@ -560,7 +840,6 @@ async def generar_informe_actividades_docx(
     buf = io.BytesIO()
     doc.save(buf)
 
-    filename = f"informe-actividades-{contrato.numero_contrato}-{cuenta.anio}-{cuenta.mes:02d}.docx"
     await logger.ainfo(
         "informe_actividades_generado",
         cuenta_id=str(cuenta_id),
@@ -578,6 +857,11 @@ async def generar_informe_supervision_docx(
     Adaptive generation (billing-resilience-templates, slice #6): see
     `generar_informe_actividades_docx`'s docstring — organismo/posicion/prior
     context are resolved internally, the public signature is unchanged.
+
+    Clone path (phase 3): same as the actividades report, with justificaciones
+    pre-converted to third person. The BORRADOR header is NOT injected into
+    cloned bytes (it would corrupt the entity's format) — draft status stays on
+    the `X-Es-Borrador` response header.
     """
     cuenta, contrato, usuario, obligaciones, actividades = await _load_context(db, usuario_id, cuenta_id)
     if not actividades:
@@ -590,6 +874,24 @@ async def generar_informe_supervision_docx(
     actividades_visibles = _filtrar_actividades_una_vez(actividades, cuenta, obligaciones_by_id)
     overrides = await _convertir_actividades_tercera_persona(actividades_visibles)
     layout = await _resolver_layout_organismo(db, contrato, "informe_supervision")
+    filename = f"informe-supervision-{contrato.numero_contrato}-{cuenta.anio}-{cuenta.mes:02d}.docx"
+
+    clonado = await _generar_docx_clonado(
+        db,
+        layout,
+        cuenta,
+        contrato,
+        actividades_visibles,
+        obligaciones_by_id,
+        justificaciones_override=_justificaciones_tercera_por_orden(actividades_visibles, obligaciones_by_id, overrides)
+        or None,
+    )
+    if clonado is not None:
+        await logger.ainfo(
+            "informe_supervision_clonado", cuenta_id=str(cuenta_id), usuario_id=str(usuario_id), size=len(clonado)
+        )
+        return clonado, filename
+
     contexto_progresivo = await _construir_contexto_progresivo(db, contrato.id, cuenta)
 
     doc = Document()
@@ -656,7 +958,6 @@ async def generar_informe_supervision_docx(
     buf = io.BytesIO()
     doc.save(buf)
 
-    filename = f"informe-supervision-{contrato.numero_contrato}-{cuenta.anio}-{cuenta.mes:02d}.docx"
     await logger.ainfo(
         "informe_supervision_generado",
         cuenta_id=str(cuenta_id),
@@ -664,6 +965,132 @@ async def generar_informe_supervision_docx(
         size=len(buf.getvalue()),
     )
     return buf.getvalue(), filename
+
+
+async def generar_cuenta_cobro_docx(db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: uuid.UUID) -> tuple[bytes, str]:
+    """Generate the entity's cuenta-de-cobro letter as DOCX. Returns (bytes, filename).
+
+    Clone-only: unlike the informes there is NO built-from-scratch fallback —
+    this letter family only exists as the organism's own ingested template
+    (tipo_documento="cuenta_cobro"). No BORRADOR header is injected (it would
+    corrupt the entity format); draft status stays on the `X-Es-Borrador`
+    response header.
+    """
+    cuenta, contrato, _usuario, obligaciones, actividades = await _load_context(db, usuario_id, cuenta_id)
+    plantilla = await _resolver_layout_organismo(db, contrato, "cuenta_cobro")
+    if plantilla is None or not (plantilla.estructura_json or {}).get("clonable"):
+        raise ValidationError("No hay plantilla de cuenta de cobro ingerida para este organismo.")
+
+    obligaciones_by_id = {ob.id: ob for ob in obligaciones}
+    actividades_visibles = _filtrar_actividades_una_vez(actividades, cuenta, obligaciones_by_id)
+    contenido = await _generar_docx_clonado(db, plantilla, cuenta, contrato, actividades_visibles, obligaciones_by_id)
+    if contenido is None:
+        raise ValidationError("No se pudo generar la cuenta de cobro desde la plantilla del organismo.")
+
+    filename = f"cuenta-cobro-{contrato.numero_contrato}-{cuenta.anio}-{cuenta.mes:02d}.docx"
+    await logger.ainfo(
+        "cuenta_cobro_docx_generado", cuenta_id=str(cuenta_id), usuario_id=str(usuario_id), size=len(contenido)
+    )
+    return contenido, filename
+
+
+async def generar_documento_soporte_xlsx(
+    db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: uuid.UUID
+) -> tuple[bytes, str]:
+    """Generate the entity's Documento Soporte spreadsheet as XLSX. Returns (bytes, filename).
+
+    Clone-only, like `generar_cuenta_cobro_docx`: this document only exists as
+    the organism's own ingested xlsx template (tipo_documento=
+    "documento_soporte"). It is OPTIONAL everywhere — nothing in the billing
+    flow requires it. Values come from `_valores_plantilla` (no justificaciones
+    for xlsx); draft status stays on the `X-Es-Borrador` response header.
+    """
+    from app.services.xlsx_clone_service import rellenar_xlsx
+
+    cuenta, contrato, _usuario, _obligaciones, _actividades = await _load_context(db, usuario_id, cuenta_id)
+    plantilla = await _resolver_layout_organismo(db, contrato, "documento_soporte")
+    estructura = (plantilla.estructura_json or {}) if plantilla is not None else {}
+    campos = estructura.get("campos") or []
+    if (
+        plantilla is None
+        or plantilla.formato != "xlsx"
+        or not (estructura.get("clonable") and campos and plantilla.fuente_documento_id)
+    ):
+        raise ValidationError("No hay plantilla de documento soporte ingerida para este organismo.")
+
+    try:
+        doc_fuente = await db.get(DocumentoFuente, plantilla.fuente_documento_id)
+        if doc_fuente is None:
+            raise NotFoundError("Documento", str(plantilla.fuente_documento_id))
+        storage = _get_storage(settings.S3_BUCKET_DOCUMENTOS)
+        original = await storage.download(doc_fuente.storage_key)
+        valores = await _valores_plantilla(db, cuenta, contrato)
+        contenido = rellenar_xlsx(original, campos, valores)
+    except Exception as exc:
+        await logger.awarning(
+            "documento_soporte_xlsx_fallo",
+            cuenta_id=str(cuenta_id),
+            plantilla_id=str(plantilla.id),
+            exc_info=True,
+        )
+        raise ValidationError("No se pudo generar el documento soporte desde la plantilla del organismo.") from exc
+
+    filename = f"documento-soporte-{contrato.numero_contrato}-{cuenta.anio}-{cuenta.mes:02d}.xlsx"
+    await logger.ainfo(
+        "documento_soporte_xlsx_generado", cuenta_id=str(cuenta_id), usuario_id=str(usuario_id), size=len(contenido)
+    )
+    return contenido, filename
+
+
+async def obtener_formato_valores(
+    db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: uuid.UUID
+) -> tuple[dict[str, str], list[str]]:
+    """Resolved campo values + computed financials for the UI preview.
+
+    Returns ``(valores, avisos)``. When a clonable cuenta-de-cobro plantilla
+    exists, its checkbox campo also resolves `computed.tipo_informe`.
+    """
+    cuenta, contrato, _usuario, _obligaciones, _actividades = await _load_context(db, usuario_id, cuenta_id)
+    valores = await _valores_plantilla(db, cuenta, contrato)
+    avisos: list[str] = []
+
+    plantilla = await _resolver_layout_organismo(db, contrato, "cuenta_cobro")
+    if plantilla is not None:
+        estructura = plantilla.estructura_json or {}
+        campos = estructura.get("campos") or []
+        for campo in campos:
+            if campo.get("campo") == "computed.tipo_informe" and campo.get("modo") == "checkbox":
+                tipo = await _tipo_informe_desde_plantilla(db, plantilla, campo, cuenta)
+                if tipo is not None:
+                    valores["computed.tipo_informe"] = tipo
+                else:
+                    avisos.append(_AVISO_TIPO_INFORME_AMBIGUO)
+        if estructura.get("clonable"):
+            # Mirror `_generar_docx_clonado`'s blanking: warn the user which
+            # detected campos have no contrato/cuota data and will render blank.
+            # Justificaciones (filled from actividades at generation time) and
+            # checkboxes are not data-backed campos, so they are excluded.
+            vistos: set[str] = set()
+            sin_dato: list[str] = []
+            for campo in campos:
+                clave = campo.get("campo")
+                if (
+                    not clave
+                    or clave in valores
+                    or clave in vistos
+                    or campo.get("modo") in ("checkbox", "justificacion")
+                ):
+                    continue
+                vistos.add(clave)
+                sin_dato.append(campo.get("etiqueta") or clave)
+            if sin_dato:
+                avisos.append("Campos sin dato del contrato/cuota (quedarán en blanco): " + ", ".join(sin_dato) + ".")
+    else:
+        avisos.append(
+            "No hay plantilla de cuenta de cobro ingerida para este organismo; "
+            "se muestran únicamente los valores calculados."
+        )
+    return valores, avisos
 
 
 def _safe_dirname(text: str, max_len: int = 80) -> str:

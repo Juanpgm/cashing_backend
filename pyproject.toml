@@ -64,6 +64,7 @@ dependencies = [
     # File Validation
     "python-magic>=0.4,<1",
     # Utils
+    "num2words>=0.5,<1",  # spell out contract amounts in Spanish (valor en letras)
     "orjson>=3,<4",
     "python-dotenv>=1,<2",
 ]

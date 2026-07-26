@@ -39,6 +39,7 @@ from app.schemas.cuenta_cobro import (
 )
 from app.schemas.google_workspace import EvidencePersistRequest, EvidencePersistSummary
 from app.schemas.paquete import PaqueteInfoResponse
+from app.schemas.plantilla_organismo import FormatoValoresResponse
 from app.schemas.radicacion_prep import PreparaRadicacionResponse
 from app.schemas.stepper_state import StepperStateResponse
 from app.services import (
@@ -492,6 +493,7 @@ async def preview_cuenta_cobro(
 # ── Informes (DOCX/ZIP) downloads ────────────────────────────────────────────
 
 _DOCX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+_XLSX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
 @router.get("/{cuenta_id}/informe-actividades.docx", response_class=Response)
@@ -509,6 +511,54 @@ async def descargar_informe_actividades(
             "Content-Disposition": f'attachment; filename="{filename}"',
             # Machine-readable draft flag (task 7.5d) — avoids requiring callers to
             # parse the DOCX body just to detect the BORRADOR header.
+            "X-Es-Borrador": str(informe_service.ES_BORRADOR).lower(),
+        },
+    )
+
+
+@router.get("/{cuenta_id}/formato-valores", response_model=FormatoValoresResponse)
+async def obtener_formato_valores(
+    cuenta_id: uuid.UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> FormatoValoresResponse:
+    """Preview the resolved campo values (contrato/contratista/cuota/computed)
+    used to fill the organism's cloned templates."""
+    valores, avisos = await informe_service.obtener_formato_valores(db, user.id, cuenta_id)
+    return FormatoValoresResponse(valores=valores, avisos=avisos)
+
+
+@router.get("/{cuenta_id}/cuenta-cobro.docx", response_class=Response)
+async def descargar_cuenta_cobro_docx(
+    cuenta_id: uuid.UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Generate and download the entity's cuenta-de-cobro letter as DOCX (clone-only)."""
+    content, filename = await informe_service.generar_cuenta_cobro_docx(db, user.id, cuenta_id)
+    return Response(
+        content=content,
+        media_type=_DOCX_MEDIA_TYPE,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Es-Borrador": str(informe_service.ES_BORRADOR).lower(),
+        },
+    )
+
+
+@router.get("/{cuenta_id}/documento-soporte.xlsx", response_class=Response)
+async def descargar_documento_soporte_xlsx(
+    cuenta_id: uuid.UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Generate and download the entity's Documento Soporte as XLSX (clone-only, optional)."""
+    content, filename = await informe_service.generar_documento_soporte_xlsx(db, user.id, cuenta_id)
+    return Response(
+        content=content,
+        media_type=_XLSX_MEDIA_TYPE,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
             "X-Es-Borrador": str(informe_service.ES_BORRADOR).lower(),
         },
     )

@@ -94,6 +94,8 @@ distro==1.9.0
     # via openai
 dnspython==2.8.0
     # via email-validator
+docopt==0.6.2
+    # via num2words
 ecdsa==0.19.2
     # via python-jose
 email-validator==2.3.0
@@ -252,6 +254,8 @@ multidict==6.7.1
     # via
     #   aiohttp
     #   yarl
+num2words==0.5.14
+    # via cashin-backend
 numpy==2.5.1
     # via
     #   onnxruntime
