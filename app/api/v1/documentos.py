@@ -1,7 +1,5 @@
 """Documentos API — upload and process source documents per contract."""
 
-from __future__ import annotations
-
 import uuid
 
 from fastapi import APIRouter, Depends, File, Query, Request, Response, UploadFile

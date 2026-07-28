@@ -5,8 +5,6 @@ endpoints) so this stays a small, focused surface for the free-form loop in
 `app.services.agent_chat_service`.
 """
 
-from __future__ import annotations
-
 import structlog
 from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
