@@ -26,7 +26,7 @@ FOLDER_MIME = "application/vnd.google-apps.folder"
 class DriveAdapter:
     """Google Drive implementation of DrivePort.
 
-    Reuses GmailAdapter for credential management — both use the same GoogleToken.
+    Reuses GmailAdapter for credential management — both read the same `Integracion` row.
     All Google API calls run via run_in_executor to stay non-blocking.
     """
 

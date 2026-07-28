@@ -27,7 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.adapters.email.port import EmailAttachment, EmailMessage
 from app.core.config import settings
 from app.core.exceptions import ExternalServiceError, NotFoundError, ValidationError
-from app.models.google_token import GoogleToken
+from app.models.integracion import Integracion, IntegrationProvider
 
 logger = structlog.get_logger("adapters.gmail")
 
@@ -53,7 +53,8 @@ def _is_rate_limit_error(exc: GoogleHttpError) -> bool:
 class GmailAdapter:
     """Google Gmail implementation of EmailPort.
 
-    Uses encrypted OAuth tokens stored in GoogleToken model.
+    Uses encrypted OAuth tokens stored in the generalized `Integracion` model
+    (provider=google) — see app/models/integracion.py.
     All Google API calls run via run_in_executor to avoid blocking the event loop.
     """
 
@@ -70,7 +71,10 @@ class GmailAdapter:
         Default Credentials — useful for local dev without a full OAuth client setup.
         """
         result = await self._db.execute(
-            select(GoogleToken).where(GoogleToken.usuario_id == usuario_id)
+            select(Integracion).where(
+                Integracion.usuario_id == usuario_id,
+                Integracion.provider == IntegrationProvider.GOOGLE,
+            )
         )
         record = result.scalar_one_or_none()
         if not record:
@@ -154,12 +158,7 @@ class GmailAdapter:
         service = self._build_service(creds)
 
         def _search() -> dict:  # type: ignore[type-arg]
-            return (
-                service.users()
-                .messages()
-                .list(userId="me", q=query, maxResults=max_results)
-                .execute()
-            )
+            return service.users().messages().list(userId="me", q=query, maxResults=max_results).execute()
 
         try:
             result = await self._execute_with_retry(_search)
@@ -194,12 +193,7 @@ class GmailAdapter:
         service = self._build_service(creds)
 
         def _get() -> dict:  # type: ignore[type-arg]
-            return (
-                service.users()
-                .messages()
-                .get(userId="me", id=message_id, format="full")
-                .execute()
-            )
+            return service.users().messages().get(userId="me", id=message_id, format="full").execute()
 
         try:
             raw = await self._execute_with_retry(_get)
@@ -263,12 +257,7 @@ class GmailAdapter:
         raw_bytes = base64.urlsafe_b64encode(msg.as_bytes()).decode()
 
         def _send() -> dict:  # type: ignore[type-arg]
-            return (
-                service.users()
-                .messages()
-                .send(userId="me", body={"raw": raw_bytes})
-                .execute()
-            )
+            return service.users().messages().send(userId="me", body={"raw": raw_bytes}).execute()
 
         try:
             result = await self._execute_with_retry(_send)

@@ -1,24 +1,26 @@
-"""Google Workspace service — OAuth, Gmail, Drive business logic."""
+"""Google Workspace service — OAuth, Gmail, Drive business logic.
+
+Token/state/status persistence now delegates to `integration_service` (the
+generalized, provider-agnostic credential store) — this module keeps only the
+Google-specific `Flow` construction and Gmail/Drive operations. See
+openspec/changes/microsoft-365-integration/design.md D2.
+"""
 
 from __future__ import annotations
 
 import secrets
 import uuid
-from datetime import UTC, datetime, timedelta
 
 import structlog
-from cryptography.fernet import Fernet
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
-from jose import JWTError, jwt
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.drive.drive_adapter import DriveAdapter, build_contract_drive_path
 from app.adapters.email.gmail_adapter import GmailAdapter
 from app.core.config import settings
-from app.core.exceptions import ExternalServiceError, NotFoundError, ValidationError
-from app.models.google_token import GoogleToken
+from app.core.exceptions import ExternalServiceError
+from app.models.integracion import Integracion, IntegrationProvider
 from app.schemas.google_workspace import (
     DriveUploadResponse,
     EmailSearchResponse,
@@ -26,50 +28,19 @@ from app.schemas.google_workspace import (
     GoogleConnectURLResponse,
     GoogleIntegrationStatus,
 )
+from app.services import integration_service
 
 logger = structlog.get_logger("services.google_workspace")
-
-_GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail"
-_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
-_OAUTH_STATE_TYPE = "oauth_state"
-
-
-def _fernet() -> Fernet:
-    return Fernet(settings.TOKEN_ENCRYPTION_KEY.encode())
-
-
-# ── OAuth signed-state helpers ────────────────────────────────────────────────
-
-
-def _encode_oauth_state(usuario_id: uuid.UUID, code_verifier: str) -> str:
-    """Sign a short-lived JWT carrying usuario_id and PKCE code_verifier for the OAuth round-trip."""
-    now = datetime.now(UTC)
-    claims = {
-        "sub": str(usuario_id),
-        "type": _OAUTH_STATE_TYPE,
-        "cv": code_verifier,
-        "iat": now,
-        "exp": now + timedelta(seconds=settings.GOOGLE_OAUTH_STATE_TTL_SECONDS),
-    }
-    return jwt.encode(claims, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
 
 
 def verify_oauth_state(state: str) -> tuple[uuid.UUID, str]:
     """Decode and validate a signed OAuth state token.
 
     Returns (usuario_id, code_verifier). Raises ValidationError on invalid/expired/tampered tokens.
+    Thin backward-compatible wrapper — the real (now provider-aware) logic lives
+    in `integration_service.verify_oauth_state`.
     """
-    try:
-        payload = jwt.decode(state, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
-    except JWTError as exc:
-        raise ValidationError("State OAuth inválido o expirado") from exc
-    if payload.get("type") != _OAUTH_STATE_TYPE:
-        raise ValidationError("State OAuth de tipo incorrecto")
-    try:
-        usuario_id = uuid.UUID(payload["sub"])
-        code_verifier = payload["cv"]
-    except (KeyError, ValueError) as exc:
-        raise ValidationError("State OAuth sin datos válidos") from exc
+    usuario_id, code_verifier, _provider = integration_service.verify_oauth_state(state)
     return usuario_id, code_verifier
 
 
@@ -86,7 +57,7 @@ def get_authorization_url(usuario_id: uuid.UUID) -> GoogleConnectURLResponse:
         raise ExternalServiceError("Google OAuth", "CLIENT_ID y CLIENT_SECRET no configurados")
 
     code_verifier = secrets.token_urlsafe(96)  # 128 chars — satisfies RFC 7636 length requirement
-    state = _encode_oauth_state(usuario_id, code_verifier)
+    state = integration_service.encode_oauth_state(usuario_id, code_verifier, IntegrationProvider.GOOGLE)
 
     flow = Flow.from_client_config(
         client_config={
@@ -117,7 +88,7 @@ async def handle_oauth_callback(
     code: str,
     code_verifier: str,
 ) -> GoogleIntegrationStatus:
-    """Exchange authorization code for tokens and persist encrypted in GoogleToken."""
+    """Exchange authorization code for tokens and persist encrypted in `integraciones`."""
     if not settings.GOOGLE_OAUTH_CLIENT_ID:
         raise ExternalServiceError("Google OAuth", "No configurado")
 
@@ -163,68 +134,39 @@ async def store_credentials(
     refresh_token: str,
     scopes: list[str] | str,
     expires_in: int = 3600,
-) -> GoogleToken:
+) -> Integracion:
     """Encrypt and upsert a user's Google OAuth tokens.
 
     Shared by the web OAuth callback and the local loopback demo script so both
-    persist tokens identically (Fernet-encrypted, one row per user).
+    persist tokens identically. Thin wrapper — delegates to
+    `integration_service.store_credentials` with `provider=google`.
     """
-    f = _fernet()
-    scope_str = " ".join(scopes) if isinstance(scopes, (list, tuple)) else str(scopes)
-    expires_at = datetime.now(UTC) + timedelta(seconds=expires_in)
-
-    result = await db.execute(select(GoogleToken).where(GoogleToken.usuario_id == usuario_id))
-    record = result.scalar_one_or_none()
-
-    if record:
-        record.access_token_encrypted = f.encrypt(access_token.encode()).decode()
-        record.refresh_token_encrypted = f.encrypt(refresh_token.encode()).decode()
-        record.scopes = scope_str
-        record.expires_at = expires_at
-    else:
-        record = GoogleToken(
-            usuario_id=usuario_id,
-            access_token_encrypted=f.encrypt(access_token.encode()).decode(),
-            refresh_token_encrypted=f.encrypt(refresh_token.encode()).decode(),
-            scopes=scope_str,
-            expires_at=expires_at,
-        )
-        db.add(record)
-
-    await db.commit()
-    return record
+    return await integration_service.store_credentials(
+        db,
+        usuario_id,
+        IntegrationProvider.GOOGLE,
+        access_token=access_token,
+        refresh_token=refresh_token,
+        scopes=scopes,
+        expires_in=expires_in,
+    )
 
 
 async def revoke_integration(db: AsyncSession, usuario_id: uuid.UUID) -> None:
-    """Delete GoogleToken — disconnects Google account."""
-    result = await db.execute(select(GoogleToken).where(GoogleToken.usuario_id == usuario_id))
-    record = result.scalar_one_or_none()
-    if not record:
-        raise NotFoundError("Integración de Google")
-    await db.delete(record)
-    await db.commit()
-    logger.info("google_integration_revoked", user_id=str(usuario_id))
+    """Disconnect the user's Google account (deletes its `integraciones` row)."""
+    await integration_service.revoke_integration(db, usuario_id, IntegrationProvider.GOOGLE)
 
 
 async def get_integration_status(db: AsyncSession, usuario_id: uuid.UUID) -> GoogleIntegrationStatus:
-    """Return connection status and enabled scopes for the user."""
-    result = await db.execute(select(GoogleToken).where(GoogleToken.usuario_id == usuario_id))
-    record = result.scalar_one_or_none()
-
-    if not record:
-        return GoogleIntegrationStatus(connected=False)
-
-    scopes = record.scopes.split()
-    gmail_enabled = any(_GMAIL_SCOPE in s for s in scopes)
-    drive_enabled = any(_DRIVE_SCOPE in s for s in scopes)
-
-    # Decrypt email from access token (via Google tokeninfo endpoint) only if needed
+    """Return connection status and enabled scopes for the user's Google connection."""
+    status = await integration_service.get_integration_status(db, usuario_id, IntegrationProvider.GOOGLE)
     return GoogleIntegrationStatus(
-        connected=True,
-        scopes=scopes,
-        expires_at=record.expires_at,
-        gmail_enabled=gmail_enabled,
-        drive_enabled=drive_enabled,
+        connected=status.connected,
+        email=status.email,
+        scopes=status.scopes,
+        expires_at=status.expires_at,
+        gmail_enabled=status.mail_enabled,
+        drive_enabled=status.drive_enabled,
     )
 
 

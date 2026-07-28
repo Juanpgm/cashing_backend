@@ -7,24 +7,15 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from app.core.exceptions import ExternalServiceError, NotFoundError, ValidationError
+from app.models.integracion import IntegrationProvider
 from jose import jwt
 
-from app.core.exceptions import ExternalServiceError, NotFoundError, ValidationError
-
-
-class TestFernet:
-    def test_fernet_roundtrip(self) -> None:
-        """_fernet() returns a working Fernet instance that can encrypt/decrypt."""
-        from cryptography.fernet import Fernet
-
-        from app.services.google_workspace_service import _fernet
-
-        key = Fernet.generate_key()
-        with patch("app.services.google_workspace_service.settings") as mock_settings:
-            mock_settings.TOKEN_ENCRYPTION_KEY = key.decode()
-            f = _fernet()
-            encrypted = f.encrypt(b"secret")
-            assert f.decrypt(encrypted) == b"secret"
+# NOTE: `_fernet()` and the JWT state helpers moved to `integration_service.py`
+# (openspec/changes/microsoft-365-integration design D2) — `_fernet` roundtrip
+# coverage now lives in tests/test_integration_service.py::TestFernet.
+# `google_workspace_service.verify_oauth_state` is a thin wrapper that delegates
+# to `integration_service.verify_oauth_state`, so its settings live there too.
 
 
 class TestGetAuthorizationUrl:
@@ -66,7 +57,7 @@ class TestVerifyOauthState:
 
         uid = uuid.uuid4()
         state = self._make_state(uid, cv=self._CV)
-        with patch("app.services.google_workspace_service.settings") as mock_settings:
+        with patch("app.services.integration_service.settings") as mock_settings:
             mock_settings.JWT_SECRET_KEY = self._SECRET
             mock_settings.JWT_ALGORITHM = self._ALGO
             returned_uid, returned_cv = verify_oauth_state(state)
@@ -77,7 +68,7 @@ class TestVerifyOauthState:
         from app.services.google_workspace_service import verify_oauth_state
 
         state = self._make_state(uuid.uuid4()) + "TAMPERED"
-        with patch("app.services.google_workspace_service.settings") as mock_settings:
+        with patch("app.services.integration_service.settings") as mock_settings:
             mock_settings.JWT_SECRET_KEY = self._SECRET
             mock_settings.JWT_ALGORITHM = self._ALGO
             with pytest.raises(ValidationError):
@@ -87,7 +78,7 @@ class TestVerifyOauthState:
         from app.services.google_workspace_service import verify_oauth_state
 
         state = self._make_state(uuid.uuid4(), ttl_seconds=-1)
-        with patch("app.services.google_workspace_service.settings") as mock_settings:
+        with patch("app.services.integration_service.settings") as mock_settings:
             mock_settings.JWT_SECRET_KEY = self._SECRET
             mock_settings.JWT_ALGORITHM = self._ALGO
             with pytest.raises(ValidationError):
@@ -99,7 +90,7 @@ class TestVerifyOauthState:
         uid = uuid.uuid4()
         claims = {"sub": str(uid), "type": "access", "cv": "x", "exp": datetime.now(UTC) + timedelta(minutes=5)}
         state = jwt.encode(claims, self._SECRET, algorithm=self._ALGO)
-        with patch("app.services.google_workspace_service.settings") as mock_settings:
+        with patch("app.services.integration_service.settings") as mock_settings:
             mock_settings.JWT_SECRET_KEY = self._SECRET
             mock_settings.JWT_ALGORITHM = self._ALGO
             with pytest.raises(ValidationError):
@@ -127,6 +118,8 @@ class TestGetIntegrationStatus:
         fake_token = MagicMock()
         fake_token.scopes = "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/drive.file"
         fake_token.expires_at = None
+        fake_token.provider = IntegrationProvider.GOOGLE
+        fake_token.email = ""
 
         mock_result = MagicMock()
         mock_result.scalar_one_or_none.return_value = fake_token
@@ -222,8 +215,9 @@ class TestSearchEmails:
         fake_message.subject = "Test"
         fake_message.sender = "a@b.com"
         fake_message.recipients = []
-        from datetime import datetime, timezone
-        fake_message.date = datetime(2024, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
+        from datetime import datetime
+
+        fake_message.date = datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC)
         fake_message.snippet = "a snippet"
         fake_message.body_plain = ""
         fake_message.body_html = ""
@@ -243,8 +237,8 @@ class TestSearchEmails:
 class TestHandleOAuthCallbackSuccess:
     @pytest.mark.asyncio
     async def test_saves_new_token_when_no_existing(self) -> None:
-        from cryptography.fernet import Fernet
         from app.services.google_workspace_service import handle_oauth_callback
+        from cryptography.fernet import Fernet
 
         key = Fernet.generate_key()
 
@@ -265,6 +259,8 @@ class TestHandleOAuthCallbackSuccess:
         status_result.scalar_one_or_none.return_value = MagicMock(
             scopes="https://www.googleapis.com/auth/gmail.readonly",
             expires_at=None,
+            provider=IntegrationProvider.GOOGLE,
+            email="",
         )
 
         mock_db = AsyncMock()
@@ -300,7 +296,10 @@ class TestUploadPdfToDrive:
         mock_adapter.upload_file = AsyncMock(return_value=mock_file)
 
         with patch("app.services.google_workspace_service.DriveAdapter", return_value=mock_adapter):
-            with patch("app.services.google_workspace_service.build_contract_drive_path", return_value=["CashIn", "Entidad", "CON-001", "2024-03"]):
+            with patch(
+                "app.services.google_workspace_service.build_contract_drive_path",
+                return_value=["CashIn", "Entidad", "CON-001", "2024-03"],
+            ):
                 result = await upload_pdf_to_drive(
                     AsyncMock(),
                     uuid.uuid4(),

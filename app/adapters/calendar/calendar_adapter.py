@@ -1,6 +1,6 @@
 """Google Calendar adapter — reads events as contractual evidence.
 
-Reuses GmailAdapter for OAuth credential management (same GoogleToken row), so
+Reuses GmailAdapter for OAuth credential management (same `Integracion` row), so
 all Google Workspace adapters share one token store with auto-refresh. All
 Google API calls run via run_in_executor to stay non-blocking.
 """
