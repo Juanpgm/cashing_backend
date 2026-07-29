@@ -85,13 +85,19 @@ def get_authorization_url(usuario_id: uuid.UUID) -> GoogleConnectURLResponse:
     return GoogleConnectURLResponse(authorization_url=auth_url, state=state)
 
 
-async def handle_oauth_callback(
+async def google_handle_oauth_callback(
     db: AsyncSession,
     usuario_id: uuid.UUID,
     code: str,
     code_verifier: str,
 ) -> GoogleIntegrationStatus:
-    """Exchange authorization code for tokens and persist encrypted in `integraciones`."""
+    """Exchange authorization code for tokens and persist encrypted in `integraciones`.
+
+    Named `google_*` (rather than the bare `handle_oauth_callback`) to disambiguate
+    from `microsoft_graph_service.handle_oauth_callback` — same convention as
+    `google_verify_oauth_state`/`google_store_credentials`/`google_revoke_integration`/
+    `google_get_integration_status` above (see design.md D2 and Slice A1's correction round).
+    """
     if not settings.GOOGLE_OAUTH_CLIENT_ID:
         raise ExternalServiceError("Google OAuth", "No configurado")
 

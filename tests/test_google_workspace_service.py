@@ -166,16 +166,16 @@ class TestRevokeIntegration:
 class TestHandleOAuthCallbackErrorPath:
     @pytest.mark.asyncio
     async def test_raises_when_not_configured(self) -> None:
-        from app.services.google_workspace_service import handle_oauth_callback
+        from app.services.google_workspace_service import google_handle_oauth_callback
 
         with patch("app.services.google_workspace_service.settings") as mock_settings:
             mock_settings.GOOGLE_OAUTH_CLIENT_ID = ""
             with pytest.raises(ExternalServiceError):
-                await handle_oauth_callback(AsyncMock(), uuid.uuid4(), "code", "verifier")
+                await google_handle_oauth_callback(AsyncMock(), uuid.uuid4(), "code", "verifier")
 
     @pytest.mark.asyncio
     async def test_raises_on_token_exchange_failure(self) -> None:
-        from app.services.google_workspace_service import handle_oauth_callback
+        from app.services.google_workspace_service import google_handle_oauth_callback
 
         with patch("app.services.google_workspace_service.settings") as mock_settings:
             mock_settings.GOOGLE_OAUTH_CLIENT_ID = "client_id"
@@ -188,7 +188,7 @@ class TestHandleOAuthCallbackErrorPath:
 
             with patch("app.services.google_workspace_service.Flow.from_client_config", return_value=mock_flow):
                 with pytest.raises(ExternalServiceError):
-                    await handle_oauth_callback(AsyncMock(), uuid.uuid4(), "bad_code", "verifier")
+                    await google_handle_oauth_callback(AsyncMock(), uuid.uuid4(), "bad_code", "verifier")
 
 
 class TestSearchEmails:
@@ -237,7 +237,7 @@ class TestSearchEmails:
 class TestHandleOAuthCallbackSuccess:
     @pytest.mark.asyncio
     async def test_saves_new_token_when_no_existing(self) -> None:
-        from app.services.google_workspace_service import handle_oauth_callback
+        from app.services.google_workspace_service import google_handle_oauth_callback
         from cryptography.fernet import Fernet
 
         key = Fernet.generate_key()
@@ -276,7 +276,7 @@ class TestHandleOAuthCallbackSuccess:
             mock_settings.TOKEN_ENCRYPTION_KEY = key.decode()
 
             with patch("app.services.google_workspace_service.Flow.from_client_config", return_value=mock_flow):
-                result = await handle_oauth_callback(mock_db, uuid.uuid4(), "valid_code", "test-verifier")
+                result = await google_handle_oauth_callback(mock_db, uuid.uuid4(), "valid_code", "test-verifier")
 
         assert result.connected is True
         mock_db.add.assert_called_once()

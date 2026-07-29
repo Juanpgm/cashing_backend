@@ -67,7 +67,7 @@ class TestCallback:
     async def test_google_callback_still_resolves(self, client, test_user):
         state = integration_service.encode_oauth_state(test_user["user"].id, "cv", IntegrationProvider.GOOGLE)
 
-        with patch("app.api.v1.integraciones.gws.handle_oauth_callback", AsyncMock()) as mock_callback:
+        with patch("app.api.v1.integraciones.gws.google_handle_oauth_callback", AsyncMock()) as mock_callback:
             resp = await client.get(
                 "/api/v1/integraciones/google/callback",
                 params={"code": "auth-code", "state": state},
@@ -93,7 +93,7 @@ class TestCallback:
 
     @pytest.mark.asyncio
     async def test_tampered_state_rejected_before_token_exchange(self, client):
-        with patch("app.api.v1.integraciones.gws.handle_oauth_callback", AsyncMock()) as mock_callback:
+        with patch("app.api.v1.integraciones.gws.google_handle_oauth_callback", AsyncMock()) as mock_callback:
             resp = await client.get(
                 "/api/v1/integraciones/google/callback",
                 params={"code": "auth-code", "state": "tampered.state.value"},

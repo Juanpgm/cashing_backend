@@ -93,7 +93,7 @@ async def integration_callback(
         if state_provider != provider:
             raise ValidationError("El estado OAuth no corresponde al proveedor solicitado")
         if provider == IntegrationProvider.GOOGLE:
-            await gws.handle_oauth_callback(db=db, usuario_id=usuario_id, code=code, code_verifier=code_verifier)
+            await gws.google_handle_oauth_callback(db=db, usuario_id=usuario_id, code=code, code_verifier=code_verifier)
         else:
             await mgs.handle_oauth_callback(db=db, usuario_id=usuario_id, code=code, code_verifier=code_verifier)
     except DomainError as exc:
