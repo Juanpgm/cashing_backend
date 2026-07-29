@@ -14,7 +14,8 @@ import app.tools.catalog  # noqa: F401 — import-for-side-effect: populates TOO
 from app.api.deps import CurrentUser
 from app.core.config import settings
 from app.core.database import get_db
-from app.core.exceptions import DomainError
+from app.core.exceptions import DomainError, ValidationError
+from app.models.integracion import IntegrationProvider
 from app.schemas.google_workspace import (
     CalendarTestResponse,
     DriveTestResponse,
@@ -27,9 +28,11 @@ from app.schemas.google_workspace import (
     EvidenceDiscoveryRequest,
     EvidenceDiscoveryResponse,
     GoogleConnectURLResponse,
-    GoogleIntegrationStatus,
 )
+from app.schemas.integracion import IntegrationStatus
 from app.services import google_workspace_service as gws
+from app.services import integration_service
+from app.services import microsoft_graph_service as mgs
 from app.tools.context import ToolContext
 from app.tools.invoke import invoke_tool
 
@@ -38,64 +41,87 @@ router = APIRouter(prefix="/integraciones", tags=["integraciones"])
 
 
 # ── OAuth ────────────────────────────────────────────────────────────────────
+#
+# Routes generalized to a validated `{provider}` path parameter (design.md D1):
+# `provider` is typed as `IntegrationProvider` (google|microsoft), so FastAPI
+# rejects any other value with a 422 before it reaches a handler — a stray
+# `/integraciones/evidencias/status` fails validation cleanly instead of being
+# silently mis-routed. Existing `/integraciones/google/*` URLs keep resolving
+# identically (provider=google), so no redirect-URI reconfiguration or frontend
+# path change is required. Per-provider OAuth `Flow`/PKCE construction stays in
+# each provider's own service module (D2); these routes are thin dispatchers.
+#
+# NOTE: `test_calendar`/`test_drive` (below) are intentionally NOT generalized
+# in this slice — they require `MicrosoftGraphAdapter`, which is Slice C1 scope.
 
 
-@router.get("/google/connect", response_model=GoogleConnectURLResponse)
-async def google_connect(user: CurrentUser) -> GoogleConnectURLResponse:
-    """Genera la URL para que el usuario autorice el acceso a su cuenta de Google.
+@router.get("/{provider}/connect", response_model=GoogleConnectURLResponse)
+async def integration_connect(provider: IntegrationProvider, user: CurrentUser) -> GoogleConnectURLResponse:
+    """Genera la URL para que el usuario autorice el acceso a su cuenta (Google o Microsoft).
 
-    Embeds a signed state token so the callback can recover the user without a JWT header.
-    El frontend debe redirigir al usuario a `authorization_url`.
+    Embeds a signed state token (carrying `provider`) so the callback can recover the
+    user without a JWT header. El frontend debe redirigir al usuario a `authorization_url`.
     """
-    return gws.get_authorization_url(usuario_id=user.id)
+    if provider == IntegrationProvider.GOOGLE:
+        return gws.get_authorization_url(usuario_id=user.id)
+    return mgs.build_authorization_url(usuario_id=user.id)
 
 
-@router.get("/google/callback")
-async def google_oauth_callback(
+@router.get("/{provider}/callback")
+async def integration_callback(
+    provider: IntegrationProvider,
     db: AsyncSession = Depends(get_db),
     code: str | None = Query(default=None),
     state: str | None = Query(default=None),
     error: str | None = Query(default=None),
 ) -> RedirectResponse:
-    """Callback de Google OAuth2. Google redirige el navegador aquí con el authorization code.
+    """Callback OAuth2. El proveedor redirige el navegador aquí con el authorization code.
 
     No requiere JWT — la identidad del usuario viaja en el `state` firmado generado en /connect.
     Intercambia el código por tokens, los persiste y redirige el navegador de vuelta al frontend.
     """
     base = f"{settings.FRONTEND_URL}/integraciones"
+    label = provider.value
 
     if error or not code or not state:
         reason = quote(error or "missing_code_or_state")
-        logger.warning("google_oauth_callback_missing_params", error=error, has_code=bool(code))
-        return RedirectResponse(f"{base}?google=error&reason={reason}", status_code=303)
+        logger.warning("oauth_callback_missing_params", provider=label, error=error, has_code=bool(code))
+        return RedirectResponse(f"{base}?{label}=error&reason={reason}", status_code=303)
 
     try:
-        usuario_id, code_verifier = gws.google_verify_oauth_state(state)
-        await gws.handle_oauth_callback(db=db, usuario_id=usuario_id, code=code, code_verifier=code_verifier)
+        usuario_id, code_verifier, state_provider = integration_service.verify_oauth_state(state)
+        if state_provider != provider:
+            raise ValidationError("El estado OAuth no corresponde al proveedor solicitado")
+        if provider == IntegrationProvider.GOOGLE:
+            await gws.handle_oauth_callback(db=db, usuario_id=usuario_id, code=code, code_verifier=code_verifier)
+        else:
+            await mgs.handle_oauth_callback(db=db, usuario_id=usuario_id, code=code, code_verifier=code_verifier)
     except DomainError as exc:
-        logger.warning("google_oauth_callback_failed", detail=exc.detail)
-        return RedirectResponse(f"{base}?google=error&reason={quote(exc.detail)}", status_code=303)
+        logger.warning("oauth_callback_failed", provider=label, detail=exc.detail)
+        return RedirectResponse(f"{base}?{label}=error&reason={quote(exc.detail)}", status_code=303)
 
-    return RedirectResponse(f"{base}?google=connected", status_code=303)
+    return RedirectResponse(f"{base}?{label}=connected", status_code=303)
 
 
-@router.get("/google/status", response_model=GoogleIntegrationStatus)
-async def google_status(
+@router.get("/{provider}/status", response_model=IntegrationStatus)
+async def integration_status(
+    provider: IntegrationProvider,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
-) -> GoogleIntegrationStatus:
-    """Retorna el estado de la integración Google del usuario autenticado."""
-    return await gws.google_get_integration_status(db=db, usuario_id=user.id)
+) -> IntegrationStatus:
+    """Retorna el estado de la integración (Google o Microsoft) del usuario autenticado."""
+    return await integration_service.get_integration_status(db, user.id, provider)
 
 
-@router.delete("/google/revoke", status_code=200)
-async def google_revoke(
+@router.delete("/{provider}/revoke", status_code=200)
+async def integration_revoke(
+    provider: IntegrationProvider,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, str]:
-    """Desconecta la cuenta de Google eliminando los tokens almacenados."""
-    await gws.google_revoke_integration(db=db, usuario_id=user.id)
-    return {"detail": "Integración de Google desconectada"}
+    """Desconecta la cuenta (Google o Microsoft) eliminando los tokens almacenados."""
+    await integration_service.revoke_integration(db, user.id, provider)
+    return {"detail": f"Integración de {provider.value} desconectada"}
 
 
 # ── Evidence discovery (explorer agent) ──────────────────────────────────────
