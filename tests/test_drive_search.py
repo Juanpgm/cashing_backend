@@ -106,6 +106,27 @@ async def test_search_files_translates_date_range_and_excludes_folders():
 
 
 @pytest.mark.asyncio
+async def test_search_files_escapes_quote_and_backslash_in_keyword():
+    """A keyword with a trailing backslash plus a quote must not corrupt the query's quoting."""
+    from app.adapters.drive.drive_adapter import DriveAdapter
+
+    service = _fake_drive_service([])
+    adapter = DriveAdapter(db=MagicMock())
+    adapter._auth.get_credentials = AsyncMock(return_value=MagicMock())
+
+    with patch.object(adapter, "_build_service", return_value=service):
+        await adapter.search_files(uuid.uuid4(), DriveQuery(keywords=["informe's\\"], max_results=5))
+
+    _, kwargs = service.files.return_value.list.call_args
+    q = kwargs["q"]
+    # Balanced quotes: every opening ' must have a matching closing ' immediately
+    # after the sanitized term, with no stray backslash escaping it away.
+    assert q.count("'") % 2 == 0
+    assert "name contains 'informes'" in q
+    assert "\\" not in q
+
+
+@pytest.mark.asyncio
 async def test_search_files_no_keywords_omits_name_clause():
     """An empty keyword list (e.g. the 'most recent files' probe) adds no name/fullText clause."""
     from app.adapters.drive.drive_adapter import DriveAdapter

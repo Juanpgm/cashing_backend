@@ -207,7 +207,9 @@ class DriveAdapter:
         """Translate a provider-neutral `DriveQuery` into Google Drive query syntax."""
         parts: list[str] = []
         if query.keywords:
-            safe_terms = [kw.replace("'", "") for kw in query.keywords]
+            # Drive query grammar uses backslash as the escape char inside single-quoted
+            # literals; strip both quotes and backslashes so a keyword can't corrupt quoting.
+            safe_terms = [kw.replace("'", "").replace("\\", "") for kw in query.keywords]
             or_clause = " or ".join(f"name contains '{kw}' or fullText contains '{kw}'" for kw in safe_terms)
             parts.append(f"({or_clause})")
         if query.date_from:
