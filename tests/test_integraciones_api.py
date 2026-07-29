@@ -64,6 +64,30 @@ class TestConnect:
 
 class TestCallback:
     @pytest.mark.asyncio
+    async def test_callback_with_provider_error_redirects_with_reason(self, client):
+        """User clicked Cancel on the provider's consent screen (`error=access_denied`)."""
+        with patch("app.api.v1.integraciones.gws.google_handle_oauth_callback", AsyncMock()) as mock_callback:
+            resp = await client.get(
+                "/api/v1/integraciones/google/callback",
+                params={"error": "access_denied"},
+            )
+
+        assert resp.status_code == 303
+        assert "google=error" in resp.headers["location"]
+        assert "reason=access_denied" in resp.headers["location"]
+        mock_callback.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_callback_missing_code_and_state_redirects_with_reason(self, client):
+        with patch("app.api.v1.integraciones.mgs.handle_oauth_callback", AsyncMock()) as mock_callback:
+            resp = await client.get("/api/v1/integraciones/microsoft/callback")
+
+        assert resp.status_code == 303
+        assert "microsoft=error" in resp.headers["location"]
+        assert "reason=missing_code_or_state" in resp.headers["location"]
+        mock_callback.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_google_callback_still_resolves(self, client, test_user):
         state = integration_service.encode_oauth_state(test_user["user"].id, "cv", IntegrationProvider.GOOGLE)
 
@@ -127,6 +151,31 @@ class TestStatus:
         body = resp.json()
         assert body["provider"] == "google"
         assert body["connected"] is False
+
+    @pytest.mark.asyncio
+    async def test_google_status_derives_flags_from_granted_scopes_when_connected(self, client, test_user, db):
+        await integration_service.store_credentials(
+            db,
+            test_user["user"].id,
+            IntegrationProvider.GOOGLE,
+            access_token="at",
+            refresh_token="rt",
+            scopes=[
+                "https://www.googleapis.com/auth/gmail.readonly",
+                "https://www.googleapis.com/auth/calendar.readonly",
+            ],
+        )
+        await db.commit()
+
+        resp = await client.get("/api/v1/integraciones/google/status", headers=test_user["headers"])
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["provider"] == "google"
+        assert body["connected"] is True
+        assert body["mail_enabled"] is True
+        assert body["calendar_enabled"] is True
+        assert body["drive_enabled"] is False
 
     @pytest.mark.asyncio
     async def test_microsoft_status_resolves_unconnected(self, client, test_user):
@@ -245,3 +294,11 @@ class TestReconnect:
         )
         rows = result.scalars().all()
         assert len(rows) == 1
+
+        from cryptography.fernet import Fernet
+
+        f = Fernet(integration_service.settings.TOKEN_ENCRYPTION_KEY.encode())
+        stored = rows[0]
+        assert f.decrypt(stored.access_token_encrypted.encode()).decode() == "at-2"
+        assert f.decrypt(stored.refresh_token_encrypted.encode()).decode() == "rt-2"
+        assert stored.email == "user@contoso.com"
