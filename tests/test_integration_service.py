@@ -278,3 +278,64 @@ class TestRevokeIntegration:
         await revoke_integration(db, user.id, IntegrationProvider.GOOGLE)
         status = await get_integration_status(db, user.id, IntegrationProvider.GOOGLE)
         assert status.connected is False
+
+
+class TestMultipleAccountsSameProvider:
+    """Regression guard: 2+ Integracion rows for one (usuario_id, provider), distinguished
+    only by `email`, is the multi-account design goal of this whole slice (store_credentials
+    already supports it) — `get_integration_status`/`revoke_integration` must not raise
+    sqlalchemy.exc.MultipleResultsFound the moment a second account exists.
+    """
+
+    async def _store_two_accounts(self, db: AsyncSession, user_id: Any) -> None:
+        from app.services.integration_service import store_credentials
+
+        await store_credentials(
+            db,
+            user_id,
+            IntegrationProvider.GOOGLE,
+            access_token="a1",
+            refresh_token="r1",
+            scopes=["s1"],
+            email="first@example.com",
+        )
+        await store_credentials(
+            db,
+            user_id,
+            IntegrationProvider.GOOGLE,
+            access_token="a2",
+            refresh_token="r2",
+            scopes=["s2"],
+            email="second@example.com",
+        )
+
+    async def test_get_integration_status_does_not_raise_with_two_accounts(
+        self, db: AsyncSession, test_user: dict[str, Any]
+    ) -> None:
+        from app.services.integration_service import get_integration_status
+
+        user = test_user["user"]
+        await self._store_two_accounts(db, user.id)
+
+        status = await get_integration_status(db, user.id, IntegrationProvider.GOOGLE)
+        assert status.connected is True
+
+    async def test_revoke_integration_does_not_raise_with_two_accounts(
+        self, db: AsyncSession, test_user: dict[str, Any]
+    ) -> None:
+        from app.services.integration_service import revoke_integration
+
+        user = test_user["user"]
+        await self._store_two_accounts(db, user.id)
+
+        # Must resolve to exactly one row deterministically, not raise MultipleResultsFound.
+        await revoke_integration(db, user.id, IntegrationProvider.GOOGLE)
+
+    async def test_email_param_targets_one_specific_account(self, db: AsyncSession, test_user: dict[str, Any]) -> None:
+        from app.services.integration_service import get_integration_status
+
+        user = test_user["user"]
+        await self._store_two_accounts(db, user.id)
+
+        status = await get_integration_status(db, user.id, IntegrationProvider.GOOGLE, email="first@example.com")
+        assert status.email == "first@example.com"

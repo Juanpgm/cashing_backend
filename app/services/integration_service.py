@@ -139,12 +139,27 @@ async def store_credentials(
     return record
 
 
-async def revoke_integration(db: AsyncSession, usuario_id: uuid.UUID, provider: IntegrationProvider) -> None:
-    """Delete a user's stored credentials for one provider — disconnects the account."""
-    result = await db.execute(
-        select(Integracion).where(Integracion.usuario_id == usuario_id, Integracion.provider == provider)
-    )
-    record = result.scalar_one_or_none()
+async def revoke_integration(
+    db: AsyncSession,
+    usuario_id: uuid.UUID,
+    provider: IntegrationProvider,
+    *,
+    email: str | None = None,
+) -> None:
+    """Delete a user's stored credentials for one provider — disconnects the account.
+
+    A user may hold multiple accounts per (usuario_id, provider), distinguished by
+    `email`. Pass `email` to target one specific account; otherwise the most
+    recently updated row is resolved deterministically (`.scalars().first()`
+    instead of `.scalar_one_or_none()`, which raises MultipleResultsFound once a
+    second account exists — see openspec/changes/microsoft-365-integration).
+    """
+    query = select(Integracion).where(Integracion.usuario_id == usuario_id, Integracion.provider == provider)
+    if email is not None:
+        query = query.where(Integracion.email == email)
+    query = query.order_by(Integracion.updated_at.desc())
+    result = await db.execute(query)
+    record = result.scalars().first()
     if not record:
         raise NotFoundError(f"Integración de {provider.value}")
     await db.delete(record)
@@ -168,13 +183,25 @@ def _to_status(record: Integracion) -> IntegrationStatus:
 
 
 async def get_integration_status(
-    db: AsyncSession, usuario_id: uuid.UUID, provider: IntegrationProvider
+    db: AsyncSession,
+    usuario_id: uuid.UUID,
+    provider: IntegrationProvider,
+    *,
+    email: str | None = None,
 ) -> IntegrationStatus:
-    """Return connection status and enabled scopes for one (usuario, provider)."""
-    result = await db.execute(
-        select(Integracion).where(Integracion.usuario_id == usuario_id, Integracion.provider == provider)
-    )
-    record = result.scalar_one_or_none()
+    """Return connection status and enabled scopes for one (usuario, provider).
+
+    Pass `email` to target one specific account among several stored for this
+    (usuario_id, provider); otherwise the most recently updated row is returned
+    (see `revoke_integration` docstring for why `.scalars().first()` is required
+    here instead of `.scalar_one_or_none()`).
+    """
+    query = select(Integracion).where(Integracion.usuario_id == usuario_id, Integracion.provider == provider)
+    if email is not None:
+        query = query.where(Integracion.email == email)
+    query = query.order_by(Integracion.updated_at.desc())
+    result = await db.execute(query)
+    record = result.scalars().first()
     if not record:
         return IntegrationStatus(provider=provider, connected=False)
     return _to_status(record)

@@ -15,7 +15,7 @@ from email.mime.text import MIMEText
 from typing import TypeVar
 
 import structlog
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 from google.auth.exceptions import RefreshError, TransportError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -64,19 +64,27 @@ class GmailAdapter:
 
     # ── Credential Management ────────────────────────────────────────────────
 
-    async def get_credentials(self, usuario_id: uuid.UUID) -> Credentials:
+    async def get_credentials(self, usuario_id: uuid.UUID, email: str | None = None) -> Credentials:
         """Load, decrypt, and refresh Google OAuth credentials for a user.
 
         When GOOGLE_USE_ADC=true and no DB token exists, falls back to Application
         Default Credentials — useful for local dev without a full OAuth client setup.
+
+        A user may hold multiple Google accounts, distinguished by `email`. Pass
+        `email` to target one specific account; otherwise the most recently updated
+        row is resolved deterministically (`.scalars().first()` instead of
+        `.scalar_one_or_none()`, which raises MultipleResultsFound once a second
+        account exists — see openspec/changes/microsoft-365-integration).
         """
-        result = await self._db.execute(
-            select(Integracion).where(
-                Integracion.usuario_id == usuario_id,
-                Integracion.provider == IntegrationProvider.GOOGLE,
-            )
+        query = select(Integracion).where(
+            Integracion.usuario_id == usuario_id,
+            Integracion.provider == IntegrationProvider.GOOGLE,
         )
-        record = result.scalar_one_or_none()
+        if email is not None:
+            query = query.where(Integracion.email == email)
+        query = query.order_by(Integracion.updated_at.desc())
+        result = await self._db.execute(query)
+        record = result.scalars().first()
         if not record:
             if settings.GOOGLE_USE_ADC:
                 import google.auth  # lazy import — only needed for local dev ADC path
@@ -86,8 +94,15 @@ class GmailAdapter:
                 return adc_creds  # type: ignore[return-value]
             raise NotFoundError("Cuenta de Google no conectada. Ve a /api/v1/integraciones/google/connect")
 
-        access_token = self._fernet.decrypt(record.access_token_encrypted.encode()).decode()
-        refresh_token = self._fernet.decrypt(record.refresh_token_encrypted.encode()).decode()
+        try:
+            access_token = self._fernet.decrypt(record.access_token_encrypted.encode()).decode()
+            refresh_token = self._fernet.decrypt(record.refresh_token_encrypted.encode()).decode()
+        except InvalidToken as exc:
+            raise ExternalServiceError(
+                "Google OAuth",
+                "No se pudo desencriptar el token almacenado (clave de cifrado rotada o "
+                "corrupta) — reconectá tu cuenta de Google en /integraciones",
+            ) from exc
 
         creds = Credentials(
             token=access_token,
