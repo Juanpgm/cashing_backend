@@ -206,9 +206,7 @@ async def test_drive(
 
     try:
         adapter = DriveAdapter(db)
-        files = await adapter.search_files(
-            usuario_id=user.id, query=DriveQuery(keywords=[], max_results=max_results)
-        )
+        files = await adapter.search_files(usuario_id=user.id, query=DriveQuery(keywords=[], max_results=max_results))
         items = [
             DriveFileTestItem(
                 id=f.id,

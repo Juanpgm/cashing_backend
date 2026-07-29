@@ -7,7 +7,6 @@ from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from app.adapters.drive.port import DriveQuery
 
 

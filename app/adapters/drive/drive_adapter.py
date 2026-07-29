@@ -208,9 +208,7 @@ class DriveAdapter:
         parts: list[str] = []
         if query.keywords:
             safe_terms = [kw.replace("'", "") for kw in query.keywords]
-            or_clause = " or ".join(
-                f"name contains '{kw}' or fullText contains '{kw}'" for kw in safe_terms
-            )
+            or_clause = " or ".join(f"name contains '{kw}' or fullText contains '{kw}'" for kw in safe_terms)
             parts.append(f"({or_clause})")
         if query.date_from:
             parts.append(f"modifiedTime >= '{query.date_from.isoformat()}'")

@@ -10,7 +10,6 @@ from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
 import pytest
-
 from app.adapters.calendar.port import CalendarEvent
 from app.adapters.drive.port import DriveFile
 

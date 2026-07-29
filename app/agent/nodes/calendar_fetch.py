@@ -65,8 +65,7 @@ def _extract_event_metadata(event: CalendarEvent) -> dict:
     """
     return {
         "attendees": [
-            {"self": a.is_self, "responseStatus": a.response_status, "email": a.email}
-            for a in event.attendees
+            {"self": a.is_self, "responseStatus": a.response_status, "email": a.email} for a in event.attendees
         ],
         "organizer": {"email": event.organizer_email} if event.organizer_email else {},
         "event_type": event.event_type,
@@ -96,9 +95,7 @@ async def calendar_fetch_node(state: AgentState) -> AgentState:
 
     adapter = GoogleCalendarAdapter(db)
     try:
-        events = await adapter.search_events(
-            user_id, time_min, time_max, max_results=settings.EVIDENCE_MAX_EVENTS, q=q
-        )
+        events = await adapter.search_events(user_id, time_min, time_max, max_results=settings.EVIDENCE_MAX_EVENTS, q=q)
     except Exception as exc:
         await logger.aerror("calendar_fetch_error", error=str(exc), user_id=str(user_id))
         return {

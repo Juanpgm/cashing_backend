@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import uuid
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from app.adapters.calendar.port import CalendarAttendee, CalendarEvent
 from app.adapters.drive.port import DriveFile
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # drive_fetch_node
@@ -18,7 +16,7 @@ from app.adapters.drive.port import DriveFile
 
 
 def _drive_file(fid: str, name: str) -> DriveFile:
-    now = datetime(2024, 4, 12, tzinfo=timezone.utc)
+    now = datetime(2024, 4, 12, tzinfo=UTC)
     return DriveFile(
         id=fid,
         name=name,

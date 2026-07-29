@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 
 
 def test_calendar_event_defaults():
@@ -28,8 +28,8 @@ def test_calendar_event_defaults():
 def test_calendar_event_carries_timed_fields():
     from app.adapters.calendar.port import CalendarAttendee, CalendarEvent
 
-    start = datetime(2024, 4, 15, 9, 0, tzinfo=timezone.utc)
-    end = datetime(2024, 4, 15, 10, 0, tzinfo=timezone.utc)
+    start = datetime(2024, 4, 15, 9, 0, tzinfo=UTC)
+    end = datetime(2024, 4, 15, 10, 0, tzinfo=UTC)
     event = CalendarEvent(
         id="ev1",
         summary="Reunión de seguimiento",
