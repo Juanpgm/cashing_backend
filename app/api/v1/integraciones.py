@@ -109,7 +109,12 @@ async def integration_status(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> IntegrationStatus:
-    """Retorna el estado de la integración (Google o Microsoft) del usuario autenticado."""
+    """Retorna el estado de la integración (Google o Microsoft) del usuario autenticado.
+
+    BREAKING CHANGE for existing Google consumers: this generalized route replaces
+    the old `GoogleIntegrationStatus.gmail_enabled` field with `mail_enabled` (see
+    `IntegrationStatus` docstring) — deliberate, requires frontend coordination.
+    """
     return await integration_service.get_integration_status(db, user.id, provider)
 
 

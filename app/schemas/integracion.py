@@ -14,6 +14,11 @@ class IntegrationStatus(BaseModel):
 
     Replaces the hardcoded `GoogleIntegrationStatus` shape with a
     provider-discriminated schema shared across providers.
+
+    BREAKING CHANGE for existing Google consumers of GET /integraciones/google/status:
+    `GoogleIntegrationStatus.gmail_enabled` is replaced here by the provider-neutral
+    `mail_enabled` (plus the new `calendar_enabled`). This is deliberate and requires
+    frontend coordination — see openspec/changes/microsoft-365-integration/apply-progress.md.
     """
 
     provider: IntegrationProvider
