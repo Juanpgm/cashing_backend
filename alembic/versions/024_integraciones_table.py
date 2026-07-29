@@ -77,34 +77,89 @@ def upgrade() -> None:
         sa.column("created_at", sa.DateTime(timezone=True)),
         sa.column("updated_at", sa.DateTime(timezone=True)),
     )
-    rows = bind.execute(
-        sa.select(
-            google_tokens.c.usuario_id,
-            google_tokens.c.access_token_encrypted,
-            google_tokens.c.refresh_token_encrypted,
-            google_tokens.c.scopes,
-            google_tokens.c.expires_at,
-            google_tokens.c.created_at,
-            google_tokens.c.updated_at,
-        )
-    ).fetchall()
-    for row in rows:
+    if bind.dialect.name == "postgresql":
+        # Single set-based INSERT ... SELECT (design.md's original intent) — zero
+        # per-row round trips and minimal transaction/lock duration on real Postgres.
+        # gen_random_uuid() is a Postgres 13+ built-in (no pgcrypto extension needed).
         bind.execute(
-            integraciones.insert().values(
-                id=uuid.uuid4(),
-                usuario_id=row.usuario_id,
-                provider="google",
-                access_token_encrypted=row.access_token_encrypted,
-                refresh_token_encrypted=row.refresh_token_encrypted,
-                scopes=row.scopes,
-                expires_at=row.expires_at,
-                email="",
-                created_at=row.created_at,
-                updated_at=row.updated_at,
+            integraciones.insert().from_select(
+                [
+                    "id",
+                    "usuario_id",
+                    "provider",
+                    "access_token_encrypted",
+                    "refresh_token_encrypted",
+                    "scopes",
+                    "expires_at",
+                    "email",
+                    "created_at",
+                    "updated_at",
+                ],
+                sa.select(
+                    sa.literal_column("gen_random_uuid()"),
+                    google_tokens.c.usuario_id,
+                    sa.literal("google"),
+                    google_tokens.c.access_token_encrypted,
+                    google_tokens.c.refresh_token_encrypted,
+                    google_tokens.c.scopes,
+                    google_tokens.c.expires_at,
+                    sa.literal(""),
+                    google_tokens.c.created_at,
+                    google_tokens.c.updated_at,
+                ),
             )
         )
+    else:
+        # ponytail: gen_random_uuid() has no SQLite equivalent, and this branch only
+        # exists so alembic/versions/024's upgrade() is exercisable against a throwaway
+        # aiosqlite DB in tests (see tests/test_migration_024_backfill.py). Still a
+        # single bulk INSERT (one execute() call, not N) — round-trip cost is the same
+        # concern the Postgres branch above addresses. Upgrade path: none needed, real
+        # deployments always run on Postgres (bind.dialect.name == "postgresql" above).
+        rows = bind.execute(
+            sa.select(
+                google_tokens.c.usuario_id,
+                google_tokens.c.access_token_encrypted,
+                google_tokens.c.refresh_token_encrypted,
+                google_tokens.c.scopes,
+                google_tokens.c.expires_at,
+                google_tokens.c.created_at,
+                google_tokens.c.updated_at,
+            )
+        ).fetchall()
+        if rows:
+            bind.execute(
+                integraciones.insert(),
+                [
+                    {
+                        "id": uuid.uuid4(),
+                        "usuario_id": row.usuario_id,
+                        "provider": "google",
+                        "access_token_encrypted": row.access_token_encrypted,
+                        "refresh_token_encrypted": row.refresh_token_encrypted,
+                        "scopes": row.scopes,
+                        "expires_at": row.expires_at,
+                        "email": "",
+                        "created_at": row.created_at,
+                        "updated_at": row.updated_at,
+                    }
+                    for row in rows
+                ],
+            )
 
 
 def downgrade() -> None:
+    """Drop `integraciones` — DESTRUCTIVE, NOT lossless in general.
+
+    Safe (no data loss) ONLY if this runs BEFORE any post-cutover write, i.e.
+    before Slice A1's code cutover (`integration_service`/adapters reading and
+    writing `integraciones`) goes live. Once live:
+    - Any Google row created/refreshed after cutover has no equivalent write-back
+      to `google_tokens` (the cutover is one-way), so it is silently destroyed.
+    - Any Microsoft row has NO fallback table at all — `google_tokens` only ever
+      held Google credentials — so it is unconditionally lost.
+    Do not run this downgrade on an environment that has taken traffic since the
+    corresponding upgrade without first confirming no such rows exist.
+    """
     op.drop_index("ix_integraciones_usuario_provider", table_name="integraciones")
     op.drop_table("integraciones")
