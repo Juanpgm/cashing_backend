@@ -385,7 +385,7 @@ async def test_full_radicacion_journey(
     )
 
     with (
-        patch.object(eds.gws, "get_integration_status", AsyncMock(return_value=_connected_status())),
+        patch.object(eds.gws, "google_get_integration_status", AsyncMock(return_value=_connected_status())),
         patch.object(eds, "GmailAdapter", return_value=gmail),
         patch("app.agent.nodes.drive_fetch.DriveAdapter", return_value=drive_adapter),
         patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", return_value=cal_adapter),
