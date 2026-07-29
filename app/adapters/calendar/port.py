@@ -16,7 +16,13 @@ class CalendarAttendee:
     display_name: str = ""
     response_status: str = ""  # Google responseStatus / Graph status.response
     optional: bool = False
-    is_self: bool = False  # ponytail: Google-only "self" flag; Graph has no equivalent (defaults False)
+    # Google-only "self" flag; Graph has no equivalent (defaults False). Deliberate,
+    # tracked exception to this dataclass's "provider-neutral" contract: it exists solely
+    # to preserve `evidence_filter.is_noise_calendar`'s declined-RSVP check (an attendee
+    # with self=True and responseStatus="declined" marks the event as noise — see that
+    # function and `calendar_fetch.py._extract_event_metadata` for the consumer-side
+    # rationale). A future Graph adapter should leave this False rather than removing it.
+    is_self: bool = False
 
 
 @dataclass
@@ -30,7 +36,7 @@ class CalendarEvent:
     """
 
     id: str
-    summary: str = ""  # "" when the provider omits it; callers default their own placeholder text
+    summary: str = ""  # Google summary / Graph subject; "" when omitted, callers default their own placeholder text
     description: str = ""
     start: datetime | None = None  # timed events: aware datetime
     end: datetime | None = None
