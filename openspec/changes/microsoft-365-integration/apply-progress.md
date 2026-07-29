@@ -180,3 +180,25 @@ None. No regressions in the existing Google calendar/drive/discovery suites; myp
 
 ### Status
 15/15 A2 tasks complete. Ready for `sdd-verify` on this slice, or for the next apply batch (Slice B — Microsoft OAuth + generalized routes, depends on A1 only — A2 was independent).
+
+## A2 Correction Round (4R review fixes)
+
+A 4-lens review (risk, resilience, readability, reliability) ran against
+`feat/microsoft-365-a1-credential-store...feat/microsoft-365-a2-port-generalization`.
+One bounded correction transaction applied the confirmed findings as 5 atomic work-unit commits.
+
+| Ledger ID (severity/lens) | Location | Fix | Commit |
+|---|---|---|---|
+| resilience CRITICAL | `app/adapters/calendar/calendar_adapter.py:112` | `search_events` wraps each `_parse_event(item)` call in its own try/except (`ValueError, KeyError, TypeError`), logs+skips the malformed item, keeps the rest — matches `drive_fetch_node`'s established per-item isolation pattern | `fe9bd91` |
+| risk WARNING | `app/adapters/drive/drive_adapter.py:210` | `_translate_query` keyword sanitization now strips backslashes alongside single quotes (Drive query grammar uses `\` as the escape char inside `'...'` literals) | `cda3fcb` |
+| readability SUGGESTION (should-fix) | `app/adapters/calendar/port.py` | `CalendarAttendee.is_self` and `CalendarEvent.summary` docstrings/comments now explain the Google-only exception and add the missing Google/Graph cross-reference, matching the pattern already used by `html_link`/`event_type`/`response_status` | `e984cbd` |
+| test-coverage gap | `tests/test_drive_calendar_fetch.py` | New `test_drive_fetch_truncation_keeps_keyword_queries_over_generic_terms` pins the ordering property `drive_fetch_node`'s `EVIDENCE_QUERIES_PER_OBLIGACION` truncation depends on | `590a815` |
+| test-coverage gap | `tests/test_drive_calendar_fetch.py` | New `test_declined_rsvp_is_noise_end_to_end` / `test_accepted_rsvp_is_not_noise_end_to_end` drive the real `_parse_event` → `_extract_event_metadata` → `is_noise_calendar` pipeline instead of only hand-built half-tests | `ba321ca` |
+
+Out of scope per correction instructions (not touched): `tests/test_drive_port.py` file-organization suggestion; anything Microsoft/OAuth/credential-store related.
+
+### Correction Verification
+- Focused: `pytest tests/test_calendar_adapter.py tests/test_drive_search.py tests/test_drive_calendar_fetch.py tests/test_calendar_port.py -q` → 30/30 passed (was 28/28 before this round; +1 fault-isolation test, +1 backslash-escaping test, +3 new regression tests replacing/extending the coverage-gap items — net +9 test functions across the 3 modified test files).
+- Full suite: `pytest -q` → 1165 passed, 5 failed (same 5 pre-existing/environmental failures as the A2 baseline — confirmed unchanged by running them against a `git stash` of this correction's diff, identical `FileNotFoundError` on a missing external fixture path), 12 deselected.
+- Lint: `ruff check`/`ruff format --check` clean on all 6 files this round touched. `mypy app/adapters/calendar/ app/adapters/drive/` → 43 errors, identical count/content to the pre-correction baseline (verified via `git stash`) — no new mypy errors introduced.
+- Rollback boundary: each of the 5 commits (`fe9bd91`, `cda3fcb`, `e984cbd`, `590a815`, `ba321ca`) is independently revertible without touching unrelated work.
