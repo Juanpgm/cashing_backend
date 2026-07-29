@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from app.adapters.calendar.port import CalendarAttendee, CalendarEvent
 from app.adapters.drive.port import DriveFile
 
 
@@ -108,15 +109,18 @@ async def test_calendar_fetch_normalizes_events():
     from app.agent.nodes import calendar_fetch as mod
 
     events = [
-        {
-            "id": "ev1",
-            "summary": "Reunión de seguimiento",
-            "description": "Revisión de avances del contrato",
-            "htmlLink": "https://calendar.google.com/event?eid=ev1",
-            "start": {"dateTime": "2024-04-15T09:00:00-05:00"},
-            "attendees": [{"self": True, "responseStatus": "accepted"}, {"self": False, "email": "supervisor@entidad.gov.co"}],
-            "eventType": "default",
-        },
+        CalendarEvent(
+            id="ev1",
+            summary="Reunión de seguimiento",
+            description="Revisión de avances del contrato",
+            html_link="https://calendar.google.com/event?eid=ev1",
+            start=datetime.fromisoformat("2024-04-15T09:00:00-05:00"),
+            attendees=[
+                CalendarAttendee(is_self=True, response_status="accepted"),
+                CalendarAttendee(email="supervisor@entidad.gov.co", is_self=False),
+            ],
+            event_type="default",
+        ),
     ]
     mock_adapter = MagicMock()
     mock_adapter.search_events = AsyncMock(return_value=events)
@@ -136,9 +140,14 @@ async def test_calendar_fetch_normalizes_events():
     assert ev[0]["source"] == "calendar"
     assert ev[0]["link"].startswith("https://calendar.google.com")
     assert ev[0]["date"] == "2024-04-15T09:00:00-05:00"
-    # Metadatos de asistencia presentes para evidence_filter
+    # Metadatos de asistencia presentes para evidence_filter (evidence_filter.is_noise_calendar
+    # lee metadata["attendees"][i]["self"]/["responseStatus"] — el shape debe preservarse
+    # exactamente aunque ahora se construya desde CalendarAttendee, no desde el dict crudo.
     assert "metadata" in ev[0]
     assert "attendees" in ev[0]["metadata"]
+    assert ev[0]["metadata"]["attendees"][0]["self"] is True
+    assert ev[0]["metadata"]["attendees"][0]["responseStatus"] == "accepted"
+    assert ev[0]["metadata"]["attendees"][1]["self"] is False
     assert ev[0]["metadata"]["is_all_day"] is False
     assert ev[0]["metadata"]["event_type"] == "default"
 
@@ -148,12 +157,13 @@ async def test_calendar_fetch_marks_allday_events():
     from app.agent.nodes import calendar_fetch as mod
 
     events = [
-        {
-            "id": "ev2",
-            "summary": "Día festivo",
-            "start": {"date": "2024-04-19"},  # all-day: sin dateTime
-            "htmlLink": "https://calendar.google.com/event?eid=ev2",
-        },
+        CalendarEvent(
+            id="ev2",
+            summary="Día festivo",
+            start_date=date(2024, 4, 19),
+            is_all_day=True,  # sin dateTime: el adapter ya marca all-day
+            html_link="https://calendar.google.com/event?eid=ev2",
+        ),
     ]
     mock_adapter = MagicMock()
     mock_adapter.search_events = AsyncMock(return_value=events)
