@@ -154,6 +154,97 @@ class TestExchangeCode:
                 await exchange_code(code="auth-code", code_verifier="verifier-value")
 
     @pytest.mark.asyncio
+    async def test_token_response_missing_access_token_raises_external_service_error(self) -> None:
+        """A 200 response with a malformed/non-conformant body must degrade cleanly, not crash."""
+        from app.services.microsoft_graph_service import exchange_code
+
+        token_response = MagicMock()
+        token_response.raise_for_status = MagicMock()
+        # Azure returned 200 but the body is missing access_token entirely.
+        token_response.json.return_value = {"token_type": "Bearer"}
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=token_response)
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.__aexit__.return_value = None
+
+        with (
+            patch("app.services.microsoft_graph_service.settings") as mock_settings,
+            patch("app.services.microsoft_graph_service.httpx.AsyncClient", return_value=mock_client),
+        ):
+            mock_settings.AZURE_AD_CLIENT_ID = "test-client-id"
+            mock_settings.AZURE_AD_CLIENT_SECRET = "test-secret"
+            mock_settings.AZURE_AD_TENANT_ID = "common"
+            mock_settings.AZURE_AD_REDIRECT_URI = "http://localhost:8000/callback"
+            mock_settings.MICROSOFT_OAUTH_SCOPES = ["Mail.Read"]
+
+            with pytest.raises(ExternalServiceError):
+                await exchange_code(code="auth-code", code_verifier="verifier-value")
+
+    @pytest.mark.asyncio
+    async def test_token_response_non_json_body_raises_external_service_error(self) -> None:
+        """A 200 response with a non-JSON body must degrade cleanly, not crash."""
+        import json
+
+        from app.services.microsoft_graph_service import exchange_code
+
+        token_response = MagicMock()
+        token_response.raise_for_status = MagicMock()
+        token_response.json.side_effect = json.JSONDecodeError("Expecting value", "", 0)
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=token_response)
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.__aexit__.return_value = None
+
+        with (
+            patch("app.services.microsoft_graph_service.settings") as mock_settings,
+            patch("app.services.microsoft_graph_service.httpx.AsyncClient", return_value=mock_client),
+        ):
+            mock_settings.AZURE_AD_CLIENT_ID = "test-client-id"
+            mock_settings.AZURE_AD_CLIENT_SECRET = "test-secret"
+            mock_settings.AZURE_AD_TENANT_ID = "common"
+            mock_settings.AZURE_AD_REDIRECT_URI = "http://localhost:8000/callback"
+            mock_settings.MICROSOFT_OAUTH_SCOPES = ["Mail.Read"]
+
+            with pytest.raises(ExternalServiceError):
+                await exchange_code(code="auth-code", code_verifier="verifier-value")
+
+    @pytest.mark.asyncio
+    async def test_token_endpoint_http_error_includes_azure_error_body_in_detail(self) -> None:
+        """Azure's AADSTS error/error_description must reach the log and the raised detail."""
+        from app.services.microsoft_graph_service import exchange_code
+
+        error_response = MagicMock()
+        error_response.status_code = 400
+        error_response.json.return_value = {
+            "error": "invalid_grant",
+            "error_description": "AADSTS70008: The provided authorization code has expired.",
+        }
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(
+            side_effect=httpx.HTTPStatusError("bad", request=MagicMock(), response=error_response)
+        )
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.__aexit__.return_value = None
+
+        with (
+            patch("app.services.microsoft_graph_service.settings") as mock_settings,
+            patch("app.services.microsoft_graph_service.httpx.AsyncClient", return_value=mock_client),
+        ):
+            mock_settings.AZURE_AD_CLIENT_ID = "test-client-id"
+            mock_settings.AZURE_AD_CLIENT_SECRET = "test-secret"
+            mock_settings.AZURE_AD_TENANT_ID = "common"
+            mock_settings.AZURE_AD_REDIRECT_URI = "http://localhost:8000/callback"
+            mock_settings.MICROSOFT_OAUTH_SCOPES = ["Mail.Read"]
+
+            with pytest.raises(ExternalServiceError) as exc_info:
+                await exchange_code(code="auth-code", code_verifier="verifier-value")
+
+        assert "AADSTS70008" in str(exc_info.value)
+
+    @pytest.mark.asyncio
     async def test_email_fetch_failure_defaults_to_empty_string_without_failing_exchange(self) -> None:
         """The token exchange itself succeeded; a Graph /me hiccup shouldn't block connecting."""
         from app.services.microsoft_graph_service import exchange_code

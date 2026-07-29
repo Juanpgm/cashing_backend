@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import secrets
 import uuid
 from typing import Any
@@ -74,6 +75,24 @@ def build_authorization_url(usuario_id: uuid.UUID) -> GoogleConnectURLResponse:
     return GoogleConnectURLResponse(authorization_url=f"{authorize_url}?{urlencode(params)}", state=state)
 
 
+def _describe_http_status_error(exc: httpx.HTTPStatusError) -> str:
+    """Extract Azure's `{"error": ..., "error_description": "AADSTS..."}` body for ops triage.
+
+    Falls back to raw response text (truncated) if the body isn't JSON.
+    """
+    try:
+        payload = exc.response.json()
+    except (json.JSONDecodeError, ValueError):
+        return exc.response.text[:500]
+    if isinstance(payload, dict):
+        error = payload.get("error", "")
+        description = payload.get("error_description", "")
+        detail = " ".join(part for part in (error, description) if part)
+        if detail:
+            return detail[:500]
+    return str(payload)[:500]
+
+
 async def _fetch_account_email(http_client: httpx.AsyncClient, access_token: str) -> str:
     """Best-effort lookup of the connected account's email via Graph `/me`.
 
@@ -86,7 +105,7 @@ async def _fetch_account_email(http_client: httpx.AsyncClient, access_token: str
         resp = await http_client.get(_GRAPH_ME_URL, headers={"Authorization": f"Bearer {access_token}"})
         resp.raise_for_status()
         data = resp.json()
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, json.JSONDecodeError, KeyError) as exc:
         logger.warning("microsoft_fetch_email_failed", error=str(exc))
         return ""
     email = data.get("mail") or data.get("userPrincipalName") or ""
@@ -120,11 +139,15 @@ async def exchange_code(code: str, code_verifier: str) -> dict[str, Any]:
             token_data = token_resp.json()
             email = await _fetch_account_email(http_client, token_data["access_token"])
     except httpx.HTTPStatusError as exc:
-        logger.error("microsoft_oauth_token_exchange_failed", status=exc.response.status_code)
-        raise ExternalServiceError("Microsoft OAuth", f"HTTP {exc.response.status_code}") from exc
+        detail = _describe_http_status_error(exc)
+        logger.error("microsoft_oauth_token_exchange_failed", status=exc.response.status_code, detail=detail)
+        raise ExternalServiceError("Microsoft OAuth", f"HTTP {exc.response.status_code}: {detail}") from exc
     except httpx.RequestError as exc:
         logger.error("microsoft_oauth_token_exchange_failed", error=str(exc))
         raise ExternalServiceError("Microsoft OAuth", f"Error intercambiando código: {exc}") from exc
+    except (json.JSONDecodeError, KeyError) as exc:
+        logger.error("microsoft_oauth_token_exchange_failed", error=str(exc))
+        raise ExternalServiceError("Microsoft OAuth", f"Respuesta de token malformada: {exc}") from exc
 
     scope_str = token_data.get("scope", "")
     scopes = scope_str.split() if scope_str else list(settings.MICROSOFT_OAUTH_SCOPES)
