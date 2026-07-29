@@ -74,6 +74,37 @@ async def test_drive_fetch_dedupes_files_across_queries():
 
 
 @pytest.mark.asyncio
+async def test_drive_fetch_truncation_keeps_keyword_queries_over_generic_terms(monkeypatch):
+    """`drive_fetch_node`'s truncation only behaves correctly because keyword-derived
+    queries are listed before generic-term ones in `build_drive_queries` — pin that order
+    so a future reordering there breaks this test instead of silently degrading evidence.
+    """
+    from app.agent.nodes import drive_fetch as mod
+    from app.agent.nodes.drive_fetch import _GENERIC_TERMS
+
+    # Fewer slots than the 3 keyword + 5 generic queries build_drive_queries can produce
+    # for a single obligación, so the slice at the drive_fetch_node call site is exercised.
+    monkeypatch.setattr(mod.settings, "EVIDENCE_QUERIES_PER_OBLIGACION", 1)
+
+    mock_adapter = MagicMock()
+    mock_adapter.search_files = AsyncMock(return_value=[])
+
+    state = {
+        "user_id": uuid.uuid4(),
+        "_db": MagicMock(),
+        "contrato_contexto": {"fecha_inicio": "2024-04-01", "fecha_fin": "2024-04-30"},
+        "obligaciones_contexto": [{"id": "ob1", "descripcion": "Entregar informe mensual de actividades"}],
+    }
+
+    with patch.object(mod, "DriveAdapter", return_value=mock_adapter):
+        await mod.drive_fetch_node(state)
+
+    called_keywords = [call.args[1].keywords[0] for call in mock_adapter.search_files.call_args_list]
+    assert len(called_keywords) == 1
+    assert called_keywords[0] not in _GENERIC_TERMS
+
+
+@pytest.mark.asyncio
 async def test_drive_fetch_no_db_returns_empty():
     from app.agent.nodes.drive_fetch import drive_fetch_node
 
