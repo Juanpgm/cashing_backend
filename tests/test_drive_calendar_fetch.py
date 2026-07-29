@@ -251,3 +251,53 @@ async def test_calendar_fetch_no_dates_returns_empty():
 
     result = await calendar_fetch_node({"user_id": uuid.uuid4(), "_db": MagicMock(), "contrato_contexto": {}})
     assert result["calendar_evidencias"] == []
+
+
+def test_declined_rsvp_is_noise_end_to_end():
+    """Real adapter parse + real metadata extraction + real noise-filter call.
+
+    A future rename/refactor of `_parse_event`, `_extract_event_metadata`, or
+    `is_noise_calendar` breaks this test instead of silently breaking noise
+    detection — the three halves are only checked together elsewhere via
+    hand-built data.
+    """
+    from app.adapters.calendar.calendar_adapter import _parse_event
+    from app.agent.nodes.calendar_fetch import _extract_event_metadata
+    from app.agent.prompts.evidence_filter import is_noise_calendar
+
+    raw_event = {
+        "id": "ev-declined",
+        "summary": "Reunión de seguimiento",
+        "start": {"dateTime": "2024-04-15T09:00:00-05:00"},
+        "attendees": [
+            {"self": True, "responseStatus": "declined"},
+            {"self": False, "email": "supervisor@entidad.gov.co", "responseStatus": "accepted"},
+        ],
+    }
+
+    event = _parse_event(raw_event)
+    metadata = _extract_event_metadata(event)
+
+    assert is_noise_calendar(event.summary, metadata) is True
+
+
+def test_accepted_rsvp_is_not_noise_end_to_end():
+    """Same real pipeline, non-declined counterpart — must not be flagged as noise."""
+    from app.adapters.calendar.calendar_adapter import _parse_event
+    from app.agent.nodes.calendar_fetch import _extract_event_metadata
+    from app.agent.prompts.evidence_filter import is_noise_calendar
+
+    raw_event = {
+        "id": "ev-accepted",
+        "summary": "Reunión de seguimiento",
+        "start": {"dateTime": "2024-04-15T09:00:00-05:00"},
+        "attendees": [
+            {"self": True, "responseStatus": "accepted"},
+            {"self": False, "email": "supervisor@entidad.gov.co", "responseStatus": "accepted"},
+        ],
+    }
+
+    event = _parse_event(raw_event)
+    metadata = _extract_event_metadata(event)
+
+    assert is_noise_calendar(event.summary, metadata) is False
