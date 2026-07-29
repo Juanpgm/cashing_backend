@@ -88,15 +88,27 @@ def test_build_drive_queries_includes_date_clause():
 
     queries = build_drive_queries("Entregar informe mensual", "2024-04-01", "2024-04-30")
     assert queries
-    assert all("modifiedTime >=" in q for q in queries)
-    assert any("informe" in q for q in queries)
+    assert all(q.date_from is not None and q.date_to is not None for q in queries)
+    assert any("informe" in kw for q in queries for kw in q.keywords)
 
 
 def test_build_drive_queries_excludes_folders():
     from app.agent.nodes.drive_fetch import build_drive_queries
 
     queries = build_drive_queries("Entregar informe mensual", "2024-04-01", "2024-04-30")
-    assert all("mimeType != 'application/vnd.google-apps.folder'" in q for q in queries)
+    assert all(q.exclude_folders for q in queries)
+
+
+def test_build_drive_queries_returns_drive_query_objects():
+    from app.adapters.drive.port import DriveQuery
+    from app.agent.nodes.drive_fetch import build_drive_queries
+
+    queries = build_drive_queries("Entregar informe mensual", "2024-04-01", "2024-04-30")
+    assert all(isinstance(q, DriveQuery) for q in queries)
+    # One query per extracted keyword (up to 3) plus one per generic term — same
+    # granularity as the pre-refactor per-string queries, so EVIDENCE_QUERIES_PER_OBLIGACION
+    # truncation (which used to keep only the keyword-derived queries) still behaves the same.
+    assert all(len(q.keywords) == 1 for q in queries)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

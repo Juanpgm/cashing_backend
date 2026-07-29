@@ -201,11 +201,14 @@ async def test_drive(
 ) -> DriveTestResponse:
     """Lista los archivos más recientes del Drive del usuario (prueba de integración)."""
     from app.adapters.drive.drive_adapter import DriveAdapter
+    from app.adapters.drive.port import DriveQuery
     from app.schemas.google_workspace import DriveFileTestItem
 
     try:
         adapter = DriveAdapter(db)
-        files = await adapter.search_files(usuario_id=user.id, query="", max_results=max_results)
+        files = await adapter.search_files(
+            usuario_id=user.id, query=DriveQuery(keywords=[], max_results=max_results)
+        )
         items = [
             DriveFileTestItem(
                 id=f.id,
@@ -230,7 +233,7 @@ async def test_calendar(
     days: int = Query(default=60, ge=1, le=365),
 ) -> CalendarTestResponse:
     """Lista eventos de los últimos/próximos N días del Calendar del usuario (prueba de integración)."""
-    from datetime import UTC, datetime, timedelta
+    from datetime import UTC, date, datetime, timedelta
 
     from app.adapters.calendar.calendar_adapter import GoogleCalendarAdapter
     from app.schemas.google_workspace import CalendarEventItem
@@ -241,26 +244,30 @@ async def test_calendar(
 
     try:
         adapter = GoogleCalendarAdapter(db)
-        raw = await adapter.search_events(
+        events = await adapter.search_events(
             usuario_id=user.id,
             time_min=time_min,
             time_max=time_max,
             max_results=20,
         )
 
-        def _extract_dt(boundary: dict) -> str:
-            return boundary.get("dateTime") or boundary.get("date") or ""
+        def _extract_dt(dt: datetime | None, d: date | None) -> str:
+            if dt is not None:
+                return dt.isoformat()
+            if d is not None:
+                return d.isoformat()
+            return ""
 
         items = [
             CalendarEventItem(
-                id=ev.get("id", ""),
-                summary=ev.get("summary", "(sin título)"),
-                start=_extract_dt(ev.get("start", {})),
-                end=_extract_dt(ev.get("end", {})),
-                location=ev.get("location"),
-                html_link=ev.get("htmlLink"),
+                id=ev.id,
+                summary=ev.summary or "(sin título)",
+                start=_extract_dt(ev.start, ev.start_date),
+                end=_extract_dt(ev.end, ev.end_date),
+                location=ev.location,
+                html_link=ev.html_link,
             )
-            for ev in raw
+            for ev in events
         ]
         return CalendarTestResponse(events=items, total=len(items))
     except (HTTPException, DomainError):
