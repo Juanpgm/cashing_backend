@@ -109,7 +109,18 @@ class GoogleCalendarAdapter:
         except GoogleHttpError as exc:
             raise ExternalServiceError("Calendar", f"Error consultando eventos: {exc}") from exc
         raw_items: list[dict[str, Any]] = result.get("items", [])
-        events = [_parse_event(item) for item in raw_items]
+        events: list[CalendarEvent] = []
+        for item in raw_items:
+            try:
+                events.append(_parse_event(item))
+            except (ValueError, KeyError, TypeError) as exc:
+                logger.warning(
+                    "calendar_event_parse_failed",
+                    event_id=item.get("id"),
+                    user_id=str(usuario_id),
+                    error=str(exc),
+                )
+                continue
         logger.info("calendar_search", user_id=str(usuario_id), count=len(events), q=q)
         return events
 

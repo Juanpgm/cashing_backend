@@ -136,6 +136,31 @@ async def test_search_events_maps_attendees_and_organizer():
 
 
 @pytest.mark.asyncio
+async def test_search_events_skips_malformed_event_keeps_valid_ones():
+    """A single unparseable event (bad date) must not drop the rest of the batch."""
+    from app.adapters.calendar.calendar_adapter import GoogleCalendarAdapter
+
+    items = [
+        {"id": "ev-bad", "summary": "Evento corrupto", "start": {"dateTime": "not-a-date"}},
+        {
+            "id": "ev-good",
+            "summary": "Reunión de seguimiento",
+            "start": {"dateTime": "2024-04-15T09:00:00-05:00"},
+        },
+    ]
+    adapter = GoogleCalendarAdapter(db=MagicMock())
+    adapter._auth.get_credentials = AsyncMock(return_value=MagicMock())
+
+    with patch.object(adapter, "_build_service", return_value=_fake_calendar_service(items)):
+        events = await adapter.search_events(
+            uuid.uuid4(), time_min="2024-04-01T00:00:00Z", time_max="2024-04-30T23:59:59Z"
+        )
+
+    assert len(events) == 1
+    assert events[0].id == "ev-good"
+
+
+@pytest.mark.asyncio
 async def test_get_event_returns_calendar_event():
     from app.adapters.calendar.calendar_adapter import GoogleCalendarAdapter
     from app.adapters.calendar.port import CalendarEvent
