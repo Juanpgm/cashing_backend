@@ -202,3 +202,70 @@ Out of scope per correction instructions (not touched): `tests/test_drive_port.p
 - Full suite: `pytest -q` → 1165 passed, 5 failed (same 5 pre-existing/environmental failures as the A2 baseline — confirmed unchanged by running them against a `git stash` of this correction's diff, identical `FileNotFoundError` on a missing external fixture path), 12 deselected.
 - Lint: `ruff check`/`ruff format --check` clean on all 6 files this round touched. `mypy app/adapters/calendar/ app/adapters/drive/` → 43 errors, identical count/content to the pre-correction baseline (verified via `git stash`) — no new mypy errors introduced.
 - Rollback boundary: each of the 5 commits (`fe9bd91`, `cda3fcb`, `e984cbd`, `590a815`, `ba321ca`) is independently revertible without touching unrelated work.
+
+## Slice B — Microsoft OAuth + generalized routes (PR 3, this batch)
+
+**Branch**: `feat/microsoft-365-b-oauth-routes` (off A2 tip `6664a73`, same worktree `cashing-backend-ms365`), NOT pushed.
+**Mode**: Strict TDD
+**Status**: 13/13 B tasks complete (B.1-B.13).
+
+### TDD Cycle Evidence
+
+| Task | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
+|------|-----------|-------|------------|-----|-------|-------------|----------|
+| B.3/B.4 | `tests/test_microsoft_graph_service.py::TestBuildAuthorizationUrl` | Unit | N/A (new) | Written (ModuleNotFoundError) | 3/3 passed | no-client-id error / full URL shape / distinct PKCE challenge per call (3 cases) | Clean |
+| B.7/B.8 | `tests/test_microsoft_graph_service.py::TestExchangeCode` | Unit (mocked httpx.AsyncClient) | N/A (new) | Written (ModuleNotFoundError) | 4/4 passed | happy path / missing client id / token-endpoint HTTP error / Graph `/me` failure degrades to `email=""` without failing the exchange (4 cases) | Clean |
+| B.6/B.10 | `tests/test_microsoft_graph_service.py::TestHandleOAuthCallback` | Unit (mocked db + service calls) | N/A (new) | Written | 1/1 passed | single scenario — pure wiring/dispatch, no branching logic to triangulate | ➖ Single (structural glue) |
+| B.1/B.2 | `tests/test_integraciones_api.py::TestProviderPathValidation` | Integration (httpx.AsyncClient) | N/A (new route shape) | Written (404 — routes didn't exist) | 3/3 passed | unknown provider on connect / on status / static-second-segment collision case (3 cases) | Clean |
+| B.2 (connect) | `tests/test_integraciones_api.py::TestConnect` | Integration | 0 pre-existing route tests (none existed for `/google/connect` at API level before this slice) | Written | 2/2 passed | google (regression) + microsoft (new) — both dispatch paths | Clean |
+| B.5/B.6 | `tests/test_integraciones_api.py::TestCallback` | Integration | Same | Written | 4/4 passed | google regression / microsoft new / tampered state / state-provider≠path-provider mismatch (4 cases) | Clean |
+| B.12 | `tests/test_integraciones_api.py::TestStatus` | Integration | Same | Written | 3/3 passed | google unconnected / microsoft unconnected / microsoft connected with scope-derived flags (3 cases) | Clean |
+| B.7 (coexistence) | `tests/test_integraciones_api.py::TestRevoke` | Integration | Same | Written | 2/2 passed | google 404-when-disconnected / revoke microsoft leaves google connected (2 cases) | Clean |
+| B.9 | `tests/test_integraciones_api.py::TestReconnect` | Integration | Same | Written | 1/1 passed | reconnect-same-account collapses to 1 row — single scenario per spec | ➖ Single |
+
+### Test Summary
+- Total tests written (new): 23 (`test_microsoft_graph_service.py`: 8, `test_integraciones_api.py`: 15)
+- Total tests passing (B-scoped regression set): 61/61 (`test_microsoft_graph_service.py`, `test_integraciones_api.py`, `test_integraciones_test_routes.py`, `test_google_workspace_service.py`, `test_integration_service.py`)
+- Full repo suite: **1188 passed**, 5 failed (pre-existing/environmental, identical set to A1/A2's documented baseline — MinIO/S3 not running, one external golden fixture missing), 12 deselected (`live_llm`)
+- Approval tests (refactoring): N/A — no existing Google route had prior API-level test coverage to use as an approval baseline; `TestConnect`/`TestCallback`/`TestStatus`/`TestRevoke`'s "google" cases serve as the first-ever regression pin for those routes, added in the same commit as the generalization
+- Pure functions created: `_generate_pkce_pair` (microsoft_graph_service.py)
+
+### Files Changed
+
+| File | Action | What Was Done |
+|------|--------|----------------|
+| `app/core/config.py` | Modified | Added `AZURE_AD_CLIENT_ID`/`AZURE_AD_CLIENT_SECRET`/`AZURE_AD_TENANT_ID`/`AZURE_AD_REDIRECT_URI`/`MICROSOFT_OAUTH_SCOPES` Pydantic Settings (no hardcoded secrets) |
+| `app/services/microsoft_graph_service.py` | Created | `build_authorization_url()` (PKCE S256), `exchange_code()` (token exchange + best-effort Graph `/me` email lookup), `handle_oauth_callback()` — mirrors `google_workspace_service.py`'s OAuth shape, delegates all crypto/state/persistence to `integration_service` |
+| `app/services/integration_service.py` | Modified | Extended `_SCOPE_MARKERS` with Microsoft's `Mail.Read`/`Files.Read`/`Calendars.Read` markers — `_derive_enabled_flags`/`_to_status` (from A1) needed no changes, already generic |
+| `app/api/v1/integraciones.py` | Modified | Replaced `/google/connect\|callback\|status\|revoke` with `/{provider}/connect\|callback\|status\|revoke`, `provider` typed as the existing `IntegrationProvider` StrEnum (path-param validation, no new "Provider" type introduced); callback cross-checks decoded state provider against path provider before dispatch; `status`/`revoke` now call `integration_service` directly (already provider-generic, no per-provider wrapper needed) |
+| `tests/test_microsoft_graph_service.py` | Created | PKCE URL building, token exchange (+ email lookup, + error paths), callback wiring |
+| `tests/test_integraciones_api.py` | Created | First-ever API-level (httpx.AsyncClient) coverage for connect/callback/status/revoke — both providers, plus provider-path validation and state/provider mismatch defense |
+
+### Deviations from Design
+- **`test_calendar`/`test_drive` NOT generalized to `{provider}`**, despite tasks.md Reconciliation #3 saying both should be in this slice. The user's explicit Slice B scope instruction excludes `MicrosoftGraphAdapter` (Slice C1 only) — generalizing these probe routes for `provider=microsoft` would require calling an adapter that doesn't exist yet. Kept both Google-only, unchanged; to be generalized in Slice C1 alongside the adapter itself.
+- **No new "Microsoft OAuth request/callback schemas" in `app/schemas/integracion.py`** (task B.12 literally lists this). Not needed: the connect/callback routes take no Pydantic request body (query params only, same as Google today), and the existing `GoogleConnectURLResponse{authorization_url, state}` shape is already provider-neutral — reused as-is for both providers rather than duplicating an identical schema under a new name.
+- **No separate `Provider` FastAPI-path enum type.** `IntegrationProvider` (already `google | microsoft`, defined in `app/models/integracion.py` since A1) is used directly as the path-parameter type. FastAPI validates path segments against `Enum` types natively — introducing a second enum with the same two members would be pure duplication.
+- **`/{provider}/status` now returns `IntegrationStatus` (provider-discriminated, `mail_enabled`/`drive_enabled`/`calendar_enabled`) instead of the old Google-only `GoogleIntegrationStatus` (`gmail_enabled`/`drive_enabled`, no `calendar_enabled`) for `provider=google` too.** This is exactly what design.md's Interfaces section specifies ("`IntegrationStatus` ... replaces hardcoded `GoogleIntegrationStatus` shape") and what task B.12 requires (scope-derived flags for both providers via one shared schema/route). **Flagged as a risk**: this is a JSON field-rename for the existing `/integraciones/google/status` response (`gmail_enabled` → `mail_enabled`, plus a new `calendar_enabled` field) — any frontend code reading `gmail_enabled` from that endpoint needs a coordinated update. The *URL* keeps resolving identically (no redirect-URI/path change), which is what the hard backward-compatibility requirement was about, but the response *shape* changes per design's explicit interface contract. `GoogleIntegrationStatus` itself is untouched and still used internally by `google_get_integration_status`/`handle_oauth_callback` — it is simply no longer the API response model for the generalized `/status` route.
+- **Reconnect coexistence relies on `email=""` collapsing to one row per `(usuario_id, provider)`**, same fallback Google already uses (`google_store_credentials` never passes an `email` kwarg either) — Microsoft's real email IS captured (via Graph `/me`, per spec's "persists ... account email" requirement and task B.8) and passed to `store_credentials`, so multi-account-per-provider (A1's locked goal) works correctly once a real email is available; the reconnect test uses the same email both times, which is the realistic path (a user reconnecting the same Microsoft account gets the same `mail`/`userPrincipalName` back from Graph).
+
+### Issues Found
+None. No regressions in any existing Google OAuth/discovery/adapter suite.
+
+### Verification
+
+- **Focused tests**: `uv run --no-sync python -m pytest tests/test_microsoft_graph_service.py tests/test_integraciones_api.py -q` → 23/23 passed.
+- **B regression set**: `uv run --no-sync python -m pytest tests/test_microsoft_graph_service.py tests/test_integraciones_api.py tests/test_integraciones_test_routes.py tests/test_google_workspace_service.py tests/test_integration_service.py -q` → 61/61 passed.
+- **Broader regression** (`-k "integracion or google or microsoft or drive or calendar or evidence"`): 210/210 passed.
+- **Full suite**: `uv run --no-sync python -m pytest -q` → 1188 passed, 5 failed, 12 deselected. All 5 failures confirmed pre-existing/environmental and identical to A1/A2's documented baseline set (`test_agent_chat_robustness.py` x2, `test_agent_chat_service.py`, `test_checklist_api.py`, `test_obligaciones_golden_ejemplos.py` — MinIO/S3 not running, one external golden fixture missing; none import integraciones/OAuth code).
+- **Lint**: `ruff check`/`ruff format --check` clean on every file this slice touched or created (`app/core/config.py`, `app/services/microsoft_graph_service.py`, `app/services/integration_service.py`, `app/api/v1/integraciones.py`, `tests/test_microsoft_graph_service.py`, `tests/test_integraciones_api.py`). Repo-wide debt is unchanged/untouched (same category documented in A1/A2's baseline, not introduced or fixable within this slice's scope).
+- **Type check**: mypy on the 4 touched/created source files: 2 pre-existing errors on lines this diff didn't add (`config.py`'s `parse_cors_origins` validator, `integration_service.py`'s `verify_oauth_state` — both confirmed identical via `git stash` at the equivalent pre-diff line numbers, only line-number drift from new settings/lines added earlier in the file). `microsoft_graph_service.py` and the new routes in `integraciones.py` introduce zero new mypy errors.
+- **Rollback boundary**: revert the 3 feature commits (config settings, `microsoft_graph_service.py` + scope markers, route generalization) — `google_tokens`/`integraciones` schema untouched (no migration in this slice), `/google/*` routes revert to their literal-path A2-tip shape exactly.
+
+### Workload / PR Boundary
+- Mode: stacked-to-main chained PR slice (auto-chain, already resolved — no decision needed)
+- Current work unit: B — Microsoft OAuth + generalized routes (this batch)
+- Boundary: starts at A2 tip `6664a73`, ends at the 3 feature commits on `feat/microsoft-365-b-oauth-routes` (+ 1 docs commit for this apply-progress update)
+- Estimated review budget impact: forecast ~450-550 changed lines, High risk. **Actual measured below in the commit log** — driven mainly by the two new test files (23 new tests) needed to cover both the new PKCE/token-exchange service and the first-ever API-level regression pins for the Google OAuth routes this slice touches.
+
+### Status
+13/13 B tasks complete. Ready for `sdd-verify` on this slice, or for the next apply batch (Slice C1 — `MicrosoftGraphAdapter`, depends on A2 + B).
