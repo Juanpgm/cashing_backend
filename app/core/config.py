@@ -142,6 +142,25 @@ class Settings(BaseSettings):
     # Never set this in production.
     GOOGLE_USE_ADC: bool = False
 
+    # Microsoft 365 (Azure AD) OAuth — Graph: Outlook Mail, Outlook Calendar, OneDrive.
+    # App registered as multi-tenant with delegated scopes; AZURE_AD_TENANT_ID stays
+    # "common" for multi-tenant + personal-account sign-in unless a specific tenant
+    # is required (see openspec/changes/microsoft-365-integration/design.md D2).
+    AZURE_AD_CLIENT_ID: str = ""
+    AZURE_AD_CLIENT_SECRET: str = ""
+    AZURE_AD_TENANT_ID: str = "common"
+    AZURE_AD_REDIRECT_URI: str = "http://localhost:8000/api/v1/integraciones/microsoft/callback"
+    # Delegated scopes locked by specs/microsoft-oauth/spec.md: Mail.Read, Calendars.Read,
+    # Files.Read (+ offline_access for refresh tokens, User.Read for account email lookup).
+    # Admin-consent-per-tenant is a deployment/doc concern, not code (tasks.md Reconciliation #2).
+    MICROSOFT_OAUTH_SCOPES: list[str] = [
+        "Mail.Read",
+        "Calendars.Read",
+        "Files.Read",
+        "offline_access",
+        "User.Read",
+    ]
+
     # Frontend base URL — used to redirect the browser back after the OAuth callback.
     FRONTEND_URL: str = "http://localhost:3000"
     # Signed OAuth state token TTL — covers the Google round-trip window.
