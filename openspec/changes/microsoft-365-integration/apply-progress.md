@@ -113,3 +113,70 @@ were pushed back to origin (local commits only, per instruction).
 - Lint: `ruff check`/`ruff format --check` clean on every line this round touched or added; pre-existing repo-wide debt (documented in the A1 baseline above) is unchanged and untouched.
 - Type check: zero new mypy errors attributable to this round's diff (spot-checked: no error in the 209 baseline errors traces to a line added/changed here — `integration_service.py` and `gmail_adapter.py` report zero errors of their own).
 - Environment note: a stray `uv sync` early in this round temporarily desynced the venv from `requirements-dev.txt` (this repo's real dependency source of truth — `pyproject.toml` only lists 3 unrelated packages) against `uv.lock`; recovered via `uv pip install -r requirements-dev.txt --override <cryptography override>` (a pre-existing, unrelated `pyhanko`/`cryptography` version-floor conflict in `requirements-dev.txt` needed a temporary install-time override, not a requirements-file edit). All subsequent commands in this round used `uv run --no-sync` to avoid re-triggering the implicit project sync.
+
+## Slice A2 — Port generalization (PR 2, this batch)
+
+**Branch**: `feat/microsoft-365-a2-port-generalization` (off A1 tip `3e8a538`, worktree `cashing-backend-ms365`), 4 commits, NOT pushed.
+**Mode**: Strict TDD
+**Status**: 15/15 A2 tasks complete (A2.1-A2.15). Only Google-code-touching slice; full existing Google suite green throughout.
+
+### TDD Cycle Evidence
+
+| Task | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
+|------|-----------|-------|------------|-----|-------|-------------|----------|
+| A2.1/A2.2 | `tests/test_calendar_port.py` (new) | Unit | N/A (new) | Written (ImportError) | 4/4 passed | defaults / timed fields / all-day fields / attendee defaults (4 cases) | Clean |
+| A2.3/A2.4 | `tests/test_calendar_adapter.py` | Unit (mocked Google service) | 3/3 passing before (baseline) | Written (dict-access `AttributeError`, 4 failures) | 10/10 passed | all-day mapping, attendees+organizer mapping, `get_event` mapping (3 new cases + updated existing) | Clean |
+| A2.5/A2.6/A2.7 | `tests/test_drive_calendar_fetch.py` (calendar half), `tests/test_integraciones_test_routes.py` (new) | Unit + httpx integration | 9/9 (calendar+drive) passing before | Written (`AttributeError: 'CalendarEvent' object has no attribute 'get'`, then route dict-access failures) | 9/9 + 3/3 route tests passed | all-day event, keyword-query passthrough, missing-summary route default (3 route cases) | Clean |
+| A2.8/A2.9/A2.10 | `tests/test_drive_search.py` | Unit (mocked Google service) | 3/3 passing before | Written (string-vs-DriveQuery mismatch, 2 failures) | 5/5 passed | date-range translation, empty-keywords omits clause (2 new cases) | Clean |
+| A2.11/A2.12/A2.13 | `tests/test_drive_calendar_fetch.py` (drive half), `tests/test_integraciones_test_routes.py` | Unit + httpx integration | 7/7 (drive) passing before | Written (`AttributeError: 'str' object has no attribute 'exclude_folders'`) | 10/10 + drive-route case passed | `list[DriveQuery]` shape + one-keyword-per-query granularity (1 new case) | Clean |
+
+### Test Summary
+- Total tests written/updated: 4 new files/additions (`test_calendar_port.py`: 4 new, `test_integraciones_test_routes.py`: 3 new) + updates to `test_calendar_adapter.py` (+3 new, 1 updated), `test_drive_search.py` (+2 new, 2 updated), `test_drive_calendar_fetch.py` (+1 new, 5 updated)
+- Total tests passing (A2-scoped regression set): 28/28 (`test_calendar_port.py`, `test_calendar_adapter.py`, `test_drive_search.py`, `test_drive_calendar_fetch.py`, `test_integraciones_test_routes.py`)
+- Merge-gate set (`-k "calendar or drive or evidence or integracion"`): **147/147 passed**
+- Full repo suite: **1160 passed**, 5 failed (pre-existing, unrelated — same category as A1's baseline), 12 deselected (`live_llm`)
+- Approval tests: existing Google calendar/drive suites (28 tests total across the touched files) served as the approval-test baseline before each refactor step
+- Pure functions created/extended: `_parse_event` (calendar_adapter.py), `_translate_query` (drive_adapter.py), `build_drive_queries` (drive_fetch.py, now dataclass-returning)
+
+### Files Changed
+
+| File | Action | What Was Done |
+|------|--------|----------------|
+| `app/adapters/calendar/port.py` | Modified | Added `CalendarEvent`/`CalendarAttendee` dataclasses; `CalendarPort.search_events`/`get_event` now return them |
+| `app/adapters/calendar/calendar_adapter.py` | Modified | New `_parse_event()` maps raw Google event JSON → `CalendarEvent`/`CalendarAttendee` once, internally |
+| `app/agent/nodes/calendar_fetch.py` | Modified | `_event_start()`/`_extract_event_metadata()` consume `CalendarEvent` attributes; metadata dict still emits the `self`/`responseStatus` attendee shape `evidence_filter.is_noise_calendar` expects |
+| `app/adapters/drive/port.py` | Modified | Added `DriveQuery` dataclass; `DrivePort.search_files` signature changed to `(usuario_id, query: DriveQuery)` |
+| `app/adapters/drive/drive_adapter.py` | Modified | New `_translate_query()` maps `DriveQuery` → Google Drive query syntax (keywords OR-fan, date range, folder exclude, mime filter) |
+| `app/agent/nodes/drive_fetch.py` | Modified | `build_drive_queries()` returns `list[DriveQuery]`; dedup now keys on a normalized field tuple (DriveQuery isn't hashable) |
+| `app/api/v1/integraciones.py` | Modified | `test_calendar`/`test_drive` routes consume `CalendarEvent`/`DriveQuery` instead of raw dicts/strings |
+| `tests/test_calendar_port.py` | Created | Dataclass shape/defaults tests for `CalendarEvent`/`CalendarAttendee` |
+| `tests/test_calendar_adapter.py` | Modified | Updated dict-access assertions to attribute access; added all-day/attendees/organizer/`get_event` mapping tests |
+| `tests/test_drive_search.py` | Modified | Updated raw-string calls to `DriveQuery`; added date-range and empty-keywords translation tests |
+| `tests/test_drive_calendar_fetch.py` | Modified | Updated calendar/drive fixtures to `CalendarEvent`/`DriveQuery`; added dataclass-shape assertions |
+| `tests/test_integraciones_test_routes.py` | Created | httpx tests for `/integraciones/calendar/test` and `/integraciones/drive/test` (no prior test existed for either route) |
+
+### Deviations from Design
+- **`CalendarAttendee.is_self: bool = False` added** — not in design D3's field list (`email`, `display_name`, `response_status`, `optional`). `evidence_filter.is_noise_calendar` (downstream, Slice C2 file but already live) reads `metadata["attendees"][i]["self"]` to detect "the connected user declined this event" as a noise signal. Design D3 didn't carry this Google-specific "is this attendee the calendar owner" flag onto `CalendarAttendee`, which would have silently broken that noise-detection branch (attendee dicts would lose `self` entirely once sourced from the dataclass instead of raw Google JSON). Marked `ponytail:` in the dataclass — Graph has no equivalent, defaults `False`, revisit only if Slice C1's Microsoft calendar heuristic needs an analogous self-detection signal.
+- **`build_drive_queries()` builds one `DriveQuery` per extracted keyword/generic term (same granularity as the old per-string list), not literally "one `DriveQuery` per obligation" as design.md's D4 prose states.** Reason: `drive_fetch_node` truncates each obligation's query list to `settings.EVIDENCE_QUERIES_PER_OBLIGACION` (default 3) *before* dedup — with the old per-string queries, that truncation kept only the 3 keyword-derived queries and silently dropped the 5 generic-term queries for the per-obligation path (the generic terms were only ever reachable via the no-obligations fallback). Collapsing to one combined `DriveQuery(keywords=[...all terms...])` per obligation, as design.md's prose suggests, would have started including generic terms in the per-obligation search path where they were previously truncated away — a real (if minor) behavior change forbidden by this slice's merge gate. Kept the granular structure to make the refactor strictly behavior-preserving; noted here per design-deviation reporting requirement, not silently deviated.
+- `CalendarEvent.summary`/`description` default to `""` per design (not `None`); each caller applies its own placeholder text (`"(evento sin título)"` in `calendar_fetch.py`, `"(sin título)"` in the `test_calendar` route) — matches design D3's stated intent exactly, no deviation, called out here only because it's easy to misread as inconsistent.
+
+### Issues Found
+None. No regressions in the existing Google calendar/drive/discovery suites; mypy error count on touched files improved slightly (see Verification).
+
+### Verification
+
+- **Focused tests**: `uv run --no-sync python -m pytest tests/test_calendar_port.py tests/test_calendar_adapter.py tests/test_drive_search.py tests/test_drive_calendar_fetch.py tests/test_integraciones_test_routes.py -q` → 28/28 passed.
+- **Merge gate (A2.14)**: `uv run --no-sync python -m pytest tests/ -q -k "calendar or drive or evidence or integracion"` → 147/147 passed.
+- **Full suite**: `uv run --no-sync python -m pytest -q` → 1160 passed, 5 failed, 12 deselected. All 5 failures confirmed pre-existing/environmental and unrelated to this diff (`test_agent_chat_robustness.py` x2, `test_agent_chat_service.py`, `test_checklist_api.py`, `test_obligaciones_golden_ejemplos.py` — same category documented in A1's baseline: missing MinIO/S3 and an external golden fixture, none of which import calendar/drive/integraciones code).
+- **Lint**: `ruff check`/`ruff format --check` clean on every file this slice touched (`app/adapters/calendar/port.py`, `app/adapters/calendar/calendar_adapter.py`, `app/adapters/drive/port.py`, `app/adapters/drive/drive_adapter.py`, `app/agent/nodes/calendar_fetch.py`, `app/agent/nodes/drive_fetch.py`, `app/api/v1/integraciones.py`, and all 5 touched/new test files). Repo-wide `ruff check .` shows 968 pre-existing findings across files this slice never touched — same documented pre-existing debt as A1's baseline, not introduced or fixable within this slice's scope.
+- **Type check**: mypy on the 7 touched source files: **206 errors** (this branch) vs **209 errors** (A1-tip baseline, same 7-file target set, verified via a temporary git worktree at commit `3e8a538` using the main repo's venv) — net **-3 errors, -1 file with errors**, no new error categories. All remaining errors are pre-existing (`_build_service` untyped-call warnings, `Missing type arguments for generic type "dict"` on lines unchanged by this diff, unrelated `secop_service.py`/`document_service.py`/`extraction.py` debt).
+- **Rollback boundary**: `git revert` the 3 feature commits (calendar port/adapter, calendar_fetch node, drive port/adapter/node/routes) + 1 formatting commit — behavior-preserving refactor, no schema/migration involved, Google discovery/adapter behavior reverts to its A1-tip state exactly.
+
+### Workload / PR Boundary
+- Mode: stacked-to-main chained PR slice (auto-chain, already resolved — no decision needed)
+- Current work unit: A2 — port generalization (this batch)
+- Boundary: starts at A1 tip `3e8a538`, ends at the 4 commits on `feat/microsoft-365-a2-port-generalization`
+- Estimated review budget impact: forecast ~380-450 changed lines, Medium risk. **Actual: 574 insertions + 110 deletions = 684 changed lines** (`git diff --stat 3e8a538..HEAD`) — exceeds the forecast, similar overage pattern to A1 (943 vs 350-420), driven mainly by the 5 touched/new test files (372 of the 574 insertions) needed to cover both the new dataclasses and the behavior-preservation regression cases the merge gate requires. Each of the 4 commits is independently reviewable and none exceeds ~250 lines; recommend accepting as a well-tested single-purpose refactor PR rather than splitting further, consistent with A1's precedent.
+
+### Status
+15/15 A2 tasks complete. Ready for `sdd-verify` on this slice, or for the next apply batch (Slice B — Microsoft OAuth + generalized routes, depends on A1 only — A2 was independent).
