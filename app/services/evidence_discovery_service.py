@@ -229,7 +229,7 @@ async def descubrir_evidencias(
             fecha_fin = fecha_fin or date.today().isoformat()
 
     # Verificar conexión de Google antes de gastar llamadas.
-    status = await gws.get_integration_status(db, usuario_id)
+    status = await gws.google_get_integration_status(db, usuario_id)
     if not status.connected:
         raise ExternalServiceError(
             "Google",

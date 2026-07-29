@@ -33,12 +33,15 @@ from app.services import integration_service
 logger = structlog.get_logger("services.google_workspace")
 
 
-def verify_oauth_state(state: str) -> tuple[uuid.UUID, str]:
+def google_verify_oauth_state(state: str) -> tuple[uuid.UUID, str]:
     """Decode and validate a signed OAuth state token.
 
     Returns (usuario_id, code_verifier). Raises ValidationError on invalid/expired/tampered tokens.
     Thin backward-compatible wrapper — the real (now provider-aware) logic lives
-    in `integration_service.verify_oauth_state`.
+    in `integration_service.verify_oauth_state`. Named `google_*` (rather than the
+    bare `verify_oauth_state` this used to be) to disambiguate from the identically
+    named/shaped helper this module used to share with `integration_service`
+    and the upcoming `microsoft_graph_service` module (Slice B).
     """
     usuario_id, code_verifier, _provider = integration_service.verify_oauth_state(state)
     return usuario_id, code_verifier
@@ -114,7 +117,7 @@ async def handle_oauth_callback(
         raise ExternalServiceError("Google OAuth", f"Error intercambiando código: {exc}") from exc
 
     creds: Credentials = flow.credentials
-    await store_credentials(
+    await google_store_credentials(
         db,
         usuario_id,
         access_token=creds.token,
@@ -123,10 +126,10 @@ async def handle_oauth_callback(
     )
     logger.info("google_oauth_connected", user_id=str(usuario_id))
 
-    return await get_integration_status(db, usuario_id)
+    return await google_get_integration_status(db, usuario_id)
 
 
-async def store_credentials(
+async def google_store_credentials(
     db: AsyncSession,
     usuario_id: uuid.UUID,
     *,
@@ -139,7 +142,9 @@ async def store_credentials(
 
     Shared by the web OAuth callback and the local loopback demo script so both
     persist tokens identically. Thin wrapper — delegates to
-    `integration_service.store_credentials` with `provider=google`.
+    `integration_service.store_credentials` with `provider=google`. Named
+    `google_*` to disambiguate from `integration_service.store_credentials` (and
+    the future `microsoft_*` equivalent in Slice B) — see design.md D2.
     """
     return await integration_service.store_credentials(
         db,
@@ -152,12 +157,12 @@ async def store_credentials(
     )
 
 
-async def revoke_integration(db: AsyncSession, usuario_id: uuid.UUID) -> None:
+async def google_revoke_integration(db: AsyncSession, usuario_id: uuid.UUID) -> None:
     """Disconnect the user's Google account (deletes its `integraciones` row)."""
     await integration_service.revoke_integration(db, usuario_id, IntegrationProvider.GOOGLE)
 
 
-async def get_integration_status(db: AsyncSession, usuario_id: uuid.UUID) -> GoogleIntegrationStatus:
+async def google_get_integration_status(db: AsyncSession, usuario_id: uuid.UUID) -> GoogleIntegrationStatus:
     """Return connection status and enabled scopes for the user's Google connection."""
     status = await integration_service.get_integration_status(db, usuario_id, IntegrationProvider.GOOGLE)
     return GoogleIntegrationStatus(

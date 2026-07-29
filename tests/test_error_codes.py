@@ -120,7 +120,7 @@ async def test_evidencias_descubrir_google_not_connected_returns_code(
     disconnected.connected = False
 
     with patch(
-        "app.services.evidence_discovery_service.gws.get_integration_status",
+        "app.services.evidence_discovery_service.gws.google_get_integration_status",
         AsyncMock(return_value=disconnected),
     ):
         resp = await client.post(

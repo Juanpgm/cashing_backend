@@ -53,39 +53,39 @@ class TestVerifyOauthState:
         return jwt.encode(claims, self._SECRET, algorithm=self._ALGO)
 
     def test_round_trip_returns_same_uuid_and_verifier(self) -> None:
-        from app.services.google_workspace_service import verify_oauth_state
+        from app.services.google_workspace_service import google_verify_oauth_state
 
         uid = uuid.uuid4()
         state = self._make_state(uid, cv=self._CV)
         with patch("app.services.integration_service.settings") as mock_settings:
             mock_settings.JWT_SECRET_KEY = self._SECRET
             mock_settings.JWT_ALGORITHM = self._ALGO
-            returned_uid, returned_cv = verify_oauth_state(state)
+            returned_uid, returned_cv = google_verify_oauth_state(state)
             assert returned_uid == uid
             assert returned_cv == self._CV
 
     def test_tampered_token_raises_validation_error(self) -> None:
-        from app.services.google_workspace_service import verify_oauth_state
+        from app.services.google_workspace_service import google_verify_oauth_state
 
         state = self._make_state(uuid.uuid4()) + "TAMPERED"
         with patch("app.services.integration_service.settings") as mock_settings:
             mock_settings.JWT_SECRET_KEY = self._SECRET
             mock_settings.JWT_ALGORITHM = self._ALGO
             with pytest.raises(ValidationError):
-                verify_oauth_state(state)
+                google_verify_oauth_state(state)
 
     def test_expired_token_raises_validation_error(self) -> None:
-        from app.services.google_workspace_service import verify_oauth_state
+        from app.services.google_workspace_service import google_verify_oauth_state
 
         state = self._make_state(uuid.uuid4(), ttl_seconds=-1)
         with patch("app.services.integration_service.settings") as mock_settings:
             mock_settings.JWT_SECRET_KEY = self._SECRET
             mock_settings.JWT_ALGORITHM = self._ALGO
             with pytest.raises(ValidationError):
-                verify_oauth_state(state)
+                google_verify_oauth_state(state)
 
     def test_wrong_type_raises_validation_error(self) -> None:
-        from app.services.google_workspace_service import verify_oauth_state
+        from app.services.google_workspace_service import google_verify_oauth_state
 
         uid = uuid.uuid4()
         claims = {"sub": str(uid), "type": "access", "cv": "x", "exp": datetime.now(UTC) + timedelta(minutes=5)}
@@ -94,26 +94,26 @@ class TestVerifyOauthState:
             mock_settings.JWT_SECRET_KEY = self._SECRET
             mock_settings.JWT_ALGORITHM = self._ALGO
             with pytest.raises(ValidationError):
-                verify_oauth_state(state)
+                google_verify_oauth_state(state)
 
 
 class TestGetIntegrationStatus:
     @pytest.mark.asyncio
     async def test_returns_not_connected_when_no_token(self) -> None:
-        from app.services.google_workspace_service import get_integration_status
+        from app.services.google_workspace_service import google_get_integration_status
 
         mock_result = MagicMock()
-        mock_result.scalar_one_or_none.return_value = None
+        mock_result.scalars.return_value.first.return_value = None
 
         mock_db = AsyncMock()
         mock_db.execute.return_value = mock_result
 
-        status = await get_integration_status(mock_db, uuid.uuid4())
+        status = await google_get_integration_status(mock_db, uuid.uuid4())
         assert status.connected is False
 
     @pytest.mark.asyncio
     async def test_returns_connected_when_token_exists(self) -> None:
-        from app.services.google_workspace_service import get_integration_status
+        from app.services.google_workspace_service import google_get_integration_status
 
         fake_token = MagicMock()
         fake_token.scopes = "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/drive.file"
@@ -122,12 +122,12 @@ class TestGetIntegrationStatus:
         fake_token.email = ""
 
         mock_result = MagicMock()
-        mock_result.scalar_one_or_none.return_value = fake_token
+        mock_result.scalars.return_value.first.return_value = fake_token
 
         mock_db = AsyncMock()
         mock_db.execute.return_value = mock_result
 
-        status = await get_integration_status(mock_db, uuid.uuid4())
+        status = await google_get_integration_status(mock_db, uuid.uuid4())
         assert status.connected is True
         assert status.gmail_enabled is True
         assert status.drive_enabled is True
@@ -136,29 +136,29 @@ class TestGetIntegrationStatus:
 class TestRevokeIntegration:
     @pytest.mark.asyncio
     async def test_raises_not_found_when_no_token(self) -> None:
-        from app.services.google_workspace_service import revoke_integration
+        from app.services.google_workspace_service import google_revoke_integration
 
         mock_result = MagicMock()
-        mock_result.scalar_one_or_none.return_value = None
+        mock_result.scalars.return_value.first.return_value = None
 
         mock_db = AsyncMock()
         mock_db.execute.return_value = mock_result
 
         with pytest.raises(NotFoundError):
-            await revoke_integration(mock_db, uuid.uuid4())
+            await google_revoke_integration(mock_db, uuid.uuid4())
 
     @pytest.mark.asyncio
     async def test_deletes_token_when_found(self) -> None:
-        from app.services.google_workspace_service import revoke_integration
+        from app.services.google_workspace_service import google_revoke_integration
 
         fake_token = MagicMock()
         mock_result = MagicMock()
-        mock_result.scalar_one_or_none.return_value = fake_token
+        mock_result.scalars.return_value.first.return_value = fake_token
 
         mock_db = AsyncMock()
         mock_db.execute.return_value = mock_result
 
-        await revoke_integration(mock_db, uuid.uuid4())
+        await google_revoke_integration(mock_db, uuid.uuid4())
         mock_db.delete.assert_called_once_with(fake_token)
         mock_db.commit.assert_called_once()
 
@@ -251,12 +251,14 @@ class TestHandleOAuthCallbackSuccess:
         mock_flow.fetch_token.return_value = None
         mock_flow.credentials = mock_creds
 
-        # DB: first execute for GoogleToken lookup → none; second for get_integration_status
+        # DB: first execute for GoogleToken lookup (store_credentials — still .scalar_one_or_none(),
+        # not touched by the multi-account fix) → none; second for get_integration_status (now
+        # .scalars().first() — see integration_service.get_integration_status).
         no_token_result = MagicMock()
         no_token_result.scalar_one_or_none.return_value = None
 
         status_result = MagicMock()
-        status_result.scalar_one_or_none.return_value = MagicMock(
+        status_result.scalars.return_value.first.return_value = MagicMock(
             scopes="https://www.googleapis.com/auth/gmail.readonly",
             expires_at=None,
             provider=IntegrationProvider.GOOGLE,

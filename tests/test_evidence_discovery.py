@@ -66,7 +66,7 @@ async def test_descubrir_evidencias_full_flow():
     justify_llm.complete = AsyncMock(return_value=MagicMock(content="Elaboré y entregué el informe mensual de actividades del contrato."))
 
     with (
-        patch.object(eds.gws, "get_integration_status", AsyncMock(return_value=_connected_status())),
+        patch.object(eds.gws, "google_get_integration_status", AsyncMock(return_value=_connected_status())),
         patch.object(eds, "GmailAdapter", return_value=gmail),
         patch("app.agent.nodes.drive_fetch.DriveAdapter", return_value=drive_adapter),
         patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", return_value=cal_adapter),
@@ -124,7 +124,7 @@ async def test_descubrir_evidencias_filters_promo_emails():
     justify_llm.complete = AsyncMock(return_value=MagicMock(content="No se encontraron evidencias."))
 
     with (
-        patch.object(eds.gws, "get_integration_status", AsyncMock(return_value=_connected_status())),
+        patch.object(eds.gws, "google_get_integration_status", AsyncMock(return_value=_connected_status())),
         patch.object(eds, "GmailAdapter", return_value=gmail),
         patch("app.agent.nodes.drive_fetch.DriveAdapter", return_value=drive_adapter),
         patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", return_value=cal_adapter),
@@ -154,7 +154,7 @@ async def test_descubrir_evidencias_requires_google_connected():
     disconnected = MagicMock()
     disconnected.connected = False
 
-    with patch.object(eds.gws, "get_integration_status", AsyncMock(return_value=disconnected)):
+    with patch.object(eds.gws, "google_get_integration_status", AsyncMock(return_value=disconnected)):
         with pytest.raises(ExternalServiceError):
             await eds.descubrir_evidencias(MagicMock(), uuid.uuid4(), req)
 
@@ -189,7 +189,7 @@ async def test_descubrir_evidencias_endpoint_routes_through_tool_registry(
     with (
         patch("app.api.v1.integraciones.invoke_tool", spy),
         patch(
-            "app.services.evidence_discovery_service.gws.get_integration_status",
+            "app.services.evidence_discovery_service.gws.google_get_integration_status",
             AsyncMock(return_value=disconnected),
         ),
     ):
@@ -391,7 +391,7 @@ async def test_descubrir_evidencias_propio_cuenta_id_no_lanza_not_found(db: Asyn
     disconnected = MagicMock()
     disconnected.connected = False
     with (
-        patch.object(eds.gws, "get_integration_status", AsyncMock(return_value=disconnected)),
+        patch.object(eds.gws, "google_get_integration_status", AsyncMock(return_value=disconnected)),
         pytest.raises(ExternalServiceError),
     ):
         await eds.descubrir_evidencias(db, user.id, req)
@@ -423,7 +423,7 @@ async def test_descubrir_evidencias_default_fechas_desde_contrato(db: AsyncSessi
     justify_llm.complete = AsyncMock(return_value=MagicMock(content="No hay evidencia."))
 
     with (
-        patch.object(eds.gws, "get_integration_status", AsyncMock(return_value=_connected_status())),
+        patch.object(eds.gws, "google_get_integration_status", AsyncMock(return_value=_connected_status())),
         patch.object(eds, "GmailAdapter", return_value=gmail),
         patch("app.agent.nodes.drive_fetch.DriveAdapter", return_value=drive_adapter),
         patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", return_value=cal_adapter),

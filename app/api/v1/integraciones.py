@@ -70,7 +70,7 @@ async def google_oauth_callback(
         return RedirectResponse(f"{base}?google=error&reason={reason}", status_code=303)
 
     try:
-        usuario_id, code_verifier = gws.verify_oauth_state(state)
+        usuario_id, code_verifier = gws.google_verify_oauth_state(state)
         await gws.handle_oauth_callback(db=db, usuario_id=usuario_id, code=code, code_verifier=code_verifier)
     except DomainError as exc:
         logger.warning("google_oauth_callback_failed", detail=exc.detail)
@@ -85,7 +85,7 @@ async def google_status(
     db: AsyncSession = Depends(get_db),
 ) -> GoogleIntegrationStatus:
     """Retorna el estado de la integración Google del usuario autenticado."""
-    return await gws.get_integration_status(db=db, usuario_id=user.id)
+    return await gws.google_get_integration_status(db=db, usuario_id=user.id)
 
 
 @router.delete("/google/revoke", status_code=200)
@@ -94,7 +94,7 @@ async def google_revoke(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, str]:
     """Desconecta la cuenta de Google eliminando los tokens almacenados."""
-    await gws.revoke_integration(db=db, usuario_id=user.id)
+    await gws.google_revoke_integration(db=db, usuario_id=user.id)
     return {"detail": "Integración de Google desconectada"}
 
 
