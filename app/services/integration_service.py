@@ -28,14 +28,18 @@ logger = structlog.get_logger("services.integration")
 
 _OAUTH_STATE_TYPE = "oauth_state"
 
-# Scope substrings used to derive IntegrationStatus's per-source enabled flags.
-# Only Google is populated here; Microsoft's Graph scope mapping is a Slice B
-# follow-up (see openspec/changes/microsoft-365-integration/tasks.md, B.12).
+# Scope substrings used to derive IntegrationStatus's per-source enabled flags,
+# computed from granted-scope membership at read time (tasks.md Reconciliation #4).
 _SCOPE_MARKERS: dict[IntegrationProvider, dict[str, str]] = {
     IntegrationProvider.GOOGLE: {
         "mail_enabled": "https://www.googleapis.com/auth/gmail",
         "drive_enabled": "https://www.googleapis.com/auth/drive",
         "calendar_enabled": "https://www.googleapis.com/auth/calendar",
+    },
+    IntegrationProvider.MICROSOFT: {
+        "mail_enabled": "Mail.Read",
+        "drive_enabled": "Files.Read",
+        "calendar_enabled": "Calendars.Read",
     },
 }
 
