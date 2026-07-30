@@ -201,7 +201,11 @@ async def _gather_email_evidence(
             ]
         )
     seen_q: set[str] = set()
-    unique_queries = [q for q in queries if q and not (q in seen_q or seen_q.add(q))]
+    unique_queries: list[str] = []
+    for q in queries:
+        if q and q not in seen_q:
+            seen_q.add(q)
+            unique_queries.append(q)
 
     emails_by_id: dict[str, dict] = {}
     filtered_count = 0

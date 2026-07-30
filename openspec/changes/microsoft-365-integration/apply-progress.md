@@ -333,7 +333,7 @@ None. Pre-existing uncommitted changes to `app/services/microsoft_graph_service.
 
 ## Slice C2 — Provider-agnostic gate + noise heuristics (PR 5, this batch)
 
-**Branch**: `feat/microsoft-365-c2-gate-heuristics` (off C1 tip `cdc777d`, same worktree `cashing-backend-ms365`), NOT pushed, NOT committed (working tree only).
+**Branch**: `feat/microsoft-365-c2-gate-heuristics` (off C1 tip `cdc777d`, same worktree `cashing-backend-ms365`), NOT pushed. 4 commits (3 feature/docs commits + 1 correction commit below).
 **Mode**: Strict TDD (RED confirmed via `git stash` of implementation files only, re-running the new/updated tests against pre-C2 code before restoring).
 **Status**: 14/15 C2 tasks complete (C2.1-C2.2, C2.4-C2.15). C2.3 is **N/A** — see Deviations.
 
@@ -398,11 +398,26 @@ One real regression introduced mid-slice and fixed before completion: removing t
 - **Type check**: `mypy` on the 8 touched/created files, compared line-for-line against a `git stash`-restored pre-C2 baseline of the same 8-file target set: baseline 24 errors → post-C2 29 errors, **net +5, zero new error categories** (all 5 new instances are `Missing type arguments for generic type "dict"`/`"list[dict]"`, the same pre-existing repo-wide style already used by every sibling function in these exact files — e.g. `existing: list[dict] = state.get(...)` in the two fetch nodes, `emails_by_id: dict[str, dict] = {}`-style locals in the new email-gather code, `metadata: dict` in the new `is_noise_ms_calendar`). No error in `app/adapters/microsoft/graph_adapter.py`, `app/adapters/email/port.py`, or `app/core/exceptions.py` (0 baseline, 0 post).
 - **Rollback boundary**: revert the 8 `app/` files + `tasks.md` — no schema/migration involved; `local_only`/Google-only gate behavior for the pre-existing (pre-C2) codebase is unaffected since this slice only generalizes behavior that already required a connected provider (Google before, any provider now). No other slice depends on C2 (final slice in the chain).
 
+### Correction Round (independent re-verification, this session)
+
+Re-verified the above (committed) C2 work independently before reporting it done: re-ran the focused set (84/84), the broader regression set (210/210), and ruff/mypy on all 8 touched `app/` files. Ruff findings (7, all pre-existing per `git blame`) matched the documented claim. **Found one real gap the prior verification missed**: `mypy` on `evidence_discovery_service.py` reported a genuinely NEW `func-returns-value` error (not in the documented "zero new error categories" claim) on the new query-dedup line — `not (q in seen_q or seen_q.add(q))` relies on `set.add()`'s `None` return, a correct but mypy-flagged idiom, and no sibling instance of this exact pattern exists elsewhere in the codebase to call it "pre-existing style". Fixed by rewriting as an explicit loop (functionally identical, order-preserving dedup):
+
+```python
+seen_q: set[str] = set()
+unique_queries: list[str] = []
+for q in queries:
+    if q and q not in seen_q:
+        seen_q.add(q)
+        unique_queries.append(q)
+```
+
+Re-confirmed: `tests/test_evidence_discovery.py` 13/13, broader regression 210/210, `mypy app/services/evidence_discovery_service.py` no longer reports `func-returns-value` (only the same pre-existing `dict`-type-arg/`no-any-return`/`typeddict-item` findings), `ruff check`/`ruff format --diff` clean on the changed lines. Committed separately as a small fixup on top of the 3 C2 commits (see commit log).
+
 ### Workload / PR Boundary
 - Mode: stacked-to-main chained PR slice (auto-chain, already resolved — no decision needed)
 - Current work unit: C2 — provider-agnostic gate + noise heuristics (final batch, PR 5/5)
-- Boundary: starts at C1 tip `cdc777d`, ends at this batch's (uncommitted) working-tree diff on `feat/microsoft-365-c2-gate-heuristics`
-- Estimated review budget impact: forecast ~350-420 changed lines, Medium risk. **Actual: 769 insertions + 110 deletions = 879 changed lines** (`git diff --stat`, including `tasks.md`) — exceeds forecast, consistent with every prior slice's documented overage pattern (driven mainly by the 4 touched/extended test files, which needed ~530 of those lines to cover the new dispatch/merge/dedup/heuristic behavior). No commits made yet in this batch — the working tree is one clean, revertible diff.
+- Boundary: starts at C1 tip `cdc777d`, ends at the 4 commits (3 feature/docs + 1 correction fixup) on `feat/microsoft-365-c2-gate-heuristics`
+- Estimated review budget impact: forecast ~350-420 changed lines, Medium risk. **Actual: 769 insertions + 110 deletions = 879 changed lines** (`git diff --stat` of the 3 feature/docs commits, including `tasks.md`) — exceeds forecast, consistent with every prior slice's documented overage pattern (driven mainly by the 4 touched/extended test files, which needed ~530 of those lines to cover the new dispatch/merge/dedup/heuristic behavior).
 
 ### Status
 14/15 C2 tasks complete (C2.3 is N/A — see Deviations #1). This is the final slice in the microsoft-365-integration chain (A1 → A2 → B → C1 → C2, all now implemented). Ready for `sdd-verify` on this slice / the full chain, or for commit + review.
