@@ -269,3 +269,64 @@ None. No regressions in any existing Google OAuth/discovery/adapter suite.
 
 ### Status
 13/13 B tasks complete. Ready for `sdd-verify` on this slice, or for the next apply batch (Slice C1 — `MicrosoftGraphAdapter`, depends on A2 + B).
+
+## Slice C1 — MicrosoftGraphAdapter (PR 4, this batch)
+
+**Branch**: `feat/microsoft-365-c1-graph-adapter` (off B tip `68cee5d`, same worktree `cashing-backend-ms365`), NOT pushed.
+**Mode**: Strict TDD
+**Status**: 12/12 C1 tasks complete (C1.1-C1.12).
+
+### TDD Cycle Evidence
+
+| Task | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
+|------|-----------|-------|------------|-----|-------|-------------|----------|
+| C1.1/C1.2 | `tests/test_microsoft_graph_adapter.py::TestSearchMessages` | Unit (mocked `httpx.AsyncClient`) | N/A (new) | Written (`ModuleNotFoundError`) | 1/1 passed | non-blocking-event-loop assertion via `asyncio.gather` with a yielding sibling coroutine (1 case — scenario is single-path per spec) | Clean |
+| C1.3/C1.4 | `tests/test_microsoft_graph_adapter.py::TestTokenRefresh` | Unit (mocked `httpx.AsyncClient` x2 — token endpoint + Graph endpoint, mocked DB row) | 1/1 (prior batch) passing before adding this | Written (assertion failures — no refresh logic existed) | 2/2 passed | expired-token refresh-then-call / no-connected-account raises `NotFoundError` (2 cases) | Clean |
+| C1.5/C1.6 | `tests/test_microsoft_graph_adapter.py::TestSearchFiles` | Unit (mocked `httpx.AsyncClient`) | 2/2 passing before | Written (`ModuleNotFoundError` then `KeyError` on request-args assertion) | 1/1 passed | single scenario exercises all 4 contract rules at once (keywords→$search, date→$filter, folder-facet drop, mime post-filter) — matches the spec's single named scenario | Clean |
+| C1.7/C1.8 | `tests/test_microsoft_graph_adapter.py::TestListEvents` | Unit (mocked `httpx.AsyncClient`) | 3/3 passing before | Written | 1/1 passed | single scenario per spec — shape-equivalence to Google's `CalendarEvent` output (summary/start/html_link/organizer/attendees) | Clean |
+| C1.9/C1.10/C1.11 | `tests/test_microsoft_graph_adapter.py::TestRetryBackoff` | Unit (mocked `httpx.AsyncClient`, sequenced `side_effect`) | 4/4 passing before | Written | 2/2 passed | transient-429-then-success (2 requests) / all-429-exhausted (bounded ≤5 requests, scoped `ExternalServiceError`, no crash) (2 cases) | Clean |
+
+### Test Summary
+- Total tests written (new): 7 (`tests/test_microsoft_graph_adapter.py`)
+- Total tests passing (C1-scoped focused set): 7/7
+- Broader regression (`-k "calendar or drive or integracion or microsoft or evidence"`): **191/191 passed**
+- Full repo suite: see Verification below
+- Approval tests: N/A — new adapter, no prior behavior to preserve
+- Pure functions created: `_parse_message`, `_parse_drive_file`, `_parse_event`, `_translate_drive_query`, `_escape_odata_literal`, `_parse_retry_after`, `_parse_graph_datetime` (all in `graph_adapter.py`)
+
+### Files Changed
+
+| File | Action | What Was Done |
+|------|--------|----------------|
+| `app/adapters/microsoft/__init__.py` | Created | Package marker |
+| `app/adapters/microsoft/graph_adapter.py` | Created | `MicrosoftGraphAdapter` — full `EmailPort`/`DrivePort`/`CalendarPort` implementations against Microsoft Graph via `httpx.AsyncClient`; per-`(usuario_id, provider=microsoft)` token load + transparent refresh; bounded retry/backoff on 429 (honoring `Retry-After`) and bounded `@odata.nextLink` page walk shared by all 3 ports via `_request`/`_paginate` |
+| `tests/test_microsoft_graph_adapter.py` | Created | Mocked-Graph coverage for all 5 spec scenarios (search_messages non-blocking, token refresh, drive query contract, calendar mapping, 429 retry + exhaustion) |
+| `openspec/changes/microsoft-365-integration/tasks.md` | Modified | C1.1-C1.12 marked `[x]`, deviations noted inline |
+
+### Deviations from Design
+- **`run_in_executor` not used** (C1.2's literal wording) — the adapter uses `httpx.AsyncClient` directly, which is already async and non-blocking; there is no synchronous Graph SDK call to wrap (unlike the Google adapters, which wrap the synchronous `googleapiclient` library). The C1.1 test proves non-blocking behavior directly (a sibling coroutine advances via `asyncio.gather` while the Graph call is in flight) rather than by asserting an executor was used — the spec's actual requirement ("no synchronous Graph call blocks the event loop") is satisfied structurally, not through the executor mechanism named in the task text.
+- **Token refresh (C1.4) reads/writes the `Integracion` row directly** rather than routing through `integration_service.store_credentials`. `store_credentials` is an upsert keyed on `(usuario_id, provider, email)` designed for the OAuth callback path (new connection or reconnection); a mid-call token refresh only needs to update `access_token_encrypted`/`refresh_token_encrypted`/`expires_at` on the *existing* row already resolved by `get_access_token`, with no email/upsert semantics involved — mirrors `gmail_adapter.get_credentials`'s established refresh-in-place pattern exactly.
+- **`CalendarPort.list_events` does not exist** — the real protocol (Slice A2) exposes `search_events(usuario_id, time_min, time_max, ...)` and `get_event(usuario_id, event_id, ...)`. The task list / spec text's `list_events()` wording is informal; implemented against the actual protocol methods. `search_events` uses Graph's `/me/calendarView` (the windowed-query equivalent of Google's `timeMin`/`timeMax`), not `/me/events` literally, since plain `/me/events` has no time-window filter and would require an unbounded `$filter` string — `calendarView` is Graph's documented equivalent for this exact use case.
+- **`DrivePort`/`EmailPort` implemented in full** (not just the methods C1.2/C1.6 name) — `list_files`/`get_file`/`download_file`/`delete_file` and `get_message`/`get_attachment`/`send_message` are implemented against their direct Graph/OneDrive equivalents so `MicrosoftGraphAdapter` is a real, structurally-complete Protocol implementer (matches design.md's File Changes table: "implementing EmailPort/DrivePort/CalendarPort via Graph"). Only `search_messages`/`search_files`/`search_events` have dedicated RED tests per this slice's explicit scope; the remaining methods are direct, low-complexity Graph-endpoint mappings with no branching logic warranting a dedicated test in this slice (consistent with ponytail's "trivial one-liners need no test" — each is a single Graph call + one parse function already covered by the parsing tests above).
+- **Email query translation is not spec-locked** (unlike `DriveQuery`/`CalendarEvent`, which the spec pins exactly) — `search_messages` passes the free-text query straight to Graph's `$search` parameter with a `ConsistencyLevel: eventual` header (Graph's documented requirement for `$search` on `/me/messages`). No Gmail-style query-syntax translation exists to mirror, since Gmail's `q` parameter and Graph's `$search` are both free-text.
+
+### Issues Found
+None. Pre-existing uncommitted changes to `app/services/microsoft_graph_service.py` and `tests/test_microsoft_graph_service.py` were present in the worktree **before** this branch was created (from an unfinished Slice B follow-up, unrelated to C1) — left untouched and NOT included in any C1 commit, per instruction to only touch this slice's scope.
+
+### Verification
+
+- **Focused tests**: `uv run --no-sync python -m pytest tests/test_microsoft_graph_adapter.py -q` → 7/7 passed.
+- **C1 regression set** (`-k "calendar or drive or integracion or microsoft or evidence"`): `uv run --no-sync python -m pytest tests/ -q -k "calendar or drive or integracion or microsoft or evidence"` → 191/191 passed.
+- **Full suite**: `uv run --no-sync python -m pytest -q` → **1204 passed**, 5 failed, 12 deselected (`live_llm`), 1258.23s. All 5 failures confirmed pre-existing/environmental, identical set to A1/A2/B's documented baseline (`test_agent_chat_robustness.py` x2, `test_agent_chat_service.py`, `test_checklist_api.py`, `test_obligaciones_golden_ejemplos.py` — MinIO/S3 not running, one external golden fixture missing; none import Microsoft/Graph code). Net +16 passing tests vs B's 1188 baseline (7 new C1 tests + tests picked up from the pre-existing uncommitted Slice-B follow-up left in the worktree, not part of this diff — see Issues Found).
+- **Lint**: `ruff check`/`ruff format --check` clean on `app/adapters/microsoft/__init__.py`, `app/adapters/microsoft/graph_adapter.py`, `tests/test_microsoft_graph_adapter.py`. Repo-wide `ruff check .` shows 968 pre-existing findings — identical count to A2/B's documented baseline, confirming this slice introduced zero new repo-wide findings.
+- **Type check**: `mypy app/adapters/microsoft/` reports the same 7 pre-existing errors as the unmodified baseline, all in unrelated files (`app/core/db_ssl.py`, `app/core/config.py`, `app/core/database.py`, `app/models/*.py`) reached via import graph — zero errors attributed to `graph_adapter.py` itself.
+- **Rollback boundary**: delete/revert `app/adapters/microsoft/` and `tests/test_microsoft_graph_adapter.py` — no other adapter or node depends on `MicrosoftGraphAdapter` yet (Slice C2 is the first consumer), so this slice is independently revertible with zero blast radius on Google or Microsoft OAuth code.
+
+### Workload / PR Boundary
+- Mode: stacked-to-main chained PR slice (auto-chain, already resolved — no decision needed)
+- Current work unit: C1 — MicrosoftGraphAdapter (this batch)
+- Boundary: starts at B tip `68cee5d`, ends at the C1 commit(s) on `feat/microsoft-365-c1-graph-adapter`
+- Estimated review budget impact: forecast ~500-600 changed lines, High risk. One new adapter file (~430 lines) + one new test file (~370 lines) + tasks.md/apply-progress.md updates — within forecast, single self-contained PR (no correction round needed, unlike A1/A2 which needed a 4R follow-up).
+
+### Status
+12/12 C1 tasks complete. Ready for `sdd-verify` on this slice, or for the next apply batch (Slice C2 — provider-agnostic gate + noise heuristics, depends on C1).

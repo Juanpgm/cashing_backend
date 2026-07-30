@@ -1,0 +1,1 @@
+"""Microsoft Graph adapter package."""
