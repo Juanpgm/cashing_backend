@@ -14,9 +14,11 @@ import structlog
 
 from app.adapters.calendar.calendar_adapter import GoogleCalendarAdapter
 from app.adapters.calendar.port import CalendarEvent
+from app.adapters.microsoft.graph_adapter import MicrosoftGraphAdapter
 from app.agent.prompts.email_evidence import _extract_keywords
 from app.agent.state import AgentState
 from app.core.config import settings
+from app.models.integracion import IntegrationProvider
 
 logger = structlog.get_logger("agent.nodes.calendar_fetch")
 
@@ -73,35 +75,44 @@ def _extract_event_metadata(event: CalendarEvent) -> dict:
     }
 
 
-async def calendar_fetch_node(state: AgentState) -> AgentState:
-    """Lista eventos del Calendar del usuario en el período del contrato como evidencia.
+async def calendar_fetch_node(
+    state: AgentState, provider: IntegrationProvider = IntegrationProvider.GOOGLE
+) -> AgentState:
+    """Lista eventos del Calendar/Outlook del usuario en el período del contrato como evidencia.
 
     Requiere en state: user_id, _db, contrato_contexto (fecha_inicio/fecha_fin).
     Produce en state: calendar_evidencias (lista de dicts con title/link/date/event_id/metadata).
+
+    `provider` selects the adapter (Google Calendar vs. Microsoft Graph). Results
+    are APPENDED to any `calendar_evidencias` already in `state` — so calling this
+    once per connected provider (evidence_discovery_service.descubrir_evidencias)
+    merges every provider's events instead of the last call clobbering the rest.
     """
+    existing: list[dict] = state.get("calendar_evidencias") or []
+
     user_id = state.get("user_id")
     db = state.get("_db")
     if not user_id or not db:
-        return {**state, "calendar_evidencias": []}
+        return {**state, "calendar_evidencias": existing}
 
     contrato = state.get("contrato_contexto") or {}
     time_min = _to_rfc3339(str(contrato.get("fecha_inicio", "")))
     time_max = _to_rfc3339(str(contrato.get("fecha_fin", "")), end_of_day=True)
     if not time_min or not time_max:
-        return {**state, "calendar_evidencias": []}
+        return {**state, "calendar_evidencias": existing}
 
     obligaciones = state.get("obligaciones_contexto") or []
     q = _build_calendar_query(obligaciones)
 
-    adapter = GoogleCalendarAdapter(db)
+    adapter = GoogleCalendarAdapter(db) if provider == IntegrationProvider.GOOGLE else MicrosoftGraphAdapter(db)
     try:
         events = await adapter.search_events(user_id, time_min, time_max, max_results=settings.EVIDENCE_MAX_EVENTS, q=q)
     except Exception as exc:
-        await logger.aerror("calendar_fetch_error", error=str(exc), user_id=str(user_id))
+        await logger.aerror("calendar_fetch_error", error=str(exc), user_id=str(user_id), provider=provider.value)
         return {
             **state,
-            "calendar_evidencias": [],
-            "error": f"Error leyendo Calendar: {exc}. Verifica que tu cuenta de Google esté conectada.",
+            "calendar_evidencias": existing,
+            "error": f"Error leyendo Calendar ({provider.value}): {exc}. Verifica que tu cuenta esté conectada.",
         }
 
     calendar_evidencias = []
@@ -117,8 +128,11 @@ async def calendar_fetch_node(state: AgentState) -> AgentState:
                 "date": _event_start(ev),
                 "event_id": ev.id,
                 "metadata": _extract_event_metadata(ev),
+                "provider": provider.value,
             }
         )
 
-    await logger.ainfo("calendar_fetch_complete", user_id=str(user_id), events=len(calendar_evidencias), q=q)
-    return {**state, "calendar_evidencias": calendar_evidencias}
+    await logger.ainfo(
+        "calendar_fetch_complete", user_id=str(user_id), events=len(calendar_evidencias), q=q, provider=provider.value
+    )
+    return {**state, "calendar_evidencias": existing + calendar_evidencias}

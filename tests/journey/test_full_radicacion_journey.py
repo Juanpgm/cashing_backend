@@ -150,6 +150,9 @@ def _email(mid: str, subject: str, body: str) -> EmailMessage:
 def _connected_status() -> MagicMock:
     s = MagicMock()
     s.connected = True
+    from app.models.integracion import IntegrationProvider
+
+    s.provider = IntegrationProvider.GOOGLE
     return s
 
 
@@ -385,7 +388,10 @@ async def test_full_radicacion_journey(
     )
 
     with (
-        patch.object(eds.gws, "google_get_integration_status", AsyncMock(return_value=_connected_status())),
+        patch.object(eds.integration_service, "has_any_connected_provider", AsyncMock(return_value=True)),
+        patch.object(
+            eds.integration_service, "list_integration_statuses", AsyncMock(return_value=[_connected_status()])
+        ),
         patch.object(eds, "GmailAdapter", return_value=gmail),
         patch("app.agent.nodes.drive_fetch.DriveAdapter", return_value=drive_adapter),
         patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", return_value=cal_adapter),

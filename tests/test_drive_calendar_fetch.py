@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from app.adapters.calendar.port import CalendarAttendee, CalendarEvent
 from app.adapters.drive.port import DriveFile
+from app.models.integracion import IntegrationProvider
 
 # ─────────────────────────────────────────────────────────────────────────────
 # drive_fetch_node
@@ -102,6 +103,69 @@ async def test_drive_fetch_truncation_keeps_keyword_queries_over_generic_terms(m
     called_keywords = [call.args[1].keywords[0] for call in mock_adapter.search_files.call_args_list]
     assert len(called_keywords) == 1
     assert called_keywords[0] not in _GENERIC_TERMS
+
+
+@pytest.mark.asyncio
+async def test_drive_fetch_microsoft_provider_uses_graph_adapter_and_appends(monkeypatch):
+    """Calling drive_fetch_node once per connected provider (Slice C2's
+    evidence_discovery_service loop) must APPEND results, not overwrite the
+    other provider's — and tag each item with its own `provider`."""
+    from app.agent.nodes import drive_fetch as mod
+
+    google_adapter = MagicMock()
+    google_adapter.search_files = AsyncMock(return_value=[_drive_file("g1", "Informe Google.pdf")])
+    ms_adapter = MagicMock()
+    ms_adapter.search_files = AsyncMock(return_value=[_drive_file("m1", "Informe OneDrive.pdf")])
+
+    state = {
+        "user_id": uuid.uuid4(),
+        "_db": MagicMock(),
+        "contrato_contexto": {"fecha_inicio": "2024-04-01", "fecha_fin": "2024-04-30"},
+        "obligaciones_contexto": [{"id": "ob1", "descripcion": "Entregar informe mensual de actividades"}],
+    }
+
+    with (
+        patch.object(mod, "DriveAdapter", return_value=google_adapter),
+        patch.object(mod, "MicrosoftGraphAdapter", return_value=ms_adapter),
+    ):
+        state = await mod.drive_fetch_node(state, provider=IntegrationProvider.GOOGLE)
+        state = await mod.drive_fetch_node(state, provider=IntegrationProvider.MICROSOFT)
+
+    ev = state["drive_evidencias"]
+    assert len(ev) == 2
+    providers = {e["provider"] for e in ev}
+    assert providers == {"google", "microsoft"}
+    ms_adapter.search_files.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_drive_fetch_preserves_existing_evidencias_on_provider_error():
+    """One provider's failure must not wipe out evidence already gathered from
+    another provider (evidence-discovery-gate spec: isolate per-provider failure)."""
+    from app.agent.nodes import drive_fetch as mod
+
+    google_adapter = MagicMock()
+    google_adapter.search_files = AsyncMock(return_value=[_drive_file("g1", "Informe Google.pdf")])
+    failing_ms_adapter = MagicMock()
+    failing_ms_adapter.search_files = AsyncMock(side_effect=RuntimeError("Graph down"))
+
+    state = {
+        "user_id": uuid.uuid4(),
+        "_db": MagicMock(),
+        "contrato_contexto": {"fecha_inicio": "2024-04-01", "fecha_fin": "2024-04-30"},
+        "obligaciones_contexto": [{"id": "ob1", "descripcion": "Entregar informe mensual de actividades"}],
+    }
+
+    with patch.object(mod, "DriveAdapter", return_value=google_adapter):
+        state = await mod.drive_fetch_node(state, provider=IntegrationProvider.GOOGLE)
+
+    with patch.object(mod, "MicrosoftGraphAdapter", return_value=failing_ms_adapter):
+        state = await mod.drive_fetch_node(state, provider=IntegrationProvider.MICROSOFT)
+
+    # drive_query_failed is caught per-query inside the try, so this still returns
+    # the Google evidence gathered in the previous call, unharmed.
+    assert len(state["drive_evidencias"]) == 1
+    assert state["drive_evidencias"][0]["provider"] == "google"
 
 
 @pytest.mark.asyncio
@@ -251,6 +315,38 @@ async def test_calendar_fetch_no_dates_returns_empty():
 
     result = await calendar_fetch_node({"user_id": uuid.uuid4(), "_db": MagicMock(), "contrato_contexto": {}})
     assert result["calendar_evidencias"] == []
+
+
+@pytest.mark.asyncio
+async def test_calendar_fetch_microsoft_provider_uses_graph_adapter_and_appends():
+    """Same append/tag contract as drive_fetch_node's provider param (Slice C2)."""
+    from app.agent.nodes import calendar_fetch as mod
+
+    google_event = CalendarEvent(id="g1", summary="Reunión Google", html_link="https://calendar.google.com/g1")
+    ms_event = CalendarEvent(id="m1", summary="Reunión Outlook", html_link="https://outlook.office.com/m1")
+
+    google_adapter = MagicMock()
+    google_adapter.search_events = AsyncMock(return_value=[google_event])
+    ms_adapter = MagicMock()
+    ms_adapter.search_events = AsyncMock(return_value=[ms_event])
+
+    state = {
+        "user_id": uuid.uuid4(),
+        "_db": MagicMock(),
+        "contrato_contexto": {"fecha_inicio": "2024-04-01", "fecha_fin": "2024-04-30"},
+    }
+
+    with (
+        patch.object(mod, "GoogleCalendarAdapter", return_value=google_adapter),
+        patch.object(mod, "MicrosoftGraphAdapter", return_value=ms_adapter),
+    ):
+        state = await mod.calendar_fetch_node(state, provider=IntegrationProvider.GOOGLE)
+        state = await mod.calendar_fetch_node(state, provider=IntegrationProvider.MICROSOFT)
+
+    ev = state["calendar_evidencias"]
+    assert len(ev) == 2
+    providers = {e["provider"] for e in ev}
+    assert providers == {"google", "microsoft"}
 
 
 def test_declined_rsvp_is_noise_end_to_end():
