@@ -6,7 +6,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-
 # ── Helpers de construcción de items de evidence_raw ─────────────────────────
 
 def _email_item(
@@ -466,3 +465,163 @@ def test_score_personal_gmail_with_bank_word_still_kept():
         labels=[],
     )
     assert score == 0
+
+
+# ── Microsoft Graph noise heuristics (microsoft-365-integration Slice C2) ─────
+
+
+def test_score_ms_other_inference_classification_is_noise_likely():
+    """'other' inferenceClassification (Graph's own ML clutter classifier) scores
+    filter-worthy, mirroring Gmail's CATEGORY_* label behavior."""
+    from app.agent.prompts.evidence_filter import score_non_personal_ms_email
+
+    score, reason = score_non_personal_ms_email(
+        sender="newsletter@service.com",
+        subject="Novedades del mes",
+        categories=[],
+        inference_classification="other",
+    )
+    assert score >= 3
+    assert "inferenceClassification" in reason
+
+
+def test_score_ms_ambiguous_email_passes_to_llm():
+    """An email with no matching noise signal at all gets a low score — it must
+    reach the LLM layer, not be silently discarded (spec: 'Ambiguous email
+    defaults to LLM review')."""
+    from app.agent.prompts.evidence_filter import score_non_personal_ms_email
+
+    score, _ = score_non_personal_ms_email(
+        sender="colega@empresa.com",
+        subject="Reunión de seguimiento del proyecto",
+        categories=[],
+        inference_classification="focused",
+    )
+    assert score < 3
+
+
+def test_score_ms_whitelisted_domain_never_filtered():
+    """Personal/institutional domains stay whitelisted regardless of Graph signals."""
+    from app.agent.prompts.evidence_filter import score_non_personal_ms_email
+
+    score, _ = score_non_personal_ms_email(
+        sender="supervisor@entidad.gov.co",
+        subject="Aprobación de informe",
+        categories=[],
+        inference_classification="other",
+    )
+    assert score == 0
+
+
+def test_is_noise_ms_calendar_flags_allday_with_no_response():
+    """All-day Outlook event with no attendee response recorded → noise-likely."""
+    from app.agent.prompts.evidence_filter import is_noise_ms_calendar
+
+    metadata = {
+        "attendees": [{"responseStatus": "none"}, {"responseStatus": ""}],
+        "is_all_day": True,
+    }
+    assert is_noise_ms_calendar("Bloqueo de agenda", metadata) is True
+
+
+def test_is_noise_ms_calendar_keeps_confirmed_meeting():
+    """A normal meeting with confirmed attendee responses is not flagged."""
+    from app.agent.prompts.evidence_filter import is_noise_ms_calendar
+
+    metadata = {
+        "attendees": [{"responseStatus": "accepted"}, {"responseStatus": "accepted"}],
+        "is_all_day": False,
+    }
+    assert is_noise_ms_calendar("Reunión de seguimiento", metadata) is False
+
+
+def test_is_noise_ms_drive_filters_folder_like_item():
+    """OneDrive folder items lack a `file` facet → empty mime_type → filtered."""
+    from app.agent.prompts.evidence_filter import is_noise_ms_drive
+
+    assert is_noise_ms_drive("") is True
+
+
+def test_is_noise_ms_drive_keeps_real_file():
+    from app.agent.prompts.evidence_filter import is_noise_ms_drive
+
+    assert is_noise_ms_drive("application/pdf") is False
+
+
+# ── _heuristic_is_noise dispatch by (source, provider) ────────────────────────
+
+
+def _ms_email_item(title: str, sender: str = "", inference_classification: str = "") -> dict:
+    meta = {
+        "sender": sender,
+        "labels": [],
+        "headers": {"inferenceClassification": inference_classification},
+        "provider": "microsoft",
+    }
+    return {"source": "email", "title": title, "content": title, "link": "", "date": "", "metadata": meta}
+
+
+def _ms_calendar_item(title: str, attendees: list | None = None, is_all_day: bool = False) -> dict:
+    cal_meta = {"attendees": attendees or [], "is_all_day": is_all_day, "event_type": "default", "organizer": {}}
+    item_meta = {"title": title, "metadata": cal_meta, "provider": "microsoft"}
+    return {"source": "calendar", "title": title, "content": title, "link": "", "date": "", "metadata": item_meta}
+
+
+def _ms_drive_item(title: str, mime: str = "application/pdf") -> dict:
+    meta = {"mime_type": mime, "title": title, "provider": "microsoft"}
+    return {"source": "drive", "title": title, "content": title, "link": "", "date": "", "metadata": meta}
+
+
+def test_dispatch_drops_ms_email_other_inference_classification():
+    from app.agent.nodes.evidence_filter import _heuristic_is_noise
+
+    # Sender/subject deliberately avoid Google's own generic auto-prefix/subject
+    # signals (e.g. "newsletter@") — this must only be flagged noise via the
+    # Microsoft-specific inferenceClassification dispatch path, not by accident.
+    item = _ms_email_item("Novedades del mes", sender="asistente@empresa.com", inference_classification="other")
+    assert _heuristic_is_noise(item) is True
+
+
+def test_dispatch_keeps_ms_calendar_confirmed_meeting():
+    from app.agent.nodes.evidence_filter import _heuristic_is_noise
+
+    attendees = [{"responseStatus": "accepted"}, {"responseStatus": "accepted"}]
+    item = _ms_calendar_item("Reunión de seguimiento", attendees=attendees)
+    assert _heuristic_is_noise(item) is False
+
+
+def test_dispatch_drops_ms_drive_folder_item():
+    from app.agent.nodes.evidence_filter import _heuristic_is_noise
+
+    item = _ms_drive_item("Carpeta", mime="")
+    assert _heuristic_is_noise(item) is True
+
+
+def test_dispatch_mixed_google_and_microsoft_batch_scored_by_own_heuristic():
+    """Mixed Google/Microsoft batch: each item is scored by its own provider's
+    heuristic — Google items unchanged (microsoft-noise-heuristics spec scenario
+    'Mixed Google/Microsoft batch scored correctly')."""
+    from app.agent.nodes.evidence_filter import _heuristic_is_noise
+
+    google_noreply = _email_item("Informe mensual", sender="no-reply@promo.com")
+    google_supervisor = _email_item("Informe mensual de actividades", sender="supervisor@entidad.gov.co")
+    ms_other = _ms_email_item("Novedades", sender="asistente@empresa.com", inference_classification="other")
+    ms_ambiguous = _ms_email_item(
+        "Reunión de seguimiento del proyecto", sender="colega@empresa.com", inference_classification="focused"
+    )
+
+    assert _heuristic_is_noise(google_noreply) is True
+    assert _heuristic_is_noise(google_supervisor) is False
+    assert _heuristic_is_noise(ms_other) is True
+    assert _heuristic_is_noise(ms_ambiguous) is False
+
+
+def test_dispatch_defaults_legacy_items_without_provider_to_google():
+    """Items predating the `provider` marker (e.g. local_file, old fixtures) must
+    keep using the Google heuristics by default — see nodes/evidence_filter.py's
+    `_heuristic_is_noise` docstring."""
+    from app.agent.nodes.evidence_filter import _heuristic_is_noise
+
+    item = _email_item("Informe mensual", sender="no-reply@promo.com")
+    assert "provider" not in item["metadata"]
+    assert _heuristic_is_noise(item) is True

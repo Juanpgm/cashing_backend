@@ -90,7 +90,12 @@ def _parse_message(raw: dict[str, Any]) -> EmailMessage:
         snippet=raw.get("bodyPreview", "") or "",
         attachments=[],  # attachments require a separate call — see get_attachment
         labels=raw.get("categories") or [],
-        headers={},
+        # inferenceClassification ("focused"|"other") is Graph's own ML classifier
+        # signal — stashed in `headers` (generic string bag) so
+        # `score_non_personal_ms_email` can read it the same way Gmail's scorer
+        # reads real email headers, without widening EmailMessage's shape further.
+        headers={"inferenceClassification": raw.get("inferenceClassification", "") or ""},
+        web_link=raw.get("webLink", "") or "",
     )
 
 
