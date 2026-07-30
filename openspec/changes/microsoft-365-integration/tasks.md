@@ -124,21 +124,21 @@ Branch: `feat/microsoft-365-a2-port-generalization` (off A1 tip `3e8a538`, workt
 
 ## Slice C2 — Provider-agnostic gate + noise heuristics (PR 5, depends on C1)
 
-- [ ] C2.1 [RED] Test gate raises `NO_PROVIDER_CONNECTED` only at zero connected providers; succeeds with Microsoft-only connected (evidence-discovery-gate spec scenarios).
-- [ ] C2.2 [GREEN] `app/core/exceptions.py` — add `NO_PROVIDER_CONNECTED` (replaces `GOOGLE_NOT_CONNECTED`, no alias — see Reconciliation #1); `evidence_discovery_service.py` gate calls `integration_service.has_any_connected_provider`.
-- [ ] C2.3 [RED] Regression test: `local_only=True` still bypasses the gate unchanged.
-- [ ] C2.4 [RED] Test discovery merges `evidence_raw` from both providers when both connected; one provider's failure doesn't abort the other's results (spec scenarios "both connected" / "Microsoft fails, Google succeeds").
-- [ ] C2.5 [GREEN] `evidence_discovery_service.py` + `calendar_fetch.py`/`drive_fetch.py`/Gmail-gather step — provider-aware adapter instantiation per connected provider; append normalized items with `metadata.provider` set; isolate per-provider failures.
-- [ ] C2.6 [RED] Test duplicate evidence across providers deduplicated by existing dedup logic (spec scenario).
-- [ ] C2.7 [RED] Test `score_non_personal_ms_email` flags "other" `inferenceClassification` as noise-likely; ambiguous email passes to the LLM, not silently discarded (microsoft-noise-heuristics spec scenarios).
-- [ ] C2.8 [GREEN] `app/agent/prompts/evidence_filter.py` — `score_non_personal_ms_email`.
-- [ ] C2.9 [RED] Test `is_noise_ms_calendar` flags all-day-with-no-response as noise; confirmed meeting not flagged (spec scenarios).
-- [ ] C2.10 [GREEN] `is_noise_ms_calendar`.
-- [ ] C2.11 [RED] Test `is_noise_ms_drive` filters OneDrive folder/system items (spec scenario).
-- [ ] C2.12 [GREEN] `is_noise_ms_drive`.
-- [ ] C2.13 [RED] Test `_heuristic_is_noise` dispatch by `(source, provider)` — mixed batch scored by each item's own heuristic; Google items unchanged (spec scenario "Mixed Google/Microsoft batch scored correctly").
-- [ ] C2.14 [GREEN] `app/agent/nodes/evidence_filter.py` — dispatch by `(source, provider)`, default `provider="google"` for legacy items.
-- [ ] C2.15 Verify: `make lint` + `make test`; full regression across `evidence_discovery`, `evidence_filter`, `calendar_fetch`, `drive_fetch` suites.
+- [x] C2.1 [RED] Test gate raises `NO_PROVIDER_CONNECTED` only at zero connected providers; succeeds with Microsoft-only connected (evidence-discovery-gate spec scenarios).
+- [x] C2.2 [GREEN] `app/core/exceptions.py` — add `NO_PROVIDER_CONNECTED` (replaces `GOOGLE_NOT_CONNECTED`, no alias — see Reconciliation #1); `evidence_discovery_service.py` gate calls `integration_service.has_any_connected_provider`.
+- [ ] C2.3 [RED] Regression test: `local_only=True` still bypasses the gate unchanged. **N/A in this codebase lineage** — `local_only` does not exist anywhere in this worktree/branch chain (`ms365-integration/base` → A1 → A2 → B → C1 → C2); it exists only on the separate `cashing-backend` repo's `master`, added there after this SDD change's base was cut (confirmed via `git log --all -- app/services/evidence_discovery_service.py` and grepping both trees). There is nothing to regress-test. See apply-progress.md for full analysis; recommend rebasing this feature chain onto master (or backporting `local_only`) before this scenario becomes applicable.
+- [x] C2.4 [RED] Test discovery merges `evidence_raw` from both providers when both connected; one provider's failure doesn't abort the other's results (spec scenarios "both connected" / "Microsoft fails, Google succeeds").
+- [x] C2.5 [GREEN] `evidence_discovery_service.py` + `calendar_fetch.py`/`drive_fetch.py`/Gmail-gather step — provider-aware adapter instantiation per connected provider; append normalized items with `metadata.provider` set; isolate per-provider failures.
+- [x] C2.6 [RED] Test duplicate evidence across providers deduplicated by existing dedup logic (spec scenario).
+- [x] C2.7 [RED] Test `score_non_personal_ms_email` flags "other" `inferenceClassification` as noise-likely; ambiguous email passes to the LLM, not silently discarded (microsoft-noise-heuristics spec scenarios).
+- [x] C2.8 [GREEN] `app/agent/prompts/evidence_filter.py` — `score_non_personal_ms_email`.
+- [x] C2.9 [RED] Test `is_noise_ms_calendar` flags all-day-with-no-response as noise; confirmed meeting not flagged (spec scenarios).
+- [x] C2.10 [GREEN] `is_noise_ms_calendar`.
+- [x] C2.11 [RED] Test `is_noise_ms_drive` filters OneDrive folder/system items (spec scenario).
+- [x] C2.12 [GREEN] `is_noise_ms_drive`.
+- [x] C2.13 [RED] Test `_heuristic_is_noise` dispatch by `(source, provider)` — mixed batch scored by each item's own heuristic; Google items unchanged (spec scenario "Mixed Google/Microsoft batch scored correctly").
+- [x] C2.14 [GREEN] `app/agent/nodes/evidence_filter.py` — dispatch by `(source, provider)`, default `provider="google"` for legacy items.
+- [x] C2.15 Verify: `make lint` + `make test`; full regression across `evidence_discovery`, `evidence_filter`, `calendar_fetch`, `drive_fetch` suites.
 
 ---
 
