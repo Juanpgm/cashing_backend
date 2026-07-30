@@ -391,15 +391,29 @@ class MicrosoftGraphAdapter:
     # ── DrivePort ─────────────────────────────────────────────────────────────
 
     async def search_files(self, usuario_id: uuid.UUID, query: DriveQuery) -> list[DriveFile]:
-        """Search across the user's OneDrive using the same `DriveQuery` contract as Google."""
+        """Search across the user's personal OneDrive using the same `DriveQuery` contract as Google."""
+        return await self._search_drive(usuario_id, f"{_GRAPH_BASE_URL}/me/drive", query)
+
+    async def search_site_files(self, usuario_id: uuid.UUID, site_id: str, query: DriveQuery) -> list[DriveFile]:
+        """Search a SharePoint team-site document library instead of the user's personal OneDrive.
+
+        Same `DriveQuery` contract as `search_files` — only the drive root differs. `site_id`
+        is a Graph site identifier (e.g. "contoso.sharepoint.com,<site-guid>,<web-guid>"),
+        resolved by the caller via `GET /sites/{hostname}:/{site-path}` (not done here — this
+        method assumes the caller already knows which site to target). Requires the
+        `Sites.Read.All` delegated scope granted at connect time.
+        """
+        return await self._search_drive(usuario_id, f"{_GRAPH_BASE_URL}/sites/{site_id}/drive", query)
+
+    async def _search_drive(self, usuario_id: uuid.UUID, drive_base_url: str, query: DriveQuery) -> list[DriveFile]:
         search_text, filter_clause = _translate_drive_query(query)
         params: dict[str, Any] = {"$top": query.max_results}
         if filter_clause:
             params["$filter"] = filter_clause
         if search_text:
-            url = f"{_GRAPH_BASE_URL}/me/drive/root/search(q='{_escape_odata_literal(search_text)}')"
+            url = f"{drive_base_url}/root/search(q='{_escape_odata_literal(search_text)}')"
         else:
-            url = f"{_GRAPH_BASE_URL}/me/drive/root/children"
+            url = f"{drive_base_url}/root/children"
 
         items = await self._paginate(usuario_id, url, params=params, cap=query.max_results)
 
@@ -412,7 +426,7 @@ class MicrosoftGraphAdapter:
                 if mime not in query.mime_types:
                     continue
             files.append(_parse_drive_file(item))
-        logger.info("onedrive_search", user_id=str(usuario_id), keywords=query.keywords, count=len(files))
+        logger.info("onedrive_search", user_id=str(usuario_id), drive=drive_base_url, count=len(files))
         return files
 
     async def upload_file(

@@ -265,6 +265,52 @@ class TestSearchFiles:
         assert "lastModifiedDateTime ge" in kwargs["params"]["$filter"]
 
 
+class TestSearchSiteFiles:
+    @pytest.mark.asyncio
+    async def test_search_site_files_targets_sharepoint_site_drive_with_same_query_contract(self) -> None:
+        """search_site_files hits /sites/{site_id}/drive (not /me/drive) using the same DriveQuery contract."""
+        from app.adapters.microsoft.graph_adapter import MicrosoftGraphAdapter
+
+        record = _fake_integracion(
+            access_token_encrypted="enc-at",
+            refresh_token_encrypted="enc-rt",
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+        )
+        db = _mock_db_returning(record)
+        adapter = MicrosoftGraphAdapter(db=db)
+        adapter._fernet.decrypt = MagicMock(side_effect=[b"real-access-token", b"real-refresh-token"])
+
+        graph_response = _ok_response(
+            {
+                "value": [
+                    {
+                        "id": "site-file-1",
+                        "name": "Acta de supervision.pdf",
+                        "file": {"mimeType": "application/pdf"},
+                        "size": 4096,
+                        "createdDateTime": "2024-05-01T10:00:00Z",
+                        "lastModifiedDateTime": "2024-05-02T10:00:00Z",
+                        "webUrl": "https://contoso.sharepoint.com/sites/contratos/acta.pdf",
+                    }
+                ]
+            }
+        )
+        mock_client = _mock_graph_client([graph_response])
+
+        query = DriveQuery(keywords=["acta"], exclude_folders=True, max_results=5)
+
+        with patch("app.adapters.microsoft.graph_adapter.httpx.AsyncClient", return_value=mock_client):
+            results = await adapter.search_site_files(record.usuario_id, "contoso.sharepoint.com,site-guid", query)
+
+        assert len(results) == 1
+        assert results[0].id == "site-file-1"
+
+        args, _ = mock_client.request.call_args
+        requested_url = args[1]
+        assert "/sites/contoso.sharepoint.com,site-guid/drive" in requested_url
+        assert "/me/drive" not in requested_url
+
+
 class TestListEvents:
     @pytest.mark.asyncio
     async def test_search_events_maps_graph_events_to_calendar_event(self) -> None:

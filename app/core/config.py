@@ -153,10 +153,14 @@ class Settings(BaseSettings):
     # Delegated scopes locked by specs/microsoft-oauth/spec.md: Mail.Read, Calendars.Read,
     # Files.Read (+ offline_access for refresh tokens, User.Read for account email lookup).
     # Admin-consent-per-tenant is a deployment/doc concern, not code (tasks.md Reconciliation #2).
+    # Sites.Read.All added for SharePoint team-site document libraries (search_site_files) —
+    # existing connected accounts must reconnect to pick up this scope; new consents get it
+    # immediately. Not covered by microsoft-oauth/spec.md; ad-hoc addition, not a locked scope.
     MICROSOFT_OAUTH_SCOPES: list[str] = [
         "Mail.Read",
         "Calendars.Read",
         "Files.Read",
+        "Sites.Read.All",
         "offline_access",
         "User.Read",
     ]
