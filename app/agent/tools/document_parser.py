@@ -35,10 +35,36 @@ _ARCHIVE_MAX_TEXT_CHARS = 200_000  # cap the concatenated text a single archive 
 
 # Extensions we never try to read as text (binaries / executables / scripts).
 _NON_TEXT_EXTENSIONS = {
-    ".exe", ".dll", ".so", ".dylib", ".bin", ".msi", ".apk", ".jar",
-    ".bat", ".cmd", ".com", ".scr", ".ps1", ".sh", ".app",
-    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".webp", ".ico",
-    ".mp3", ".mp4", ".mov", ".avi", ".mkv", ".wav", ".flac",
+    ".exe",
+    ".dll",
+    ".so",
+    ".dylib",
+    ".bin",
+    ".msi",
+    ".apk",
+    ".jar",
+    ".bat",
+    ".cmd",
+    ".com",
+    ".scr",
+    ".ps1",
+    ".sh",
+    ".app",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".bmp",
+    ".tiff",
+    ".webp",
+    ".ico",
+    ".mp3",
+    ".mp4",
+    ".mov",
+    ".avi",
+    ".mkv",
+    ".wav",
+    ".flac",
 }
 
 _ARCHIVE_EXTENSIONS = {".zip", ".tar", ".gz", ".tgz", ".rar"}
@@ -223,16 +249,23 @@ def iter_archive_members(content: bytes, filename: str) -> Iterator[tuple[str, b
     """Yield `(member_path, member_bytes)` for each member of a zip/tar/gz archive.
 
     Reuses `_iter_zip_members`/`_iter_tar_members` — directories and members over
-    `_ARCHIVE_MAX_MEMBER_BYTES` are skipped there already. Bounded here by
-    `_ARCHIVE_MAX_MEMBERS` total members, same cap `parse_archive` uses, so a caller
-    (e.g. the agent chat's attachment expansion) can't be flooded by a zip-bomb-style
-    archive with a huge member count.
+    `_ARCHIVE_MAX_MEMBER_BYTES` are skipped there already. Bounded here by BOTH
+    `_ARCHIVE_MAX_MEMBERS` total members AND `_ARCHIVE_MAX_TOTAL_BYTES` total
+    decompressed bytes — the same two caps `parse_archive` enforces (mirrored
+    exactly, same accumulate-then-check order) — so a caller (e.g. the agent
+    chat's attachment expansion, or the plantillas-organismo archive endpoint)
+    can't be flooded by a zip-bomb-style archive with a huge member count OR a
+    small archive that expands to unbounded memory.
     """
     member_iter = _archive_member_iter(content, filename)
 
     count = 0
+    total_bytes = 0
     for name, data in member_iter:
         if count >= _ARCHIVE_MAX_MEMBERS:
+            break
+        total_bytes += len(data)
+        if total_bytes > _ARCHIVE_MAX_TOTAL_BYTES:
             break
         count += 1
         yield name, data

@@ -14,9 +14,20 @@ def strip_accents(text: str) -> str:
 
 
 def normalize(text: str | None) -> str:
+    """Accent/case-insensitive, whitespace-collapsed form for tolerant matching.
+
+    Free-text fields (e.g. `Contrato.entidad` from SECOP imports / manual
+    entry) vary by stray leading/trailing/doubled spaces across rows that
+    represent the same real-world value — collapsing whitespace here (not
+    just accents/case) keeps every caller's matching symmetric. Previously
+    this only stripped accents/lowercased; `docx_clone_service`/
+    `xlsx_clone_service` each layered `" ".join(normalize(text).split())` on
+    top locally to get this exact behavior — folded into the shared
+    primitive instead of duplicating it a third time.
+    """
     if not text:
         return ""
-    return strip_accents(text).lower()
+    return " ".join(strip_accents(text).lower().split())
 
 
 def solo_digitos(text: str | None) -> str:

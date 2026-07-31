@@ -493,3 +493,38 @@ async def test_obtener_plantilla_organismo_returns_persisted_structure(
     plantilla = await svc.obtener_plantilla_organismo(db, contrato_dagma.usuario_id, contrato_dagma.id)
     assert plantilla is not None
     assert plantilla.entidad_normalizada == "dagma"
+
+
+async def test_obtener_plantilla_organismo_tolerates_whitespace_variance_in_entidad(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch, contrato_dagma: Contrato, documento_dagma: DocumentoFuente
+) -> None:
+    """`Contrato.entidad` is free text (SECOP imports / manual entry) — the SAME
+    real organismo can appear as "DAGMA" on one contrato and "DAGMA " or
+    "DAGMA  X" (double space) on another. `entidad_normalizada` must match
+    across that whitespace variance, not just accents/case."""
+    monkeypatch.setattr(document_service, "extraer_texto_documento", AsyncMock(return_value=("texto", [])))
+    monkeypatch.setattr("app.adapters.storage.get_storage", lambda *_a, **_k: _fake_storage(b"docx-bytes"))
+    _patch_llm(monkeypatch, _DAGMA_2COL_JSON)
+
+    await svc.ingerir_plantilla_organismo(db, contrato_dagma.usuario_id, contrato_dagma.id, documento_dagma.id)
+    await db.commit()
+
+    otro_contrato = Contrato(
+        usuario_id=contrato_dagma.usuario_id,
+        numero_contrato="CTR-PLANTILLA-DAGMA-002",
+        objeto="Otro contrato con el mismo organismo, entidad con espacios distintos",
+        valor_total=12_000_000,
+        valor_mensual=1_000_000,
+        fecha_inicio=date(2024, 1, 1),
+        fecha_fin=date(2024, 12, 31),
+        entidad="DAGMA  ",  # trailing double space — same organismo as contrato_dagma's "DAGMA"
+        dependencia="Sistemas",
+        supervisor_nombre="Sup",
+    )
+    db.add(otro_contrato)
+    await db.commit()
+    await db.refresh(otro_contrato)
+
+    plantilla = await svc.obtener_plantilla_organismo(db, contrato_dagma.usuario_id, otro_contrato.id)
+    assert plantilla is not None
+    assert plantilla.entidad_normalizada == "dagma"

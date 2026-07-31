@@ -8,22 +8,30 @@ graceful degradation: `clonable=false` + avisos, never an error response.
 from __future__ import annotations
 
 import uuid
+from pathlib import Path
 
 import structlog
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, File, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser
 from app.core.database import get_db
+from app.core.exceptions import ValidationError
+from app.core.file_validation import MAX_FILE_SIZE_BYTES, validate_file_size
 from app.models.plantilla_organismo import PlantillaOrganismo
 from app.schemas.plantilla_organismo import (
+    AnalizarArchivoResponse,
     CampoResponse,
+    ConfirmarArchivoRequest,
+    ConfirmarArchivoResponse,
     PlantillaOrganismoIngestRequest,
     PlantillaOrganismoResponse,
 )
 from app.services import requisito_inference_service
 
 logger = structlog.get_logger("api.plantillas_organismo")
+
+_ARCHIVO_EXTENSIONS = {".zip", ".rar"}
 
 router = APIRouter(prefix="/contratos/{contrato_id}/plantillas-organismo", tags=["plantillas-organismo"])
 
@@ -77,3 +85,39 @@ async def ingerir_plantilla_organismo(
     if plantilla is None:
         return PlantillaOrganismoResponse(clonable=False, avisos=avisos)
     return _to_response(plantilla, avisos)
+
+
+@router.post("/archivo:analizar", response_model=AnalizarArchivoResponse)
+async def analizar_archivo_organismo(
+    contrato_id: uuid.UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    file: UploadFile = File(...),
+) -> AnalizarArchivoResponse:
+    """Expand a `.zip`/`.rar` bundle of organism templates and propose a
+    `tipo_documento` per member. Nothing is ingested until `archivo:confirmar`.
+    """
+    if not file.filename or Path(file.filename).suffix.lower() not in _ARCHIVO_EXTENSIONS:
+        raise ValidationError("Se espera un archivo .zip o .rar.")
+    content = await file.read()
+    if not validate_file_size(len(content)):
+        max_mb = MAX_FILE_SIZE_BYTES // (1024 * 1024)
+        raise ValidationError(f"El archivo excede el tamaño máximo de {max_mb}MB.")
+    propuestas, avisos = await requisito_inference_service.analizar_archivo_organismo(
+        db, user.id, contrato_id, file.filename, content
+    )
+    return AnalizarArchivoResponse(propuestas=propuestas, avisos=avisos)
+
+
+@router.post("/archivo:confirmar", response_model=ConfirmarArchivoResponse)
+async def confirmar_archivo_organismo(
+    contrato_id: uuid.UUID,
+    data: ConfirmarArchivoRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ConfirmarArchivoResponse:
+    """Bounded-concurrency ingestion of the user-confirmed archive members."""
+    resultados, avisos = await requisito_inference_service.confirmar_archivo_organismo(
+        db, user.id, contrato_id, data.miembros
+    )
+    return ConfirmarArchivoResponse(resultados=resultados, avisos=avisos)

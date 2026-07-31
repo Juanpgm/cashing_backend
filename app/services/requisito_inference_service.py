@@ -9,23 +9,35 @@ before applying.
 
 from __future__ import annotations
 
+import asyncio
 import re
+import shutil
 import uuid
 from decimal import Decimal
+from pathlib import Path
 
 import structlog
 from pydantic import ValidationError
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.core.exceptions import ForbiddenError, NotFoundError
+from app.core.exceptions import DomainError, ForbiddenError, NotFoundError
 from app.core.exceptions import ValidationError as DomainValidationError
 from app.core.text_match import keyword_score, normalize, strip_accents
 from app.models.contrato import Contrato
 from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
 from app.models.plantilla_organismo import PlantillaOrganismo
 from app.models.requisito_documento import RequisitoDocumento
-from app.schemas.plantilla_organismo import CamposPlantillaLLM, EstructuraPlantillaLLM
+from app.schemas.plantilla_organismo import (
+    CamposPlantillaLLM,
+    ClasificacionArchivoLLM,
+    EstructuraPlantillaLLM,
+    MiembroClasificadoLLM,
+    MiembroConfirmado,
+    MiembroIngestaResultado,
+    MiembroPropuesto,
+)
 from app.schemas.requisito_cuenta import (
     RequisitoCuentaItem,
     RequisitoEstructuradoItem,
@@ -777,3 +789,354 @@ async def listar_plantillas_organismo(
         .order_by(PlantillaOrganismo.tipo_documento)
     )
     return list(result.scalars().all())
+
+
+# ── Archive ingestion (formato-replicacion-inteligente, slice 1) ─────────────
+#
+# Lets a user upload a `.zip`/`.rar` bundle of entity templates in one shot
+# instead of one file per tipo_documento. `analizar_archivo_organismo` expands
+# the archive (reusing `document_parser.iter_archive_members` — no ad-hoc
+# walker), persists each eligible (docx/xlsx/pdf) member as an ordinary
+# DocumentoFuente (tipo=PLANTILLA placeholder), and proposes a tipo_documento
+# per member via one batched LLM call. Nothing is ingested as a
+# PlantillaOrganismo until `confirmar_archivo_organismo` runs, which maps
+# each confirmed member back to `ingerir_plantilla_organismo` — UNCHANGED —
+# under a bounded concurrency cap.
+
+_TIPO_ARCHIVO_A_ENUM: dict[str, TipoDocumentoFuente] = {
+    "informe_actividades": TipoDocumentoFuente.INFORME_ACTIVIDADES,
+    "informe_supervision": TipoDocumentoFuente.INFORME_SUPERVISION,
+    "cuenta_cobro": TipoDocumentoFuente.PLANTILLA,
+    "documento_soporte": TipoDocumentoFuente.PLANTILLA,
+}
+
+_ELEGIBLE_EXTENSIONS = {".docx", ".xlsx", ".pdf"}
+_CONFIANZA_MINIMA = 0.5
+# ponytail: fixed cap 3, make configurable if provider rate limits bite.
+_INGEST_CONCURRENCY = 3
+
+_CLASIFICACION_ARCHIVO_SYSTEM = """\
+Eres un experto en documentos de organismos contratantes colombianos. Recibís \
+una lista de archivos extraídos de un comprimido, cada uno con su nombre y un \
+fragmento de su texto. Para cada archivo, proponé el tipo_documento que mejor \
+describe su contenido, de este vocabulario cerrado:
+- informe_actividades: informe de actividades del contratista
+- informe_supervision: informe de supervisión del contrato
+- cuenta_cobro: carta/plantilla de cuenta de cobro
+- documento_soporte: planilla/documento soporte de pago
+
+Si no podés proponer un tipo con razonable confianza, dejá tipo_documento en \
+null. Respondé confianza entre 0 y 1. Respondé ÚNICAMENTE el JSON del esquema.
+"""
+
+
+def _snippet_miembro(filename: str, content: bytes) -> str:
+    from app.agent.tools.document_parser import parse_document
+
+    try:
+        texto = parse_document(content, filename)
+    except Exception:
+        return ""
+    return texto[:300].strip()
+
+
+async def clasificar_miembros_archivo(
+    miembros: list[tuple[str, bytes]],
+) -> tuple[dict[str, MiembroClasificadoLLM], list[str]]:
+    """Batched LLM classification of archive members into the closed
+    tipo_documento vocabulary. Never raises — degrades to an empty proposal
+    map + aviso on any LLM failure, same philosophy as the other extraction
+    functions in this module.
+
+    Members whose extension isn't docx/xlsx/pdf are excluded before the LLM
+    call — this includes executables/scripts (threat matrix: executable-file
+    classification), never classified, never proposed.
+    """
+    from app.adapters.llm import get_llm
+    from app.core.config import settings
+    from app.schemas.agent import LLMMessage
+
+    avisos: list[str] = []
+    elegibles: list[tuple[str, bytes]] = []
+    for filename, content in miembros:
+        if Path(filename).suffix.lower() in _ELEGIBLE_EXTENSIONS:
+            elegibles.append((filename, content))
+        else:
+            avisos.append(f"'{filename}' no es un formato soportado (docx/xlsx/pdf); se omitió.")
+
+    if not elegibles:
+        return {}, avisos
+
+    listado = "\n".join(f"- {filename}: {_snippet_miembro(filename, content)}" for filename, content in elegibles)
+    messages = [
+        LLMMessage(role="system", content=_CLASIFICACION_ARCHIVO_SYSTEM),
+        LLMMessage(role="user", content=f"ARCHIVOS:\n{listado}"),
+    ]
+    llm = get_llm(model=settings.LLM_EXTRACTION_MODEL or None)
+    try:
+        resp = await llm.complete(messages, temperature=0.0, max_tokens=4096, response_format=ClasificacionArchivoLLM)
+        parsed = ClasificacionArchivoLLM.model_validate_json(resp.content)
+    except Exception as exc:
+        await logger.awarning("clasificar_miembros_archivo_llm_error", error=str(exc)[:200])
+        avisos.append("No se pudo clasificar los miembros del archivo automáticamente; asigná el tipo manualmente.")
+        # RES-001: a transient LLM failure must not strand the archive — every
+        # eligible member still gets uploaded and proposed, just with no
+        # suggested tipo (the confirm UI already requires a manual pick for
+        # any null-tipo proposal, so this degrades to that same path).
+        fallback = {fn: MiembroClasificadoLLM(filename=fn, tipo_documento=None, confianza=0.0) for fn, _c in elegibles}
+        return fallback, avisos
+
+    por_filename = {m.filename: m for m in parsed.miembros}
+    resultado: dict[str, MiembroClasificadoLLM] = {}
+    for filename, _content in elegibles:
+        propuesta = por_filename.get(filename)
+        if propuesta is None or propuesta.confianza < _CONFIANZA_MINIMA:
+            resultado[filename] = MiembroClasificadoLLM(
+                filename=filename, tipo_documento=None, confianza=propuesta.confianza if propuesta else 0.0
+            )
+        else:
+            resultado[filename] = propuesta
+
+    await logger.ainfo(
+        "clasificar_miembros_archivo_ok", elegibles=len(elegibles), omitidos=len(miembros) - len(elegibles)
+    )
+    return resultado, avisos
+
+
+async def analizar_archivo_organismo(
+    db: AsyncSession,
+    usuario_id: uuid.UUID,
+    contrato_id: uuid.UUID,
+    filename: str,
+    content: bytes,
+) -> tuple[list[MiembroPropuesto], list[str]]:
+    """Expand a `.zip`/`.rar` archive, persist each eligible member as a
+    DocumentoFuente (tipo=PLANTILLA placeholder), and return an AI-proposed
+    tipo_documento per member. Never ingests a PlantillaOrganismo — only
+    `confirmar_archivo_organismo` does that."""
+    from app.agent.tools import document_parser
+    from app.services import document_service
+
+    await _get_contrato_con_ownership(db, usuario_id, contrato_id)
+
+    if Path(filename).suffix.lower() == ".rar" and not (shutil.which("unrar") or shutil.which("bsdtar")):
+        return [], ["El soporte para archivos .rar no está disponible en este servidor; usá .zip."]
+
+    miembros = list(document_parser.iter_archive_members(content, filename))
+    if not miembros:
+        return [], ["El archivo comprimido está vacío; no se ingirió ningún documento."]
+
+    avisos: list[str] = []
+    if len(miembros) >= document_parser._ARCHIVE_MAX_MEMBERS:
+        avisos.append(
+            f"El archivo excede el límite de {document_parser._ARCHIVE_MAX_MEMBERS} miembros; "
+            "se procesaron solo los primeros."
+        )
+
+    propuestas_llm, avisos_clasificacion = await clasificar_miembros_archivo(miembros)
+    avisos.extend(avisos_clasificacion)
+
+    propuestas: list[MiembroPropuesto] = []
+    for member_filename, member_bytes in miembros:
+        clasif = propuestas_llm.get(member_filename)
+        if clasif is None:
+            continue  # not eligible (extension) — already avisado above
+        doc_result = await document_service.upload_document(
+            db=db,
+            user_id=usuario_id,
+            filename=Path(member_filename).name,
+            content=member_bytes,
+            content_type="application/octet-stream",
+            tipo=TipoDocumentoFuente.PLANTILLA,
+            contrato_id=contrato_id,
+        )
+        propuestas.append(
+            MiembroPropuesto(
+                documento_fuente_id=doc_result.id,
+                filename=member_filename,
+                tipo_propuesto=clasif.tipo_documento,
+                confianza=clasif.confianza,
+            )
+        )
+
+    return propuestas, avisos
+
+
+async def confirmar_archivo_organismo(
+    db: AsyncSession,
+    usuario_id: uuid.UUID,
+    contrato_id: uuid.UUID,
+    miembros: list[MiembroConfirmado],
+) -> tuple[list[MiembroIngestaResultado], list[str]]:
+    """Bounded-concurrency ingestion of user-confirmed archive members through
+    the existing single-member `ingerir_plantilla_organismo`. Rejects the
+    whole batch if two members share a `tipo_documento` (avoids a
+    nondeterministic UPSERT race on PlantillaOrganismo's unique constraint).
+
+    Each concurrent ingestion runs on its OWN AsyncSession (same engine as
+    `db`, via `async_sessionmaker`) — AsyncSession is not safe for concurrent
+    use by multiple coroutines, so the shared `db` is only used for the
+    up-front checks.
+    """
+    await _get_contrato_con_ownership(db, usuario_id, contrato_id)
+
+    tipos_vistos: dict[str, list[str]] = {}
+    for m in miembros:
+        tipos_vistos.setdefault(m.tipo_documento, []).append(str(m.documento_fuente_id))
+    duplicados = {tipo: ids for tipo, ids in tipos_vistos.items() if len(ids) > 1}
+    if duplicados:
+        detalle = "; ".join(f"{tipo}: {', '.join(ids)}" for tipo, ids in duplicados.items())
+        raise DomainValidationError(
+            f"Dos o más miembros tienen el mismo tipo_documento en este lote: {detalle}. Reasigná antes de confirmar."
+        )
+
+    session_factory = async_sessionmaker(bind=db.bind, class_=AsyncSession, expire_on_commit=False)
+    resultados = await _ingerir_miembros_bounded(session_factory, usuario_id, contrato_id, miembros)
+    avisos_globales = [a for r in resultados for a in r.avisos]
+    return resultados, avisos_globales
+
+
+async def _ingerir_miembros_bounded(
+    session_factory: async_sessionmaker[AsyncSession],
+    usuario_id: uuid.UUID,
+    contrato_id: uuid.UUID,
+    miembros: list[MiembroConfirmado],
+) -> list[MiembroIngestaResultado]:
+    """The bounded-concurrency gather itself, extracted so the concurrency
+    cap can be tested in isolation from the batch-level duplicate-tipo guard
+    (only 4 tipo_documento values exist, so a realistic 10-member confirm
+    batch always includes a caller-side duplicate check upstream of here)."""
+    semaforo = asyncio.Semaphore(_INGEST_CONCURRENCY)
+
+    async def _intentar_ingerir(m: MiembroConfirmado, member_db: AsyncSession) -> MiembroIngestaResultado:
+        """One ingest attempt for `m` on `member_db`. Raises `IntegrityError` on
+        a concurrent-insert collision on the intermediate derived key
+        `ingerir_plantilla_organismo` upserts on — the caller retries."""
+        doc = await member_db.get(DocumentoFuente, m.documento_fuente_id)
+        filename = doc.nombre if doc is not None else str(m.documento_fuente_id)
+        if doc is None or doc.usuario_id != usuario_id:
+            return MiembroIngestaResultado(
+                documento_fuente_id=m.documento_fuente_id,
+                filename=filename,
+                persistida=False,
+                avisos=["El documento no existe o no pertenece al usuario."],
+            )
+        doc.tipo = _TIPO_ARCHIVO_A_ENUM[m.tipo_documento]
+        await member_db.flush()
+        plantilla, avisos = await ingerir_plantilla_organismo(member_db, usuario_id, contrato_id, m.documento_fuente_id)
+        # `ingerir_plantilla_organismo` (unchanged) derives cuenta_cobro vs
+        # documento_soporte from the file extension for tipo=PLANTILLA docs —
+        # the user's CONFIRMED tipo_documento must win over that derivation,
+        # so it's applied here, in the same transaction.
+        if plantilla is not None and plantilla.tipo_documento != m.tipo_documento:
+            # Newest wins: the confirmed tipo_documento may already be occupied
+            # by another PlantillaOrganismo for this organismo (unique on
+            # usuario_id+entidad_normalizada+tipo_documento). The just-ingested
+            # plantilla supersedes it — delete the old row rather than raising
+            # an IntegrityError.
+            conflicto = await member_db.execute(
+                select(PlantillaOrganismo).where(
+                    PlantillaOrganismo.usuario_id == usuario_id,
+                    PlantillaOrganismo.entidad_normalizada == plantilla.entidad_normalizada,
+                    PlantillaOrganismo.tipo_documento == m.tipo_documento,
+                    PlantillaOrganismo.id != plantilla.id,
+                )
+            )
+            existente = conflicto.scalar_one_or_none()
+            if existente is not None:
+                await member_db.delete(existente)
+                await member_db.flush()
+            plantilla.tipo_documento = m.tipo_documento
+            await member_db.flush()
+        await member_db.commit()
+        return MiembroIngestaResultado(
+            documento_fuente_id=m.documento_fuente_id,
+            filename=filename,
+            persistida=plantilla is not None,
+            avisos=avisos,
+        )
+
+    async def _ingerir_uno(m: MiembroConfirmado) -> MiembroIngestaResultado:
+        async with semaforo, session_factory() as member_db:
+            filename = str(m.documento_fuente_id)
+            for intento in range(2):
+                try:
+                    return await _intentar_ingerir(m, member_db)
+                except DomainError as exc:
+                    await member_db.rollback()
+                    await logger.awarning(
+                        "archivo_confirmar_miembro_fallo",
+                        documento_fuente_id=str(m.documento_fuente_id),
+                        error=exc.detail,
+                    )
+                    return MiembroIngestaResultado(
+                        documento_fuente_id=m.documento_fuente_id,
+                        filename=filename,
+                        persistida=False,
+                        avisos=[exc.detail],
+                    )
+                except IntegrityError:
+                    # REL-001: two members whose ingest derives the same
+                    # intermediate (usuario, entidad, tipo) key can both reach
+                    # the SELECT-then-INSERT in `ingerir_plantilla_organismo`
+                    # before either commits, under Semaphore(3) concurrency —
+                    # the loser's flush/commit raises IntegrityError. Rollback
+                    # and retry ONCE: by then the winner's row is committed, so
+                    # the retry's SELECT finds it and takes the UPDATE branch.
+                    await member_db.rollback()
+                    if intento == 0:
+                        await logger.awarning(
+                            "archivo_confirmar_miembro_colision_concurrente",
+                            documento_fuente_id=str(m.documento_fuente_id),
+                        )
+                        continue
+                    await logger.awarning(
+                        "archivo_confirmar_miembro_colision_persistente",
+                        documento_fuente_id=str(m.documento_fuente_id),
+                    )
+                    return MiembroIngestaResultado(
+                        documento_fuente_id=m.documento_fuente_id,
+                        filename=filename,
+                        persistida=False,
+                        avisos=["No se pudo ingerir: conflicto de concurrencia con otro miembro del lote."],
+                    )
+                except Exception as exc:
+                    # RES-002: any other failure (storage errors, etc.) must
+                    # degrade to a per-member result, not abort the batch.
+                    await member_db.rollback()
+                    await logger.awarning(
+                        "archivo_confirmar_miembro_error_inesperado",
+                        documento_fuente_id=str(m.documento_fuente_id),
+                        error=str(exc)[:200],
+                    )
+                    return MiembroIngestaResultado(
+                        documento_fuente_id=m.documento_fuente_id,
+                        filename=filename,
+                        persistida=False,
+                        avisos=["No se pudo ingerir la plantilla debido a un error inesperado."],
+                    )
+            raise AssertionError("unreachable")  # pragma: no cover — loop always returns or raises above
+
+    resultados_o_excepciones = await asyncio.gather(*(_ingerir_uno(m) for m in miembros), return_exceptions=True)
+    resultados: list[MiembroIngestaResultado] = []
+    for m, r in zip(miembros, resultados_o_excepciones, strict=True):
+        if isinstance(r, BaseException):
+            # Defensive: should be unreachable (every path inside _ingerir_uno
+            # already returns a MiembroIngestaResultado), but a stray exception
+            # here must still degrade to a per-member failure, never abort gather.
+            await logger.awarning(
+                "archivo_confirmar_miembro_excepcion_no_capturada",
+                documento_fuente_id=str(m.documento_fuente_id),
+                error=str(r)[:200],
+            )
+            resultados.append(
+                MiembroIngestaResultado(
+                    documento_fuente_id=m.documento_fuente_id,
+                    filename=str(m.documento_fuente_id),
+                    persistida=False,
+                    avisos=["No se pudo ingerir la plantilla debido a un error inesperado."],
+                )
+            )
+        else:
+            resultados.append(r)
+    return resultados

@@ -117,3 +117,17 @@ class TestIterArchiveMembers:
         files = {f"f{i}.txt": f"contenido {i}".encode() for i in range(80)}
         members = list(iter_archive_members(_make_zip(files), "muchos.zip"))
         assert len(members) == 50  # _ARCHIVE_MAX_MEMBERS cap
+
+    def test_respects_total_decompressed_bytes_cap(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """RISK-001: `iter_archive_members` must stop yielding once the total
+        decompressed bytes exceed the same cap `parse_archive` already
+        enforces — otherwise a small, highly-compressible zip can expand to
+        unbounded memory (zip-bomb DoS) since only the member-COUNT was capped."""
+        import app.agent.tools.document_parser as dp
+
+        monkeypatch.setattr(dp, "_ARCHIVE_MAX_TOTAL_BYTES", 100)
+        files = {f"f{i}.txt": b"x" * 60 for i in range(5)}  # 300 bytes total, cap is 100
+        members = list(iter_archive_members(_make_zip(files), "muchos.zip"))
+        total = sum(len(data) for _, data in members)
+        assert total <= 100
+        assert len(members) < 5

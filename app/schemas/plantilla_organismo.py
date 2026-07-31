@@ -114,3 +114,55 @@ class FormatoValoresResponse(BaseModel):
 
     valores: dict[str, str]
     avisos: list[str] = Field(default_factory=list)
+
+
+# ── Archive ingestion (formato-replicacion-inteligente, slice 1) ─────────────
+
+TipoDocumentoArchivo = Literal["informe_actividades", "informe_supervision", "cuenta_cobro", "documento_soporte"]
+
+
+class MiembroClasificadoLLM(BaseModel):
+    """One archive member's AI-proposed `tipo_documento`, from the batched
+    classification LLM call. `tipo_documento=None` means low confidence /
+    unrecognized — the member is surfaced for manual pick, never dropped."""
+
+    filename: str
+    tipo_documento: TipoDocumentoArchivo | None = None
+    confianza: float = 0.0
+
+
+class ClasificacionArchivoLLM(BaseModel):
+    miembros: list[MiembroClasificadoLLM] = Field(default_factory=list)
+
+
+class MiembroPropuesto(BaseModel):
+    documento_fuente_id: uuid.UUID
+    filename: str
+    tipo_propuesto: TipoDocumentoArchivo | None = None
+    confianza: float = 0.0
+
+
+class AnalizarArchivoResponse(BaseModel):
+    propuestas: list[MiembroPropuesto] = Field(default_factory=list)
+    avisos: list[str] = Field(default_factory=list)
+
+
+class MiembroConfirmado(BaseModel):
+    documento_fuente_id: uuid.UUID
+    tipo_documento: TipoDocumentoArchivo
+
+
+class ConfirmarArchivoRequest(BaseModel):
+    miembros: list[MiembroConfirmado]
+
+
+class MiembroIngestaResultado(BaseModel):
+    documento_fuente_id: uuid.UUID
+    filename: str
+    persistida: bool
+    avisos: list[str] = Field(default_factory=list)
+
+
+class ConfirmarArchivoResponse(BaseModel):
+    resultados: list[MiembroIngestaResultado] = Field(default_factory=list)
+    avisos: list[str] = Field(default_factory=list)
