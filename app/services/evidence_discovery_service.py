@@ -165,7 +165,10 @@ async def _evidencias_subidas(db: AsyncSession, cuenta_id: uuid.UUID | None) -> 
 
     # ponytail: backfill at most 20 legacy rows per call (sequential downloads inside
     # a read flow); the remainder is picked up by subsequent discovery calls.
-    pendientes = [e for e in rows if not (e.texto_extraido or "").strip()][:20]
+    # ponytail: failed/empty extractions persist "" and are not retried — only
+    # never-attempted rows (texto_extraido IS NULL) are selected, so each row is
+    # attempted at most once; add a retry/error marker column if retries matter.
+    pendientes = [e for e in rows if e.texto_extraido is None][:20]
     if pendientes:
         from app.adapters.storage import get_storage
         from app.services.evidencia_service import _extraer_texto_seguro

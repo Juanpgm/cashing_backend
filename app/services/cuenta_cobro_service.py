@@ -1527,11 +1527,13 @@ async def actualizar_cuenta_cobro(
     cuenta_id: uuid.UUID,
     data: CuentaCobroUpdate,
 ) -> CuentaCobroResponse:
-    """Partially update a CuentaCobro (mes/anio/valor). Only allowed in BORRADOR."""
+    """Partially update a CuentaCobro (mes/anio/valor). Only allowed in BORRADOR or RECHAZADA."""
     cuenta = await _get_cuenta_con_ownership(db, usuario_id, cuenta_id)
 
-    if cuenta.estado != EstadoCuentaCobro.BORRADOR:
-        raise ValidationError(f"Solo se pueden editar cuentas en estado 'borrador'. Estado actual: '{cuenta.estado}'.")
+    if cuenta.estado not in (EstadoCuentaCobro.BORRADOR, EstadoCuentaCobro.RECHAZADA):
+        raise ValidationError(
+            f"Solo se pueden editar cuentas en estado 'borrador' o 'rechazada'. Estado actual: '{cuenta.estado}'."
+        )
 
     nuevo_mes = data.mes if data.mes is not None else cuenta.mes
     nuevo_anio = data.anio if data.anio is not None else cuenta.anio
