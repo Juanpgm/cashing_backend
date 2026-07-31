@@ -4,11 +4,14 @@
 and evidence links, it never writes to the database. This module is the write
 path: given the `ObligacionJustificada` list the discovery agent produced, it
 upserts one `Actividad` per obligación (linked by `obligacion_id`) and creates
-one link-type `Evidencia` per `EvidenceLink`, so `cobertura_service` picks them
-up and the obligación stops being SIN_EVIDENCIA.
+one link-type `Evidencia` per `EvidenceLink`, plus a CONFIRMED `EvidenciaObligacion`
+row for the same (evidencia, obligación) pair — that link table is the
+classification source of truth `cobertura_service` reads from, so the
+obligación stops being SIN_EVIDENCIA.
 
-Idempotent: re-persisting the same discovery result does not duplicate rows,
-and never clobbers a justificación the user already wrote by hand.
+Idempotent on rows: re-persisting the same discovery result does not duplicate
+Actividad/Evidencia rows. Text is REPLACED on regeneration: a new discovery run
+overwrites the existing descripcion/justificacion of the matched Actividad.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ from app.models.actividad import Actividad
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro
 from app.models.evidencia import Evidencia
+from app.models.evidencia_obligacion import ConfianzaEnlace, EstadoEnlace, EvidenciaObligacion, FuenteEnlace
 from app.models.obligacion import Obligacion
 from app.schemas.google_workspace import EvidencePersistSummary, ObligacionJustificada
 
@@ -83,9 +87,7 @@ async def _obligacion_ids_del_contrato(db: AsyncSession, contrato_id: uuid.UUID)
     return {ob_id for (ob_id,) in result.all()}
 
 
-async def _find_actividad(
-    db: AsyncSession, cuenta_id: uuid.UUID, obligacion_id: uuid.UUID
-) -> Actividad | None:
+async def _find_actividad(db: AsyncSession, cuenta_id: uuid.UUID, obligacion_id: uuid.UUID) -> Actividad | None:
     """Find the Actividad to attach evidence to for this cuenta + obligación.
 
     An obligación can legitimately have MORE THAN ONE Actividad on the same cuenta
@@ -135,8 +137,9 @@ async def persistir_evidencias(
     """Persist discovered justificaciones/evidencias for a CuentaCobro.
 
     For each obligación entry: upsert one Actividad (by cuenta_id + obligacion_id).
-    An existing Actividad's justificación is only filled in if it was empty —
-    user-written text is never overwritten. Each EvidenceLink becomes a
+    An existing Actividad's descripcion/justificacion are REPLACED when the new
+    discovery produced text (regeneration = the user wants a fresh draft); an
+    empty generation never blanks existing text. Each EvidenceLink becomes a
     link-type Evidencia (storage_key=None, url set); re-persisting the same
     link on the same actividad is a no-op (deduped by url).
 
@@ -179,7 +182,11 @@ async def persistir_evidencias(
             db.add(actividad)
             await db.flush()
             actividades_creadas += 1
-        elif ob.justificacion.strip() and not (actividad.justificacion or "").strip():
+        elif ob.justificacion.strip() or ob.actividad.strip():
+            # Regenerar REEMPLAZA el texto existente (pedido de producto): quien
+            # vuelve a dar "Generar" quiere descartar la redacción anterior.
+            # Solo se pisa cuando la nueva generación trae texto real.
+            actividad.descripcion = ob.actividad.strip() or _descripcion_fallback(ob)
             actividad.justificacion = ob.justificacion
             actividades_actualizadas += 1
 
@@ -190,6 +197,7 @@ async def persistir_evidencias(
                 evidencias_omitidas += 1
                 continue
             evidencia = Evidencia(
+                id=uuid.uuid4(),
                 actividad_id=actividad.id,
                 fuente=link.source,
                 url=link.link,
@@ -201,6 +209,23 @@ async def persistir_evidencias(
             db.add(evidencia)
             existing_urls.add(link.link)
             evidencias_creadas += 1
+
+            # evidencia_obligacion is the classification source of truth
+            # (cobertura_service counts CONFIRMED links only) - the discovery
+            # matcher already decided this evidencia belongs to `obligacion_uuid`,
+            # so persisting it here IS a confirmed classification. Without this,
+            # obligaciones covered only via Google-discovery stay SIN_EVIDENCIA.
+            if obligacion_uuid is not None:
+                db.add(
+                    EvidenciaObligacion(
+                        evidencia_id=evidencia.id,
+                        obligacion_id=obligacion_uuid,
+                        confianza=ConfianzaEnlace.ALTA.value,
+                        status=EstadoEnlace.CONFIRMED.value,
+                        source=FuenteEnlace.AI.value,
+                        reasoning="Evidencia descubierta y vinculada automáticamente por el agente de descubrimiento.",
+                    )
+                )
 
     await db.commit()
 

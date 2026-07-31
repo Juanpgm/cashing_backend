@@ -439,6 +439,68 @@ async def test_periodo_explicito_acota_el_periodo_señalado_al_agente(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# justification-context: Contract-tested regression safety — generar_actividades_
+# agente end-to-end with confirmed evidencia<->obligación links present.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def test_generar_actividades_agente_usa_contexto_por_obligacion_end_to_end(
+    db: AsyncSession,
+    test_user: dict[str, Any],
+    contrato_con_obligaciones: tuple[Contrato, list[Obligacion]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: generar_actividades_agente must keep working end-to-end when
+    the cuenta has confirmed evidencia<->obligación links — the per-obligación
+    context replaces the flat query but the function's contract (creates
+    actividades from the LLM's structured response) is unchanged."""
+    from app.models.evidencia import Evidencia
+    from app.models.evidencia_obligacion import EstadoEnlace, EvidenciaObligacion, FuenteEnlace
+
+    contrato, obs = contrato_con_obligaciones
+    cuenta = await _make_cuenta(db, contrato)
+    user = test_user["user"]
+
+    act = Actividad(cuenta_cobro_id=cuenta.id, descripcion="stub")
+    db.add(act)
+    await db.flush()
+    ev = Evidencia(
+        actividad_id=act.id,
+        storage_key="evidencias/x/informe.txt",
+        nombre_archivo="informe.txt",
+        tipo_archivo="text/plain",
+        tamano_bytes=10,
+        texto_extraido="Informe mensual entregado con el detalle de actividades del período.",
+    )
+    db.add(ev)
+    await db.flush()
+    db.add(
+        EvidenciaObligacion(
+            evidencia_id=ev.id,
+            obligacion_id=obs[0].id,
+            confianza="alta",
+            status=EstadoEnlace.CONFIRMED.value,
+            source=FuenteEnlace.AI.value,
+        )
+    )
+    await db.commit()
+
+    llm_response = (
+        "ACTIVIDAD|Elaboré informe mensual completo y detallado|Cumplimiento ob. 1|1\n"
+        "ACTIVIDAD|Participé activamente en reuniones de coordinación|Cumplimiento ob. 2|2\n"
+        "ACTIVIDAD|Desarrollé y entregué los entregables solicitados|Cumplimiento ob. 3|3\n"
+    )
+    fake = _patch_llm(monkeypatch, llm_response)
+
+    resp = await cuenta_cobro_service.generar_actividades_agente(db, user.id, cuenta.id)
+
+    assert resp.creadas == 3
+    prompt = fake.captured_messages[-1].content
+    assert "informe.txt" in prompt
+    assert "Informe mensual entregado" in prompt
+
+
 def test_evidence_discovery_request_sigue_sin_requerir_fecha_inicio_fecha_fin() -> None:
     """Regression guard for the 'Backward compatibility' scenario: adding
     month-scoping to generar_actividades_agente must NOT touch

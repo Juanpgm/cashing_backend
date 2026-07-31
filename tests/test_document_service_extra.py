@@ -89,9 +89,7 @@ class TestProcessDocument:
         mock_db = AsyncMock()
         mock_db.execute.return_value = result_mock
 
-        with patch(
-            "app.services.document_service._get_storage"
-        ) as mock_s3_cls:
+        with patch("app.services.document_service._get_storage") as mock_s3_cls:
             mock_s3 = AsyncMock()
             mock_s3.download.return_value = b"%PDF-content"
             mock_s3_cls.return_value = mock_s3
@@ -268,3 +266,71 @@ class TestVerificarConfiguracionContrato:
         assert result.tiene_instrucciones is True
         assert result.tiene_obligaciones is True
         assert result.faltantes == []
+
+
+# ---------------------------------------------------------------------------
+# extraer_texto_documento(relaxed_ocr=...)
+#
+# Real scanned evidence PDFs run through RapidOCR often recover readable text
+# that is concatenated ("Consultalasactividadesprogramadas") — the strict
+# `is_text_sufficient` spacing heuristic rejects it (by design, for the
+# contrato/vision escalation path), which otherwise discards perfectly
+# classifiable evidence text. `relaxed_ocr=True` accepts it anyway above a
+# much lower char floor (`settings.EVIDENCE_MIN_TEXT_CHARS`).
+# ---------------------------------------------------------------------------
+
+# One long concatenated "word" repeated — over EXTRACTION_MIN_TEXT_CHARS (200)
+# but every token exceeds 20 chars, so is_text_sufficient's spacing heuristic
+# rejects it regardless of the char-count gate.
+_CONCATENATED_OCR_TEXT = "Consultalasactividadesprogramadasenelmesdemarzoparaelseguimientodelcontrato " * 4
+
+
+class TestExtraerTextoDocumentoRelaxedOcr:
+    @pytest.mark.asyncio
+    async def test_relaxed_true_accepts_concatenated_ocr_text_above_floor(self) -> None:
+        from app.services.document_service import extraer_texto_documento
+
+        with (
+            patch("app.services.document_service.parse_document", return_value=None),
+            patch("app.services.document_service.ocr_available", return_value=True),
+            patch(
+                "app.services.document_service.ocr_extract_text",
+                return_value=_CONCATENATED_OCR_TEXT,
+            ),
+        ):
+            texto, avisos = await extraer_texto_documento(b"%PDF-fake", "escaneo.pdf", relaxed_ocr=True)
+
+        assert texto == _CONCATENATED_OCR_TEXT.strip()
+        assert any("espaciado imperfecto" in a for a in avisos)
+
+    @pytest.mark.asyncio
+    async def test_relaxed_true_still_rejects_text_below_floor(self) -> None:
+        from app.services.document_service import extraer_texto_documento
+
+        with (
+            patch("app.services.document_service.parse_document", return_value=None),
+            patch("app.services.document_service.ocr_available", return_value=True),
+            patch("app.services.document_service.ocr_extract_text", return_value="Pago"),
+        ):
+            texto, avisos = await extraer_texto_documento(b"%PDF-fake", "escaneo.pdf", relaxed_ocr=True)
+
+        assert texto is None
+        assert any("No se pudo extraer texto legible" in a for a in avisos)
+
+    @pytest.mark.asyncio
+    async def test_relaxed_false_default_keeps_current_behavior(self) -> None:
+        from app.services.document_service import extraer_texto_documento
+
+        with (
+            patch("app.services.document_service.parse_document", return_value=None),
+            patch("app.services.document_service.ocr_available", return_value=True),
+            patch(
+                "app.services.document_service.ocr_extract_text",
+                return_value=_CONCATENATED_OCR_TEXT,
+            ),
+        ):
+            texto, avisos = await extraer_texto_documento(b"%PDF-fake", "escaneo.pdf")
+
+        assert texto is None
+        assert any("No se pudo extraer texto legible" in a for a in avisos)
+        assert not any("espaciado imperfecto" in a for a in avisos)

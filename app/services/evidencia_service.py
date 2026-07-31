@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import uuid
+from typing import Any
 
 import structlog
+from fastapi import BackgroundTasks
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.llm import get_llm
 from app.adapters.storage.port import StoragePort
-from app.agent.nodes.evidence_matcher import clasificar_evidencia
+from app.agent.nodes.evidence_matcher import clasificar_evidencia, confidence_bucket, evidence_matcher_node
+from app.agent.state import AgentState
 from app.core.exceptions import NotFoundError, ValidationError
 from app.core.file_validation import (
     sanitize_filename,
@@ -20,7 +23,10 @@ from app.core.file_validation import (
     validate_mime_type,
 )
 from app.models.actividad import Actividad
+from app.models.clasificacion_job import ClasificacionEvidenciasJob
 from app.models.evidencia import Evidencia
+from app.models.evidencia_obligacion import EstadoEnlace, EvidenciaObligacion, FuenteEnlace
+from app.models.obligacion import Obligacion
 from app.schemas.evidencia import (
     EvidenciaClasificadaResponse,
     EvidenciaPresignedResponse,
@@ -36,22 +42,32 @@ _TEXTO_EXTRAIDO_MAX_CHARS = 20_000
 _PLACEHOLDER_DESCRIPCION = "Pendiente de redactar — evidencia adjunta: {nombre_archivo}"
 
 
-async def _extraer_texto_seguro(filename: str, data: bytes) -> str | None:
+async def _extraer_texto_seguro(filename: str, data: bytes) -> str:
     """Best-effort text extraction for an uploaded evidence file.
 
     Reuses the document_service ladder (native text → OCR) so the justification
     LLM can ground on the file's content. Extraction failure NEVER breaks the
-    upload — it just leaves texto_extraido as NULL.
+    upload — it stores ``""`` so the row is marked as attempted (NULL means
+    never-attempted, which is what the discovery backfill keys on).
+
+    ponytail: failed extractions are not retried (stored as ""); add a
+    retry/error marker column if retries ever matter.
+
+    Passes ``relaxed_ocr=True``: scanned evidence (a photographed government
+    form, a screenshot) commonly recovers concatenated OCR text that fails
+    ``document_service``'s strict spacing heuristic — that heuristic exists to
+    escalate the CONTRATO parsing flow to the vision model, not to discard
+    otherwise-classifiable evidence text.
     """
     from app.services.document_service import extraer_texto_documento
 
     try:
-        texto, _avisos = await extraer_texto_documento(data, filename)
+        texto, _avisos = await extraer_texto_documento(data, filename, relaxed_ocr=True)
     except Exception as exc:
         logger.warning("evidencia_extraccion_failed", filename=filename, error=str(exc))
-        return None
+        return ""
     if not texto or not texto.strip():
-        return None
+        return ""
     return texto.strip()[:_TEXTO_EXTRAIDO_MAX_CHARS]
 
 
@@ -75,6 +91,27 @@ async def _get_actividad_owned(db: AsyncSession, actividad_id: uuid.UUID, usuari
     return a
 
 
+def _enlazar_si_actividad_tiene_obligacion(db: AsyncSession, evidencia: Evidencia, actividad: Actividad) -> None:
+    """A user manually attaching a file to an actividad that already targets a
+    specific obligación IS a user classification, not an AI suggestion — write
+    a CONFIRMED/user `EvidenciaObligacion` link so `cobertura_service` (which
+    counts CONFIRMED links exclusively) sees this evidence. `confianza` is an
+    AI-confidence field and stays NULL for user-sourced links. No-op when the
+    actividad has no `obligacion_id` (e.g. the default free-form actividad).
+    """
+    if actividad.obligacion_id is None:
+        return
+    db.add(
+        EvidenciaObligacion(
+            evidencia_id=evidencia.id,
+            obligacion_id=actividad.obligacion_id,
+            confianza=None,
+            status=EstadoEnlace.CONFIRMED.value,
+            source=FuenteEnlace.USER.value,
+        )
+    )
+
+
 async def subir_evidencia(
     db: AsyncSession,
     storage: StoragePort,
@@ -92,12 +129,13 @@ async def subir_evidencia(
     if not validate_mime_type(data, content_type):
         raise ValidationError("Tipo MIME no coincide con la extensión del archivo.")
 
-    await _get_actividad_owned(db, actividad_id, usuario_id)
+    actividad = await _get_actividad_owned(db, actividad_id, usuario_id)
 
     key = f"evidencias/{usuario_id}/{actividad_id}/{uuid.uuid4()}_{filename}"
     await storage.upload(key=key, data=data, content_type=content_type)
 
     evidencia = Evidencia(
+        id=uuid.uuid4(),
         actividad_id=actividad_id,
         storage_key=key,
         nombre_archivo=filename,
@@ -106,6 +144,7 @@ async def subir_evidencia(
         texto_extraido=await _extraer_texto_seguro(filename, data),
     )
     db.add(evidencia)
+    _enlazar_si_actividad_tiene_obligacion(db, evidencia, actividad)
     await db.commit()
     await db.refresh(evidencia)
 
@@ -158,7 +197,7 @@ async def subir_evidencias(
     for filename, content_type, data in archivos:
         validate_evidence_file(filename=filename, size=len(data), content_type=content_type, content=data)
 
-    await _get_actividad_owned(db, actividad_id, usuario_id)
+    actividad = await _get_actividad_owned(db, actividad_id, usuario_id)
 
     resultados: list[EvidenciaUploadResponse] = []
     for filename, content_type, data in archivos:
@@ -169,6 +208,7 @@ async def subir_evidencias(
         await storage.upload(key=key, data=data, content_type=content_type)
 
         evidencia = Evidencia(
+            id=uuid.uuid4(),
             actividad_id=actividad_id,
             storage_key=key,
             nombre_archivo=filename,
@@ -177,6 +217,7 @@ async def subir_evidencias(
             texto_extraido=await _extraer_texto_seguro(filename, data),
         )
         db.add(evidencia)
+        _enlazar_si_actividad_tiene_obligacion(db, evidencia, actividad)
         await db.commit()
         await db.refresh(evidencia)
 
@@ -242,12 +283,89 @@ async def _find_or_create_actividad_stub(
     return actividad
 
 
+async def _avanzar_progreso(db: AsyncSession, job: ClasificacionEvidenciasJob | None) -> None:
+    """Increment the background job's per-file progress counter as each
+    evidencia finishes — the staleness/progress signal that distinguishes a
+    slow-but-alive run from a stuck one (RES-002: `EVIDENCE_JOB_STALE_SECONDS`
+    reads `job.updated_at`, which this commit refreshes). No-op when called
+    outside a background job (`job=None`, e.g. the synchronous test/direct-
+    caller path)."""
+    if job is None:
+        return
+    job.procesadas += 1
+    await db.commit()
+
+
+async def _clasificar_y_enlazar_lote(
+    db: AsyncSession,
+    obligaciones: list[Obligacion],
+    evidencias: list[Evidencia],
+    job: ClasificacionEvidenciasJob | None = None,
+) -> None:
+    """Batch-match freshly uploaded evidencias against the contrato's obligaciones
+    (embeddings + keyword blend, at most ONE LLM call per obligación via
+    `evidence_matcher_node`) and persist `EvidenciaObligacion` links.
+
+    Every evidencia resolves to either >=1 confidence-bucketed link or an
+    explicit "no obligación applies" link with reasoning — never silently
+    unclassified (evidence-classification-pipeline: Every evidence resolves to
+    a suggestion or explicit non-match). Independent of, and additive to, the
+    single-best-guess `clasificar_evidencia` call already used above to pick
+    each file's stub Actividad — this is the new multi-obligación source of
+    truth (the `evidencia_obligacion` link table).
+
+    `job` (optional): when provided (the background-job path), `job.procesadas`
+    is incremented after each evidencia finishes — see `_avanzar_progreso`.
+    """
+    con_texto = [ev for ev in evidencias if (ev.texto_extraido or "").strip()]
+    sin_texto = [ev for ev in evidencias if not (ev.texto_extraido or "").strip()]
+    for ev in sin_texto:
+        await marcar_evidencia_sin_obligacion(db, ev.id, "Sin texto extraído para clasificar.")
+        await _avanzar_progreso(db, job)
+
+    if not obligaciones or not con_texto:
+        for ev in con_texto:
+            await marcar_evidencia_sin_obligacion(db, ev.id, "El contrato no tiene obligaciones registradas.")
+            await _avanzar_progreso(db, job)
+        return
+
+    evidence_raw: list[dict[str, Any]] = [
+        {"id": str(ev.id), "content": (ev.texto_extraido or "")[:2000]} for ev in con_texto
+    ]
+    obligaciones_extraidas: list[dict[str, str | int]] = [
+        {"id": str(ob.id), "descripcion": ob.descripcion} for ob in obligaciones
+    ]
+    state: AgentState = {"obligaciones_extraidas": obligaciones_extraidas, "evidence_raw": evidence_raw}
+    result = await evidence_matcher_node(state)
+    matched: dict[str, list[dict[str, Any]]] = result.get("matched_evidence") or {}
+    scores: dict[str, dict[str, float]] = result.get("matched_evidence_scores") or {}
+
+    sugerencias_por_evidencia: dict[str, list[dict[str, Any]]] = {ev["id"]: [] for ev in evidence_raw}
+    for ob_id, evs in matched.items():
+        for ev_dict in evs:
+            ev_id = ev_dict["id"]
+            score = scores.get(ob_id, {}).get(ev_id, 0.0)
+            sugerencias_por_evidencia[ev_id].append(
+                {"obligacion_id": uuid.UUID(ob_id), "confianza": confidence_bucket(score), "score": score}
+            )
+
+    for ev_id, sugerencias in sugerencias_por_evidencia.items():
+        if sugerencias:
+            await guardar_enlaces_evidencia(db, uuid.UUID(ev_id), sugerencias)
+        else:
+            await marcar_evidencia_sin_obligacion(
+                db, uuid.UUID(ev_id), "Ninguna obligación coincide con el contenido de esta evidencia."
+            )
+        await _avanzar_progreso(db, job)
+
+
 async def subir_evidencias_cuenta(
     db: AsyncSession,
     storage: StoragePort,
     usuario_id: uuid.UUID,
     cuenta_id: uuid.UUID,
     archivos: list[tuple[str, str, bytes]],
+    background_tasks: BackgroundTasks | None = None,
 ) -> list[EvidenciaClasificadaResponse]:
     """Upload evidence files scoped to a CuentaCobro, BEFORE any Actividad exists.
 
@@ -262,6 +380,14 @@ async def subir_evidencias_cuenta(
 
     ALL files are validated up front (same all-or-nothing contract as
     `subir_evidencias`) before anything is written.
+
+    `background_tasks` (evidence-classification-jobs: Fast upload response):
+    when provided (the real request path, wired from the API route), the
+    multi-obligación link-table classification (`_clasificar_y_enlazar_lote`)
+    is ENQUEUED via `evidence_classification_service.encolar_clasificacion`
+    instead of running inline, so the HTTP response returns before it
+    completes. `None` (the default — used by callers/tests that don't care
+    about the background aspect) preserves the prior synchronous behavior.
     """
     if not archivos:
         raise ValidationError("Debe incluir al menos un archivo.")
@@ -282,6 +408,7 @@ async def subir_evidencias_cuenta(
     actividad_cache: dict[uuid.UUID | None, Actividad] = {}
 
     resultados: list[EvidenciaClasificadaResponse] = []
+    evidencias_creadas: list[Evidencia] = []
     for filename, content_type, data in archivos:
         texto = await _extraer_texto_seguro(filename, data)
         matched_ob = await clasificar_evidencia(texto, obligaciones, llm=llm) if texto and obligaciones else None
@@ -307,6 +434,7 @@ async def subir_evidencias_cuenta(
         db.add(evidencia)
         await db.commit()
         await db.refresh(evidencia)
+        evidencias_creadas.append(evidencia)
 
         try:
             presigned = await storage.presigned_url(key=key, expires_in=3600)
@@ -333,6 +461,28 @@ async def subir_evidencias_cuenta(
                 created_at=evidencia.created_at,
             )
         )
+
+    # Multi-obligación batched classification (evidencia_obligacion link table) —
+    # additive to, and independent of, the single-best-guess stub assignment above
+    # (evidence-classification-pipeline: Every evidence resolves to a suggestion
+    # or explicit non-match). Backgrounded when a real request provides
+    # `background_tasks` (evidence-classification-jobs: Fast upload response);
+    # otherwise runs inline for backward-compatible direct/test callers.
+    if background_tasks is not None:
+        from app.services import evidence_classification_service
+
+        try:
+            await evidence_classification_service.encolar_clasificacion(db, background_tasks, cuenta_id)
+        except Exception as exc:
+            # RES-003: the upload itself already succeeded (files committed
+            # above) — an enqueue failure (e.g. a job-row unique-constraint
+            # race between two concurrent uploads) must NOT turn a successful
+            # upload into a 500. The user can still trigger classification
+            # later via the retry button (RES-002).
+            logger.warning("clasificacion_enqueue_failed", cuenta_cobro_id=str(cuenta_id), error=str(exc))
+    else:
+        await _clasificar_y_enlazar_lote(db, obligaciones, evidencias_creadas)
+
     return resultados
 
 
@@ -421,3 +571,226 @@ async def eliminar_evidencia(
     await db.delete(evidencia)
     await db.commit()
     logger.info("evidencia_deleted", id=str(evidencia_id))
+
+
+async def guardar_enlaces_evidencia(
+    db: AsyncSession,
+    evidencia_id: uuid.UUID,
+    sugerencias: list[dict[str, Any]],
+) -> list[EvidenciaObligacion]:
+    """Persist matcher suggestions as `evidencia_obligacion` link rows.
+
+    `alta` confidence auto-confirms the link (status=confirmed, source=ai);
+    `media`/`baja` persist as `proposed`, awaiting explicit user confirmation
+    (evidence-obligation-links: Suggest-and-confirm auto-link threshold).
+
+    Each item in `sugerencias` is a dict with `obligacion_id`, `confianza`, and
+    optionally `score`/`reasoning`. Upserts by explicit SELECT on
+    `(evidencia_id, obligacion_id)` — never via a lazy relationship, matching the
+    `expire_on_commit=False` cache gotcha this module already guards against.
+    """
+    links: list[EvidenciaObligacion] = []
+    for sugerencia in sugerencias:
+        confianza = sugerencia["confianza"]
+        obligacion_id = sugerencia["obligacion_id"]
+        status = EstadoEnlace.CONFIRMED.value if confianza == "alta" else EstadoEnlace.PROPOSED.value
+
+        result = await db.execute(
+            select(EvidenciaObligacion).where(
+                EvidenciaObligacion.evidencia_id == evidencia_id,
+                EvidenciaObligacion.obligacion_id == obligacion_id,
+            )
+        )
+        link = result.scalar_one_or_none()
+        if link is None:
+            link = EvidenciaObligacion(
+                evidencia_id=evidencia_id,
+                obligacion_id=obligacion_id,
+                source=FuenteEnlace.AI.value,
+            )
+            db.add(link)
+        link.confianza = confianza
+        link.score = sugerencia.get("score")
+        link.reasoning = sugerencia.get("reasoning")
+        link.status = status
+        links.append(link)
+
+    await db.commit()
+    for link in links:
+        await db.refresh(link)
+
+    logger.info("evidencia_enlaces_guardados", evidencia_id=str(evidencia_id), n_links=len(links))
+    return links
+
+
+async def marcar_evidencia_sin_obligacion(
+    db: AsyncSession,
+    evidencia_id: uuid.UUID,
+    reasoning: str,
+) -> EvidenciaObligacion:
+    """Record "no obligación applies" for an evidence — distinct from zero links.
+
+    Persisted as a single row with `obligacion_id=None`, `status=no_aplica`, and
+    the reasoning explaining the non-match (evidence-obligation-links: "No
+    obligación applies" state). Upserts by explicit SELECT, never a lazy
+    relationship.
+    """
+    result = await db.execute(
+        select(EvidenciaObligacion).where(
+            EvidenciaObligacion.evidencia_id == evidencia_id,
+            EvidenciaObligacion.obligacion_id.is_(None),
+            EvidenciaObligacion.status == EstadoEnlace.NO_APLICA.value,
+        )
+    )
+    link = result.scalar_one_or_none()
+    if link is None:
+        link = EvidenciaObligacion(
+            evidencia_id=evidencia_id,
+            obligacion_id=None,
+            status=EstadoEnlace.NO_APLICA.value,
+            source=FuenteEnlace.AI.value,
+        )
+        db.add(link)
+    link.reasoning = reasoning
+    await db.commit()
+    await db.refresh(link)
+
+    logger.info("evidencia_marcada_sin_obligacion", evidencia_id=str(evidencia_id))
+    return link
+
+
+async def _get_evidencia_de_cuenta(
+    db: AsyncSession,
+    usuario_id: uuid.UUID,
+    cuenta_id: uuid.UUID,
+    evidencia_id: uuid.UUID,
+) -> tuple[Evidencia, uuid.UUID]:
+    """Load an Evidencia scoped to `cuenta_id`, verifying the user owns the
+    cuenta (via its contrato) — returns (evidencia, contrato_id) so callers
+    can validate obligación ids without a second ownership round-trip."""
+    cuenta = await cuenta_cobro_service._get_cuenta_con_ownership(db, usuario_id, cuenta_id)
+
+    result = await db.execute(
+        select(Evidencia)
+        .join(Actividad, Actividad.id == Evidencia.actividad_id)
+        .where(Evidencia.id == evidencia_id, Actividad.cuenta_cobro_id == cuenta_id)
+    )
+    evidencia = result.scalar_one_or_none()
+    if evidencia is None:
+        raise NotFoundError("Evidencia", str(evidencia_id))
+    return evidencia, cuenta.contrato_id
+
+
+async def reclasificar_evidencia(
+    db: AsyncSession,
+    usuario_id: uuid.UUID,
+    cuenta_id: uuid.UUID,
+    evidencia_id: uuid.UUID,
+    *,
+    add: list[uuid.UUID] | None = None,
+    remove: list[uuid.UUID] | None = None,
+    confirm: list[uuid.UUID] | None = None,
+    no_aplica: bool = False,
+) -> list[EvidenciaObligacion]:
+    """Full user authority over one evidencia's obligación links
+    (evidence-reclassification capability): add a link the AI missed, remove
+    any existing link, confirm a pending suggestion, or mark the evidencia as
+    having no applicable obligación — each independently, no approval gate.
+
+    Validates the evidencia belongs to `cuenta_id` and every referenced
+    obligación belongs to that cuenta's contrato before writing anything.
+    Operations apply in a fixed order (remove -> add -> confirm -> no_aplica)
+    so a caller combining `no_aplica=True` with add/confirm ends up with the
+    "no obligación applies" state winning, matching its "clears any pending
+    suggestions" contract.
+    """
+    add = add or []
+    remove = remove or []
+    confirm = confirm or []
+
+    evidencia, contrato_id = await _get_evidencia_de_cuenta(db, usuario_id, cuenta_id, evidencia_id)
+
+    referenciadas = {*add, *confirm}
+    if referenciadas:
+        ob_result = await db.execute(
+            select(Obligacion.id).where(Obligacion.contrato_id == contrato_id, Obligacion.id.in_(referenciadas))
+        )
+        validas = {row[0] for row in ob_result.all()}
+        faltantes = referenciadas - validas
+        if faltantes:
+            raise NotFoundError("Obligacion", ", ".join(str(i) for i in faltantes))
+
+    async def _find_link(obligacion_id: uuid.UUID) -> EvidenciaObligacion | None:
+        result = await db.execute(
+            select(EvidenciaObligacion).where(
+                EvidenciaObligacion.evidencia_id == evidencia.id,
+                EvidenciaObligacion.obligacion_id == obligacion_id,
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def _limpiar_no_aplica() -> None:
+        """Delete any `no_aplica` row(s) for this evidencia — a real link (from
+        `add`/`confirm`) contradicts "no obligación applies" (REL-001: the two
+        states must never coexist). Explicit SELECT/DELETE, never a lazy
+        relationship, matching this module's `expire_on_commit=False` cache
+        gotcha."""
+        result = await db.execute(
+            select(EvidenciaObligacion).where(
+                EvidenciaObligacion.evidencia_id == evidencia.id,
+                EvidenciaObligacion.obligacion_id.is_(None),
+                EvidenciaObligacion.status == EstadoEnlace.NO_APLICA.value,
+            )
+        )
+        for row in result.scalars().all():
+            await db.delete(row)
+
+    if remove:
+        for obligacion_id in remove:
+            link = await _find_link(obligacion_id)
+            if link is not None:
+                await db.delete(link)
+        await db.commit()
+
+    if add:
+        for obligacion_id in add:
+            link = await _find_link(obligacion_id)
+            if link is None:
+                link = EvidenciaObligacion(evidencia_id=evidencia.id, obligacion_id=obligacion_id)
+                db.add(link)
+            link.status = EstadoEnlace.CONFIRMED.value
+            link.source = FuenteEnlace.USER.value
+        await _limpiar_no_aplica()
+        await db.commit()
+
+    if confirm:
+        for obligacion_id in confirm:
+            link = await _find_link(obligacion_id)
+            if link is None:
+                raise NotFoundError("EvidenciaObligacion", str(obligacion_id))
+            link.status = EstadoEnlace.CONFIRMED.value
+        await _limpiar_no_aplica()
+        await db.commit()
+
+    if no_aplica:
+        vigentes_result = await db.execute(
+            select(EvidenciaObligacion).where(
+                EvidenciaObligacion.evidencia_id == evidencia.id,
+                EvidenciaObligacion.obligacion_id.isnot(None),
+            )
+        )
+        for vigente in vigentes_result.scalars().all():
+            await db.delete(vigente)
+        await db.commit()
+        await marcar_evidencia_sin_obligacion(db, evidencia.id, "Marcado manualmente por el usuario: no aplica.")
+
+    final_result = await db.execute(select(EvidenciaObligacion).where(EvidenciaObligacion.evidencia_id == evidencia.id))
+    logger.info(
+        "evidencia_reclasificada",
+        evidencia_id=str(evidencia.id),
+        add=len(add),
+        remove=len(remove),
+        confirm=len(confirm),
+        no_aplica=no_aplica,
+    )
+    return list(final_result.scalars().all())

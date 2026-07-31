@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import re
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, date, datetime
+from typing import TYPE_CHECKING, Any
 
 import structlog
 from jinja2 import BaseLoader, Environment
 from sqlalchemy import ColumnElement, func, or_, select
 from sqlalchemy import delete as sa_delete
+from sqlalchemy import update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -27,10 +30,22 @@ from app.core.exceptions import (
     ValidationError,
 )
 from app.models.actividad import Actividad
+from app.models.borrador_cuenta_cobro import BorradorCuentaCobro
+from app.models.clasificacion_job import ClasificacionEvidenciasJob
 from app.models.contrato import Contrato
+from app.models.conversacion import Conversacion
 from app.models.credito import Credito, TipoCredito
 from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro, PosicionCuota
+from app.models.documento_cuenta_cobro import (
+    DocumentoChecklistCandidato,
+    DocumentoCuentaCobro,
+    DocumentoRequisitoVinculo,
+)
+from app.models.documento_fuente import DocumentoFuente
+from app.models.evidencia import Evidencia
+from app.models.evidencia_obligacion import EvidenciaObligacion
 from app.models.plantilla import Plantilla, TipoPlantilla
+from app.models.requisito_cuenta import RequisitoCuenta
 from app.models.usuario import Usuario
 from app.schemas.coherence import FindingOut
 from app.schemas.cuenta_cobro import (
@@ -47,14 +62,30 @@ from app.schemas.cuenta_cobro import (
 from app.services import checklist_service, coherence_validator_service
 from app.services.coherence_validator_service import Severity
 
+if TYPE_CHECKING:
+    from app.models.obligacion import Obligacion
+
 logger = structlog.get_logger("service.cuenta_cobro")
+
+# Per-obligación justification-context budget (justification-context: Per-
+# obligación context not bound to the old flat caps) — deliberately DIFFERENT
+# from the legacy flat-blob cap (10 rows / 1500 chars, still used verbatim by
+# `_contexto_evidencias_flat` as the zero-links fallback below).
+_EVIDENCIAS_POR_OBLIGACION_MAX = 4
+_EVIDENCIA_CHARS_POR_OBLIGACION_MAX = 1200
 
 # Valid state machine transitions.
 # RECHAZADA -> ENVIADA lets a resubmission (POST /radicar) go straight back to
 # ENVIADA without forcing a detour through BORRADOR first.
+# ENVIADA -> BORRADOR lets a user reopen a submitted cuenta for edits ("Reabrir
+# y editar") before it has been aprobada/rechazada.
 _TRANSICIONES: dict[EstadoCuentaCobro, set[EstadoCuentaCobro]] = {
     EstadoCuentaCobro.BORRADOR: {EstadoCuentaCobro.ENVIADA},
-    EstadoCuentaCobro.ENVIADA: {EstadoCuentaCobro.APROBADA, EstadoCuentaCobro.RECHAZADA},
+    EstadoCuentaCobro.ENVIADA: {
+        EstadoCuentaCobro.APROBADA,
+        EstadoCuentaCobro.RECHAZADA,
+        EstadoCuentaCobro.BORRADOR,
+    },
     EstadoCuentaCobro.RECHAZADA: {EstadoCuentaCobro.BORRADOR, EstadoCuentaCobro.ENVIADA},
     EstadoCuentaCobro.APROBADA: {EstadoCuentaCobro.PAGADA},
     EstadoCuentaCobro.PAGADA: set(),
@@ -569,6 +600,87 @@ async def agregar_actividades_desde_texto(
     return ActividadesBulkResponse(creadas=len(created), actividades=created)
 
 
+async def _contexto_evidencias_flat(db: AsyncSession, cuenta_id: uuid.UUID) -> str:
+    """Legacy top-10/1500-char flat query (unchanged behavior) — kept ONLY as the
+    fallback for cuentas with ZERO confirmed evidencia<->obligación links at all
+    (justification-context: Flat blob as fallback only when no links exist)."""
+    from app.models.evidencia import Evidencia
+
+    evidencias_result = await db.execute(
+        select(Evidencia.nombre_archivo, Evidencia.texto_extraido)
+        .join(Actividad, Evidencia.actividad_id == Actividad.id)
+        .where(
+            Actividad.cuenta_cobro_id == cuenta_id,
+            Evidencia.storage_key.is_not(None),
+            Evidencia.texto_extraido.is_not(None),
+        )
+        .order_by(Evidencia.created_at.asc())
+        .limit(10)
+    )
+    return "\n\n".join(
+        f"### {nombre}\n{(texto or '')[:1500]}" for nombre, texto in evidencias_result.all() if (texto or "").strip()
+    )
+
+
+async def _contexto_evidencias_por_obligacion(
+    db: AsyncSession, cuenta_id: uuid.UUID, obligaciones: Sequence[Obligacion]
+) -> str:
+    """Build the 'EVIDENCIAS SUBIDAS' prompt block grounded in CONFIRMED
+    Evidencia<->Obligacion links, one section per obligación (justification-
+    context: Per-obligación context consumption) — replaces the flat
+    cross-obligación query previously at this call site.
+
+    Caps at `_EVIDENCIAS_POR_OBLIGACION_MAX` evidencias / `_EVIDENCIA_CHARS_POR_
+    OBLIGACION_MAX` chars EACH, a deliberately different budget from the legacy
+    flat cap since it's now scoped per obligación (justification-context: not
+    bound to the old flat caps).
+
+    Falls back to `_contexto_evidencias_flat` ONLY when the cuenta has ZERO
+    confirmed links at all — an obligación that individually lacks a confirmed
+    link simply contributes no section, rather than repeating the whole
+    cuenta's flat evidence blob for every unlinked obligación (which would
+    reintroduce the cross-obligación leakage this rewire removes).
+    """
+    from app.models.evidencia import Evidencia
+    from app.models.evidencia_obligacion import EstadoEnlace, EvidenciaObligacion
+
+    obligacion_ids = [ob.id for ob in obligaciones]
+    if not obligacion_ids:
+        return await _contexto_evidencias_flat(db, cuenta_id)
+
+    links_result = await db.execute(
+        select(EvidenciaObligacion.obligacion_id, Evidencia.nombre_archivo, Evidencia.texto_extraido)
+        .join(Evidencia, Evidencia.id == EvidenciaObligacion.evidencia_id)
+        .where(
+            EvidenciaObligacion.status == EstadoEnlace.CONFIRMED.value,
+            EvidenciaObligacion.obligacion_id.in_(obligacion_ids),
+            Evidencia.texto_extraido.is_not(None),
+        )
+        .order_by(Evidencia.created_at.asc())
+    )
+    por_obligacion: dict[uuid.UUID, list[tuple[str, str]]] = {}
+    for obligacion_id, nombre, texto in links_result.all():
+        if not (texto or "").strip():
+            continue
+        por_obligacion.setdefault(obligacion_id, []).append((nombre, texto))
+
+    if not por_obligacion:
+        return await _contexto_evidencias_flat(db, cuenta_id)
+
+    secciones: list[str] = []
+    for ob in obligaciones:
+        archivos = por_obligacion.get(ob.id)
+        if not archivos:
+            continue
+        cuerpo = "\n\n".join(
+            f"### {nombre}\n{texto[:_EVIDENCIA_CHARS_POR_OBLIGACION_MAX]}"
+            for nombre, texto in archivos[:_EVIDENCIAS_POR_OBLIGACION_MAX]
+        )
+        secciones.append(f"[Obligación: {ob.descripcion[:120]}]\n{cuerpo}")
+
+    return "\n\n".join(secciones)
+
+
 async def generar_actividades_agente(
     db: AsyncSession,
     usuario_id: uuid.UUID,
@@ -651,22 +763,10 @@ async def generar_actividades_agente(
 
     # Evidencias subidas por el usuario en esta cuenta, con su texto extraído —
     # grounding real para que "Generar todas con IA" no infiera en el vacío.
-    from app.models.evidencia import Evidencia
-
-    evidencias_result = await db.execute(
-        select(Evidencia.nombre_archivo, Evidencia.texto_extraido)
-        .join(Actividad, Evidencia.actividad_id == Actividad.id)
-        .where(
-            Actividad.cuenta_cobro_id == cuenta_id,
-            Evidencia.storage_key.is_not(None),
-            Evidencia.texto_extraido.is_not(None),
-        )
-        .order_by(Evidencia.created_at.asc())
-        .limit(10)
-    )
-    evidencias_str = "\n\n".join(
-        f"### {nombre}\n{(texto or '')[:1500]}" for nombre, texto in evidencias_result.all() if (texto or "").strip()
-    )
+    # Per-obligación, grounded in CONFIRMED evidencia<->obligación links
+    # (justification-context: Per-obligación context consumption); falls back to
+    # the legacy flat query only when the cuenta has zero confirmed links.
+    evidencias_str = await _contexto_evidencias_por_obligacion(db, cuenta_id, list(obligaciones))
 
     contexto_usuario = (cuenta.contexto_usuario or "").strip()
 
@@ -703,14 +803,16 @@ async def generar_actividades_agente(
             f"{periodo_inicio.isoformat()} a {periodo_fin.isoformat()}\n"
         )
 
-    llm = get_llm()
+    # Mismo modelo de calidad que evidence_justify/cruzar: el default de sesión
+    # (Groq 8B) rompe el formato y produce redacción pobre.
+    llm = get_llm(model=settings.LLM_EXTRACTION_MODEL or None)
     messages = [
         LLMMessage(role="system", content=ACTIVIDADES_GENERATION_PROMPT),
         LLMMessage(role="user", content=user_content),
     ]
 
     try:
-        resp = await llm.complete(messages, temperature=0.3, max_tokens=4096)
+        resp = await llm.complete(messages, temperature=0.3, max_tokens=8192)
     except Exception as exc:
         await logger.aerror("generar_actividades_error", cuenta_id=str(cuenta_id), error=str(exc))
         raise ValidationError(f"Error al generar actividades con el agente: {exc}") from exc
@@ -723,19 +825,14 @@ async def generar_actividades_agente(
             "Use POST /actividades/desde-texto para ingresar las actividades manualmente."
         )
 
-    # Evidence uploaded ahead of generation (Evidencias step now runs before this
-    # one) already lives on a placeholder "stub" Actividad created by
-    # `evidencia_service.subir_evidencias_cuenta` (find-or-create by obligacion_id).
-    # Filling that same row in place — rather than always inserting a fresh one —
-    # keeps the Evidencia.actividad_id link intact, so the generated text ends up
-    # in the row the package/cobertura already read evidence from. Only rows that
-    # actually carry evidence are reused; obligaciones with no upload keep the
-    # original always-insert behavior unchanged.
+    # Regenerar REEMPLAZA: cualquier Actividad existente de la misma obligación en
+    # esta cuenta (stub de evidencias, generación anterior, o descubrimiento) se
+    # reescribe en su lugar en vez de insertar una fila duplicada. Mantener la fila
+    # conserva los links Evidencia.actividad_id que ya cuelgan de ella. Con varias
+    # filas por obligación se reescribe la más reciente (las demás quedan para
+    # borrado manual — eliminarlas arrastraría sus evidencias).
     stubs_result = await db.execute(
-        select(Actividad)
-        .join(Evidencia, Evidencia.actividad_id == Actividad.id)
-        .where(Actividad.cuenta_cobro_id == cuenta_id)
-        .distinct()
+        select(Actividad).where(Actividad.cuenta_cobro_id == cuenta_id).order_by(Actividad.created_at)
     )
     stubs_con_evidencia: dict[uuid.UUID | None, Actividad] = {act.obligacion_id: act for act in stubs_result.scalars()}
 
@@ -844,6 +941,15 @@ async def cambiar_estado(
     cuenta.estado = nuevo_estado
     if nuevo_estado == EstadoCuentaCobro.ENVIADA:
         cuenta.fecha_envio = datetime.now(UTC)
+    elif nuevo_estado == EstadoCuentaCobro.BORRADOR:
+        # Reopening (e.g. ENVIADA -> BORRADOR) clears the radicación stamp so a
+        # fresh radicar_cuenta call re-stamps it, AND the stale PDF reference
+        # (REL-002): otherwise obtener_url_pdf and the email/Drive senders could
+        # keep serving the pre-edit PDF after the user edits and re-radica. The
+        # storage blob itself is left in place (no delete); only the pointer is
+        # cleared, so generar_pdf must be called again before it's reachable.
+        cuenta.fecha_envio = None
+        cuenta.pdf_storage_key = None
 
     await db.flush()
 
@@ -1027,18 +1133,392 @@ async def obtener_url_pdf(
     return PDFUrlResponse(pdf_url=presigned)
 
 
-async def eliminar_cuenta_cobro(db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: uuid.UUID) -> None:
-    """Soft-delete a CuentaCobro. Only allowed when in BORRADOR state."""
+async def _borrar_storage_keys_best_effort(
+    storage: StoragePort, keys: Sequence[str], **log_context: str
+) -> tuple[int, int]:
+    """Best-effort `storage.delete` for each key — never raises, logs and moves on.
+    Shared by `eliminar_cuenta_cobro` and `purgar_huerfanos_cuentas`. Returns (ok, failed)."""
+    ok = failed = 0
+    for key in keys:
+        try:
+            await storage.delete(key)
+            ok += 1
+        except Exception as exc:
+            failed += 1
+            await logger.awarning("cuenta_hard_delete_storage_failed", key=key, error=str(exc), **log_context)
+    return ok, failed
+
+
+def _paquete_prefix(usuario_id: uuid.UUID, cuenta_id: uuid.UUID) -> str:
+    """Deterministic radicación package storage prefix (mirrors
+    `paquete_service._clave_paquete`'s `paquetes/{usuario_id}/{cuenta_id}/` — not
+    imported from there to avoid a `cuenta_cobro_service` <-> `paquete_service`
+    import cycle, since `paquete_service` already imports this module)."""
+    return f"paquetes/{usuario_id}/{cuenta_id}/"
+
+
+async def _listar_y_borrar_prefix_best_effort(
+    storage: StoragePort, prefix: str, **log_context: str
+) -> tuple[int, int]:
+    """List every object under `prefix` and best-effort delete each. Shared by
+    `eliminar_cuenta_cobro` and `purgar_huerfanos_cuentas`'s tombstone loop. A
+    failing `list_objects` counts as one failure and yields zero further keys —
+    it never raises out, same contract as `_borrar_storage_keys_best_effort`."""
+    try:
+        objetos = await storage.list_objects(prefix)
+    except Exception as exc:
+        await logger.awarning("cuenta_hard_delete_storage_failed", key=prefix, error=str(exc), **log_context)
+        return 0, 1
+    return await _borrar_storage_keys_best_effort(storage, [o.key for o in objetos], **log_context)
+
+
+async def eliminar_cuenta_cobro(
+    db: AsyncSession,
+    usuario_id: uuid.UUID,
+    cuenta_id: uuid.UUID,
+    storage: StoragePort,
+) -> None:
+    """Hard-delete a CuentaCobro and every row scoped to it. Allowed for borrador,
+    rechazada, and enviada; blocked once aprobada or pagada (those represent a
+    settled/paid financial record).
+
+    Soft-delete used to leave a `deleted_at`-marked tombstone row behind. The
+    `uq_contrato_mes_anio` unique index has no `WHERE deleted_at IS NULL`
+    predicate, so that tombstone kept blocking recreation of a cuota for the
+    same contrato/mes/anio — the actual conflict this hard-delete fixes.
+
+    Deletes are explicit and ordered (not just DB `ondelete` cascades): SQLite
+    (tests, and possibly dev) does not enforce FK constraints, so relying on
+    cascade alone would silently leave orphaned rows there even though
+    Postgres (prod) would enforce them. Everything needed after the delete
+    (storage keys) is captured into plain variables BEFORE the commit — the
+    session expires all ORM attributes on commit, so the `cuenta` object
+    itself must not be touched afterward.
+    """
     cuenta = await _get_cuenta_con_ownership(db, usuario_id, cuenta_id)
 
-    if cuenta.estado != EstadoCuentaCobro.BORRADOR:
-        raise ValidationError(
-            f"Solo se pueden eliminar cuentas en estado 'borrador'. Estado actual: '{cuenta.estado}'."
-        )
+    if cuenta.estado in (EstadoCuentaCobro.APROBADA, EstadoCuentaCobro.PAGADA):
+        raise ValidationError("No se puede eliminar una cuenta aprobada o pagada.")
 
-    cuenta.deleted_at = datetime.now(UTC)
-    await db.flush()
-    await logger.ainfo("cuenta_cobro_eliminada", cuenta_id=str(cuenta_id), usuario_id=str(usuario_id))
+    pdf_storage_key = cuenta.pdf_storage_key
+
+    actividad_ids = [
+        row[0] for row in (await db.execute(select(Actividad.id).where(Actividad.cuenta_cobro_id == cuenta_id))).all()
+    ]
+
+    evidencia_rows = (
+        (
+            await db.execute(
+                select(Evidencia.id, Evidencia.storage_key).where(Evidencia.actividad_id.in_(actividad_ids))
+            )
+        ).all()
+        if actividad_ids
+        else []
+    )
+    evidencia_ids = [row[0] for row in evidencia_rows]
+    evidencia_storage_keys = [row[1] for row in evidencia_rows if row[1]]
+
+    if evidencia_ids:
+        await db.execute(sa_delete(EvidenciaObligacion).where(EvidenciaObligacion.evidencia_id.in_(evidencia_ids)))
+        await db.execute(sa_delete(Evidencia).where(Evidencia.id.in_(evidencia_ids)))
+
+    await db.execute(
+        sa_delete(ClasificacionEvidenciasJob).where(ClasificacionEvidenciasJob.cuenta_cobro_id == cuenta_id)
+    )
+
+    if actividad_ids:
+        await db.execute(sa_delete(Actividad).where(Actividad.id.in_(actividad_ids)))
+
+    await db.execute(sa_delete(BorradorCuentaCobro).where(BorradorCuentaCobro.cuenta_cobro_id == cuenta_id))
+
+    documento_ids = [
+        row[0]
+        for row in (
+            await db.execute(select(DocumentoCuentaCobro.id).where(DocumentoCuentaCobro.cuenta_cobro_id == cuenta_id))
+        ).all()
+    ]
+    if documento_ids:
+        await db.execute(
+            sa_delete(DocumentoRequisitoVinculo).where(
+                DocumentoRequisitoVinculo.documento_cuenta_cobro_id.in_(documento_ids)
+            )
+        )
+        await db.execute(sa_delete(DocumentoCuentaCobro).where(DocumentoCuentaCobro.id.in_(documento_ids)))
+
+    await db.execute(
+        sa_delete(DocumentoChecklistCandidato).where(DocumentoChecklistCandidato.cuenta_cobro_id == cuenta_id)
+    )
+
+    await db.execute(sa_delete(RequisitoCuenta).where(RequisitoCuenta.cuenta_cobro_id == cuenta_id))
+
+    # Not owned by the cuenta (contract-level / cross-cuenta records) — only the
+    # nullable pointer is cleared, the row itself survives.
+    await db.execute(
+        sa_update(DocumentoFuente).where(DocumentoFuente.cuenta_cobro_id == cuenta_id).values(cuenta_cobro_id=None)
+    )
+    await db.execute(
+        sa_update(Conversacion).where(Conversacion.cuenta_cobro_id == cuenta_id).values(cuenta_cobro_id=None)
+    )
+
+    await db.execute(sa_delete(CuentaCobro).where(CuentaCobro.id == cuenta_id))
+    await db.commit()
+
+    await logger.ainfo(
+        "cuenta_cobro_eliminada_hard",
+        cuenta_id=str(cuenta_id),
+        usuario_id=str(usuario_id),
+        actividades=len(actividad_ids),
+        evidencias=len(evidencia_ids),
+    )
+
+    # Storage cleanup is BEST-EFFORT and runs AFTER the commit above — the DB
+    # deletion is the source of truth and must never be rolled back or failed
+    # by a storage-side error.
+    keys_to_delete = [*evidencia_storage_keys, *([pdf_storage_key] if pdf_storage_key else [])]
+    await _borrar_storage_keys_best_effort(storage, keys_to_delete, cuenta_id=str(cuenta_id))
+    await _listar_y_borrar_prefix_best_effort(
+        storage, _paquete_prefix(usuario_id, cuenta_id), cuenta_id=str(cuenta_id)
+    )
+
+
+def _huerfanos_subqueries() -> tuple[Any, Any, Any, Any]:
+    """Build the four validity subqueries fresh — NEVER materialize these into
+    Python sets. Each is embedded directly into every DELETE/UPDATE's WHERE
+    clause below, so the DB evaluates it fresh at THAT statement's own
+    execution instant (RISK-001): a cuenta committed by a live writer between
+    two of the ~10 statements in `purgar_huerfanos_cuentas` is already visible
+    to every subquery run after it commits — a frozen Python set captured once
+    at function start could never see it, and would purge its children as
+    false orphans.
+    """
+    from app.models.obligacion import Obligacion
+
+    valid_cuentas = select(CuentaCobro.id).where(CuentaCobro.deleted_at.is_(None))
+    good_actividades = select(Actividad.id).where(Actividad.cuenta_cobro_id.in_(valid_cuentas))
+    good_evidencias = select(Evidencia.id).where(Evidencia.actividad_id.in_(good_actividades))
+    valid_obligaciones = select(Obligacion.id)
+    return valid_cuentas, good_actividades, good_evidencias, valid_obligaciones
+
+
+async def _contar_huerfanos(
+    db: AsyncSession, valid_cuentas: Any, good_actividades: Any, good_evidencias: Any, valid_obligaciones: Any
+) -> dict[str, int]:
+    """Dry-run counterpart of `purgar_huerfanos_cuentas` — the exact same
+    conditions, COUNT instead of DELETE/UPDATE, zero mutations, zero storage
+    calls."""
+
+    async def _count(stmt: Any) -> int:
+        return (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+
+    documento_huerfano_ids = select(DocumentoCuentaCobro.id).where(
+        DocumentoCuentaCobro.cuenta_cobro_id.not_in(valid_cuentas)
+    )
+
+    counts = {
+        "cuenta_cobro": await _count(select(CuentaCobro.id).where(CuentaCobro.deleted_at.is_not(None))),
+        "actividad": await _count(select(Actividad.id).where(Actividad.cuenta_cobro_id.not_in(valid_cuentas))),
+        "evidencia": await _count(select(Evidencia.id).where(Evidencia.actividad_id.not_in(good_actividades))),
+        "evidencia_obligacion": await _count(
+            select(EvidenciaObligacion.id).where(
+                or_(
+                    EvidenciaObligacion.evidencia_id.not_in(good_evidencias),
+                    (EvidenciaObligacion.obligacion_id.is_not(None))
+                    & (EvidenciaObligacion.obligacion_id.not_in(valid_obligaciones)),
+                )
+            )
+        ),
+        "clasificacion_job": await _count(
+            select(ClasificacionEvidenciasJob.id).where(ClasificacionEvidenciasJob.cuenta_cobro_id.not_in(valid_cuentas))
+        ),
+        "borrador": await _count(
+            select(BorradorCuentaCobro.id).where(BorradorCuentaCobro.cuenta_cobro_id.not_in(valid_cuentas))
+        ),
+        "documento_cuenta_cobro": await _count(documento_huerfano_ids),
+        "documento_requisito_vinculo": await _count(
+            select(DocumentoRequisitoVinculo.id).where(
+                DocumentoRequisitoVinculo.documento_cuenta_cobro_id.in_(documento_huerfano_ids)
+            )
+        ),
+        "documento_checklist_candidato": await _count(
+            select(DocumentoChecklistCandidato.id).where(
+                DocumentoChecklistCandidato.cuenta_cobro_id.not_in(valid_cuentas)
+            )
+        ),
+        "requisito_cuenta": await _count(
+            select(RequisitoCuenta.id).where(RequisitoCuenta.cuenta_cobro_id.not_in(valid_cuentas))
+        ),
+        "documento_fuente_actualizados": await _count(
+            select(DocumentoFuente.id).where(
+                DocumentoFuente.cuenta_cobro_id.is_not(None), DocumentoFuente.cuenta_cobro_id.not_in(valid_cuentas)
+            )
+        ),
+        "conversacion_actualizadas": await _count(
+            select(Conversacion.id).where(
+                Conversacion.cuenta_cobro_id.is_not(None), Conversacion.cuenta_cobro_id.not_in(valid_cuentas)
+            )
+        ),
+        "storage_keys_ok": 0,
+        "storage_keys_failed": 0,
+    }
+    await logger.ainfo("purga_huerfanos_dry_run", **counts)
+    return counts
+
+
+async def purgar_huerfanos_cuentas(db: AsyncSession, storage: StoragePort, *, dry_run: bool = False) -> dict[str, int]:
+    """Set-based cleanup of legacy soft-delete leftovers: tombstoned `CuentaCobro`
+    rows (`deleted_at IS NOT NULL`) whose children were never removed, PLUS any
+    row anywhere whose FK chain is broken (points at a cuenta that is tombstoned
+    or altogether gone). Mirrors `eliminar_cuenta_cobro`'s FK-safe explicit
+    order, applied across every orphan at once instead of one cuenta at a time.
+
+    A row is "orphan" here if its (possibly indirect) `cuenta_cobro_id` is NOT
+    in the healthy set — this single condition covers both "points at a
+    tombstone that still physically exists" and "points at nothing at all"
+    (a truly dangling FK), since neither case can appear in the healthy set.
+    Safe to re-run: a clean DB purges zero rows.
+
+    `dry_run=True` reports the exact same candidate counts via `_contar_huerfanos`
+    (COUNT instead of DELETE/UPDATE) and returns before any mutation or storage
+    call — used by `scripts/cleanup_orphans.py --dry-run`.
+    """
+    valid_cuentas, good_actividades, good_evidencias, valid_obligaciones = _huerfanos_subqueries()
+
+    if dry_run:
+        return await _contar_huerfanos(db, valid_cuentas, good_actividades, good_evidencias, valid_obligaciones)
+
+    # --- Evidencia (collect storage_key first; the concrete ids collected here
+    # are safe to reuse for the DELETE right below — they're specific rows
+    # already decided, not a re-evaluated validity filter). ---
+    evidencia_rows = (
+        await db.execute(
+            select(Evidencia.id, Evidencia.storage_key).where(Evidencia.actividad_id.not_in(good_actividades))
+        )
+    ).all()
+    orphan_evidencia_ids = [row[0] for row in evidencia_rows]
+    orphan_evidencia_storage_keys = [row[1] for row in evidencia_rows if row[1]]
+
+    # --- EvidenciaObligacion: dangling evidencia_id, dangling/invalid obligacion_id,
+    # or evidencia belongs to an actividad of an invalid cuenta (covered by
+    # `evidencia_id NOT IN good_evidencias`, since that subquery already
+    # excludes those). ---
+    enlace_result = await db.execute(
+        sa_delete(EvidenciaObligacion).where(
+            or_(
+                EvidenciaObligacion.evidencia_id.not_in(good_evidencias),
+                (EvidenciaObligacion.obligacion_id.is_not(None))
+                & (EvidenciaObligacion.obligacion_id.not_in(valid_obligaciones)),
+            )
+        )
+    )
+    count_evidencia_obligacion = enlace_result.rowcount or 0
+
+    if orphan_evidencia_ids:
+        await db.execute(sa_delete(Evidencia).where(Evidencia.id.in_(orphan_evidencia_ids)))
+
+    job_result = await db.execute(
+        sa_delete(ClasificacionEvidenciasJob).where(ClasificacionEvidenciasJob.cuenta_cobro_id.not_in(valid_cuentas))
+    )
+
+    actividad_result = await db.execute(sa_delete(Actividad).where(Actividad.cuenta_cobro_id.not_in(valid_cuentas)))
+
+    borrador_result = await db.execute(
+        sa_delete(BorradorCuentaCobro).where(BorradorCuentaCobro.cuenta_cobro_id.not_in(valid_cuentas))
+    )
+
+    documento_huerfano_ids = select(DocumentoCuentaCobro.id).where(
+        DocumentoCuentaCobro.cuenta_cobro_id.not_in(valid_cuentas)
+    )
+    vinculo_result = await db.execute(
+        sa_delete(DocumentoRequisitoVinculo).where(
+            DocumentoRequisitoVinculo.documento_cuenta_cobro_id.in_(documento_huerfano_ids)
+        )
+    )
+    documento_result = await db.execute(
+        sa_delete(DocumentoCuentaCobro).where(DocumentoCuentaCobro.id.in_(documento_huerfano_ids))
+    )
+
+    candidato_result = await db.execute(
+        sa_delete(DocumentoChecklistCandidato).where(
+            DocumentoChecklistCandidato.cuenta_cobro_id.not_in(valid_cuentas)
+        )
+    )
+
+    requisito_result = await db.execute(
+        sa_delete(RequisitoCuenta).where(RequisitoCuenta.cuenta_cobro_id.not_in(valid_cuentas))
+    )
+
+    # Not owned by any cuenta (contract-level / cross-cuenta records) — only the
+    # nullable pointer is cleared, the rows themselves survive. Explicit
+    # `.is_not(None)` guard (RELIABILITY-002): `col.not_in(subquery)` where the
+    # subquery returns ZERO rows (e.g. zero valid cuentas system-wide) evaluates
+    # to TRUE for every value of `col` under standard SQL semantics — INCLUDING
+    # NULL — so without this guard a never-linked row would be wrongly touched.
+    fuente_result = await db.execute(
+        sa_update(DocumentoFuente)
+        .where(DocumentoFuente.cuenta_cobro_id.is_not(None), DocumentoFuente.cuenta_cobro_id.not_in(valid_cuentas))
+        .values(cuenta_cobro_id=None)
+    )
+    conversacion_result = await db.execute(
+        sa_update(Conversacion)
+        .where(Conversacion.cuenta_cobro_id.is_not(None), Conversacion.cuenta_cobro_id.not_in(valid_cuentas))
+        .values(cuenta_cobro_id=None)
+    )
+
+    # --- Tombstones themselves — collect pdf_storage_key + the usuario_id needed
+    # for the deterministic paquete prefix BEFORE deleting the rows. Tombstones
+    # are already-soft-deleted rows: no live writer races to guard against here,
+    # so a materialized list is fine (unlike the validity subqueries above).
+    tombstones = (
+        await db.execute(
+            select(CuentaCobro.id, CuentaCobro.pdf_storage_key, Contrato.usuario_id)
+            .outerjoin(Contrato, Contrato.id == CuentaCobro.contrato_id)
+            .where(CuentaCobro.deleted_at.is_not(None))
+        )
+    ).all()
+    cuenta_result = await db.execute(sa_delete(CuentaCobro).where(CuentaCobro.deleted_at.is_not(None)))
+
+    await db.commit()
+
+    counts = {
+        "cuenta_cobro": cuenta_result.rowcount or 0,
+        "actividad": actividad_result.rowcount or 0,
+        "evidencia": len(orphan_evidencia_ids),
+        "evidencia_obligacion": count_evidencia_obligacion,
+        "clasificacion_job": job_result.rowcount or 0,
+        "borrador": borrador_result.rowcount or 0,
+        "documento_cuenta_cobro": documento_result.rowcount or 0,
+        "documento_requisito_vinculo": vinculo_result.rowcount or 0,
+        "documento_checklist_candidato": candidato_result.rowcount or 0,
+        "requisito_cuenta": requisito_result.rowcount or 0,
+        "documento_fuente_actualizados": fuente_result.rowcount or 0,
+        "conversacion_actualizadas": conversacion_result.rowcount or 0,
+    }
+
+    await logger.ainfo("purga_huerfanos_done", **counts)
+
+    # Storage cleanup is BEST-EFFORT and runs AFTER the commit above, exactly
+    # like `eliminar_cuenta_cobro`.
+    ok, failed = await _borrar_storage_keys_best_effort(
+        storage, orphan_evidencia_storage_keys, origen="purga_huerfanos"
+    )
+
+    pdf_keys = [row[1] for row in tombstones if row[1]]
+    ok2, failed2 = await _borrar_storage_keys_best_effort(storage, pdf_keys, origen="purga_huerfanos")
+    ok += ok2
+    failed += failed2
+
+    for tombstone_id, _pdf_key, usuario_id in tombstones:
+        if usuario_id is None:
+            continue  # contrato gone too — no reliable prefix to list
+        obj_ok, obj_failed = await _listar_y_borrar_prefix_best_effort(
+            storage, _paquete_prefix(usuario_id, tombstone_id), origen="purga_huerfanos"
+        )
+        ok += obj_ok
+        failed += obj_failed
+
+    counts["storage_keys_ok"] = ok
+    counts["storage_keys_failed"] = failed
+    return counts
 
 
 async def actualizar_cuenta_cobro(

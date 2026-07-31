@@ -192,6 +192,51 @@ async def test_radicar_desde_rechazada_200(
     assert resp.json()["estado"] == "enviada"
 
 
+async def test_radicar_reabrir_editar_reradicar_200(
+    client: AsyncClient, test_user: dict[str, Any], cuenta: CuentaCobro
+) -> None:
+    """REL-003 (reliability review, cuenta-delete-and-reopen): the full reopen
+    user story end-to-end — radicar, reopen ("Reabrir y editar") back to
+    borrador, edit the cuota, radicar again. Must land on enviada with a
+    freshly-stamped fecha_envio (not the stale one from the first radicación)."""
+    await _completar_checklist(client, test_user["headers"], cuenta.id)
+
+    first = await client.post(
+        f"/api/v1/cuentas-cobro/{cuenta.id}/radicar",
+        headers=test_user["headers"],
+    )
+    assert first.status_code == 200, first.text
+    assert first.json()["estado"] == "enviada"
+    fecha_envio_1 = first.json()["fecha_envio"]
+    assert fecha_envio_1 is not None
+
+    reabrir = await client.patch(
+        f"/api/v1/cuentas-cobro/{cuenta.id}/estado",
+        json={"estado": "borrador"},
+        headers=test_user["headers"],
+    )
+    assert reabrir.status_code == 200, reabrir.text
+    assert reabrir.json()["estado"] == "borrador"
+    assert reabrir.json()["fecha_envio"] is None
+
+    editar = await client.patch(
+        f"/api/v1/cuentas-cobro/{cuenta.id}",
+        json={"valor": "1500000.00"},
+        headers=test_user["headers"],
+    )
+    assert editar.status_code == 200, editar.text
+
+    second = await client.post(
+        f"/api/v1/cuentas-cobro/{cuenta.id}/radicar",
+        headers=test_user["headers"],
+    )
+    assert second.status_code == 200, second.text
+    body = second.json()
+    assert body["estado"] == "enviada"
+    assert body["fecha_envio"] is not None
+    assert body["fecha_envio"] != fecha_envio_1
+
+
 async def test_radicar_cuenta_routes_through_tool_registry(
     client: AsyncClient, test_user: dict[str, Any], cuenta: CuentaCobro, monkeypatch: pytest.MonkeyPatch
 ) -> None:

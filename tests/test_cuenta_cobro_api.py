@@ -62,6 +62,7 @@ def _mock_pdf_storage() -> S3StorageAdapter:
     mock = AsyncMock(spec=S3StorageAdapter)
     mock.upload = AsyncMock(return_value="pdfs/fake/fake.pdf")
     mock.presigned_url = AsyncMock(return_value="https://storage.example.com/fake.pdf")
+    mock.list_objects = AsyncMock(return_value=[])
     return mock  # type: ignore[return-value]
 
 
@@ -271,24 +272,79 @@ async def test_obtener_cuenta_cobro_404(client: AsyncClient, test_user: dict[str
 async def test_eliminar_cuenta_borrador_204(
     client: AsyncClient, test_user: dict[str, Any], cuenta_borrador: CuentaCobro
 ) -> None:
-    resp = await client.delete(f"/api/v1/cuentas-cobro/{cuenta_borrador.id}", headers=test_user["headers"])
-    assert resp.status_code == 204
+    fastapi_app.dependency_overrides[get_pdf_storage] = _mock_pdf_storage
+    try:
+        resp = await client.delete(f"/api/v1/cuentas-cobro/{cuenta_borrador.id}", headers=test_user["headers"])
+        assert resp.status_code == 204
 
-    # Should now 404
-    resp2 = await client.get(f"/api/v1/cuentas-cobro/{cuenta_borrador.id}", headers=test_user["headers"])
-    assert resp2.status_code == 404
+        # Should now 404 — hard delete, not just deleted_at.
+        resp2 = await client.get(f"/api/v1/cuentas-cobro/{cuenta_borrador.id}", headers=test_user["headers"])
+        assert resp2.status_code == 404
+    finally:
+        fastapi_app.dependency_overrides.pop(get_pdf_storage, None)
 
 
 @pytest.mark.asyncio
-async def test_eliminar_cuenta_no_borrador_422(
+async def test_eliminar_cuenta_enviada_204(
     client: AsyncClient, test_user: dict[str, Any], contrato: Contrato, db: AsyncSession
 ) -> None:
     cc = CuentaCobro(contrato_id=contrato.id, mes=6, anio=2024, valor=3_000_000, estado=EstadoCuentaCobro.ENVIADA)
     db.add(cc)
     await db.commit()
 
-    resp = await client.delete(f"/api/v1/cuentas-cobro/{cc.id}", headers=test_user["headers"])
-    assert resp.status_code == 422
+    fastapi_app.dependency_overrides[get_pdf_storage] = _mock_pdf_storage
+    try:
+        resp = await client.delete(f"/api/v1/cuentas-cobro/{cc.id}", headers=test_user["headers"])
+        assert resp.status_code == 204
+    finally:
+        fastapi_app.dependency_overrides.pop(get_pdf_storage, None)
+
+
+@pytest.mark.asyncio
+async def test_eliminar_cuenta_aprobada_422(
+    client: AsyncClient, test_user: dict[str, Any], contrato: Contrato, db: AsyncSession
+) -> None:
+    cc = CuentaCobro(contrato_id=contrato.id, mes=6, anio=2024, valor=3_000_000, estado=EstadoCuentaCobro.APROBADA)
+    db.add(cc)
+    await db.commit()
+
+    fastapi_app.dependency_overrides[get_pdf_storage] = _mock_pdf_storage
+    try:
+        resp = await client.delete(f"/api/v1/cuentas-cobro/{cc.id}", headers=test_user["headers"])
+        assert resp.status_code == 422
+    finally:
+        fastapi_app.dependency_overrides.pop(get_pdf_storage, None)
+
+
+@pytest.mark.asyncio
+async def test_eliminar_cuenta_enviada_storage_falla_sigue_204(
+    client: AsyncClient, test_user: dict[str, Any], contrato: Contrato, db: AsyncSession
+) -> None:
+    """REL follow-up: a raising storage adapter must not turn the delete into a
+    5xx — cleanup is best-effort and logs, never fails the request."""
+    cc = CuentaCobro(
+        contrato_id=contrato.id,
+        mes=6,
+        anio=2024,
+        valor=3_000_000,
+        estado=EstadoCuentaCobro.ENVIADA,
+        pdf_storage_key="pdfs/fake/stale.pdf",
+    )
+    db.add(cc)
+    await db.commit()
+
+    def _failing_storage() -> S3StorageAdapter:
+        mock = AsyncMock(spec=S3StorageAdapter)
+        mock.delete = AsyncMock(side_effect=Exception("storage is down"))
+        mock.list_objects = AsyncMock(side_effect=Exception("storage is down"))
+        return mock  # type: ignore[return-value]
+
+    fastapi_app.dependency_overrides[get_pdf_storage] = _failing_storage
+    try:
+        resp = await client.delete(f"/api/v1/cuentas-cobro/{cc.id}", headers=test_user["headers"])
+        assert resp.status_code == 204
+    finally:
+        fastapi_app.dependency_overrides.pop(get_pdf_storage, None)
 
 
 # ---------------------------------------------------------------------------
@@ -467,6 +523,24 @@ async def test_cambiar_estado_rechazada_a_borrador_sigue_funcionando(
     client: AsyncClient, test_user: dict[str, Any], contrato: Contrato, db: AsyncSession
 ) -> None:
     cc = CuentaCobro(contrato_id=contrato.id, mes=11, anio=2024, valor=3_000_000, estado=EstadoCuentaCobro.RECHAZADA)
+    db.add(cc)
+    await db.commit()
+
+    resp = await client.patch(
+        f"/api/v1/cuentas-cobro/{cc.id}/estado",
+        json={"estado": "borrador"},
+        headers=test_user["headers"],
+    )
+    assert resp.status_code == 200
+    assert resp.json()["estado"] == "borrador"
+
+
+@pytest.mark.asyncio
+async def test_cambiar_estado_enviada_a_borrador_reabre(
+    client: AsyncClient, test_user: dict[str, Any], contrato: Contrato, db: AsyncSession
+) -> None:
+    """'Reabrir y editar': an ENVIADA cuenta can go back to BORRADOR via PATCH /estado."""
+    cc = CuentaCobro(contrato_id=contrato.id, mes=12, anio=2024, valor=3_000_000, estado=EstadoCuentaCobro.ENVIADA)
     db.add(cc)
     await db.commit()
 

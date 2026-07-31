@@ -10,6 +10,8 @@ Covers the three generation-input changes:
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, patch
+
 from app.agent.nodes.evidence_justify import _evidence_links
 from app.agent.prompts.actividad_generation import build_actividad_justificacion_prompt
 from app.agent.tools.document_parser import is_archive_filename, parse_document
@@ -50,5 +52,19 @@ def test_rar_es_archive_y_no_revienta_sin_backend():
 async def test_extraer_texto_seguro_txt_y_binario():
     texto = await _extraer_texto_seguro("notas.txt", "Acta de reunión del 5 de julio".encode())
     assert texto is not None and "Acta de reuni" in texto
-    # Undecodable binary garbage → None, never an exception.
-    assert await _extraer_texto_seguro("foto.xyz", b"\x00\x01\x02\xff" * 100) is None
+    # Undecodable binary garbage → "" (attempted, no text), never an exception.
+    assert await _extraer_texto_seguro("foto.xyz", b"\x00\x01\x02\xff" * 100) == ""
+
+
+async def test_extraer_texto_seguro_llama_con_relaxed_ocr_true():
+    """`_extraer_texto_seguro` must opt into the relaxed OCR-acceptance gate —
+    scanned evidence PDFs with concatenated OCR text are otherwise discarded
+    (see `extraer_texto_documento`'s `relaxed_ocr` param)."""
+    with patch(
+        "app.services.document_service.extraer_texto_documento",
+        AsyncMock(return_value=("texto ocr relajado", [])),
+    ) as mock_extraer:
+        texto = await _extraer_texto_seguro("escaneo.pdf", b"%PDF-fake")
+
+    assert texto == "texto ocr relajado"
+    mock_extraer.assert_awaited_once_with(b"%PDF-fake", "escaneo.pdf", relaxed_ocr=True)

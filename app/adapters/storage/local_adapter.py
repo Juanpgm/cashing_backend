@@ -10,10 +10,18 @@ Files fetched from S3 are cached locally so subsequent reads are instant.
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 
 from app.adapters.storage.port import StorageObjectInfo
 from app.core.config import settings
+
+
+def _winsafe(path: Path) -> Path:
+    """Prefix with \\\\?\\ on Windows to lift the 260-char MAX_PATH limit."""
+    if os.name == "nt" and not str(path).startswith("\\\\?\\"):
+        return Path("\\\\?\\" + str(path))
+    return path
 
 
 class LocalStorageAdapter:
@@ -32,6 +40,7 @@ class LocalStorageAdapter:
         resolved = (self._root / key).resolve()
         if not str(resolved).startswith(str(self._root)):
             raise ValueError(f"Path traversal attempt blocked: {key}")
+        resolved = _winsafe(resolved)
         resolved.parent.mkdir(parents=True, exist_ok=True)
         return resolved
 
@@ -85,14 +94,16 @@ class LocalStorageAdapter:
         loop = asyncio.get_running_loop()
 
         def _scan() -> list[StorageObjectInfo]:
-            if not base.exists():
+            safe_base = _winsafe(base)
+            safe_root = _winsafe(self._root)
+            if not safe_base.exists():
                 return []
             return [
                 StorageObjectInfo(
-                    key=str(path.relative_to(self._root)).replace("\\", "/"),
+                    key=str(path.relative_to(safe_root)).replace("\\", "/"),
                     size_bytes=path.stat().st_size,
                 )
-                for path in sorted(base.rglob("*"))
+                for path in sorted(safe_base.rglob("*"))
                 if path.is_file()
             ]
 

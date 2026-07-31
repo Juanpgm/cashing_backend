@@ -36,6 +36,6 @@ def format_evidencias_for_prompt(evidencias: list[dict]) -> str:
         source = ev.get("source", "?")
         title = ev.get("title") or ev.get("subject") or ev.get("filename") or "(sin título)"
         date = ev.get("date", "")
-        content = (ev.get("content") or "")[:300]
+        content = (ev.get("content") or "")[:800]
         parts.append(f"{i}. [{source}] {title} ({date})\n   {content}")
     return "\n".join(parts)

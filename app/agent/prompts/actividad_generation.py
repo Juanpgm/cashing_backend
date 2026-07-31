@@ -26,8 +26,13 @@ contrato, redactas DOS textos distintos y complementarios:
 1. ACTIVIDAD: qué se hizo concretamente en el período. Primera persona del contratista
    en pasado o forma impersonal, específico, mencionando entregables, reuniones o
    documentos reales que aparecen en las evidencias (con su título y/o fecha).
-2. JUSTIFICACION: cómo lo realizado da cumplimiento a la obligación contractual,
-   citando las evidencias por título y fecha.
+   Extensión: 2 a 4 oraciones completas.
+2. JUSTIFICACION: cómo lo realizado da cumplimiento a la obligación contractual.
+   Extensión: un párrafo desarrollado de 4 a 6 oraciones (100 a 180 palabras) que
+   (a) describa el trabajo realizado y su alcance, (b) cite cada evidencia por título
+   y fecha explicando QUÉ demuestra concretamente, y (c) cierre conectando ese
+   trabajo con el resultado que la obligación persigue. Debe poder sustentar por sí
+   sola las acciones del mes ante el supervisor del contrato.
 
 REGLAS OBLIGATORIAS (nunca las rompas):
 - NUNCA repitas ni parafrasees el texto literal de la obligación en ninguno de los dos campos.

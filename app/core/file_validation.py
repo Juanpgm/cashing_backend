@@ -21,9 +21,17 @@ MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10MB
 # Safe filename pattern: alphanumeric, hyphens, underscores, dots
 SAFE_FILENAME_RE = re.compile(r"^[a-zA-Z0-9_\-][a-zA-Z0-9_\-\.]*$")
 
+# Storage keys embed this verbatim after a UUID prefix (see evidencia_service's
+# `evidencias/{usuario_id}/{actividad_id}/{uuid}_{safe_filename}`). An unbounded
+# original name — common with folder uploads pulling in build caches or deeply
+# nested project files — can push the local filesystem path past Windows'
+# 260-char MAX_PATH, crashing the upload with a raw FileNotFoundError instead
+# of a clean validation error.
+_MAX_SANITIZED_FILENAME_LENGTH = 100
+
 
 def sanitize_filename(filename: str) -> str:
-    """Strip path components and unsafe characters from filename."""
+    """Strip path components and unsafe characters from filename, and cap length."""
     # Remove path separators
     name = filename.replace("\\", "/").rsplit("/", maxsplit=1)[-1]
     # Remove anything non-safe
@@ -32,7 +40,15 @@ def sanitize_filename(filename: str) -> str:
     parts = name.rsplit(".", maxsplit=1)
     if len(parts) == 2:
         base = parts[0].replace(".", "_")
-        return f"{base}.{parts[1]}"
+        name = f"{base}.{parts[1]}"
+
+    if len(name) > _MAX_SANITIZED_FILENAME_LENGTH:
+        parts = name.rsplit(".", maxsplit=1)
+        if len(parts) == 2 and len(parts[1]) <= 10:
+            base, ext = parts
+            name = base[: _MAX_SANITIZED_FILENAME_LENGTH - len(ext) - 1] + "." + ext
+        else:
+            name = name[:_MAX_SANITIZED_FILENAME_LENGTH]
     return name
 
 

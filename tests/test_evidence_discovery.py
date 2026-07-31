@@ -433,3 +433,100 @@ async def test_descubrir_evidencias_default_fechas_desde_contrato(db: AsyncSessi
 
     assert "2024-02-01" in resp.resumen
     assert date.today().isoformat() in resp.resumen
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pipeline unification: local_only mode (evidence-classification-pipeline)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_descubrir_evidencias_local_only_true_zero_google_calls(db: AsyncSession) -> None:
+    """local_only=True must run the orchestrator→filter→matcher→justify pipeline
+    to completion over uploaded local evidence WITHOUT touching Gmail/Drive/
+    Calendar adapters, and WITHOUT ever evaluating the Google-connection gate
+    (evidence-classification-pipeline: Zero Google API calls in local-only mode,
+    Local path never evaluates the Google gate)."""
+    from app.models.actividad import Actividad
+    from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
+    from app.models.evidencia import Evidencia
+    from app.services import evidence_discovery_service as eds
+
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+    cuenta = CuentaCobro(contrato_id=contrato.id, mes=4, anio=2024, estado=EstadoCuentaCobro.BORRADOR, valor=1_000_000)
+    db.add(cuenta)
+    await db.flush()
+    actividad = Actividad(cuenta_cobro_id=cuenta.id, descripcion="stub")
+    db.add(actividad)
+    await db.flush()
+    db.add(
+        Evidencia(
+            actividad_id=actividad.id,
+            storage_key="evidencias/x/informe.pdf",
+            nombre_archivo="informe.pdf",
+            tipo_archivo="application/pdf",
+            tamano_bytes=10,
+            texto_extraido="Entregué el informe mensual de actividades del contrato.",
+        )
+    )
+    await db.commit()
+
+    req = EvidenceDiscoveryRequest(
+        obligaciones=[{"id": "ob1", "descripcion": "Entregar informe mensual de actividades del contrato"}],
+        cuenta_id=cuenta.id,
+    )
+
+    gmail_ctor = MagicMock()
+    drive_ctor = MagicMock()
+    cal_ctor = MagicMock()
+    gate_spy = AsyncMock()
+
+    matcher_llm = AsyncMock()
+    matcher_llm.complete = AsyncMock(return_value=MagicMock(content="[1]"))
+    justify_llm = AsyncMock()
+    justify_llm.complete = AsyncMock(return_value=MagicMock(content="Entregué el informe mensual."))
+
+    with (
+        patch.object(eds.gws, "get_integration_status", gate_spy),
+        patch.object(eds, "GmailAdapter", gmail_ctor),
+        patch("app.agent.nodes.drive_fetch.DriveAdapter", drive_ctor),
+        patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", cal_ctor),
+        patch("app.agent.nodes.evidence_matcher.get_llm", return_value=matcher_llm),
+        patch("app.agent.nodes.evidence_justify.get_llm", return_value=justify_llm),
+    ):
+        resp = await eds.descubrir_evidencias(db, user.id, req, local_only=True)
+
+    gmail_ctor.assert_not_called()
+    drive_ctor.assert_not_called()
+    cal_ctor.assert_not_called()
+    gate_spy.assert_not_called()
+    assert resp.fuentes["email"] == 0
+    assert resp.fuentes["drive"] == 0
+    assert resp.fuentes["calendar"] == 0
+    assert resp.fuentes["local_file"] == 1
+    assert resp.total_evidencias == 1
+
+
+@pytest.mark.asyncio
+async def test_descubrir_evidencias_local_only_false_still_requires_google_gate() -> None:
+    """Explicit local_only=False (or omitted — the default) preserves the
+    pre-existing Google-connected requirement unchanged: the gate decoupling
+    applies ONLY to the local branch (evidence-classification-pipeline: Google
+    gate preserved for Google-sourced evidence)."""
+    from app.core.exceptions import ExternalServiceError
+    from app.services import evidence_discovery_service as eds
+
+    req = EvidenceDiscoveryRequest(
+        obligaciones=[{"descripcion": "Asistir a reuniones"}],
+        fecha_inicio="2024-04-01",
+        fecha_fin="2024-04-30",
+    )
+    disconnected = MagicMock()
+    disconnected.connected = False
+
+    with (
+        patch.object(eds.gws, "get_integration_status", AsyncMock(return_value=disconnected)),
+        pytest.raises(ExternalServiceError),
+    ):
+        await eds.descubrir_evidencias(MagicMock(), uuid.uuid4(), req, local_only=False)

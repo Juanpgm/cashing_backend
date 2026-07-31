@@ -20,6 +20,11 @@ REGLAS DE REDACCIÓN:
 - Primera persona, tiempo pasado, verbo de acción concreto \
 (Elaboré, Desarrollé, Participé, Entregué, Asistí...).
 - Lenguaje formal apropiado para documentos oficiales colombianos.
+- Extensión: la descripción de la actividad debe tener 2 a 4 oraciones completas; la \
+justificación debe ser un párrafo desarrollado de 3 a 5 oraciones (80 a 150 palabras) que \
+describa el trabajo, cite las evidencias disponibles (por nombre de archivo) explicando qué \
+demuestra cada una, y conecte lo realizado con el resultado que la obligación persigue. \
+Todo el texto de cada actividad va en UNA SOLA línea (sin saltos de línea internos).
 - La justificación debe indicar explícitamente a qué obligación contractual da cumplimiento,
   con SU PROPIA redacción — nunca copiando la descripción de la actividad.
 - No inventes datos, cifras ni fechas específicas que no estén en el contexto.

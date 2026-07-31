@@ -523,7 +523,9 @@ async def _extraer_contrato_multimodal(
     return None
 
 
-async def extraer_texto_documento(content: bytes, filename: str) -> tuple[str | None, list[str]]:
+async def extraer_texto_documento(
+    content: bytes, filename: str, *, relaxed_ocr: bool = False
+) -> tuple[str | None, list[str]]:
     """Best-effort plain-text extraction from an uploaded document.
 
     Reuses the same ladder the contract upload uses: native text extraction
@@ -534,11 +536,20 @@ async def extraer_texto_documento(content: bytes, filename: str) -> tuple[str | 
     Intended for generic text recovery (e.g. inferring a requirements checklist
     from a pliego de condiciones), independent of the contract-specific vision
     extraction in ``_extraer_contrato_multimodal``.
+
+    ``relaxed_ocr``: when True and the strict ``is_text_sufficient`` gate
+    rejects both tiers (native and OCR), the extracted text is still accepted
+    if it clears the much lower ``settings.EVIDENCE_MIN_TEXT_CHARS`` floor —
+    RapidOCR often concatenates Spanish words ("Consultalasactividades…"),
+    which fails the spacing heuristic but is still classifiable evidence.
+    Default (False) behavior is byte-for-byte unchanged — only the evidence
+    classification caller opts in.
     """
     avisos: list[str] = []
     texto: str | None = None
     try:
-        texto = parse_document(content, filename)
+        # parse_document is CPU-bound (pdfplumber/docx/xlsx); off the event loop.
+        texto = await asyncio.to_thread(parse_document, content, filename)
     except Exception as exc:
         await logger.awarning("extraer_texto_parse_failed", filename=filename, error=str(exc))
 
@@ -546,6 +557,7 @@ async def extraer_texto_documento(content: bytes, filename: str) -> tuple[str | 
         return texto, avisos
 
     mime = guess_mime_type(filename)
+    texto_ocr: str | None = None
     if (
         settings.EXTRACTION_OCR_ENABLED
         and is_multimodal_supported(mime)
@@ -565,6 +577,12 @@ async def extraer_texto_documento(content: bytes, filename: str) -> tuple[str | 
             await logger.awarning("extraer_texto_ocr_failed", filename=filename, error=str(exc))
         if is_text_sufficient(texto_ocr, settings.EXTRACTION_MIN_TEXT_CHARS):
             return texto_ocr, avisos
+
+    if relaxed_ocr:
+        candidato = texto_ocr if texto_ocr and texto_ocr.strip() else texto
+        if candidato and len(candidato.strip()) >= settings.EVIDENCE_MIN_TEXT_CHARS:
+            avisos.append("Texto extraído por OCR con espaciado imperfecto; se usa para clasificación.")
+            return candidato.strip(), avisos
 
     if not (texto and texto.strip()):
         avisos.append(

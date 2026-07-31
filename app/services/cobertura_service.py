@@ -17,7 +17,7 @@ from __future__ import annotations
 import uuid
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -25,6 +25,7 @@ from app.core.exceptions import ForbiddenError, NotFoundError
 from app.models.actividad import Actividad
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro
+from app.models.evidencia_obligacion import EstadoEnlace, EvidenciaObligacion
 from app.schemas.cobertura import (
     COLOR_POR_ESTADO,
     CoberturaResponse,
@@ -83,11 +84,29 @@ async def calcular_cobertura(
     if cuenta.contrato.usuario_id != usuario_id:
         raise ForbiddenError()
 
-    # Agrupar actividades por obligación vinculada.
+    # Agrupar actividades por obligación vinculada (justificación sigue viniendo
+    # de aquí). El conteo de evidencia, en cambio, viene de los enlaces
+    # `evidencia_obligacion` CONFIRMADOS (slice 7) — desacoplado de a qué
+    # actividad apunta `Evidencia.actividad_id` (p.ej. un stub genérico de carga).
     acts_por_obligacion: dict[uuid.UUID, list[Actividad]] = {}
+    evidencia_ids: set[uuid.UUID] = set()
     for act in cuenta.actividades:
         if act.obligacion_id is not None:
             acts_por_obligacion.setdefault(act.obligacion_id, []).append(act)
+        evidencia_ids.update(ev.id for ev in act.evidencias)
+
+    num_evidencias_confirmadas: dict[uuid.UUID, int] = {}
+    if evidencia_ids:
+        links_result = await db.execute(
+            select(EvidenciaObligacion.obligacion_id, func.count())
+            .where(
+                EvidenciaObligacion.evidencia_id.in_(evidencia_ids),
+                EvidenciaObligacion.status == EstadoEnlace.CONFIRMED.value,
+                EvidenciaObligacion.obligacion_id.is_not(None),
+            )
+            .group_by(EvidenciaObligacion.obligacion_id)
+        )
+        num_evidencias_confirmadas = {ob_id: count for ob_id, count in links_result.all() if ob_id is not None}
 
     obligaciones = sorted(cuenta.contrato.obligaciones, key=lambda o: o.orden)
 
@@ -95,7 +114,7 @@ async def calcular_cobertura(
     cubiertas = debiles = sin_evidencia = 0
     for ob in obligaciones:
         acts = acts_por_obligacion.get(ob.id, [])
-        num_evidencias = sum(len(a.evidencias) for a in acts)
+        num_evidencias = num_evidencias_confirmadas.get(ob.id, 0)
         tiene_justificacion = any((a.justificacion or "").strip() for a in acts)
 
         estado, fuerza, detalle = _evaluar_obligacion(num_evidencias, tiene_justificacion)

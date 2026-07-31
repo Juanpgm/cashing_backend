@@ -66,3 +66,38 @@ async def test_clasificar_evidencia_llm_falla_usa_mejor_keyword_score() -> None:
     )
 
     assert result is ob1
+
+
+async def test_clasificar_evidencia_cero_candidatos_llm_encuentra_match_semantico() -> None:
+    # Source code has zero keyword overlap with the Spanish obligación wording,
+    # but the LLM can still judge it semantically relevant.
+    ob = _FakeObligacion(id="ob1", descripcion="desarrollar modulo de notificaciones por correo electronico")
+    llm = AsyncMock()
+    llm.complete.return_value = _FakeResp("1")
+
+    result = await clasificar_evidencia("def send_email(to, subject, body): ...", [ob], llm=llm)
+
+    llm.complete.assert_called_once()
+    assert result is ob
+
+
+async def test_clasificar_evidencia_cero_candidatos_llm_responde_ninguna() -> None:
+    ob = _FakeObligacion(id="ob1", descripcion="desarrollar modulo de notificaciones por correo electronico")
+    llm = AsyncMock()
+    llm.complete.return_value = _FakeResp("0")
+
+    result = await clasificar_evidencia("import os\nimport sys\n", [ob], llm=llm)
+
+    assert result is None
+
+
+async def test_clasificar_evidencia_cero_candidatos_llm_falla_retorna_none() -> None:
+    # Unlike the >=1-keyword-candidate path, an LLM failure here has NO fallback
+    # signal to fall back on — it must not fabricate a match.
+    ob = _FakeObligacion(id="ob1", descripcion="desarrollar modulo de notificaciones por correo electronico")
+    llm = AsyncMock()
+    llm.complete.side_effect = RuntimeError("llm down")
+
+    result = await clasificar_evidencia("import os\nimport sys\n", [ob], llm=llm)
+
+    assert result is None

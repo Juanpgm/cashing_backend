@@ -6,6 +6,7 @@ from app.models.agent_checkpoint import AgentCheckpoint  # noqa: F401
 from app.models.agent_run import AgentRun  # noqa: F401
 from app.models.audit_log import AuditLog  # noqa: F401
 from app.models.borrador_cuenta_cobro import BorradorCuentaCobro  # noqa: F401
+from app.models.clasificacion_job import ClasificacionEvidenciasJob  # noqa: F401
 from app.models.contrato import Contrato  # noqa: F401
 from app.models.conversacion import Conversacion  # noqa: F401
 from app.models.credito import Credito  # noqa: F401
@@ -17,6 +18,7 @@ from app.models.documento_cuenta_cobro import (  # noqa: F401
 )
 from app.models.documento_fuente import DocumentoFuente  # noqa: F401
 from app.models.evidencia import Evidencia  # noqa: F401
+from app.models.evidencia_obligacion import EvidenciaObligacion  # noqa: F401
 from app.models.google_token import GoogleToken  # noqa: F401
 from app.models.invite_code import InviteCode  # noqa: F401
 from app.models.obligacion import Obligacion  # noqa: F401

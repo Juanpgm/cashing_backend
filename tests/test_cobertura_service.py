@@ -6,17 +6,17 @@ import uuid
 from datetime import date
 
 import pytest
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from app.core.exceptions import ForbiddenError, NotFoundError
 from app.models.actividad import Actividad
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
 from app.models.evidencia import Evidencia
+from app.models.evidencia_obligacion import EstadoEnlace, EvidenciaObligacion
 from app.models.obligacion import Obligacion, TipoObligacion
 from app.models.usuario import Usuario
 from app.schemas.cobertura import EstadoCobertura
 from app.services import cobertura_service
+from sqlalchemy.ext.asyncio import AsyncSession
 
 
 async def _make_user(db: AsyncSession, *, email: str = "u@test.com") -> Usuario:
@@ -92,7 +92,14 @@ async def _make_actividad(
     return act
 
 
-async def _make_evidencia(db: AsyncSession, actividad_id: uuid.UUID) -> Evidencia:
+async def _make_evidencia(
+    db: AsyncSession, actividad_id: uuid.UUID, obligacion_id: uuid.UUID | None = None
+) -> Evidencia:
+    """Create an Evidencia row. When `obligacion_id` is given, ALSO create a
+    CONFIRMED evidencia_obligacion link — since slice 7 re-points cobertura's
+    evidence count to confirmed links (decoupled from `Actividad.evidencias`),
+    this is what "evidence supports this obligación" means now for these fixtures.
+    """
     ev = Evidencia(
         actividad_id=actividad_id,
         storage_key=f"evidencias/{uuid.uuid4()}.pdf",
@@ -102,7 +109,25 @@ async def _make_evidencia(db: AsyncSession, actividad_id: uuid.UUID) -> Evidenci
     )
     db.add(ev)
     await db.flush()
+    if obligacion_id is not None:
+        await _make_link(db, ev.id, obligacion_id)
     return ev
+
+
+async def _make_link(
+    db: AsyncSession,
+    evidencia_id: uuid.UUID,
+    obligacion_id: uuid.UUID,
+    *,
+    status: str = EstadoEnlace.CONFIRMED.value,
+    confianza: str = "alta",
+) -> EvidenciaObligacion:
+    link = EvidenciaObligacion(
+        evidencia_id=evidencia_id, obligacion_id=obligacion_id, confianza=confianza, status=status
+    )
+    db.add(link)
+    await db.flush()
+    return link
 
 
 @pytest.mark.asyncio
@@ -150,7 +175,7 @@ async def test_evidencia_sin_justificacion_es_amarillo(db: AsyncSession) -> None
     ob = await _make_obligacion(db, contrato.id, 1)
     cuenta = await _make_cuenta(db, contrato.id)
     act = await _make_actividad(db, cuenta.id, ob.id, justificacion=None)
-    await _make_evidencia(db, act.id)
+    await _make_evidencia(db, act.id, ob.id)
     await db.commit()
 
     resp = await cobertura_service.calcular_cobertura(db, user.id, cuenta.id)
@@ -168,8 +193,8 @@ async def test_evidencia_y_justificacion_es_verde(db: AsyncSession) -> None:
     ob = await _make_obligacion(db, contrato.id, 1)
     cuenta = await _make_cuenta(db, contrato.id)
     act = await _make_actividad(db, cuenta.id, ob.id, justificacion="Cumple la obligación")
-    await _make_evidencia(db, act.id)
-    await _make_evidencia(db, act.id)
+    await _make_evidencia(db, act.id, ob.id)
+    await _make_evidencia(db, act.id, ob.id)
     await db.commit()
 
     resp = await cobertura_service.calcular_cobertura(db, user.id, cuenta.id)
@@ -194,9 +219,9 @@ async def test_resumen_mixto_y_orden(db: AsyncSession) -> None:
     cuenta = await _make_cuenta(db, contrato.id)
 
     a1 = await _make_actividad(db, cuenta.id, ob1.id, justificacion="ok")
-    await _make_evidencia(db, a1.id)
+    await _make_evidencia(db, a1.id, ob1.id)
     a2 = await _make_actividad(db, cuenta.id, ob2.id, justificacion=None)
-    await _make_evidencia(db, a2.id)
+    await _make_evidencia(db, a2.id, ob2.id)
     await db.commit()
 
     resp = await cobertura_service.calcular_cobertura(db, user.id, cuenta.id)
@@ -228,3 +253,54 @@ async def test_cobertura_otro_usuario(db: AsyncSession) -> None:
 
     with pytest.raises(ForbiddenError):
         await cobertura_service.calcular_cobertura(db, other.id, cuenta.id)
+
+
+# ── Slice 7: re-point evidence count to confirmed evidencia_obligacion links ──
+
+
+@pytest.mark.asyncio
+async def test_cobertura_cuenta_evidencia_confirmada_via_link_no_via_actividad_directa(
+    db: AsyncSession,
+) -> None:
+    """Evidence count must come from CONFIRMED evidencia_obligacion links, not
+    from `Actividad.evidencias` on the obligación's own actividad — a file
+    attached to a generic upload stub (obligacion_id=None) still counts once
+    linked. `_evaluar_obligacion`'s own bucket rules stay untouched."""
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+    ob = await _make_obligacion(db, contrato.id, 1)
+    cuenta = await _make_cuenta(db, contrato.id)
+
+    # Actividad WITH justificación but NO evidencia attached directly.
+    await _make_actividad(db, cuenta.id, ob.id, justificacion="Cumple la obligación")
+    # Separate generic upload stub actividad (obligacion_id=None) holding the file.
+    stub = await _make_actividad(db, cuenta.id, None)
+    ev = await _make_evidencia(db, stub.id)
+    await _make_link(db, ev.id, ob.id)
+    await db.commit()
+
+    resp = await cobertura_service.calcular_cobertura(db, user.id, cuenta.id)
+
+    item = resp.obligaciones[0]
+    assert item.num_evidencias == 1
+    assert item.estado == EstadoCobertura.CUBIERTA
+    assert item.color == "verde"
+
+
+@pytest.mark.asyncio
+async def test_cobertura_enlace_pendiente_no_cuenta(db: AsyncSession) -> None:
+    """A proposed (non-confirmed) link must NOT count toward coverage."""
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+    ob = await _make_obligacion(db, contrato.id, 1)
+    cuenta = await _make_cuenta(db, contrato.id)
+    act = await _make_actividad(db, cuenta.id, ob.id, justificacion="Cumple la obligación")
+    ev = await _make_evidencia(db, act.id)
+    await _make_link(db, ev.id, ob.id, status=EstadoEnlace.PROPOSED.value, confianza="media")
+    await db.commit()
+
+    resp = await cobertura_service.calcular_cobertura(db, user.id, cuenta.id)
+
+    item = resp.obligaciones[0]
+    assert item.num_evidencias == 0
+    assert item.estado == EstadoCobertura.SIN_EVIDENCIA

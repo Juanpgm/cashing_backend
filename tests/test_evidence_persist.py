@@ -17,6 +17,7 @@ from app.models.actividad import Actividad
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
 from app.models.evidencia import Evidencia
+from app.models.evidencia_obligacion import EstadoEnlace, EvidenciaObligacion
 from app.models.obligacion import Obligacion, TipoObligacion
 from app.models.usuario import Usuario
 from app.schemas.cobertura import EstadoCobertura
@@ -143,6 +144,28 @@ async def test_persistir_crea_actividad_y_evidencia_y_cubre_obligacion(
     assert item.estado == EstadoCobertura.CUBIERTA
 
 
+async def test_persistir_crea_enlace_confirmado_evidencia_obligacion(
+    db: AsyncSession, scenario: dict[str, Any]
+) -> None:
+    """`cobertura_service` counts CONFIRMED `EvidenciaObligacion` links only —
+    the discovery/persist path must write one per persisted evidencia, or
+    coverage falls back to SIN_EVIDENCIA even though evidence was persisted."""
+    user, obligacion, cuenta = scenario["user"], scenario["obligacion"], scenario["cuenta"]
+    entrada = [_obligacion_justificada(obligacion)]
+
+    await evidence_persist_service.persistir_evidencias(db, user.id, cuenta.id, entrada)
+
+    result = await db.execute(select(Evidencia).join(Actividad).where(Actividad.obligacion_id == obligacion.id))
+    evidencia = result.scalars().one()
+
+    result = await db.execute(select(EvidenciaObligacion).where(EvidenciaObligacion.evidencia_id == evidencia.id))
+    link = result.scalars().one()
+    assert link.obligacion_id == obligacion.id
+    assert link.status == EstadoEnlace.CONFIRMED.value
+    assert link.source == "ai"
+    assert link.confianza == "alta"
+
+
 async def test_persistir_es_idempotente(db: AsyncSession, scenario: dict[str, Any]) -> None:
     user, obligacion, cuenta = scenario["user"], scenario["obligacion"], scenario["cuenta"]
     entrada = [_obligacion_justificada(obligacion)]
@@ -158,9 +181,10 @@ async def test_persistir_es_idempotente(db: AsyncSession, scenario: dict[str, An
     assert len(result.scalars().all()) == 1
 
 
-async def test_persistir_no_sobreescribe_justificacion_existente(
-    db: AsyncSession, scenario: dict[str, Any]
-) -> None:
+async def test_persistir_reemplaza_justificacion_existente(db: AsyncSession, scenario: dict[str, Any]) -> None:
+    """Regenerating REPLACES the existing draft text (product decision): the user
+    clicks "Generar" again precisely to discard the previous wording. An empty
+    generation must never blank existing text, though."""
     obligacion, cuenta = scenario["obligacion"], scenario["cuenta"]
     user = scenario["user"]
 
@@ -168,7 +192,7 @@ async def test_persistir_no_sobreescribe_justificacion_existente(
         cuenta_cobro_id=cuenta.id,
         obligacion_id=obligacion.id,
         descripcion=obligacion.descripcion,
-        justificacion="Texto escrito manualmente por el usuario.",
+        justificacion="Borrador anterior que el usuario quiere descartar.",
     )
     db.add(existente)
     await db.commit()
@@ -178,11 +202,36 @@ async def test_persistir_no_sobreescribe_justificacion_existente(
     summary = await evidence_persist_service.persistir_evidencias(db, user.id, cuenta.id, entrada)
 
     assert summary.actividades_creadas == 0
-    assert summary.actividades_actualizadas == 0
+    assert summary.actividades_actualizadas == 1
     assert summary.evidencias_creadas == 1
 
     await db.refresh(existente)
-    assert existente.justificacion == "Texto escrito manualmente por el usuario."
+    assert existente.justificacion == "Justificación generada por el agente."
+
+
+async def test_persistir_generacion_vacia_no_borra_texto_existente(
+    db: AsyncSession, scenario: dict[str, Any]
+) -> None:
+    obligacion, cuenta = scenario["obligacion"], scenario["cuenta"]
+    user = scenario["user"]
+
+    existente = Actividad(
+        cuenta_cobro_id=cuenta.id,
+        obligacion_id=obligacion.id,
+        descripcion="Descripción previa.",
+        justificacion="Justificación previa.",
+    )
+    db.add(existente)
+    await db.commit()
+    await db.refresh(existente)
+
+    entrada = [_obligacion_justificada(obligacion, actividad="", justificacion="")]
+    summary = await evidence_persist_service.persistir_evidencias(db, user.id, cuenta.id, entrada)
+
+    assert summary.actividades_actualizadas == 0
+    await db.refresh(existente)
+    assert existente.descripcion == "Descripción previa."
+    assert existente.justificacion == "Justificación previa."
 
 
 async def test_persistir_usa_actividad_no_descripcion_ni_justificacion(
@@ -397,9 +446,7 @@ async def test_persistir_endpoint_rechaza_link_javascript_scheme(
     assert resp.status_code == 422
 
 
-async def test_persistir_endpoint_rechaza_link_data_scheme(
-    client, db: AsyncSession, test_user: dict[str, Any]
-) -> None:
+async def test_persistir_endpoint_rechaza_link_data_scheme(client, db: AsyncSession, test_user: dict[str, Any]) -> None:
     user = test_user["user"]
     contrato = await _make_contrato(db, user.id)
     obligacion = await _make_obligacion(db, contrato.id)

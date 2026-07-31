@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from unittest.mock import AsyncMock
 
@@ -592,9 +592,71 @@ async def test_cambiar_estado_pagada_es_terminal(db: AsyncSession) -> None:
         await cuenta_cobro_service.cambiar_estado(db, user.id, cuenta.id, EstadoCuentaCobro.BORRADOR)
 
 
+@pytest.mark.asyncio
+async def test_cambiar_estado_enviada_a_borrador_reabre_y_limpia_fecha_envio(db: AsyncSession) -> None:
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+    cuenta = await _make_cuenta(db, contrato.id, estado=EstadoCuentaCobro.ENVIADA)
+    cuenta.fecha_envio = datetime.now(UTC)
+    await db.commit()
+
+    resp = await cuenta_cobro_service.cambiar_estado(db, user.id, cuenta.id, EstadoCuentaCobro.BORRADOR)
+    assert resp.estado == EstadoCuentaCobro.BORRADOR
+    assert resp.fecha_envio is None
+
+
+@pytest.mark.asyncio
+async def test_cambiar_estado_enviada_a_borrador_limpia_pdf_storage_key(db: AsyncSession) -> None:
+    """REL-002: reopening must null the stale-PDF reference too, not just fecha_envio —
+    otherwise obtener_url_pdf / email / Drive senders can still serve the pre-edit PDF."""
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+    cuenta = await _make_cuenta(db, contrato.id, estado=EstadoCuentaCobro.ENVIADA)
+    cuenta.pdf_storage_key = "pdfs/fake/stale.pdf"
+    await db.commit()
+
+    resp = await cuenta_cobro_service.cambiar_estado(db, user.id, cuenta.id, EstadoCuentaCobro.BORRADOR)
+    assert resp.pdf_storage_key is None
+
+
+@pytest.mark.asyncio
+async def test_obtener_url_pdf_tras_reabrir_falla_hasta_regenerar(db: AsyncSession) -> None:
+    """REL-002 companion: after reopen, obtener_url_pdf must fail cleanly (same
+    convention as never having generated a PDF) instead of serving the stale one."""
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+    cuenta = await _make_cuenta(db, contrato.id, estado=EstadoCuentaCobro.ENVIADA)
+    cuenta.pdf_storage_key = "pdfs/fake/stale.pdf"
+    await db.commit()
+
+    await cuenta_cobro_service.cambiar_estado(db, user.id, cuenta.id, EstadoCuentaCobro.BORRADOR)
+    await db.commit()
+
+    mock_storage = AsyncMock()
+    with pytest.raises(ValidationError):
+        await cuenta_cobro_service.obtener_url_pdf(db, user.id, cuenta.id, mock_storage)
+
+
+@pytest.mark.asyncio
+async def test_cambiar_estado_aprobada_a_borrador_transicion_invalida(db: AsyncSession) -> None:
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+    cuenta = await _make_cuenta(db, contrato.id, estado=EstadoCuentaCobro.APROBADA)
+    await db.commit()
+
+    with pytest.raises(ValidationError):
+        await cuenta_cobro_service.cambiar_estado(db, user.id, cuenta.id, EstadoCuentaCobro.BORRADOR)
+
+
 # ---------------------------------------------------------------------------
 # eliminar_cuenta_cobro
 # ---------------------------------------------------------------------------
+
+
+def _mock_storage() -> AsyncMock:
+    storage = AsyncMock()
+    storage.list_objects = AsyncMock(return_value=[])
+    return storage
 
 
 @pytest.mark.asyncio
@@ -604,7 +666,7 @@ async def test_eliminar_cuenta_cobro_borrador(db: AsyncSession) -> None:
     cuenta = await _make_cuenta(db, contrato.id, estado=EstadoCuentaCobro.BORRADOR)
     await db.commit()
 
-    await cuenta_cobro_service.eliminar_cuenta_cobro(db, user.id, cuenta.id)
+    await cuenta_cobro_service.eliminar_cuenta_cobro(db, user.id, cuenta.id, _mock_storage())
     await db.commit()
 
     with pytest.raises(NotFoundError):
@@ -612,14 +674,67 @@ async def test_eliminar_cuenta_cobro_borrador(db: AsyncSession) -> None:
 
 
 @pytest.mark.asyncio
-async def test_eliminar_cuenta_cobro_no_borrador_falla(db: AsyncSession) -> None:
+async def test_eliminar_cuenta_cobro_enviada(db: AsyncSession) -> None:
     user = await _make_user(db)
     contrato = await _make_contrato(db, user.id)
     cuenta = await _make_cuenta(db, contrato.id, estado=EstadoCuentaCobro.ENVIADA)
     await db.commit()
 
+    await cuenta_cobro_service.eliminar_cuenta_cobro(db, user.id, cuenta.id, _mock_storage())
+    await db.commit()
+
+    with pytest.raises(NotFoundError):
+        await cuenta_cobro_service.obtener_cuenta_cobro(db, user.id, cuenta.id)
+
+
+@pytest.mark.asyncio
+async def test_eliminar_cuenta_cobro_rechazada(db: AsyncSession) -> None:
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+    cuenta = await _make_cuenta(db, contrato.id, estado=EstadoCuentaCobro.RECHAZADA)
+    await db.commit()
+
+    await cuenta_cobro_service.eliminar_cuenta_cobro(db, user.id, cuenta.id, _mock_storage())
+    await db.commit()
+
+    with pytest.raises(NotFoundError):
+        await cuenta_cobro_service.obtener_cuenta_cobro(db, user.id, cuenta.id)
+
+
+@pytest.mark.asyncio
+async def test_eliminar_cuenta_cobro_aprobada_falla(db: AsyncSession) -> None:
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+    cuenta = await _make_cuenta(db, contrato.id, estado=EstadoCuentaCobro.APROBADA)
+    await db.commit()
+
     with pytest.raises(ValidationError):
-        await cuenta_cobro_service.eliminar_cuenta_cobro(db, user.id, cuenta.id)
+        await cuenta_cobro_service.eliminar_cuenta_cobro(db, user.id, cuenta.id, _mock_storage())
+
+
+@pytest.mark.asyncio
+async def test_eliminar_cuenta_cobro_pagada_falla(db: AsyncSession) -> None:
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+    cuenta = await _make_cuenta(db, contrato.id, estado=EstadoCuentaCobro.PAGADA)
+    await db.commit()
+
+    with pytest.raises(ValidationError):
+        await cuenta_cobro_service.eliminar_cuenta_cobro(db, user.id, cuenta.id, _mock_storage())
+
+
+@pytest.mark.asyncio
+async def test_eliminar_cuenta_cobro_otro_usuario_falla(db: AsyncSession) -> None:
+    """Pinning existing ownership behavior: cross-user delete is NotFoundError, not a
+    silent no-op or a different error type."""
+    owner = await _make_user(db)
+    otro = await _make_user(db, email="otro@test.com")
+    contrato = await _make_contrato(db, owner.id)
+    cuenta = await _make_cuenta(db, contrato.id, estado=EstadoCuentaCobro.BORRADOR)
+    await db.commit()
+
+    with pytest.raises(ForbiddenError):
+        await cuenta_cobro_service.eliminar_cuenta_cobro(db, otro.id, cuenta.id, _mock_storage())
 
 
 # ---------------------------------------------------------------------------
@@ -663,3 +778,124 @@ async def test_obtener_url_pdf_sin_pdf_generado(db: AsyncSession) -> None:
     mock_storage = AsyncMock()
     with pytest.raises(ValidationError):
         await cuenta_cobro_service.obtener_url_pdf(db, user.id, cuenta.id, mock_storage)
+
+
+# ---------------------------------------------------------------------------
+# _contexto_evidencias_por_obligacion (justification-context capability)
+# Contract tests for the per-obligación context builder that replaces the
+# flat top-10/1500-char query in generar_actividades_agente.
+# ---------------------------------------------------------------------------
+
+
+async def _make_obligacion(db: AsyncSession, contrato_id: uuid.UUID, descripcion: str, orden: int = 1) -> Obligacion:
+    ob = Obligacion(contrato_id=contrato_id, descripcion=descripcion, tipo=TipoObligacion.ESPECIFICA, orden=orden)
+    db.add(ob)
+    await db.flush()
+    return ob
+
+
+async def _make_actividad_con_evidencia(db: AsyncSession, cuenta_id: uuid.UUID, nombre: str, texto: str):
+    from app.models.actividad import Actividad
+    from app.models.evidencia import Evidencia
+
+    act = Actividad(cuenta_cobro_id=cuenta_id, descripcion="stub")
+    db.add(act)
+    await db.flush()
+    ev = Evidencia(
+        actividad_id=act.id,
+        storage_key=f"evidencias/x/{nombre}",
+        nombre_archivo=nombre,
+        tipo_archivo="text/plain",
+        tamano_bytes=len(texto),
+        texto_extraido=texto,
+    )
+    db.add(ev)
+    await db.flush()
+    return ev
+
+
+async def _confirm_link(db: AsyncSession, evidencia_id: uuid.UUID, obligacion_id: uuid.UUID) -> None:
+    from app.models.evidencia_obligacion import EstadoEnlace, EvidenciaObligacion, FuenteEnlace
+
+    db.add(
+        EvidenciaObligacion(
+            evidencia_id=evidencia_id,
+            obligacion_id=obligacion_id,
+            confianza="alta",
+            status=EstadoEnlace.CONFIRMED.value,
+            source=FuenteEnlace.AI.value,
+        )
+    )
+    await db.flush()
+
+
+@pytest.mark.asyncio
+async def test_contexto_evidencias_agrupa_por_obligacion_sin_fuga_cruzada(db: AsyncSession) -> None:
+    """justification-context: Per-obligación context consumption — an obligación
+    with confirmed links gets EXACTLY those evidencias, never another
+    obligación's evidence (no cross-obligación leakage)."""
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+    cuenta = await _make_cuenta(db, contrato.id)
+    ob1 = await _make_obligacion(db, contrato.id, "Elaborar informes tecnicos mensuales", orden=1)
+    ob2 = await _make_obligacion(db, contrato.id, "Asistir a reuniones de seguimiento", orden=2)
+    ev1 = await _make_actividad_con_evidencia(db, cuenta.id, "informe.txt", "Contenido del informe mensual.")
+    ev2 = await _make_actividad_con_evidencia(db, cuenta.id, "acta.txt", "Acta de la reunión de seguimiento.")
+    await _confirm_link(db, ev1.id, ob1.id)
+    await _confirm_link(db, ev2.id, ob2.id)
+    await db.commit()
+
+    contexto = await cuenta_cobro_service._contexto_evidencias_por_obligacion(db, cuenta.id, [ob1, ob2])
+
+    assert "informe.txt" in contexto
+    assert "Contenido del informe mensual." in contexto
+    assert "acta.txt" in contexto
+    assert "Acta de la reunión de seguimiento." in contexto
+    # No cross-obligación leakage: ob1's section must not repeat ob2's evidence and vice versa.
+    ob1_section = contexto.split(ob2.descripcion[:30])[0]
+    assert "acta.txt" not in ob1_section
+
+
+@pytest.mark.asyncio
+async def test_contexto_evidencias_sin_ningun_enlace_usa_fallback_plano(db: AsyncSession) -> None:
+    """justification-context: Flat blob as fallback only when no links exist —
+    a cuenta with ZERO confirmed evidencia<->obligación links anywhere still
+    gets context from the legacy flat top-10/1500-char query, so generation
+    can proceed."""
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+    cuenta = await _make_cuenta(db, contrato.id)
+    ob1 = await _make_obligacion(db, contrato.id, "Elaborar informes tecnicos mensuales", orden=1)
+    await _make_actividad_con_evidencia(db, cuenta.id, "suelto.txt", "Evidencia sin ningún enlace confirmado.")
+    await db.commit()
+
+    contexto = await cuenta_cobro_service._contexto_evidencias_por_obligacion(db, cuenta.id, [ob1])
+
+    assert "suelto.txt" in contexto
+    assert "Evidencia sin ningún enlace confirmado." in contexto
+
+
+@pytest.mark.asyncio
+async def test_contexto_evidencias_usa_cap_nuevo_no_el_plano(db: AsyncSession) -> None:
+    """justification-context: Per-obligación context not bound to the old flat
+    caps — 15 confirmed links for ONE obligación must be capped at the NEW
+    per-obligación budget (4 evidencias / 1200 chars each), not the legacy flat
+    cap (10 rows / 1500 chars)."""
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+    cuenta = await _make_cuenta(db, contrato.id)
+    ob1 = await _make_obligacion(db, contrato.id, "Elaborar informes tecnicos mensuales", orden=1)
+
+    texto_largo = "X" * 2000  # longer than both the old (1500) and new (1200) char caps
+    for i in range(15):
+        ev = await _make_actividad_con_evidencia(db, cuenta.id, f"doc{i}.txt", texto_largo)
+        await _confirm_link(db, ev.id, ob1.id)
+    await db.commit()
+
+    contexto = await cuenta_cobro_service._contexto_evidencias_por_obligacion(db, cuenta.id, [ob1])
+
+    # Capped at 4 files, NOT the old flat 10-row cap.
+    assert contexto.count(".txt") == 4
+    # Each row truncated at the NEW 1200-char cap, not the old 1500.
+    assert "X" * 1200 in contexto
+    assert "X" * 1201 not in contexto

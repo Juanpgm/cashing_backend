@@ -85,6 +85,10 @@ class Settings(BaseSettings):
     LLM_MULTIMODAL_MODEL: str = "gemini/gemini-2.5-flash"
     EXTRACTION_MULTIMODAL_FALLBACK_ENABLED: bool = True
     EXTRACTION_MIN_TEXT_CHARS: int = 200
+    # Relaxed floor for `extraer_texto_documento(relaxed_ocr=True)` (evidence
+    # classification only): a short OCR'd caption is still highly classifiable
+    # evidence, so the strict spacing/length gate is bypassed above this floor.
+    EVIDENCE_MIN_TEXT_CHARS: int = 20
     # When a PDF is rasterized (for a local vision model or the OCR tier), cap
     # pages and resolution to keep payloads and latency reasonable on a dev machine.
     MULTIMODAL_MAX_PDF_PAGES: int = 8
@@ -251,6 +255,28 @@ class Settings(BaseSettings):
     EVIDENCE_MAX_FILES_TOTAL: int = 60
     EVIDENCE_MAX_EVENTS: int = 100
     EVIDENCE_MATCHER_TOP_N: int = 8
+
+    # Embeddings — in-memory semantic ranking signal for evidence-to-obligación
+    # matching (evidence-embeddings capability). No persistent vector store:
+    # vectors exist only for the duration of one classification run.
+    # Groq has no embed API, so the fallback chain is embedding-capable models only.
+    LLM_EMBEDDING_MODEL: str = "gemini/gemini-embedding-001"
+    LLM_EMBEDDING_FALLBACK_MODEL: str = "ollama/nomic-embed-text"
+
+    # A `running` classification job with no `updated_at` progress for this
+    # long is considered stale/orphaned (crash/restart never got to mark it
+    # failed) — (re)triggering resets and re-enqueues it instead of leaving it
+    # stuck forever (evidence-classification-jobs: Retryable failure state,
+    # RES-002 fix). A FRESH running job re-trigger is a no-op (idempotent,
+    # avoids duplicate concurrent runs).
+    EVIDENCE_JOB_STALE_SECONDS: int = 120
+
+    # Confidence buckets for the blended (keyword+cosine) evidence<->obligación
+    # score (evidence-obligation-links: Qualitative confidence levels). alta
+    # auto-confirms the link; media/baja persist as proposed (see
+    # evidencia_service.guardar_enlaces_evidencia).
+    EVIDENCE_EMBED_ALTA: float = 0.75
+    EVIDENCE_EMBED_MEDIA: float = 0.5
 
     @field_validator("CORS_ORIGINS", mode="before")
     @classmethod

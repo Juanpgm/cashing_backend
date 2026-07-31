@@ -268,6 +268,49 @@ class LiteLLMAdapter:
             if delta and delta.content:
                 yield delta.content
 
+    @staticmethod
+    def _get_embedding_model_chain(model: str | None) -> list[str]:
+        """Ordered embedding models to try: requested/default → configured fallback.
+
+        Mirrors `_get_model_chain`'s dedup logic, scoped to the two embedding-capable
+        models (Groq has no embedding API, so it never enters this chain).
+        """
+        candidates = [model or settings.LLM_EMBEDDING_MODEL, settings.LLM_EMBEDDING_FALLBACK_MODEL]
+        seen: set[str] = set()
+        chain: list[str] = []
+        for c in candidates:
+            if c and c not in seen:
+                seen.add(c)
+                chain.append(c)
+        return chain
+
+    async def embed(self, texts: list[str], *, model: str | None = None) -> list[list[float]]:
+        """Return one embedding vector per input text via litellm's `aembedding`.
+
+        Tries the primary embedding model, then `LLM_EMBEDDING_FALLBACK_MODEL`; raises
+        if every model fails so the caller (evidence matcher) can fail-open to
+        keyword-only ranking — see `evidence-embeddings` spec, "Fail-open" requirement.
+        """
+        import litellm
+
+        last_error: Exception | None = None
+        for m in self._get_embedding_model_chain(model):
+            try:
+                kwargs: dict = {"model": m, "input": texts, "timeout": 60}
+                api_base = self._api_base_for(m)
+                if api_base:
+                    kwargs["api_base"] = api_base
+                api_key = self._api_key_for(m)
+                if api_key:
+                    kwargs["api_key"] = api_key
+                response = await litellm.aembedding(**kwargs)
+                return [item["embedding"] if isinstance(item, dict) else item.embedding for item in response.data]
+            except Exception as exc:
+                last_error = exc
+                await logger.awarning("llm_embed_fallback", model=m, error=str(exc))
+
+        raise RuntimeError(f"All embedding models failed. Last error: {last_error}")
+
 
 def get_llm(model: str | None = None) -> LiteLLMAdapter:
     """Factory — returns the LLM adapter."""

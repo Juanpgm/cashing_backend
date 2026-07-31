@@ -7,6 +7,8 @@ para montar la Cuenta de Cobro / Radicación.
 
 from __future__ import annotations
 
+import re
+
 import structlog
 
 from app.adapters.llm import get_llm
@@ -92,7 +94,11 @@ async def _generate_actividad_justificacion(
 
     Returns (actividad, justificacion) — nunca iguales, nunca el texto de la obligación.
     """
-    llm = get_llm()
+    from app.core.config import settings
+
+    # Redacción de calidad: mismo modelo que cruzar_service usa para justificaciones —
+    # el default de sesión (Groq 8B) rompe el formato y degrada a texto genérico.
+    llm = get_llm(model=settings.LLM_EXTRACTION_MODEL or None)
     prompt = build_actividad_justificacion_prompt(
         obligacion_texto,
         format_evidencias_for_prompt(evidencias),
@@ -107,7 +113,11 @@ async def _generate_actividad_justificacion(
                 LLMMessage(role="user", content=prompt),
             ],
             temperature=0.3,
-            max_tokens=512,
+            # gemini-2.5-flash es un modelo thinking: sus tokens de razonamiento
+            # cuentan dentro de max_tokens — 512 trunca la respuesta a mitad de
+            # frase antes de la línea JUSTIFICACION (mismo gotcha que el 16384
+            # de requisito_inference_service).
+            max_tokens=4096,
         )
     except Exception as exc:
         await logger.awarning("justify_llm_failed", error=str(exc))
@@ -118,7 +128,9 @@ async def _generate_actividad_justificacion(
         # Modelo no siguió el formato estricto (frecuente en modelos chicos/locales):
         # se conserva su texto libre como justificación (compatibilidad hacia atrás)
         # y se deriva una actividad determinística que NUNCA repite la obligación.
-        justificacion = resp.content.strip() or _deterministic_justificacion(evidencias)
+        # El label "ACTIVIDAD:" de una respuesta truncada nunca debe llegar a la UI.
+        libre = re.sub(r"^\s*ACTIVIDAD\s*:\s*", "", resp.content.strip(), flags=re.IGNORECASE)
+        justificacion = libre or _deterministic_justificacion(evidencias)
         actividad = _deterministic_actividad(evidencias)
         return actividad, justificacion
 

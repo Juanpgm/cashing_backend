@@ -134,7 +134,9 @@ async def _llm_justification(obligation_text: str, candidate: dict, llm, context
                 LLMMessage(role="user", content=user_content),
             ],
             temperature=0.0,
-            max_tokens=256,
+            # gemini-2.5-flash: los tokens de thinking cuentan dentro de max_tokens;
+            # 256 trunca la salida a mitad de frase.
+            max_tokens=2048,
         )
         return resp.content.strip()
     except Exception as exc:
@@ -162,7 +164,9 @@ async def _llm_actividad(obligation_text: str, candidate: dict, llm, contexto_us
                 LLMMessage(role="user", content=user_content),
             ],
             temperature=0.0,
-            max_tokens=256,
+            # gemini-2.5-flash: los tokens de thinking cuentan dentro de max_tokens;
+            # 256 trunca la salida a mitad de frase.
+            max_tokens=2048,
         )
         actividad = resp.content.strip()
         return actividad or f"Elaboración y entrega de {candidate['source']}."

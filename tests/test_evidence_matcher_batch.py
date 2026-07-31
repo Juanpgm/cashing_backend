@@ -138,3 +138,92 @@ async def test_matcher_garbage_llm_output_does_not_accept_low_score_candidates()
     matched_ids = [e["id"] for e in result["matched_evidence"]["ob1"]]
     assert "strong" in matched_ids
     assert "weak" not in matched_ids
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Local-upload wiring (evidencia_service._clasificar_y_enlazar_lote) reuses the
+# SAME batched matcher — many files, few obligaciones must still cost at most
+# one LLM call per obligación (evidence-classification-pipeline: Batched-per-
+# obligación matching).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_subir_evidencias_cuenta_local_upload_batches_one_llm_call_per_obligacion(db) -> None:
+    """5 uploaded files against 1 obligación must trigger AT MOST one matcher
+    LLM call, not one per file — proving the new evidencia_service wiring
+    reuses evidence_matcher_node's existing batching property instead of
+    calling the LLM per evidencia (evidence-classification-pipeline: Batched-
+    per-obligación matching)."""
+    from datetime import date
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from uuid import uuid4
+
+    from app.models.contrato import Contrato
+    from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
+    from app.models.evidencia_obligacion import EvidenciaObligacion
+    from app.models.obligacion import Obligacion, TipoObligacion
+    from app.models.usuario import Usuario
+    from app.services import evidencia_service
+    from sqlalchemy import select
+
+    user = Usuario(
+        email=f"batch-{uuid4()}@test.com",
+        nombre="Batch User",
+        cedula="555000111",
+        password_hash="hashed",
+        rol="contratista",
+        activo=True,
+        creditos_disponibles=100,
+    )
+    db.add(user)
+    await db.flush()
+    contrato = Contrato(
+        usuario_id=user.id,
+        numero_contrato="CTR-BATCH-001",
+        objeto="Consultoría",
+        valor_total=36_000_000,
+        valor_mensual=3_000_000,
+        fecha_inicio=date(2024, 1, 1),
+        fecha_fin=date(2024, 12, 31),
+    )
+    db.add(contrato)
+    await db.flush()
+    ob = Obligacion(
+        contrato_id=contrato.id,
+        descripcion="Elaborar informes tecnicos mensuales de consultoria y asesoria",
+        tipo=TipoObligacion.ESPECIFICA,
+        orden=1,
+    )
+    db.add(ob)
+    cuenta = CuentaCobro(contrato_id=contrato.id, mes=3, anio=2024, estado=EstadoCuentaCobro.BORRADOR, valor=1)
+    db.add(cuenta)
+    await db.commit()
+    await db.refresh(ob)
+    await db.refresh(cuenta)
+    await db.refresh(contrato, attribute_names=["obligaciones"])
+
+    storage = AsyncMock()
+    storage.upload.return_value = "key"
+    storage.presigned_url.return_value = "https://s3.example.com/presigned"
+
+    fake = AsyncMock()
+    fake.embed = AsyncMock(side_effect=RuntimeError("no network in tests"))
+    fake.complete = AsyncMock(return_value=MagicMock(content="[1,2,3,4,5]"))
+
+    archivos = [
+        (f"informe{i}.txt", "text/plain", f"Informe tecnico mensual de consultoria y asesoria {i}.".encode())
+        for i in range(5)
+    ]
+
+    with patch("app.agent.nodes.evidence_matcher.get_llm", return_value=fake):
+        await evidencia_service.subir_evidencias_cuenta(
+            db=db, storage=storage, usuario_id=user.id, cuenta_id=cuenta.id, archivos=archivos
+        )
+
+    # 5 files, 1 obligación → exactly 1 batched relevance call (not 0, not 5).
+    assert fake.complete.await_count == 1
+
+    links_result = await db.execute(select(EvidenciaObligacion).where(EvidenciaObligacion.obligacion_id == ob.id))
+    links = links_result.scalars().all()
+    assert len(links) == 5  # every uploaded evidencia resolved to a link for this obligación

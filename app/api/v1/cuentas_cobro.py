@@ -8,7 +8,7 @@ from datetime import date
 from typing import cast
 
 import structlog
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import HTMLResponse, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,6 +18,7 @@ from app.adapters.storage.s3_adapter import S3StorageAdapter
 from app.api.deps import CurrentUser, get_pdf_storage
 from app.core.database import get_db
 from app.core.exceptions import ValidationError
+from app.core.file_validation import MAX_EVIDENCE_FILES_PER_REQUEST
 from app.models.borrador_cuenta_cobro import BorradorCuentaCobro
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
@@ -38,6 +39,12 @@ from app.schemas.cuenta_cobro import (
     PDFUrlResponse,
 )
 from app.schemas.evidencia import EvidenciaClasificadaResponse
+from app.schemas.evidencia_clasificacion import (
+    ClasificacionEstadoResponse,
+    ClasificacionJobResponse,
+    ReclasificacionRequest,
+    ReclasificacionResponse,
+)
 from app.schemas.google_workspace import EvidencePersistRequest, EvidencePersistSummary
 from app.schemas.paquete import PaqueteInfoResponse
 from app.schemas.plantilla_organismo import FormatoValoresResponse
@@ -48,6 +55,7 @@ from app.services import (
     constancia_service,
     cruzar_service,
     cuenta_cobro_service,
+    evidence_classification_service,
     evidence_persist_service,
     evidencia_service,
     informe_service,
@@ -164,9 +172,12 @@ async def eliminar_cuenta_cobro(
     cuenta_id: uuid.UUID,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
+    storage: S3StorageAdapter = Depends(get_pdf_storage),
 ) -> None:
-    """Soft-delete a CuentaCobro. Only allowed when in BORRADOR state."""
-    await cuenta_cobro_service.eliminar_cuenta_cobro(db, user.id, cuenta_id)
+    """Hard-delete a CuentaCobro and everything scoped to it (actividades,
+    evidencias, files). Allowed in borrador, rechazada, or enviada; blocked once
+    aprobada or pagada (settled/paid financial record)."""
+    await cuenta_cobro_service.eliminar_cuenta_cobro(db, user.id, cuenta_id, storage)
 
 
 @router.patch("/{cuenta_id}", response_model=CuentaCobroResponse)
@@ -345,6 +356,7 @@ async def persistir_evidencias(
 async def subir_evidencias_cuenta(
     cuenta_id: uuid.UUID,
     user: CurrentUser,
+    background_tasks: BackgroundTasks,
     files: list[UploadFile] = File(...),
     db: AsyncSession = Depends(get_db),
     storage: S3StorageAdapter = Depends(get_pdf_storage),
@@ -357,7 +369,16 @@ async def subir_evidencias_cuenta(
     la generación de justificaciones y el paquete de radicación puedan usar esa
     clasificación más adelante. Todos los archivos se validan antes de persistir
     cualquiera; un archivo inválido rechaza el lote completo.
+
+    La clasificación multi-obligación (tabla `evidencia_obligacion`) se ejecuta
+    en segundo plano (evidence-classification-jobs: Fast upload response) — esta
+    respuesta vuelve antes de que termine. Consulte el progreso en
+    GET .../evidencias/clasificacion.
     """
+    if len(files) > MAX_EVIDENCE_FILES_PER_REQUEST:
+        raise ValidationError(
+            f"Máximo {MAX_EVIDENCE_FILES_PER_REQUEST} archivos por solicitud (se enviaron {len(files)})."
+        )
     archivos = [
         (
             f.filename or "upload",
@@ -372,6 +393,84 @@ async def subir_evidencias_cuenta(
         usuario_id=user.id,
         cuenta_id=cuenta_id,
         archivos=archivos,
+        background_tasks=background_tasks,
+    )
+
+
+@router.post(
+    "/{cuenta_id}/evidencias/clasificar",
+    response_model=ClasificacionJobResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def clasificar_evidencias_cuenta(
+    cuenta_id: uuid.UUID,
+    user: CurrentUser,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+) -> ClasificacionJobResponse:
+    """(Re)triggers background classification for every not-yet-linked evidencia
+    of this cuenta. Idempotent and retry-safe: also the way to retry a
+    `failed` job — re-processes whatever is still unresolved, including files
+    that failed on a previous run (evidence-classification-jobs: Retryable
+    failure state).
+    """
+    await cuenta_cobro_service._get_cuenta_con_ownership(db, user.id, cuenta_id)
+    job = await evidence_classification_service.encolar_clasificacion(db, background_tasks, cuenta_id)
+    return ClasificacionJobResponse.model_validate(job)
+
+
+@router.get(
+    "/{cuenta_id}/evidencias/clasificacion",
+    response_model=ClasificacionEstadoResponse,
+)
+async def obtener_clasificacion_evidencias(
+    cuenta_id: uuid.UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ClasificacionEstadoResponse:
+    """Per-file/per-obligación classification progress for polling
+    (evidence-classification-jobs: Per-file/per-obligación progress status
+    endpoint)."""
+    return await evidence_classification_service.obtener_estado_clasificacion(db, user.id, cuenta_id)
+
+
+@router.patch(
+    "/{cuenta_id}/evidencias/{evidencia_id}/obligaciones",
+    response_model=ReclasificacionResponse,
+)
+async def reclasificar_evidencia_obligaciones(
+    cuenta_id: uuid.UUID,
+    evidencia_id: uuid.UUID,
+    data: ReclasificacionRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ReclasificacionResponse:
+    """Full user authority over one evidencia's AI-suggested obligación links —
+    add/remove/confirm any link, or mark it as having no applicable obligación,
+    no approval workflow (evidence-reclassification capability)."""
+    links = await evidencia_service.reclasificar_evidencia(
+        db,
+        usuario_id=user.id,
+        cuenta_id=cuenta_id,
+        evidencia_id=evidencia_id,
+        add=data.add,
+        remove=data.remove,
+        confirm=data.confirm,
+        no_aplica=data.no_aplica,
+    )
+    return ReclasificacionResponse(
+        evidencia_id=evidencia_id,
+        obligaciones=[
+            {
+                "obligacion_id": link.obligacion_id,
+                "confianza": link.confianza,
+                "score": link.score,
+                "status": link.status,
+                "source": link.source,
+                "reasoning": link.reasoning,
+            }
+            for link in links
+        ],
     )
 
 
@@ -413,7 +512,7 @@ async def cambiar_estado(
     Transition a CuentaCobro to a new state.
 
     Valid transitions:
-    - enviada → aprobada | rechazada
+    - enviada → aprobada | rechazada | borrador (reopen)
     - rechazada → borrador
     - aprobada → pagada
 

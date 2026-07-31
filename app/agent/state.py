@@ -122,6 +122,7 @@ class AgentState(TypedDict, total=False):
     evidence_raw: list[dict[str, Any]] | None
     local_evidence: list[dict[str, Any]] | None
     matched_evidence: dict[str, list[dict[str, Any]]] | None  # obligacion_id → evidencias
+    matched_evidence_scores: dict[str, dict[str, float]] | None  # obligacion_id → {evidencia_id: blended_score}
     deduplicated_evidence: list[dict[str, Any]] | None
     evidencias_descartadas: int | None  # items filtrados como ruido por evidence_filter
 

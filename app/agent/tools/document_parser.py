@@ -57,12 +57,28 @@ def parse_pdf(content: bytes) -> str:
     return "\n\n".join(text_parts)
 
 
+def _docx_table_text(table) -> list[str]:
+    """One line per table row (cells joined with ' | '), recursing into nested tables."""
+    lines: list[str] = []
+    for row in table.rows:
+        cells = [cell.text.strip() for cell in row.cells]
+        if any(cells):
+            lines.append(" | ".join(cells))
+        for cell in row.cells:
+            for nested in cell.tables:
+                lines.extend(_docx_table_text(nested))
+    return lines
+
+
 def parse_docx(content: bytes) -> str:
-    """Extract text from DOCX bytes using python-docx."""
+    """Extract text from DOCX bytes using python-docx (body paragraphs + tables)."""
     import docx
 
     doc = docx.Document(io.BytesIO(content))
-    return "\n".join(para.text for para in doc.paragraphs if para.text.strip())
+    parts = [para.text for para in doc.paragraphs if para.text.strip()]
+    for table in doc.tables:
+        parts.extend(_docx_table_text(table))
+    return "\n".join(parts)
 
 
 def parse_xlsx(content: bytes) -> str:

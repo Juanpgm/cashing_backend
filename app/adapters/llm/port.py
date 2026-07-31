@@ -41,3 +41,11 @@ class LLMPort(Protocol):
     ) -> "AsyncIterator[str]":  # noqa: F821
         """Stream completion tokens one by one."""
         ...
+
+    async def embed(self, texts: list[str], *, model: str | None = None) -> list[list[float]]:
+        """Return one embedding vector per input text.
+
+        Used for in-memory cosine similarity ranking in the evidence matcher —
+        embeddings are never persisted (evidence-embeddings capability).
+        """
+        ...

@@ -269,8 +269,19 @@ async def descubrir_evidencias(
     db: AsyncSession,
     usuario_id: uuid.UUID,
     req: EvidenceDiscoveryRequest,
+    *,
+    local_only: bool = False,
 ) -> EvidenceDiscoveryResponse:
-    """Punto de entrada: descubre evidencias y genera justificaciones por obligación."""
+    """Punto de entrada: descubre evidencias y genera justificaciones por obligación.
+
+    `local_only=True` runs the SAME orchestrator→filter→matcher→justify pipeline
+    over only the uploaded local evidence (`_evidencias_subidas`), skipping Gmail/
+    Drive/Calendar entirely — including the Google-connection gate below, which is
+    never evaluated on this path (evidence-classification-pipeline: Local-only
+    pipeline execution, Zero Google API calls in local-only mode, Local path never
+    evaluates the Google gate). Non-local (default) behavior is unchanged: the
+    Google gate still runs and still raises `GOOGLE_NOT_CONNECTED` when applicable.
+    """
     contrato_id = await _resolve_contrato_id(db, usuario_id, req)
     obligaciones = await _resolve_obligaciones(db, req, contrato_id)
 
@@ -290,19 +301,26 @@ async def descubrir_evidencias(
             # a range that ends on a future date.
             fecha_fin = fecha_fin or date.today().isoformat()
 
-    # Verificar conexión de Google antes de gastar llamadas.
-    status = await gws.get_integration_status(db, usuario_id)
-    if not status.connected:
-        raise ExternalServiceError(
-            "Google",
-            "La cuenta de Google no está conectada. Usa /integraciones/google/connect.",
-            code=GOOGLE_NOT_CONNECTED,
-        )
+    if local_only:
+        # Local-only classification never touches Google — the connection gate
+        # below must NOT run at all on this path (evidence-classification-pipeline:
+        # Local path never evaluates the Google gate).
+        email_evidencias: list[dict] = []
+        email_filtered = 0
+    else:
+        # Verificar conexión de Google antes de gastar llamadas.
+        status = await gws.get_integration_status(db, usuario_id)
+        if not status.connected:
+            raise ExternalServiceError(
+                "Google",
+                "La cuenta de Google no está conectada. Usa /integraciones/google/connect.",
+                code=GOOGLE_NOT_CONNECTED,
+            )
 
-    # 1. Reunir evidencia cruda de Gmail (filtra no-personal en origen).
-    email_evidencias, email_filtered = await _gather_gmail_evidence(
-        db, usuario_id, obligaciones, fecha_inicio, fecha_fin, req.supervisor_email, req.entidad
-    )
+        # 1. Reunir evidencia cruda de Gmail (filtra no-personal en origen).
+        email_evidencias, email_filtered = await _gather_gmail_evidence(
+            db, usuario_id, obligaciones, fecha_inicio, fecha_fin, req.supervisor_email, req.entidad
+        )
 
     # Actividades de meses anteriores del mismo contrato (grounding para no repetir texto).
     actividades_previas = await _actividades_previas(db, contrato_id, req.cuenta_id)
@@ -325,9 +343,10 @@ async def descubrir_evidencias(
         "local_evidence": local_evidence,
     }
 
-    # 2-3. Explorar Drive y Calendar.
-    state = await drive_fetch_node(state)
-    state = await calendar_fetch_node(state)
+    # 2-3. Explorar Drive y Calendar (skipped entirely in local_only mode).
+    if not local_only:
+        state = await drive_fetch_node(state)
+        state = await calendar_fetch_node(state)
 
     # 4. Consolidar → filtrar ruido → emparejar → justificar.
     state = await evidence_orchestrator_node(state)
