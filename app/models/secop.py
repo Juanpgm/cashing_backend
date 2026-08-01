@@ -124,3 +124,9 @@ class SecopDocumento(UUIDMixin, TimestampMixin, Base):
     )
     categoria_confianza: Mapped[float | None] = mapped_column(Numeric(4, 3), nullable=True)
     categoria_override: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+
+    # Content-sniff memoization (clasificacion-documentos-secop, design D2):
+    # a doc is downloaded/extracted at most once ever; re-scans re-score the
+    # stored text for free. texto_estado: 'ok' | 'sin_texto' | 'error'.
+    texto_extraido: Mapped[str | None] = mapped_column(Text, nullable=True)
+    texto_estado: Mapped[str | None] = mapped_column(String(10), nullable=True)

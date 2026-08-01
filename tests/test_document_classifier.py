@@ -1,6 +1,7 @@
 """Unit tests for document_classifier — category inference from filename/description."""
 
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
@@ -12,6 +13,8 @@ from app.services.document_classifier import (
     TIPO_A_REQUISITO,
     aplicar_clasificacion,
     clasificar,
+    clasificar_contenido,
+    extraer_texto_contenido,
 )
 
 
@@ -46,6 +49,96 @@ def test_clasificar_cdp_por_nombre(nombre):
 def test_clasificar_rpc_no_se_confunde_con_cdp():
     cat, _ = clasificar("RPC registro presupuestal compromiso.pdf", None)
     assert cat == CategoriaDocumento.REGISTRO_PRESUPUESTAL
+
+
+# ── clasificar_contenido (borderline content sniff, D2) ─────────────────────
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+@pytest.mark.parametrize(
+    "texto, expected_cat",
+    [
+        (
+            "CONTRATO DE PRESTACIÓN DE SERVICIOS PROFESIONALES No. 123-2024\n"
+            "Entre la entidad y el contratista se celebra el presente contrato, cuyo clausulado se detalla.",
+            CategoriaDocumento.CONTRATO,
+        ),
+        (
+            "CERTIFICADO DE DISPONIBILIDAD PRESUPUESTAL No. 2024-001\n"
+            "La entidad certifica la disponibilidad presupuestal del rubro.",
+            CategoriaDocumento.CDP,
+        ),
+        (
+            "REGISTRO PRESUPUESTAL DEL COMPROMISO No. 555\n"
+            "Registro de compromiso presupuestal a favor del contratista.",
+            CategoriaDocumento.REGISTRO_PRESUPUESTAL,
+        ),
+    ],
+)
+def test_clasificar_contenido_hit_inequivoco_da_0850(texto, expected_cat):
+    cat, score = clasificar_contenido(texto)
+    assert cat == expected_cat
+    assert score == Decimal("0.850")
+
+
+def test_clasificar_contenido_ambiguo_multicategoria_da_0600():
+    texto = (
+        "El presente contrato se suscribe con cargo al registro presupuestal "
+        "expedido por la entidad para amparar el compromiso."
+    )
+    cat, score = clasificar_contenido(texto)
+    assert cat in (CategoriaDocumento.CONTRATO, CategoriaDocumento.REGISTRO_PRESUPUESTAL)
+    assert score == Decimal("0.600")
+
+
+def test_clasificar_contenido_sin_hit():
+    cat, score = clasificar_contenido("texto administrativo sin senales relevantes para el checklist")
+    assert cat is None
+    assert score == Decimal("0.000")
+
+
+def test_clasificar_contenido_texto_vacio():
+    assert clasificar_contenido(None) == (None, Decimal("0.000"))
+    assert clasificar_contenido("") == (None, Decimal("0.000"))
+
+
+def test_clasificar_contenido_solo_primeros_1500_chars():
+    texto = ("x" * 2000) + " contrato de prestacion de servicios"
+    cat, score = clasificar_contenido(texto)
+    assert cat is None
+    assert score == Decimal("0.000")
+
+
+# ── extraer_texto_contenido (extraction helper, no OCR) ─────────────────────
+
+def test_extraer_texto_contenido_docx():
+    data = (FIXTURES / "contrato.docx").read_bytes()
+    texto = extraer_texto_contenido(data, "contrato.docx")
+    assert "CONTRATO DE PRESTACI" in texto
+    cat, score = clasificar_contenido(texto)
+    assert cat == CategoriaDocumento.CONTRATO
+    assert score == Decimal("0.850")
+
+
+def test_extraer_texto_contenido_pdf():
+    data = (FIXTURES / "cdp.pdf").read_bytes()
+    texto = extraer_texto_contenido(data, "cdp.pdf")
+    assert "DISPONIBILIDAD PRESUPUESTAL" in texto
+    cat, score = clasificar_contenido(texto)
+    assert cat == CategoriaDocumento.CDP
+    assert score == Decimal("0.850")
+
+
+def test_extraer_texto_contenido_pdf_rpc():
+    data = (FIXTURES / "rpc.pdf").read_bytes()
+    cat, score = clasificar_contenido(extraer_texto_contenido(data, "rpc.pdf"))
+    assert cat == CategoriaDocumento.REGISTRO_PRESUPUESTAL
+    assert score == Decimal("0.850")
+
+
+def test_extraer_texto_contenido_bytes_invalidos_devuelve_vacio():
+    assert extraer_texto_contenido(b"\x00\x01\x02\x03\xff\xfe", "binario.exe") == ""
 
 
 # ── clasificar ──────────────────────────────────────────────────────────────

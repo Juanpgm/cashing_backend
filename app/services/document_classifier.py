@@ -8,11 +8,22 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+from app.agent.tools.document_parser import parse_document
 from app.core.text_match import keyword_score
 from app.models.categoria_documento import CategoriaDocumento
 
 # Minimum score to assign a non-OTROS category.
 CATEGORIA_MIN_THRESHOLD = Decimal("0.001")
+
+# Content-sniff scores (clasificacion-documentos-secop, design D2).
+# Unambiguous keyword hit → auto-linkable (below manual 1.000); multi-category
+# ambiguous hit → candidate only (below AUTO_LINK_THRESHOLD 0.700).
+CONTENIDO_SCORE_UNICO = Decimal("0.850")
+CONTENIDO_SCORE_AMBIGUO = Decimal("0.600")
+# Only the head of the document decides — titles/headers carry the signal.
+_CONTENIDO_MAX_CHARS = 1500
+# Persisted extraction cap for memoization on secop_documentos.texto_extraido.
+TEXTO_EXTRAIDO_MAX_CHARS = 20_000
 
 # Keywords per category (normalized at runtime via keyword_score).
 # Order matters only for tie-breaking (first match wins if scores are equal).
@@ -110,6 +121,45 @@ def clasificar(
         return CategoriaDocumento.OTROS, Decimal("0.000")
 
     return best_cat, best_score
+
+
+def clasificar_contenido(texto: str | None) -> tuple[CategoriaDocumento | None, Decimal]:
+    """Content-based re-score for the borderline sniff (no LLM, no embeddings).
+
+    Scores the first ~1500 chars of extracted text against CATEGORIA_KEYWORDS:
+    exactly one category hit → (category, 0.850); hits in several categories →
+    (best category, 0.600) — candidate only; no hit → (None, 0.000).
+    """
+    if not texto:
+        return None, Decimal("0.000")
+    fragmento = texto[:_CONTENIDO_MAX_CHARS]
+
+    hits: list[tuple[CategoriaDocumento, Decimal]] = []
+    for cat, keywords in CATEGORIA_KEYWORDS.items():
+        score = keyword_score([fragmento], keywords)
+        if score > Decimal("0.000"):
+            hits.append((cat, score))
+
+    if not hits:
+        return None, Decimal("0.000")
+    best_cat = max(hits, key=lambda x: x[1])[0]
+    if len(hits) == 1:
+        return best_cat, CONTENIDO_SCORE_UNICO
+    return best_cat, CONTENIDO_SCORE_AMBIGUO
+
+
+def extraer_texto_contenido(data: bytes, filename: str) -> str:
+    """Best-effort text extraction for the content sniff (PDF/DOCX/text; NO OCR).
+
+    Reuses the shared document parser (pdfplumber/python-docx). Returns "" when
+    the bytes yield no extractable text — never raises. Output is truncated to
+    TEXTO_EXTRAIDO_MAX_CHARS for persistence on secop_documentos.texto_extraido.
+    """
+    try:
+        texto = parse_document(data, filename)
+    except Exception:  # noqa: BLE001 — unparseable bytes are simply "no text"
+        return ""
+    return texto[:TEXTO_EXTRAIDO_MAX_CHARS]
 
 
 def aplicar_clasificacion(doc: object, *, forzar: bool = False) -> None:
