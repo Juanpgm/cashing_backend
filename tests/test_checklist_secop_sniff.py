@@ -150,9 +150,7 @@ async def _candidatos(db: AsyncSession, cuenta_id: uuid.UUID, codigo: str) -> li
 # ── 2.1 trigger band + bounded cost ─────────────────────────────────────────
 
 
-async def test_score_confiado_no_dispara_sniff(
-    db: AsyncSession, contrato: Contrato, descargas: dict[str, Any]
-) -> None:
+async def test_score_confiado_no_dispara_sniff(db: AsyncSession, contrato: Contrato, descargas: dict[str, Any]) -> None:
     """Confident (>= 0.700) filename scores on CONTRATO, RPC and CDP → zero downloads."""
     db.add_all(
         [
@@ -314,9 +312,7 @@ async def test_contrato_unico_con_dos_borderline(
     vinculos = (
         (
             await db.execute(
-                select(DocumentoRequisitoVinculo).where(
-                    DocumentoRequisitoVinculo.documento_cuenta_cobro_id == fila.id
-                )
+                select(DocumentoRequisitoVinculo).where(DocumentoRequisitoVinculo.documento_cuenta_cobro_id == fila.id)
             )
         )
         .scalars()
@@ -328,9 +324,7 @@ async def test_contrato_unico_con_dos_borderline(
     assert all(c.score == Decimal("0.850") for c in cands)
 
 
-async def test_rpc_append_only_preservado(
-    db: AsyncSession, contrato: Contrato, descargas: dict[str, Any]
-) -> None:
+async def test_rpc_append_only_preservado(db: AsyncSession, contrato: Contrato, descargas: dict[str, Any]) -> None:
     rpc_original = _secop_doc(contrato, "RPC registro presupuestal compromiso presupuestal.pdf")
     url = "https://s/modificacion.docx"
     descargas["payloads"][url] = _docx_bytes(TEXTO_RPC)
@@ -353,9 +347,7 @@ async def test_rpc_append_only_preservado(
     vinculos = (
         (
             await db.execute(
-                select(DocumentoRequisitoVinculo).where(
-                    DocumentoRequisitoVinculo.documento_cuenta_cobro_id == fila.id
-                )
+                select(DocumentoRequisitoVinculo).where(DocumentoRequisitoVinculo.documento_cuenta_cobro_id == fila.id)
             )
         )
         .scalars()

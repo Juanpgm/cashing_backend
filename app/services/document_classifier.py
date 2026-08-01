@@ -157,7 +157,7 @@ def extraer_texto_contenido(data: bytes, filename: str) -> str:
     """
     try:
         texto = parse_document(data, filename)
-    except Exception:  # noqa: BLE001 — unparseable bytes are simply "no text"
+    except Exception:
         return ""
     return texto[:TEXTO_EXTRAIDO_MAX_CHARS]
 

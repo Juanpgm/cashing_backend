@@ -4,7 +4,6 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
-
 from app.models.categoria_documento import CategoriaDocumento
 from app.services.document_classifier import (
     CATEGORIA_A_REQUISITO,
@@ -16,7 +15,6 @@ from app.services.document_classifier import (
     clasificar_contenido,
     extraer_texto_contenido,
 )
-
 
 # ── CDP first-class category (clasificacion-documentos-secop, D1) ───────────
 

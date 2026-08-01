@@ -743,11 +743,9 @@ async def _asegurar_texto_extraido(doc: SecopDocumento, presupuesto: _Presupuest
         texto = extraer_texto_contenido(data, doc.nombre_archivo or "documento")
         doc.texto_extraido = texto or None
         doc.texto_estado = "ok" if texto.strip() else "sin_texto"
-    except Exception as exc:  # noqa: BLE001 — a bad download must not sink the scan
+    except Exception as exc:
         doc.texto_estado = "error"
-        await logger.awarning(
-            "secop_sniff_descarga_error", secop_documento_id=str(doc.id), error=str(exc)
-        )
+        await logger.awarning("secop_sniff_descarga_error", secop_documento_id=str(doc.id), error=str(exc))
 
 
 def _score_contenido_para_requisito(doc: SecopDocumento, req_codigo: str) -> Decimal | None:
@@ -946,7 +944,7 @@ async def detectar_desde_secop(
                 fila.confianza_deteccion = top[0][1]
                 fila.estado = EstadoRequisito.DETECTADO
                 db.add(DocumentoRequisitoVinculo(documento_cuenta_cobro_id=fila.id, secop_documento_id=top[0][0].id))
-        except Exception as exc:  # noqa: BLE001 — one bad requisito must not sink the whole scan
+        except Exception as exc:
             await logger.aerror(
                 "checklist_deteccion_error",
                 cuenta_id=str(cuenta.id),
@@ -991,7 +989,7 @@ async def detectar_desde_secop(
                     db.add(
                         DocumentoRequisitoVinculo(documento_cuenta_cobro_id=fila.id, secop_documento_id=top[0][0].id)
                     )
-            except Exception as exc:  # noqa: BLE001 — one bad requisito must not sink the whole scan
+            except Exception as exc:
                 await logger.aerror(
                     "checklist_deteccion_error",
                     cuenta_id=str(cuenta.id),
@@ -1404,7 +1402,7 @@ async def auto_vincular_documentos_fuente(
                     candidates.setdefault(req_codigo, []).append(
                         (score, doc.categoria_override, doc.categoria_confianza or 0.0, doc)
                     )
-        except Exception as exc:  # noqa: BLE001 — one bad requisito must not sink the whole pass
+        except Exception as exc:
             await logger.aerror(
                 "checklist_auto_vincular_error",
                 cuenta_id=str(cuenta.id),
@@ -1454,7 +1452,7 @@ async def auto_vincular_documentos_fuente(
                     fila.confianza_deteccion = best_score
                     fila.estado = EstadoRequisito.CARGADO
                     vinculados += 1
-            except Exception as exc:  # noqa: BLE001 — one bad requisito must not sink the whole pass
+            except Exception as exc:
                 await logger.aerror(
                     "checklist_auto_vincular_error",
                     cuenta_id=str(cuenta.id),
