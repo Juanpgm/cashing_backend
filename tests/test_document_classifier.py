@@ -6,10 +6,46 @@ import pytest
 
 from app.models.categoria_documento import CategoriaDocumento
 from app.services.document_classifier import (
+    CATEGORIA_A_REQUISITO,
+    CATEGORIA_KEYWORDS,
     CATEGORIA_MIN_THRESHOLD,
+    TIPO_A_REQUISITO,
     aplicar_clasificacion,
     clasificar,
 )
+
+
+# ── CDP first-class category (clasificacion-documentos-secop, D1) ───────────
+
+def test_categoria_cdp_es_primera_clase():
+    assert CategoriaDocumento.CDP.value == "cdp"
+    assert "cdp" in CATEGORIA_KEYWORDS[CategoriaDocumento.CDP]
+    assert "certificado de disponibilidad" in CATEGORIA_KEYWORDS[CategoriaDocumento.CDP]
+    assert "disponibilidad presupuestal" in CATEGORIA_KEYWORDS[CategoriaDocumento.CDP]
+
+
+def test_cdp_mapeos_a_requisito():
+    assert CATEGORIA_A_REQUISITO[CategoriaDocumento.CDP] == "CDP"
+    assert TIPO_A_REQUISITO["cdp"] == "CDP"
+
+
+@pytest.mark.parametrize(
+    "nombre",
+    [
+        "CDP_2024.pdf",
+        "Certificado de Disponibilidad Presupuestal.pdf",
+        "disponibilidad presupuestal 001.pdf",
+    ],
+)
+def test_clasificar_cdp_por_nombre(nombre):
+    cat, score = clasificar(nombre, None)
+    assert cat == CategoriaDocumento.CDP
+    assert score >= CATEGORIA_MIN_THRESHOLD
+
+
+def test_clasificar_rpc_no_se_confunde_con_cdp():
+    cat, _ = clasificar("RPC registro presupuestal compromiso.pdf", None)
+    assert cat == CategoriaDocumento.REGISTRO_PRESUPUESTAL
 
 
 # ── clasificar ──────────────────────────────────────────────────────────────

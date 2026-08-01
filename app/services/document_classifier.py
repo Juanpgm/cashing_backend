@@ -25,6 +25,9 @@ CATEGORIA_KEYWORDS: dict[CategoriaDocumento, list[str]] = {
         "rpc", "rp ", "registro presupuestal", "compromiso presupuestal",
         "registro de compromiso",
     ],
+    CategoriaDocumento.CDP: [
+        "cdp", "certificado de disponibilidad", "disponibilidad presupuestal",
+    ],
     CategoriaDocumento.ACTA_INICIO: [
         "acta de inicio", "acta inicio", "inicio del contrato", "acta de arranque",
     ],
@@ -52,6 +55,7 @@ CATEGORIA_KEYWORDS: dict[CategoriaDocumento, list[str]] = {
 CATEGORIA_A_REQUISITO: dict[CategoriaDocumento, str | None] = {
     CategoriaDocumento.CONTRATO: "CONTRATO",
     CategoriaDocumento.REGISTRO_PRESUPUESTAL: "RPC",
+    CategoriaDocumento.CDP: "CDP",
     CategoriaDocumento.ACTA_INICIO: "ACTA_INICIO",
     CategoriaDocumento.RUT: "RUT",
     CategoriaDocumento.CEDULA: "CEDULA",
@@ -68,6 +72,7 @@ CATEGORIA_A_REQUISITO: dict[CategoriaDocumento, str | None] = {
 TIPO_A_REQUISITO: dict[str, str] = {
     "contrato": "CONTRATO",
     "rpc": "RPC",
+    "cdp": "CDP",
     "seguridad_social": "SEGURIDAD_SOCIAL",
     "comprobante_pago_ss": "COMPROBANTE_PAGO_SS",
     "informe_actividades": "INFORME_ACTIVIDADES",
