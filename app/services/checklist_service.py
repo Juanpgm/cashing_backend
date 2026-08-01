@@ -705,6 +705,7 @@ class _PresupuestoSniff:
 
     descargas: int = 0
     inicio: float = field(default_factory=time.monotonic)
+    intentos: set[uuid.UUID] = field(default_factory=set)
 
     @property
     def agotado(self) -> bool:
@@ -741,18 +742,27 @@ async def _descargar_secop_bytes(url: str) -> bytes:
 
 
 async def _asegurar_texto_extraido(doc: SecopDocumento, presupuesto: _PresupuestoSniff) -> None:
-    """Download + extract text for a SECOP doc AT MOST ONCE EVER.
+    """Download + extract text for a SECOP doc.
 
-    Memoized via ``texto_estado``: any prior attempt (ok/sin_texto/error) is
-    final — errors are not retried. Failures persist ``texto_estado='error'``,
-    keep the filename score, and never raise (budget-friendly degradation).
+    Memoized via ``texto_estado``: 'ok' and 'sin_texto' are final — content
+    already resolved, or genuinely absent (``extraer_texto_contenido``'s
+    documented ValueError contract). 'error' (download failure or an
+    unexpected parse exception) is retried on the NEXT scan, but at most once
+    per scan (tracked in ``presupuesto.intentos``) so a persistently-failing
+    doc never burns more than one download attempt per run. Never raises
+    (budget-friendly degradation): failures persist ``texto_estado='error'``
+    and the filename score survives.
     """
-    if doc.texto_estado is not None or presupuesto.agotado:
+    if presupuesto.agotado:
+        return
+    if doc.texto_estado is not None and (doc.texto_estado != "error" or doc.id in presupuesto.intentos):
         return
     if not doc.url_descarga:
         doc.texto_estado = "error"
+        presupuesto.intentos.add(doc.id)
         return
     presupuesto.descargas += 1
+    presupuesto.intentos.add(doc.id)
     try:
         data = await _descargar_secop_bytes(doc.url_descarga)
         texto = extraer_texto_contenido(data, doc.nombre_archivo or "documento")

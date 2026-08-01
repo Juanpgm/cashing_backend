@@ -152,12 +152,16 @@ def extraer_texto_contenido(data: bytes, filename: str) -> str:
     """Best-effort text extraction for the content sniff (PDF/DOCX/text; NO OCR).
 
     Reuses the shared document parser (pdfplumber/python-docx). Returns "" when
-    the bytes yield no extractable text — never raises. Output is truncated to
+    the bytes are genuinely non-textual — ``parse_document``'s documented
+    ``ValueError`` contract, a legitimate and permanent "no text" signal. Any
+    OTHER exception (an unexpected parser failure) propagates instead of being
+    collapsed into "", so the caller can treat it as a retryable error rather
+    than the terminal "sin_texto" state. Output is truncated to
     TEXTO_EXTRAIDO_MAX_CHARS for persistence on secop_documentos.texto_extraido.
     """
     try:
         texto = parse_document(data, filename)
-    except Exception:
+    except ValueError:
         return ""
     return texto[:TEXTO_EXTRAIDO_MAX_CHARS]
 

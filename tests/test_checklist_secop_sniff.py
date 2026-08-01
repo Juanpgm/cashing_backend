@@ -285,10 +285,72 @@ async def test_error_de_descarga_persiste_estado_y_continua(
     cands = await _candidatos(db, cuenta.id, "CONTRATO")
     assert [(c.score, c.score_origen) for c in cands] == [(Decimal("0.333"), "nombre")]
 
-    # A failed doc is never retried: second scan makes no new attempts.
+    # A persistently-failing doc is retried on the NEXT scan (error is not
+    # terminal like ok/sin_texto) — still one attempt per scan.
     await checklist_service.detectar_desde_secop(db, cuenta)
     await db.commit()
+    assert descargas["llamadas"] == [url, url]
+
+
+async def test_error_transitorio_se_reintenta_y_recupera_en_scan_siguiente(
+    db: AsyncSession, contrato: Contrato, descargas: dict[str, Any]
+) -> None:
+    """A transient download failure must not poison the doc forever: the next
+    scan retries it, and a subsequent success recovers content scoring."""
+    url = "https://s/intermitente.docx"
+    descargas["errores"].add(url)  # first scan: fails
+    doc = _secop_doc(contrato, "documento_generico.docx", url=url)
+    db.add(doc)
+    await db.commit()
+    cuenta = await _make_cuenta(db, contrato)
+
+    await checklist_service.detectar_desde_secop(db, cuenta)
+    await db.commit()
+
     assert descargas["llamadas"] == [url]
+    await db.refresh(doc)
+    assert doc.texto_estado == "error"
+
+    # The network recovers before the next scan.
+    descargas["errores"].discard(url)
+    descargas["payloads"][url] = _docx_bytes(TEXTO_CONTRATO)
+
+    await checklist_service.detectar_desde_secop(db, cuenta)
+    await db.commit()
+
+    assert descargas["llamadas"] == [url, url]  # retried, not skipped
+    await db.refresh(doc)
+    assert doc.texto_estado == "ok"
+    assert doc.texto_extraido is not None and "CONTRATO DE PRESTACI" in doc.texto_extraido
+
+    fila = await _fila(db, cuenta.id, "CONTRATO")
+    assert fila.estado == EstadoRequisito.DETECTADO
+    assert fila.confianza_deteccion == Decimal("0.850")
+
+
+async def test_extraer_texto_contenido_bug_no_colapsa_a_sin_texto(
+    db: AsyncSession, contrato: Contrato, descargas: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unexpected parse exception (NOT the documented 'genuinely non-textual'
+    ValueError) must map to the retryable 'error' state, never to the terminal
+    'sin_texto' state."""
+    url = "https://s/bug-de-parseo.docx"
+    descargas["payloads"][url] = b"contenido-cualquiera"
+    doc = _secop_doc(contrato, "documento_generico.docx", url=url)
+    db.add(doc)
+    await db.commit()
+    cuenta = await _make_cuenta(db, contrato)
+
+    def _boom(data: bytes, filename: str) -> str:
+        raise RuntimeError("fallo inesperado del parser")
+
+    monkeypatch.setattr(checklist_service, "extraer_texto_contenido", _boom)
+
+    await checklist_service.detectar_desde_secop(db, cuenta)
+    await db.commit()
+
+    await db.refresh(doc)
+    assert doc.texto_estado == "error"
 
 
 # ── 2.3 invariants ──────────────────────────────────────────────────────────
