@@ -14,6 +14,7 @@ import calendar
 import json
 import re
 from datetime import date
+from typing import Any
 from uuid import UUID
 
 import structlog
@@ -126,7 +127,7 @@ _CONTEXTO_CONTRATO_SNIPPET_MAX = 400
 _CONTEXTO_CONTRATO_MAX_TOTAL = 2500
 
 
-def _contexto_contrato_bloque(contexto_docs: list[dict]) -> str:
+def _contexto_contrato_bloque(contexto_docs: list[dict[str, Any]]) -> str:
     """Optional contract-level context block for the cruzar writer prompts.
 
     Built from `checklist_service.listar_documentos_contexto` items (OTROS/

@@ -15,7 +15,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
-from typing import Protocol
+from typing import Any, Protocol
 
 import httpx
 import structlog
@@ -1110,7 +1110,7 @@ def _es_categoria_sin_requisito(categoria: CategoriaDocumento | None) -> bool:
     return categoria is None or CATEGORIA_A_REQUISITO.get(categoria) is None
 
 
-async def listar_documentos_contexto(db: AsyncSession, cuenta: CuentaCobro) -> list[dict]:
+async def listar_documentos_contexto(db: AsyncSession, cuenta: CuentaCobro) -> list[dict[str, Any]]:
     """Read-only contract-level context docs for this cuenta (design D4).
 
     Returns SECOP docs of the contract plus contract-level uploads
@@ -1139,7 +1139,7 @@ async def listar_documentos_contexto(db: AsyncSession, cuenta: CuentaCobro) -> l
     linked_fuente = {v.documento_fuente_id for v in vinculos if v.documento_fuente_id is not None}
     linked_secop = {v.secop_documento_id for v in vinculos if v.secop_documento_id is not None}
 
-    items: list[dict] = []
+    items: list[dict[str, Any]] = []
     for sdoc in await _secop_documentos_del_contrato(db, contrato):
         if sdoc.id in linked_secop or not _es_categoria_sin_requisito(sdoc.categoria):
             continue
