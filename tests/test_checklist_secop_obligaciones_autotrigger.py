@@ -96,7 +96,7 @@ def descargas(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     llamadas: list[str] = []
     payloads: dict[str, bytes] = {}
 
-    async def _fake(url: str) -> bytes:
+    async def _fake(url: str, timeout: float = checklist_service._SNIFF_HTTP_TIMEOUT) -> bytes:
         llamadas.append(url)
         return payloads[url]
 
