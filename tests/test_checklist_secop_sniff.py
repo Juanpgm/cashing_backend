@@ -119,6 +119,21 @@ TEXTO_AMBIGUO = (
 TEXTO_IRRELEVANTE = "acta administrativa interna de la dependencia sin datos utiles"
 
 
+@pytest.fixture(autouse=True)
+def _sin_extraccion_obligaciones(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Isolate this suite from the task-3.9 auto-extraction trigger: an
+    auto-linked CONTRATO would otherwise kick off the (LLM-backed) obligaciones
+    pipeline. The SNIFF itself stays LLM/embedding-free — that invariant is what
+    this suite asserts; the trigger has its own suite
+    (`test_checklist_secop_obligaciones_autotrigger.py`)."""
+    from app.services import document_service
+
+    async def _noop(texto: str, contrato_id: Any, db: Any) -> tuple[list, list]:
+        return [], []
+
+    monkeypatch.setattr(document_service, "extraer_obligaciones_texto", _noop)
+
+
 @pytest.fixture
 def descargas(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     """Fake the download seam; log every call, serve payloads, raise on demand."""
@@ -160,7 +175,14 @@ async def _candidatos(db: AsyncSession, cuenta_id: uuid.UUID, codigo: str) -> li
 
 
 async def test_score_confiado_no_dispara_sniff(db: AsyncSession, contrato: Contrato, descargas: dict[str, Any]) -> None:
-    """Confident (>= 0.700) filename scores on CONTRATO, RPC and CDP → zero downloads."""
+    """Confident (>= 0.700) filename scores on CONTRATO, RPC and CDP → zero downloads.
+
+    The contrato already has obligaciones so the task-3.9 auto-extraction trigger
+    (which may legitimately download an auto-linked CONTRATO once) stays inert —
+    this test isolates the SNIFF's zero-download invariant."""
+    from app.models.obligacion import Obligacion, TipoObligacion
+
+    db.add(Obligacion(contrato_id=contrato.id, descripcion="Obligación previa", tipo=TipoObligacion.GENERAL, orden=1))
     db.add_all(
         [
             _secop_doc(contrato, "Contrato firmado minuta clausulado.pdf", url="https://s/contrato.pdf"),
@@ -457,6 +479,11 @@ async def test_override_manual_excluido_del_sniff(
 async def test_override_a_contrato_autolinkea_sin_descarga(
     db: AsyncSession, contrato: Contrato, descargas: dict[str, Any]
 ) -> None:
+    """Categoria override scores 1.000 by itself — the SNIFF downloads nothing.
+    Contrato pre-seeded with obligaciones so the task-3.9 trigger stays inert."""
+    from app.models.obligacion import Obligacion, TipoObligacion
+
+    db.add(Obligacion(contrato_id=contrato.id, descripcion="Obligación previa", tipo=TipoObligacion.GENERAL, orden=1))
     doc = _secop_doc(
         contrato,
         "documento_generico.docx",

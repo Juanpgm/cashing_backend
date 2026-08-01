@@ -838,6 +838,53 @@ async def _sniff_requisito(
     return resultado
 
 
+async def _auto_extraer_obligaciones_contrato(
+    db: AsyncSession,
+    contrato: Contrato,
+    doc: SecopDocumento,
+    presupuesto: _PresupuestoSniff,
+) -> None:
+    """Auto-trigger obligaciones extraction on SECOP Contrato auto-assign (task 3.9).
+
+    Mirrors what an uploaded contrato gets: the same
+    ``document_service.extraer_obligaciones_texto`` pipeline, fed with the SECOP
+    doc's persisted ``texto_extraido`` (extracted here with the bounded sniff
+    helpers when the doc was never sniffed). Guards:
+    - idempotent: skipped when the contrato already has obligaciones;
+    - degraded: any failure logs a warning and returns — never breaks the scan;
+    - zero new ``DocumentoRequisitoVinculo`` writers.
+    """
+    try:
+        existente = (
+            await db.execute(select(Obligacion.id).where(Obligacion.contrato_id == contrato.id).limit(1))
+        ).scalar_one_or_none()
+        if existente is not None:
+            return
+        if doc.texto_estado is None:
+            await _asegurar_texto_extraido(doc, presupuesto)
+        if doc.texto_estado != "ok" or not doc.texto_extraido:
+            return
+
+        # Function-level import: document_service imports this module inside its
+        # own functions — a module-level import here would be circular.
+        from app.services import document_service
+
+        obligaciones, _avisos = await document_service.extraer_obligaciones_texto(doc.texto_extraido, contrato.id, db)
+        await logger.ainfo(
+            "secop_contrato_auto_obligaciones",
+            contrato_id=str(contrato.id),
+            secop_documento_id=str(doc.id),
+            total=len(obligaciones),
+        )
+    except Exception as exc:
+        await logger.awarning(
+            "secop_contrato_auto_obligaciones_error",
+            contrato_id=str(contrato.id),
+            secop_documento_id=str(doc.id),
+            error=str(exc),
+        )
+
+
 _DETECCION_ERRORES_INFO_KEY = "checklist_deteccion_errores"
 
 
@@ -987,6 +1034,11 @@ async def detectar_desde_secop(
                 fila.confianza_deteccion = top[0][1]
                 fila.estado = EstadoRequisito.DETECTADO
                 db.add(DocumentoRequisitoVinculo(documento_cuenta_cobro_id=fila.id, secop_documento_id=top[0][0].id))
+                if req.codigo == "CONTRATO":
+                    # Task 3.9: an auto-assigned SECOP Contrato kicks off the same
+                    # obligaciones extraction an uploaded contrato gets (degraded,
+                    # idempotent, never blocks the scan).
+                    await _auto_extraer_obligaciones_contrato(db, contrato, top[0][0], presupuesto)
         except Exception as exc:
             await logger.aerror(
                 "checklist_deteccion_error",
