@@ -715,11 +715,29 @@ class _PresupuestoSniff:
 
 
 async def _descargar_secop_bytes(url: str) -> bytes:
-    """Download a SECOP file (monkeypatch seam for tests)."""
-    async with httpx.AsyncClient(timeout=_SNIFF_HTTP_TIMEOUT, follow_redirects=True) as client:
-        resp = await client.get(url)
+    """Download a SECOP file (monkeypatch seam for tests).
+
+    Streams the body and aborts as soon as the accumulated size crosses
+    ``_SNIFF_MAX_BYTES`` — the cap bounds what is DOWNLOADED, not just what
+    ends up kept in memory. Also honors an early Content-Length reject when
+    the server advertises an oversized body upfront.
+    """
+    async with (
+        httpx.AsyncClient(timeout=_SNIFF_HTTP_TIMEOUT, follow_redirects=True) as client,
+        client.stream("GET", url) as resp,
+    ):
         resp.raise_for_status()
-        return resp.content
+        content_length = resp.headers.get("content-length")
+        if content_length is not None and int(content_length) > _SNIFF_MAX_BYTES:
+            msg = f"documento excede {_SNIFF_MAX_BYTES} bytes (content-length)"
+            raise ValueError(msg)
+        chunks = bytearray()
+        async for chunk in resp.aiter_bytes():
+            chunks.extend(chunk)
+            if len(chunks) > _SNIFF_MAX_BYTES:
+                msg = f"documento excede {_SNIFF_MAX_BYTES} bytes"
+                raise ValueError(msg)
+        return bytes(chunks)
 
 
 async def _asegurar_texto_extraido(doc: SecopDocumento, presupuesto: _PresupuestoSniff) -> None:
@@ -737,9 +755,6 @@ async def _asegurar_texto_extraido(doc: SecopDocumento, presupuesto: _Presupuest
     presupuesto.descargas += 1
     try:
         data = await _descargar_secop_bytes(doc.url_descarga)
-        if len(data) > _SNIFF_MAX_BYTES:
-            msg = f"documento excede {_SNIFF_MAX_BYTES} bytes"
-            raise ValueError(msg)
         texto = extraer_texto_contenido(data, doc.nombre_archivo or "documento")
         doc.texto_extraido = texto or None
         doc.texto_estado = "ok" if texto.strip() else "sin_texto"

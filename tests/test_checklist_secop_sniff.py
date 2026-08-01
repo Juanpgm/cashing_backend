@@ -435,3 +435,69 @@ async def test_cero_llamadas_llm_y_embeddings(
 
     assert llm_calls == []
     assert descargas["llamadas"] == [url]
+
+
+# ── 2.4 real download seam: streamed, bounded by bytes (RISK-001) ───────────
+#
+# These bypass the ``descargas`` fixture on purpose: it monkeypatches
+# ``_descargar_secop_bytes`` wholesale, so it can't exercise the real
+# streaming/size-cap behaviour of that function. Uses httpx.MockTransport —
+# no real network.
+
+
+_AsyncClientReal = httpx.AsyncClient
+
+
+def _client_con_transport(transport: httpx.MockTransport) -> Any:
+    """Rebuild AsyncClient with a mocked transport, keeping the app's own kwargs."""
+
+    def _factory(**kw: Any) -> httpx.AsyncClient:
+        kw["transport"] = transport
+        return _AsyncClientReal(**kw)
+
+    return _factory
+
+
+async def test_descargar_secop_bytes_aborta_stream_al_exceder_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A body without Content-Length that grows past the 25 MiB cap must be
+    aborted mid-stream — the cap bounds what is DOWNLOADED, not just kept."""
+    chunk = b"x" * (10 * 1024 * 1024)  # 10 MiB per chunk, 5 chunks = 50 MiB total
+    yielded: list[int] = []
+
+    async def cuerpo() -> Any:
+        for i in range(5):
+            yielded.append(i)
+            yield chunk
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=cuerpo())
+
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(httpx, "AsyncClient", _client_con_transport(transport))
+
+    with pytest.raises(ValueError, match="excede"):
+        await checklist_service._descargar_secop_bytes("https://s/enorme.docx")
+
+    # Aborts once the accumulated size crosses the cap (3 chunks = 30 MiB > 25 MiB):
+    # the remaining chunks of the body are never pulled from the stream.
+    assert len(yielded) < 5
+
+
+async def test_descargar_secop_bytes_rechaza_content_length_temprano(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An oversized Content-Length is rejected before any body byte is read."""
+    leido: list[bytes] = []
+
+    async def cuerpo() -> Any:
+        leido.append(b"nunca deberia leerse")
+        yield b"x" * 1024
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-length": str(50 * 1024 * 1024)}, content=cuerpo())
+
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(httpx, "AsyncClient", _client_con_transport(transport))
+
+    with pytest.raises(ValueError, match="excede"):
+        await checklist_service._descargar_secop_bytes("https://s/enorme2.docx")
+
+    assert leido == []
