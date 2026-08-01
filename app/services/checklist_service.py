@@ -697,6 +697,9 @@ _SNIFF_MAX_DESCARGAS_POR_SCAN = 6
 _SNIFF_PRESUPUESTO_SEGUNDOS = 20.0
 _SNIFF_HTTP_TIMEOUT = 10.0
 _SNIFF_MAX_BYTES = 25 * 1024 * 1024
+# Below this much remaining budget, skip the download rather than fire a
+# near-zero-timeout request that's doomed to fail anyway.
+_SNIFF_EPSILON_SEGUNDOS = 0.5
 
 
 @dataclass
@@ -709,22 +712,26 @@ class _PresupuestoSniff:
 
     @property
     def agotado(self) -> bool:
-        return (
-            self.descargas >= _SNIFF_MAX_DESCARGAS_POR_SCAN
-            or time.monotonic() - self.inicio > _SNIFF_PRESUPUESTO_SEGUNDOS
-        )
+        return self.descargas >= _SNIFF_MAX_DESCARGAS_POR_SCAN or self.restante <= 0
+
+    @property
+    def restante(self) -> float:
+        """Seconds left in the scan's wall-clock budget (may be negative)."""
+        return _SNIFF_PRESUPUESTO_SEGUNDOS - (time.monotonic() - self.inicio)
 
 
-async def _descargar_secop_bytes(url: str) -> bytes:
+async def _descargar_secop_bytes(url: str, timeout: float = _SNIFF_HTTP_TIMEOUT) -> bytes:
     """Download a SECOP file (monkeypatch seam for tests).
 
     Streams the body and aborts as soon as the accumulated size crosses
     ``_SNIFF_MAX_BYTES`` — the cap bounds what is DOWNLOADED, not just what
     ends up kept in memory. Also honors an early Content-Length reject when
-    the server advertises an oversized body upfront.
+    the server advertises an oversized body upfront. ``timeout`` is clamped by
+    the caller to the scan's remaining budget so worst-case wall time stays
+    bounded by ``_SNIFF_PRESUPUESTO_SEGUNDOS``, not the fixed HTTP timeout.
     """
     async with (
-        httpx.AsyncClient(timeout=_SNIFF_HTTP_TIMEOUT, follow_redirects=True) as client,
+        httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client,
         client.stream("GET", url) as resp,
     ):
         resp.raise_for_status()
@@ -752,6 +759,10 @@ async def _asegurar_texto_extraido(doc: SecopDocumento, presupuesto: _Presupuest
     doc never burns more than one download attempt per run. Never raises
     (budget-friendly degradation): failures persist ``texto_estado='error'``
     and the filename score survives.
+
+    The per-download HTTP timeout is clamped to the scan's remaining wall-clock
+    budget (``min(_SNIFF_HTTP_TIMEOUT, restante)``), so a slow download can't
+    push the scan past its ``_SNIFF_PRESUPUESTO_SEGUNDOS`` deadline.
     """
     if presupuesto.agotado:
         return
@@ -761,10 +772,13 @@ async def _asegurar_texto_extraido(doc: SecopDocumento, presupuesto: _Presupuest
         doc.texto_estado = "error"
         presupuesto.intentos.add(doc.id)
         return
+    restante = presupuesto.restante
+    if restante <= _SNIFF_EPSILON_SEGUNDOS:
+        return
     presupuesto.descargas += 1
     presupuesto.intentos.add(doc.id)
     try:
-        data = await _descargar_secop_bytes(doc.url_descarga)
+        data = await _descargar_secop_bytes(doc.url_descarga, min(_SNIFF_HTTP_TIMEOUT, restante))
         texto = extraer_texto_contenido(data, doc.nombre_archivo or "documento")
         doc.texto_extraido = texto or None
         doc.texto_estado = "ok" if texto.strip() else "sin_texto"

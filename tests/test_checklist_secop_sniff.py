@@ -117,7 +117,7 @@ def descargas(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     payloads: dict[str, bytes] = {}
     errores: set[str] = set()
 
-    async def _fake(url: str) -> bytes:
+    async def _fake(url: str, timeout: float = checklist_service._SNIFF_HTTP_TIMEOUT) -> bytes:
         llamadas.append(url)
         if url in errores:
             raise httpx.ConnectError("simulated download failure")
@@ -563,3 +563,63 @@ async def test_descargar_secop_bytes_rechaza_content_length_temprano(monkeypatch
         await checklist_service._descargar_secop_bytes("https://s/enorme2.docx")
 
     assert leido == []
+
+
+# ── 2.5 per-download timeout clamped to remaining budget (RES-001) ─────────
+#
+# Unit-level: exercises _asegurar_texto_extraido directly with a spy replacing
+# _descargar_secop_bytes, so the timeout it receives can be asserted. No real
+# network, no DB (SecopDocumento is a plain in-memory instance).
+
+
+def _doc_suelto(url: str) -> SecopDocumento:
+    return SecopDocumento(
+        id=uuid.uuid4(),
+        id_documento_secop=f"DOC-{uuid.uuid4().hex[:10]}",
+        nombre_archivo="doc.docx",
+        url_descarga=url,
+        datos_raw={},
+    )
+
+
+async def test_timeout_por_descarga_se_clampa_al_presupuesto_restante(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The per-download timeout must never exceed the remaining scan budget:
+    worst case must stay bounded by the ~20s budget, not the fixed 10s timeout."""
+    timeouts: list[float] = []
+
+    async def _spy(url: str, timeout: float) -> bytes:
+        timeouts.append(timeout)
+        return _docx_bytes(TEXTO_CONTRATO)
+
+    monkeypatch.setattr(checklist_service, "_descargar_secop_bytes", _spy)
+
+    presupuesto = checklist_service._PresupuestoSniff()
+    presupuesto.inicio -= 18.0  # 18s of the 20s budget already elapsed → ~2s left
+
+    doc = _doc_suelto("https://s/clamp.docx")
+    await checklist_service._asegurar_texto_extraido(doc, presupuesto)
+
+    assert len(timeouts) == 1
+    assert 0 < timeouts[0] <= 2.1  # clamped well below the 10s default
+
+
+async def test_budget_por_debajo_del_epsilon_se_salta_la_descarga(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When remaining budget is at/below the epsilon, skip the download
+    entirely instead of firing a near-zero-timeout request doomed to fail."""
+    llamado = False
+
+    async def _spy(url: str, timeout: float) -> bytes:
+        nonlocal llamado
+        llamado = True
+        return b""
+
+    monkeypatch.setattr(checklist_service, "_descargar_secop_bytes", _spy)
+
+    presupuesto = checklist_service._PresupuestoSniff()
+    presupuesto.inicio -= 19.9  # ~0.1s left, below the epsilon
+
+    doc = _doc_suelto("https://s/clamp2.docx")
+    await checklist_service._asegurar_texto_extraido(doc, presupuesto)
+
+    assert llamado is False
+    assert doc.texto_estado is None
