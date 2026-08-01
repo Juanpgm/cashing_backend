@@ -1048,6 +1048,93 @@ async def detectar_desde_secop(
     return resultado
 
 
+# ── context-docs surface (clasificacion-documentos-secop, design D4) ───────
+
+_CONTEXTO_SNIPPET_MAX = 500
+
+
+def _es_categoria_sin_requisito(categoria: CategoriaDocumento | None) -> bool:
+    """OTROS/unmapped: the categoria pre-fills no checklist requisito."""
+    return categoria is None or CATEGORIA_A_REQUISITO.get(categoria) is None
+
+
+async def listar_documentos_contexto(db: AsyncSession, cuenta: CuentaCobro) -> list[dict]:
+    """Read-only contract-level context docs for this cuenta (design D4).
+
+    Returns SECOP docs of the contract plus contract-level uploads
+    (``cuenta_cobro_id IS NULL``) whose categoria is OTROS/unmapped AND that are
+    not linked to any checklist row of this cuenta. Never downloads anything:
+    ``snippet`` comes from the already-persisted ``texto_extraido`` (<= 500
+    chars) or is None (metadata-only). ``storage_key`` is internal (paquete
+    assembly) and not exposed by the API schema.
+    """
+    contrato = (await db.execute(select(Contrato).where(Contrato.id == cuenta.contrato_id))).scalar_one()
+
+    vinculos = (
+        (
+            await db.execute(
+                select(DocumentoRequisitoVinculo)
+                .join(
+                    DocumentoCuentaCobro,
+                    DocumentoRequisitoVinculo.documento_cuenta_cobro_id == DocumentoCuentaCobro.id,
+                )
+                .where(DocumentoCuentaCobro.cuenta_cobro_id == cuenta.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    linked_fuente = {v.documento_fuente_id for v in vinculos if v.documento_fuente_id is not None}
+    linked_secop = {v.secop_documento_id for v in vinculos if v.secop_documento_id is not None}
+
+    items: list[dict] = []
+    for sdoc in await _secop_documentos_del_contrato(db, contrato):
+        if sdoc.id in linked_secop or not _es_categoria_sin_requisito(sdoc.categoria):
+            continue
+        items.append(
+            {
+                "id": sdoc.id,
+                "fuente": "secop",
+                "nombre": sdoc.nombre_archivo or sdoc.id_documento_secop,
+                "descripcion": sdoc.descripcion,
+                "categoria": sdoc.categoria.value if sdoc.categoria else None,
+                "snippet": sdoc.texto_extraido[:_CONTEXTO_SNIPPET_MAX] if sdoc.texto_extraido else None,
+                "url_descarga": sdoc.url_descarga,
+                "storage_key": None,
+            }
+        )
+
+    uploads = (
+        (
+            await db.execute(
+                select(DocumentoFuente).where(
+                    DocumentoFuente.contrato_id == cuenta.contrato_id,
+                    DocumentoFuente.cuenta_cobro_id.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for doc in uploads:
+        if doc.id in linked_fuente or not _es_categoria_sin_requisito(doc.categoria):
+            continue
+        items.append(
+            {
+                "id": doc.id,
+                "fuente": "upload",
+                "nombre": doc.nombre,
+                "descripcion": None,
+                "categoria": doc.categoria.value if doc.categoria else None,
+                "snippet": doc.texto_extraido[:_CONTEXTO_SNIPPET_MAX] if doc.texto_extraido else None,
+                "url_descarga": None,
+                "storage_key": doc.storage_key,
+            }
+        )
+
+    return items
+
+
 # ── manual transitions ─────────────────────────────────────────────────────
 
 
