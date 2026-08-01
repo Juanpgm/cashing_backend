@@ -39,7 +39,7 @@ from app.models.documento_fuente import DocumentoFuente
 from app.models.evidencia import Evidencia
 from app.schemas.agent import LLMMessage
 from app.schemas.cobertura import CoberturaResponse
-from app.services import cobertura_service
+from app.services import checklist_service, cobertura_service
 
 logger = structlog.get_logger("service.cruzar")
 
@@ -120,13 +120,51 @@ def _contexto_usuario_bloque(contexto_usuario: str) -> str:
     )
 
 
-async def _llm_justification(obligation_text: str, candidate: dict, llm, contexto_usuario: str = "") -> str:
+# Bounds for the contract-level context block (clasificacion-documentos-secop, D4).
+_CONTEXTO_CONTRATO_MAX_DOCS = 5
+_CONTEXTO_CONTRATO_SNIPPET_MAX = 400
+_CONTEXTO_CONTRATO_MAX_TOTAL = 2500
+
+
+def _contexto_contrato_bloque(contexto_docs: list[dict]) -> str:
+    """Optional contract-level context block for the cruzar writer prompts.
+
+    Built from `checklist_service.listar_documentos_contexto` items (OTROS/
+    unmapped, unlinked contract docs). Bounded: <=5 docs, <=400-char snippet
+    each, <=2500 chars total. Docs without extracted text contribute a
+    metadata-only line — this block NEVER triggers a download. Zero docs →
+    empty string, so existing prompts stay byte-identical. Same
+    anti-hallucination contract as `_contexto_usuario_bloque`: guidance only,
+    quotes still come exclusively from the document fragments.
+    """
+    if not contexto_docs:
+        return ""
+    bloque = (
+        "\nDocumentos de contexto del contrato (SOLO como orientación; "
+        "NUNCA cites de aquí — las citas salen exclusivamente de los fragmentos):\n"
+    )
+    for doc in contexto_docs[:_CONTEXTO_CONTRATO_MAX_DOCS]:
+        snippet = (doc.get("snippet") or "")[:_CONTEXTO_CONTRATO_SNIPPET_MAX]
+        linea = f"- {doc['nombre']}: {snippet}\n" if snippet else f"- {doc['nombre']} (sin texto extraído)\n"
+        if len(bloque) + len(linea) > _CONTEXTO_CONTRATO_MAX_TOTAL:
+            break
+        bloque += linea
+    return bloque
+
+
+async def _llm_justification(
+    obligation_text: str, candidate: dict, llm, contexto_usuario: str = "", contexto_contrato: str = ""
+) -> str:
     """Generate a grounded one-sentence justification from the matched evidence."""
-    user_content = CRUZAR_JUSTIFICATION_USER.format(
-        obligacion=obligation_text[:600],
-        documento_fuente=candidate["source"],
-        evidencias_texto=candidate["content"][:1500],
-    ) + _contexto_usuario_bloque(contexto_usuario)
+    user_content = (
+        CRUZAR_JUSTIFICATION_USER.format(
+            obligacion=obligation_text[:600],
+            documento_fuente=candidate["source"],
+            evidencias_texto=candidate["content"][:1500],
+        )
+        + _contexto_usuario_bloque(contexto_usuario)
+        + contexto_contrato
+    )
     try:
         resp = await llm.complete(
             [
@@ -144,7 +182,9 @@ async def _llm_justification(obligation_text: str, candidate: dict, llm, context
         return f"Evidencia documental referenciada en {candidate['source']}."
 
 
-async def _llm_actividad(obligation_text: str, candidate: dict, llm, contexto_usuario: str = "") -> str:
+async def _llm_actividad(
+    obligation_text: str, candidate: dict, llm, contexto_usuario: str = "", contexto_contrato: str = ""
+) -> str:
     """Generate a grounded one-sentence ACTIVIDAD (what was done) from the matched
     document — distinct from `_llm_justification` (why it satisfies the obligación).
 
@@ -152,11 +192,15 @@ async def _llm_actividad(obligation_text: str, candidate: dict, llm, contexto_us
     document — NEVER the raw "Evidencia documental: {source}" placeholder text,
     and never the obligación text.
     """
-    user_content = CRUZAR_ACTIVIDAD_USER.format(
-        obligacion=obligation_text[:600],
-        documento_fuente=candidate["source"],
-        evidencias_texto=candidate["content"][:1500],
-    ) + _contexto_usuario_bloque(contexto_usuario)
+    user_content = (
+        CRUZAR_ACTIVIDAD_USER.format(
+            obligacion=obligation_text[:600],
+            documento_fuente=candidate["source"],
+            evidencias_texto=candidate["content"][:1500],
+        )
+        + _contexto_usuario_bloque(contexto_usuario)
+        + contexto_contrato
+    )
     try:
         resp = await llm.complete(
             [
@@ -277,6 +321,15 @@ async def cruzar_documentos(
         for doc in documentos
     ]
 
+    # Contract-level context docs (OTROS/unmapped, unlinked) for the writer
+    # prompts — read-only and fail-open: a context failure never blocks cruzar.
+    try:
+        contexto_docs = await checklist_service.listar_documentos_contexto(db, cuenta)
+    except Exception as exc:
+        await logger.awarning("cruzar.contexto_contrato_error", error=str(exc))
+        contexto_docs = []
+    contexto_contrato = _contexto_contrato_bloque(contexto_docs)
+
     # LLM clients (reused across all obligations for connection efficiency)
     llm_relevance = get_llm(model="groq/llama-3.1-8b-instant")
     llm_justification = get_llm(model="gemini/gemini-2.5-flash")
@@ -321,8 +374,12 @@ async def cruzar_documentos(
 
             # Step 4d: generate grounded actividad (what was done) + justificación (why it counts)
             contexto_usuario = (cuenta.contexto_usuario or "").strip()
-            actividad_texto = await _llm_actividad(ob_text, candidate, llm_justification, contexto_usuario)
-            justificacion = await _llm_justification(ob_text, candidate, llm_justification, contexto_usuario)
+            actividad_texto = await _llm_actividad(
+                ob_text, candidate, llm_justification, contexto_usuario, contexto_contrato
+            )
+            justificacion = await _llm_justification(
+                ob_text, candidate, llm_justification, contexto_usuario, contexto_contrato
+            )
 
             if is_near_identical(actividad_texto, justificacion):
                 # Both texts collapsed to the same content — fall back to the
