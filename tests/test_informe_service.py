@@ -465,6 +465,153 @@ async def test_zip_evidencias_flag_desactivado_bypassa_scan(
     assert content
 
 
+# ── DOCUMENTOS_CONTRATO/ en el paquete (clasificacion-documentos-secop, D5) ──
+
+
+async def _setup_docs_contrato(
+    db: AsyncSession,
+    test_user: dict[str, Any],
+    cuenta: CuentaCobro,
+) -> dict[str, Any]:
+    """Checklist + links: an uploaded CONTRATO doc, a SECOP RPC doc and an
+    unlinked OTROS SECOP doc (context). Returns the created objects."""
+    from app.models.categoria_documento import CategoriaDocumento
+    from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
+    from app.models.secop import SecopDocumento
+    from app.services import checklist_service
+
+    contrato_id = cuenta.contrato_id
+    user = test_user["user"]
+    await checklist_service.asegurar_checklist(db, cuenta)
+
+    doc_contrato = DocumentoFuente(
+        usuario_id=user.id,
+        contrato_id=contrato_id,
+        storage_key=f"docs/{uuid.uuid4()}/contrato_firmado.pdf",
+        nombre="contrato_firmado.pdf",
+        tipo=TipoDocumentoFuente.CONTRATO,
+        categoria=CategoriaDocumento.CONTRATO,
+    )
+    rpc_secop = SecopDocumento(
+        id_documento_secop=f"DOC-{uuid.uuid4().hex[:10]}",
+        numero_contrato="CTR-INF-001",
+        nombre_archivo="rpc_secop.pdf",
+        url_descarga="https://s/rpc_secop.pdf",
+        categoria=CategoriaDocumento.REGISTRO_PRESUPUESTAL,
+        datos_raw={},
+    )
+    contexto_secop = SecopDocumento(
+        id_documento_secop=f"DOC-{uuid.uuid4().hex[:10]}",
+        numero_contrato="CTR-INF-001",
+        nombre_archivo="acta_interna.pdf",
+        url_descarga="https://s/acta_interna.pdf",
+        categoria=CategoriaDocumento.OTROS,
+        datos_raw={},
+    )
+    db.add_all([doc_contrato, rpc_secop, contexto_secop])
+    await db.commit()
+
+    await checklist_service.vincular_documento_fuente(db, cuenta.id, "CONTRATO", doc_contrato.id)
+    await checklist_service.vincular_secop_documento(db, cuenta.id, "RPC", rpc_secop.id)
+    await db.commit()
+    return {"doc_contrato": doc_contrato, "rpc_secop": rpc_secop, "contexto_secop": contexto_secop}
+
+
+def _fake_descargas_secop(monkeypatch: pytest.MonkeyPatch, payloads: dict[str, bytes], errores: set[str] | None = None):
+    from app.services import checklist_service
+
+    errores = errores or set()
+
+    async def _fake(url: str) -> bytes:
+        if url in errores:
+            raise RuntimeError("simulated secop download failure")
+        return payloads[url]
+
+    monkeypatch.setattr(checklist_service, "_descargar_secop_bytes", _fake)
+
+
+async def test_zip_incluye_documentos_contrato_por_requisito_y_contexto(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Linked contract-level docs land in DOCUMENTOS_CONTRATO/{CODIGO}/ with real
+    bytes (uploads via storage, SECOP via url_descarga); remaining context docs
+    land in DOCUMENTOS_CONTRATO/CONTEXTO/."""
+    user = test_user["user"]
+    objetos = await _setup_docs_contrato(db, test_user, cuenta)
+
+    bytes_contrato = b"bytes-reales-contrato-firmado"
+    bytes_rpc = b"bytes-reales-rpc-secop"
+    bytes_contexto = b"bytes-reales-acta-interna"
+    storage = _fake_storage({objetos["doc_contrato"].storage_key: bytes_contrato})
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: storage)
+    _fake_descargas_secop(
+        monkeypatch,
+        {"https://s/rpc_secop.pdf": bytes_rpc, "https://s/acta_interna.pdf": bytes_contexto},
+    )
+
+    content, _filename = await informe_service.generar_zip_evidencias(db, user.id, cuenta.id)
+
+    with zipfile.ZipFile(io.BytesIO(content)) as zf:
+        names = zf.namelist()
+        assert "DOCUMENTOS_CONTRATO/CONTRATO/contrato_firmado.pdf" in names
+        assert zf.read("DOCUMENTOS_CONTRATO/CONTRATO/contrato_firmado.pdf") == bytes_contrato
+        assert "DOCUMENTOS_CONTRATO/RPC/rpc_secop.pdf" in names
+        assert zf.read("DOCUMENTOS_CONTRATO/RPC/rpc_secop.pdf") == bytes_rpc
+        assert "DOCUMENTOS_CONTRATO/CONTEXTO/acta_interna.pdf" in names
+        assert zf.read("DOCUMENTOS_CONTRATO/CONTEXTO/acta_interna.pdf") == bytes_contexto
+
+
+async def test_zip_documentos_contrato_skip_on_error(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One failing download (storage or SECOP) skips ONLY that member — the
+    package is still emitted with the rest."""
+    user = test_user["user"]
+    objetos = await _setup_docs_contrato(db, test_user, cuenta)
+
+    storage = AsyncMock()
+    storage.download = AsyncMock(side_effect=RuntimeError("storage down"))
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: storage)
+    _fake_descargas_secop(
+        monkeypatch,
+        {"https://s/rpc_secop.pdf": b"bytes-rpc"},
+        errores={"https://s/acta_interna.pdf"},
+    )
+
+    content, filename = await informe_service.generar_zip_evidencias(db, user.id, cuenta.id)
+
+    assert filename.endswith(".zip")
+    with zipfile.ZipFile(io.BytesIO(content)) as zf:
+        names = zf.namelist()
+        assert "DOCUMENTOS_CONTRATO/RPC/rpc_secop.pdf" in names  # the healthy member survives
+        assert "DOCUMENTOS_CONTRATO/CONTRATO/contrato_firmado.pdf" not in names
+        assert "DOCUMENTOS_CONTRATO/CONTEXTO/acta_interna.pdf" not in names
+    assert objetos is not None
+
+
+async def test_zip_documentos_contrato_entra_al_secret_scan(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A leak-shaped payload inside a DOCUMENTOS_CONTRATO member must halt the
+    package — the new members join the mandatory secret scan."""
+    user = test_user["user"]
+    await _setup_docs_contrato(db, test_user, cuenta)
+
+    storage = _fake_storage()
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: storage)
+    _fake_descargas_secop(
+        monkeypatch,
+        {
+            "https://s/rpc_secop.pdf": b"bytes-rpc",
+            "https://s/acta_interna.pdf": _LEAK_CORPUS_TEXTO.encode("utf-8"),
+        },
+    )
+
+    with pytest.raises(ValidationError) as exc_info:
+        await informe_service.generar_zip_evidencias(db, user.id, cuenta.id)
+    assert exc_info.value.code == "SECRET_DETECTED_IN_PACKAGE"
+
+
 async def test_obtener_estado_listo_pendiente_sin_zip(
     db: AsyncSession,
     test_user: dict[str, Any],
