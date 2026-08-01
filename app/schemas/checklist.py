@@ -41,6 +41,9 @@ class SecopCandidatoOut(BaseModel):
     nombre_archivo: str | None = None
     descripcion: str | None = None
     score: Decimal
+    # 'nombre' (filename/descripcion keywords) | 'contenido' (borderline content
+    # sniff) | None (legacy rows / on-the-fly custom candidates).
+    score_origen: str | None = None
     url_descarga: str | None = None
     categoria: CategoriaDocumento | None = None
     categoria_confianza: Decimal | None = None

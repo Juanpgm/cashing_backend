@@ -9,11 +9,15 @@ never copied from a previous cuenta.
 
 from __future__ import annotations
 
+import time
 import uuid
 from collections.abc import Sequence
+from dataclasses import dataclass, field
+from datetime import date
 from decimal import Decimal
 from typing import Protocol
 
+import httpx
 import structlog
 from sqlalchemy import ColumnElement, or_, select
 from sqlalchemy.exc import IntegrityError
@@ -39,7 +43,12 @@ from app.models.obligacion import Obligacion
 from app.models.requisito_cuenta import RequisitoCuenta
 from app.models.requisito_documento import RequisitoDocumento
 from app.models.secop import SecopContrato, SecopDocumento
-from app.services.document_classifier import CATEGORIA_A_REQUISITO, TIPO_A_REQUISITO
+from app.services.document_classifier import (
+    CATEGORIA_A_REQUISITO,
+    TIPO_A_REQUISITO,
+    clasificar_contenido,
+    extraer_texto_contenido,
+)
 
 logger = structlog.get_logger("service.checklist")
 
@@ -679,6 +688,115 @@ async def _secop_documentos_del_contrato(db: AsyncSession, contrato: Contrato) -
     return list(pool.values())
 
 
+# ── borderline content sniff (clasificacion-documentos-secop, design D2) ───
+
+# Full contract-level tier: the sniff runs for these requisitos only.
+_SNIFF_REQUISITOS = frozenset({"CONTRATO", "RPC", "CDP"})
+_SNIFF_MAX_POR_REQUISITO = 5
+_SNIFF_MAX_DESCARGAS_POR_SCAN = 6
+_SNIFF_PRESUPUESTO_SEGUNDOS = 20.0
+_SNIFF_HTTP_TIMEOUT = 10.0
+_SNIFF_MAX_BYTES = 25 * 1024 * 1024
+
+
+@dataclass
+class _PresupuestoSniff:
+    """Per-scan cost budget: bounded downloads and wall clock."""
+
+    descargas: int = 0
+    inicio: float = field(default_factory=time.monotonic)
+
+    @property
+    def agotado(self) -> bool:
+        return (
+            self.descargas >= _SNIFF_MAX_DESCARGAS_POR_SCAN
+            or time.monotonic() - self.inicio > _SNIFF_PRESUPUESTO_SEGUNDOS
+        )
+
+
+async def _descargar_secop_bytes(url: str) -> bytes:
+    """Download a SECOP file (monkeypatch seam for tests)."""
+    async with httpx.AsyncClient(timeout=_SNIFF_HTTP_TIMEOUT, follow_redirects=True) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        return resp.content
+
+
+async def _asegurar_texto_extraido(doc: SecopDocumento, presupuesto: _PresupuestoSniff) -> None:
+    """Download + extract text for a SECOP doc AT MOST ONCE EVER.
+
+    Memoized via ``texto_estado``: any prior attempt (ok/sin_texto/error) is
+    final — errors are not retried. Failures persist ``texto_estado='error'``,
+    keep the filename score, and never raise (budget-friendly degradation).
+    """
+    if doc.texto_estado is not None or presupuesto.agotado:
+        return
+    if not doc.url_descarga:
+        doc.texto_estado = "error"
+        return
+    presupuesto.descargas += 1
+    try:
+        data = await _descargar_secop_bytes(doc.url_descarga)
+        if len(data) > _SNIFF_MAX_BYTES:
+            msg = f"documento excede {_SNIFF_MAX_BYTES} bytes"
+            raise ValueError(msg)
+        texto = extraer_texto_contenido(data, doc.nombre_archivo or "documento")
+        doc.texto_extraido = texto or None
+        doc.texto_estado = "ok" if texto.strip() else "sin_texto"
+    except Exception as exc:  # noqa: BLE001 — a bad download must not sink the scan
+        doc.texto_estado = "error"
+        await logger.awarning(
+            "secop_sniff_descarga_error", secop_documento_id=str(doc.id), error=str(exc)
+        )
+
+
+def _score_contenido_para_requisito(doc: SecopDocumento, req_codigo: str) -> Decimal | None:
+    """Content score for THIS requisito, or None when text is unusable or the
+    content classifies to a different requisito."""
+    if doc.texto_estado != "ok" or not doc.texto_extraido:
+        return None
+    cat, score = clasificar_contenido(doc.texto_extraido)
+    if cat is None or CATEGORIA_A_REQUISITO.get(cat) != req_codigo:
+        return None
+    return score
+
+
+async def _sniff_requisito(
+    req_codigo: str,
+    secop_docs: list[SecopDocumento],
+    scored: list[tuple[SecopDocumento, Decimal]],
+    presupuesto: _PresupuestoSniff,
+    origen_contenido: set[uuid.UUID],
+) -> list[tuple[SecopDocumento, Decimal]]:
+    """Re-score borderline docs by content; returns the merged, re-sorted list.
+
+    Eligible: current score in [0.000, 0.700), manual categoria overrides
+    excluded. Ordered score desc / fecha_carga desc, capped per requisito.
+    ``score_final = max(filename_score, content_score)``; docs whose content
+    score won are recorded in ``origen_contenido`` for candidate provenance.
+    """
+    score_por_doc: dict[uuid.UUID, Decimal] = {d.id: s for d, s in scored}
+    elegibles = [
+        d
+        for d in secop_docs
+        if not d.categoria_override and score_por_doc.get(d.id, Decimal("0.000")) < AUTO_LINK_THRESHOLD
+    ]
+    elegibles.sort(
+        key=lambda d: (score_por_doc.get(d.id, Decimal("0.000")), d.fecha_carga or date.min),
+        reverse=True,
+    )
+    for doc in elegibles[:_SNIFF_MAX_POR_REQUISITO]:
+        await _asegurar_texto_extraido(doc, presupuesto)
+        contenido = _score_contenido_para_requisito(doc, req_codigo)
+        if contenido is not None and contenido > score_por_doc.get(doc.id, Decimal("0.000")):
+            score_por_doc[doc.id] = contenido
+            origen_contenido.add(doc.id)
+
+    resultado = [(d, score_por_doc[d.id]) for d in secop_docs if score_por_doc.get(d.id, Decimal("0.000")) > 0]
+    resultado.sort(key=lambda x: x[1], reverse=True)
+    return resultado
+
+
 _DETECCION_ERRORES_INFO_KEY = "checklist_deteccion_errores"
 
 
@@ -762,6 +880,7 @@ async def detectar_desde_secop(
         categoria_candidatos.setdefault(req_codigo, []).append((doc, score))
 
     resultado: dict[str, list[tuple[SecopDocumento, Decimal]]] = {}
+    presupuesto = _PresupuestoSniff()
 
     for req in cat:
         if req.codigo not in rows:
@@ -787,6 +906,21 @@ async def detectar_desde_secop(
                         scored.append((doc, kw_score))
 
             scored.sort(key=lambda x: x[1], reverse=True)
+
+            # Borderline content sniff (design D2): only for PENDIENTE
+            # Contrato/RPC/CDP filas without a confident (>= 0.700) candidate.
+            # It ONLY changes the scores feeding the existing auto-link below —
+            # zero new DocumentoRequisitoVinculo writers.
+            origen_contenido: set[uuid.UUID] = set()
+            if (
+                req.codigo in _SNIFF_REQUISITOS
+                and fila.estado == EstadoRequisito.PENDIENTE
+                and fila.documento_fuente_id is None
+                and fila.secop_documento_id is None
+                and not (scored and scored[0][1] >= AUTO_LINK_THRESHOLD)
+            ):
+                scored = await _sniff_requisito(req.codigo, secop_docs, scored, presupuesto, origen_contenido)
+
             top = scored[:TOP_N_CANDIDATES]
             resultado[req.codigo] = top
 
@@ -797,6 +931,7 @@ async def detectar_desde_secop(
                         requisito_codigo=req.codigo,
                         secop_documento_id=doc.id,
                         score=score,
+                        score_origen="contenido" if doc.id in origen_contenido else "nombre",
                     )
                 )
 
@@ -1646,10 +1781,11 @@ async def construir_checklist_completo(
             req_cat_val = (
                 (req_cat_enum.value if hasattr(req_cat_enum, "value") else str(req_cat_enum)) if req_cat_enum else None
             )
-            # Normalize to (secop_documento_id, secop_documento, score) tuples so the
-            # display logic is uniform with the custom (computed) branch below.
+            # Normalize to (secop_documento_id, secop_documento, score, score_origen)
+            # tuples so the display logic is uniform with the custom branch below.
             candidatos_secop_src = [
-                (c.secop_documento_id, c.secop_documento, c.score) for c in cand_by_req.get(fila.requisito_codigo, [])
+                (c.secop_documento_id, c.secop_documento, c.score, c.score_origen)
+                for c in cand_by_req.get(fila.requisito_codigo, [])
             ]
         else:
             item_def = custom_by_id.get(fila.requisito_cuenta_id)
@@ -1678,7 +1814,7 @@ async def construir_checklist_completo(
                 ]
                 scored = [(d, s) for d, s in scored if s > 0]
                 scored.sort(key=lambda x: x[1], reverse=True)
-                candidatos_secop_src = [(d.id, d, s) for d, s in scored[:TOP_N_CANDIDATES]]
+                candidatos_secop_src = [(d.id, d, s, None) for d, s in scored[:TOP_N_CANDIDATES]]
 
         df = fila.documento_fuente
         sd = fila.secop_documento
@@ -1734,9 +1870,10 @@ async def construir_checklist_completo(
                         "nombre_archivo": sdoc.nombre_archivo if sdoc else None,
                         "descripcion": sdoc.descripcion if sdoc else None,
                         "score": score,
+                        "score_origen": origen,
                         "url_descarga": sdoc.url_descarga if sdoc else None,
                     }
-                    for sid, sdoc, score in candidatos_secop_src
+                    for sid, sdoc, score, origen in candidatos_secop_src
                 ],
                 "candidatos_documentos_fuente": [
                     {
