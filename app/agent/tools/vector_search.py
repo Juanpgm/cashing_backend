@@ -100,6 +100,11 @@ async def _pg_search(
         where_clause += " AND o.contrato_id = :contrato_id"
         params["contrato_id"] = str(contrato_id)
 
+    # Use CAST(... AS vector(N)) rather than the `::vector(N)` shorthand: inside
+    # SQLAlchemy text() the second colon of `::` is parsed as the start of a bind
+    # parameter (`:vector`), producing "syntax error at or near :". CAST avoids it.
+    emb = f"CAST(o.embedding AS vector({EMBEDDING_DIM}))"
+    qv = f"CAST(:query_vector AS vector({EMBEDDING_DIM}))"
     sql = text(
         f"""
         SELECT
@@ -108,10 +113,10 @@ async def _pg_search(
             o.descripcion,
             o.tipo,
             o.orden,
-            1 - (o.embedding::vector({EMBEDDING_DIM}) <=> :query_vector::vector({EMBEDDING_DIM})) AS similarity
+            1 - ({emb} <=> {qv}) AS similarity
         FROM obligaciones o
         WHERE {where_clause}
-          AND 1 - (o.embedding::vector({EMBEDDING_DIM}) <=> :query_vector::vector({EMBEDDING_DIM})) >= :min_similarity
+          AND 1 - ({emb} <=> {qv}) >= :min_similarity
         ORDER BY similarity DESC
         LIMIT :limit
         """

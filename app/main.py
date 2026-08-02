@@ -52,6 +52,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     db_ready = False
     try:
         async with engine.begin() as conn:
+            # pgvector must exist before create_all / semantic-search queries that cast
+            # embeddings to vector(1536). Idempotent; ignored on SQLite. On a Postgres
+            # image without the extension available this raises and is caught below.
+            if engine.dialect.name == "postgresql":
+                from sqlalchemy import text as _text
+
+                await conn.execute(_text("CREATE EXTENSION IF NOT EXISTS vector"))
             await conn.run_sync(Base.metadata.create_all)
         db_ready = True
         log.info("database_ready")
@@ -61,6 +68,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             error=str(exc),
             note="App starting without DB — some endpoints will fail",
         )
+
+    # 1b. Widen alembic_version before alembic touches it. Alembic's default
+    #     version_num is VARCHAR(32), but several revision ids here are longer
+    #     (e.g. "029_contexto_usuario_evidencia_texto", 36 chars). SQLite ignores the
+    #     length; Postgres enforces it and the stamp/upgrade fails with a truncation
+    #     error, leaving the DB unversioned. Pre-creating the table makes alembic reuse
+    #     it instead of creating the narrow default.
+    if db_ready:
+        from sqlalchemy import text as _text
+
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    _text(
+                        "CREATE TABLE IF NOT EXISTS alembic_version ("
+                        "version_num VARCHAR(255) NOT NULL, "
+                        "CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num))"
+                    )
+                )
+        except Exception as exc:
+            log.warning("alembic_version_prepare_failed", error=str(exc))
 
     # 2. Alembic — reconcile the migration version WITHOUT re-running the base schema.
     #    If the DB is unversioned (schema just built by create_all), STAMP head so the

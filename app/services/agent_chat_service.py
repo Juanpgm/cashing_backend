@@ -36,6 +36,7 @@ from app.agent.tools.document_parser import (
     parse_document,
 )
 from app.core.exceptions import DomainError
+from app.core.file_validation import _EXT_TO_MIME
 from app.models.conversacion import Conversacion
 from app.models.usuario import Usuario
 from app.schemas.agent import AgentChatResult, DocumentoAdjuntoResumen, LLMMessage, LLMToolCall, ToolEvent
@@ -256,7 +257,13 @@ def _expand_attachments_for_tools(attachments: dict[str, ToolAttachment]) -> dic
                 if key in expanded:
                     key = f"{archive_name}:{member_path}"
 
+                # mimetypes.guess_type relies on the OS mime database, which the slim
+                # container image lacks — it returns None for .docx/.xlsx there (and in
+                # prod), yielding "application/octet-stream" that validate_mime_type then
+                # rejects. Fall back to the app's own deterministic extension→MIME map.
                 content_type, _ = mimetypes.guess_type(member_path)
+                if content_type is None:
+                    content_type = _EXT_TO_MIME.get(ext)
                 expanded[key] = ToolAttachment(
                     filename=key,
                     content_type=content_type or "application/octet-stream",

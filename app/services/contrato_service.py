@@ -56,10 +56,15 @@ async def _get_contrato_con_ownership(
 
 
 async def _reload_contrato_response(db: AsyncSession, contrato_id: uuid.UUID) -> ContratoResponse:
+    # populate_existing overwrites the identity-mapped Contrato and its cached
+    # `.obligaciones` collection with fresh DB rows. Without it, a Contrato already in
+    # the session (e.g. right after eliminar_obligacion) keeps its stale collection —
+    # the just-deleted obligación would still show up in the reloaded response.
     result = await db.execute(
         select(Contrato)
         .options(selectinload(Contrato.obligaciones))
         .where(Contrato.id == contrato_id)
+        .execution_options(populate_existing=True)
     )
     contrato = result.scalar_one()
     response = ContratoResponse.model_validate(contrato)

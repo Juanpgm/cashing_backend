@@ -29,10 +29,15 @@ def prepare_pg_url(url: str) -> tuple[str, dict]:
         return url, {}
 
     parts = urlsplit(url)
-    kept = [(k, v) for k, v in parse_qsl(parts.query) if k not in _LIBPQ_ONLY_PARAMS]
+    query = parse_qsl(parts.query)
+    sslmode = next((v for k, v in query if k == "sslmode"), None)
+    kept = [(k, v) for k, v in query if k not in _LIBPQ_ONLY_PARAMS]
     clean = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(kept), parts.fragment))
 
-    if (parts.hostname or "") in _LOCAL_HOSTS:
+    # An explicit ``sslmode=disable`` wins over the host heuristic: a Docker Compose
+    # service host like ``db`` is a plain local Postgres with SSL off, but it isn't in
+    # _LOCAL_HOSTS, so without this it would be forced into a (rejected) SSL upgrade.
+    if sslmode == "disable" or (parts.hostname or "") in _LOCAL_HOSTS:
         return clean, {"ssl": False}
 
     ctx = ssl.create_default_context()

@@ -31,7 +31,13 @@ class Contrato(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
     direccion_ejecucion: Mapped[str | None] = mapped_column(String(255), nullable=True)
     cargo_supervisor: Mapped[str | None] = mapped_column(String(255), nullable=True)
     fuente_documento_id: Mapped[uuid.UUID | None] = mapped_column(
-        Uuid, ForeignKey("documentos_fuente.id"), nullable=True
+        # contratos <-> documentos_fuente reference each other (documentos_fuente.contrato_id
+        # points back here). Postgres create_all/drop_all needs an acyclic table order;
+        # use_alter creates THIS fk via a separate ALTER after both tables exist and drops it
+        # first, breaking the cycle. SQLite tolerated the cycle inline; Postgres does not.
+        Uuid,
+        ForeignKey("documentos_fuente.id", use_alter=True, name="fk_contratos_fuente_documento_id"),
+        nullable=True,
     )
     obligaciones_extraidas: Mapped[bool | None] = mapped_column(
         Boolean,
