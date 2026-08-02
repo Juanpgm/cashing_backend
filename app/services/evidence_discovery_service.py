@@ -40,6 +40,7 @@ from app.schemas.google_workspace import (
     EvidenceDiscoveryResponse,
     ObligacionJustificada,
 )
+from app.services import discovery_cache
 from app.services import google_workspace_service as gws
 
 logger = structlog.get_logger("services.evidence_discovery")
@@ -101,8 +102,7 @@ async def _resolve_obligaciones(
         )
         rows = result.scalars().all()
         return [
-            {"id": str(ob.id), "descripcion": ob.descripcion, "tipo": ob.tipo, "etiqueta": ob.etiqueta}
-            for ob in rows
+            {"id": str(ob.id), "descripcion": ob.descripcion, "tipo": ob.tipo, "etiqueta": ob.etiqueta} for ob in rows
         ]
 
     raise ValidationError("Debes enviar 'obligaciones' o un 'contrato_id'/'cuenta_id' válido.")
@@ -274,6 +274,7 @@ async def descubrir_evidencias(
     req: EvidenceDiscoveryRequest,
     *,
     local_only: bool = False,
+    refresh: bool = False,
 ) -> EvidenceDiscoveryResponse:
     """Punto de entrada: descubre evidencias y genera justificaciones por obligación.
 
@@ -284,6 +285,13 @@ async def descubrir_evidencias(
     pipeline execution, Zero Google API calls in local-only mode, Local path never
     evaluates the Google gate). Non-local (default) behavior is unchanged: the
     Google gate still runs and still raises `GOOGLE_NOT_CONNECTED` when applicable.
+
+    Discovery-result cache (radicar-ui-ux-improvements C.1, design §5): when
+    `req.cuenta_id` is set and this isn't a `local_only` call, a prior result for
+    the same (usuario_id, cuenta_id, ventana) is served from
+    `discovery_cache` instead of re-running the Gmail/Drive/Calendar chain, unless
+    `refresh=True` explicitly bypasses it. Standalone cache — does not touch
+    `stepper_state_service.py` / the 7-predicate `StepperStateResponse` shape.
     """
     contrato_id = await _resolve_contrato_id(db, usuario_id, req)
     obligaciones = await _resolve_obligaciones(db, req, contrato_id)
@@ -303,6 +311,12 @@ async def descubrir_evidencias(
             # "tomorrow" for anyone running after ~19:00 local (00:00 UTC), producing
             # a range that ends on a future date.
             fecha_fin = fecha_fin or date.today().isoformat()
+
+    cache_cuenta_id: uuid.UUID | None = req.cuenta_id if not local_only else None
+    if cache_cuenta_id is not None and not refresh:
+        cached = discovery_cache.get_cached(usuario_id, cache_cuenta_id, fecha_inicio, fecha_fin)
+        if cached is not None:
+            return cached
 
     if local_only:
         # Local-only classification never touches Google — the connection gate
@@ -385,9 +399,12 @@ async def descubrir_evidencias(
         descartadas=descartadas,
     )
 
-    return EvidenceDiscoveryResponse(
+    response = EvidenceDiscoveryResponse(
         obligaciones=obligaciones_out,
         resumen=resumen,
         total_evidencias=total,
         fuentes=fuentes,
     )
+    if cache_cuenta_id is not None:
+        discovery_cache.store(usuario_id, cache_cuenta_id, fecha_inicio, fecha_fin, response)
+    return response

@@ -42,7 +42,7 @@ from app.tools.registry import tool
     consumes_credits=settings.CREDITS_PER_EVIDENCE_COLLECTION,
 )
 async def descubrir_evidencias(ctx: ToolContext, params: EvidenceDiscoveryRequest) -> EvidenceDiscoveryResponse:
-    return await evidence_discovery_service.descubrir_evidencias(ctx.db, ctx.usuario_id, params)
+    return await evidence_discovery_service.descubrir_evidencias(ctx.db, ctx.usuario_id, params, refresh=params.refresh)
 
 
 class PersistirEvidenciasInput(BaseModel):

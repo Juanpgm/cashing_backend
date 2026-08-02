@@ -210,6 +210,10 @@ class Settings(BaseSettings):
     CREDITS_PER_EVIDENCE_COLLECTION: int = 5
     FREE_CREDITS_ON_SIGNUP: int = 30
 
+    # Discovery-result cache (radicar-ui-ux-improvements C.1): in-process TTL cache
+    # keyed by (usuario_id, cuenta_id, ventana). Default ~10 min.
+    DISCOVERY_CACHE_TTL_SECONDS: int = 600
+
     # Waitlist / invite-code gate: when True, account creation (email + first-time
     # Google sign-in) requires a valid, active, non-exhausted invite code.
     WAITLIST_ENABLED: bool = False

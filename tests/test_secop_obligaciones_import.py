@@ -206,9 +206,7 @@ class TestImportarContratosSecopObligaciones:
         assert contrato.requiere_obligaciones is True
 
     @pytest.mark.asyncio
-    async def test_preview_sets_requiere_obligaciones_true(
-        self, db: AsyncSession, test_user: dict[str, Any]
-    ) -> None:
+    async def test_preview_sets_requiere_obligaciones_true(self, db: AsyncSession, test_user: dict[str, Any]) -> None:
         from app.services.secop_service import importar_contratos_secop
 
         row = _make_row(numero_contrato="CO1.PCCNTR.OBLIG005")
@@ -224,3 +222,122 @@ class TestImportarContratosSecopObligaciones:
         contrato = result.contratos[0]
         assert contrato.obligaciones == []
         assert contrato.requiere_obligaciones is True
+
+
+class TestObligacionesExtraidasFlag:
+    """C.3 (slice 7a): `Contrato.obligaciones_extraidas` distinguishes a SECOP
+    import that genuinely found zero obligaciones from a contract the user
+    simply hasn't populated yet (manual creation leaves it None). Set at the
+    `Contrato(...)` construction (deterministic case) and reconciled after the
+    LLM-fallback branch resolves — the 7a.4 under-report guard: obligaciones
+    added ONLY by the LLM fallback (after the row already exists) must still
+    flip the flag to True, not just the deterministic verbatim pass."""
+
+    @pytest.mark.asyncio
+    async def test_deterministic_extraction_sets_true(self, db: AsyncSession, test_user: dict[str, Any]) -> None:
+        """Verbatim extraction finds obligaciones in `objeto` → True, LLM never called."""
+        from app.services.secop_service import importar_contratos_secop
+
+        objeto = (
+            "Prestación de servicios profesionales. OBLIGACIONES ESPECIFICAS DEL CONTRATISTA: "
+            "1. Elaborar informes mensuales de las actividades desarrolladas en el marco del contrato. "
+            "2. Apoyar la atención al ciudadano y la gestión documental de la dependencia. "
+            "Las demás actividades que le sean asignadas por el supervisor del contrato."
+        )
+        row = _make_row(numero_contrato="CO1.PCCNTR.OBLIGEXT001", objeto_del_contrato=objeto)
+
+        with patch(
+            "app.services.secop_service._query_socrata",
+            new_callable=AsyncMock,
+            return_value=[row],
+        ):
+            result = await importar_contratos_secop(db, "1016019452", test_user["user"].id, confirmar=True)
+
+        contrato = result.contratos[0]
+        assert contrato.obligaciones_extraidas is True
+
+    @pytest.mark.asyncio
+    async def test_zero_deterministic_and_zero_llm_fallback_sets_false(
+        self, db: AsyncSession, test_user: dict[str, Any]
+    ) -> None:
+        """Neither verbatim nor LLM fallback find obligaciones → False."""
+        from app.services.secop_service import importar_contratos_secop
+
+        row = _make_row(numero_contrato="CO1.PCCNTR.OBLIGEXT002")
+        llm_response = LLMResponse(content="", model="test", total_tokens=5)
+
+        with (
+            patch(
+                "app.services.secop_service._query_socrata",
+                new_callable=AsyncMock,
+                return_value=[row],
+            ),
+            patch(_PATCH_GET_LLM) as mock_get_llm,
+        ):
+            mock_llm = AsyncMock()
+            mock_llm.complete = AsyncMock(return_value=llm_response)
+            mock_get_llm.return_value = mock_llm
+
+            result = await importar_contratos_secop(db, "1016019452", test_user["user"].id, confirmar=True)
+
+        contrato = result.contratos[0]
+        assert contrato.obligaciones == []
+        assert contrato.obligaciones_extraidas is False
+
+    @pytest.mark.asyncio
+    async def test_llm_fallback_finding_obligaciones_sets_true(
+        self, db: AsyncSession, test_user: dict[str, Any]
+    ) -> None:
+        """The 7a.4 under-report guard: obligaciones added AFTER the Contrato row
+        already exists (LLM fallback branch, not the deterministic constructor
+        call) must still reconcile the flag to True."""
+        from app.services.secop_service import importar_contratos_secop
+
+        row = _make_row(numero_contrato="CO1.PCCNTR.OBLIGEXT003")
+        llm_response = LLMResponse(
+            content="OBLIGACION|especifica|Apoyar la gestión administrativa de la dependencia\n",
+            model="test",
+            total_tokens=30,
+        )
+
+        with (
+            patch(
+                "app.services.secop_service._query_socrata",
+                new_callable=AsyncMock,
+                return_value=[row],
+            ),
+            patch(_PATCH_GET_LLM) as mock_get_llm,
+        ):
+            mock_llm = AsyncMock()
+            mock_llm.complete = AsyncMock(return_value=llm_response)
+            mock_get_llm.return_value = mock_llm
+
+            result = await importar_contratos_secop(db, "1016019452", test_user["user"].id, confirmar=True)
+
+        contrato = result.contratos[0]
+        assert len(contrato.obligaciones) == 1
+        assert contrato.obligaciones_extraidas is True
+
+    @pytest.mark.asyncio
+    async def test_manually_created_contract_leaves_flag_none(
+        self, db: AsyncSession, test_user: dict[str, Any]
+    ) -> None:
+        """Manual contract creation (contrato_service.crear_contrato) never sets
+        this SECOP-import-only signal — stays None."""
+        from datetime import date
+        from decimal import Decimal
+
+        from app.schemas.contrato import ContratoCreate
+        from app.services.contrato_service import crear_contrato
+
+        data = ContratoCreate(
+            numero_contrato="MANUAL-OBLIGEXT-001",
+            objeto="Prestación de servicios profesionales de apoyo a la gestión administrativa.",
+            valor_mensual=Decimal("1000000"),
+            fecha_inicio=date(2024, 1, 1),
+            fecha_fin=date(2024, 12, 31),
+        )
+
+        contrato = await crear_contrato(db, test_user["user"].id, data)
+
+        assert contrato.obligaciones_extraidas is None

@@ -1371,6 +1371,10 @@ async def importar_contratos_secop(
             entidad=data.entidad,
             dependencia=data.dependencia,
             documento_proveedor=documento_proveedor,
+            # C.3: deterministic signal at construction time; reconciled below once
+            # the LLM-fallback branch (if any) resolves — a contract that starts
+            # with zero verbatim obligaciones can still end up True.
+            obligaciones_extraidas=bool(data.obligaciones),
         )
         db.add(contrato)
         await db.flush()
@@ -1428,7 +1432,13 @@ async def importar_contratos_secop(
         result = await db.execute(
             select(Contrato).options(selectinload(Contrato.obligaciones)).where(Contrato.id == contrato.id)
         )
-        importados.append(_to_importado(ContratoResponse.model_validate(result.scalar_one())))
+        contrato_final = result.scalar_one()
+        # C.3 under-report guard (7a.4): reconcile AFTER the LLM-fallback branch
+        # resolves — obligaciones inserted only by the fallback (not present at
+        # construction time) must still flip the flag to True. Reusing this
+        # reload's `selectinload(Contrato.obligaciones)` avoids an extra round-trip.
+        contrato_final.obligaciones_extraidas = bool(contrato_final.obligaciones)
+        importados.append(_to_importado(ContratoResponse.model_validate(contrato_final)))
 
     if confirmar:
         await db.commit()

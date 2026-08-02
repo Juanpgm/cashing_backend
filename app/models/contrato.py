@@ -3,7 +3,7 @@
 import uuid
 from datetime import date
 
-from sqlalchemy import Date, ForeignKey, Numeric, String, Text, Uuid
+from sqlalchemy import Boolean, Date, ForeignKey, Numeric, String, Text, Uuid
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -32,6 +32,16 @@ class Contrato(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
     cargo_supervisor: Mapped[str | None] = mapped_column(String(255), nullable=True)
     fuente_documento_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid, ForeignKey("documentos_fuente.id"), nullable=True
+    )
+    obligaciones_extraidas: Mapped[bool | None] = mapped_column(
+        Boolean,
+        nullable=True,
+        default=None,
+        comment=(
+            "Set at SECOP import time: True/False whether the deterministic+LLM-fallback "
+            "extraction found any obligaciones. None = manually created / legacy contract "
+            "(no signal — distinguishes 'imported empty' from 'user hasn't added any yet')."
+        ),
     )
 
     # Relationships

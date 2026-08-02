@@ -712,6 +712,51 @@ def obtener_deteccion_error(db: AsyncSession, cuenta_id: uuid.UUID, requisito_re
     return errores.get((cuenta_id, requisito_ref))
 
 
+_SCAN_SECOP_INFO_KEY = "checklist_scan_secop_estado"
+
+
+def _marcar_scan_secop_ejecutado(db: AsyncSession, cuenta_id: uuid.UUID) -> None:
+    """Record that the auto-SECOP scan/auto-link pass ran for this cuenta within
+    the current request/session.
+
+    An empty ``_DETECCION_ERRORES_INFO_KEY`` map alone cannot distinguish "pass
+    ran, zero errors" from "pass never ran" (the per-requisito error map is only
+    ever populated on a failure). This marker is the missing "ran" signal that
+    ``construir_checklist_completo`` reads to derive the top-level `scan_secop`
+    aggregate (ChecklistResponse.scan_secop, C.2).
+    """
+    estados: dict[uuid.UUID, dict[str, object]] = db.info.setdefault(_SCAN_SECOP_INFO_KEY, {})
+    # Don't clobber a `fallo` already recorded for this cuenta in this request.
+    estados.setdefault(cuenta_id, {"fallo": False, "mensaje": None})
+
+
+def marcar_scan_secop_fallido(db: AsyncSession, cuenta_id: uuid.UUID, mensaje: str) -> None:
+    """Record that the auto-SECOP scan/auto-link pass itself raised (a top-level
+    failure, not an isolated per-requisito one).
+
+    Call this from the caller's except-block wrapping `detectar_desde_secop` /
+    `auto_vincular_documentos_fuente` (e.g. the `/refresh-secop` endpoint) so a
+    pass-level exception degrades to a `scan_secop.estado == "fallido"` response
+    instead of crashing the whole request with an unhandled 500 — the "auto-scan
+    failed, retry" signal the frontend needs (usability-findings #9).
+    """
+    estados: dict[uuid.UUID, dict[str, object]] = db.info.setdefault(_SCAN_SECOP_INFO_KEY, {})
+    estados[cuenta_id] = {"fallo": True, "mensaje": mensaje}
+
+
+def _estado_scan_secop(db: AsyncSession, cuenta_id: uuid.UUID, requisitos_con_error: int) -> dict[str, object]:
+    """Derive the `scan_secop` aggregate for `construir_checklist_completo`'s payload."""
+    estados: dict[uuid.UUID, dict[str, object]] | None = db.info.get(_SCAN_SECOP_INFO_KEY)
+    info = estados.get(cuenta_id) if estados else None
+    if info is None:
+        return {"estado": "no_ejecutado", "mensaje": None, "requisitos_con_error": 0}
+    if info["fallo"]:
+        return {"estado": "fallido", "mensaje": info.get("mensaje"), "requisitos_con_error": requisitos_con_error}
+    if requisitos_con_error > 0:
+        return {"estado": "parcial", "mensaje": None, "requisitos_con_error": requisitos_con_error}
+    return {"estado": "ok", "mensaje": None, "requisitos_con_error": 0}
+
+
 async def detectar_desde_secop(
     db: AsyncSession, cuenta: CuentaCobro
 ) -> dict[str, list[tuple[SecopDocumento, Decimal]]]:
@@ -727,6 +772,7 @@ async def detectar_desde_secop(
 
     Returns a dict {requisito_codigo: [(secop_doc, score), ...]} (top-N each).
     """
+    _marcar_scan_secop_ejecutado(db, cuenta.id)
     contrato_res = await db.execute(select(Contrato).where(Contrato.id == cuenta.contrato_id))
     contrato = contrato_res.scalar_one()
 
@@ -1195,6 +1241,7 @@ async def auto_vincular_documentos_fuente(
     Only PENDIENTE rows are touched — manual links (CARGADO/DETECTADO) are never overwritten.
     Returns the number of newly linked rows.
     """
+    _marcar_scan_secop_ejecutado(db, cuenta.id)
     # Two document pools (two-tier model):
     #   - docs_contrato: shared contract-level documents (cuenta_cobro_id IS NULL)
     #     that auto-fulfil contract-level requisitos in every cuenta.
@@ -1760,6 +1807,7 @@ async def construir_checklist_completo(
 
     resumen = computar_resumen(filas, catalogo, custom_by_id)
     arbol = await listar_arbol_evidencias(db, cuenta)
+    requisitos_con_error = sum(1 for it in items if it["deteccion_error"] is not None)
 
     return {
         "cuenta_cobro_id": cuenta.id,
@@ -1767,4 +1815,5 @@ async def construir_checklist_completo(
         "items": items,
         "resumen": resumen,
         "arbol_evidencias": arbol,
+        "scan_secop": _estado_scan_secop(db, cuenta.id, requisitos_con_error),
     }

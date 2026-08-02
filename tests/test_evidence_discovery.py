@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -24,7 +24,7 @@ def _email(mid: str, subject: str, body: str) -> EmailMessage:
         subject=subject,
         sender="supervisor@entidad.gov.co",
         recipients=["contratista@gmail.com"],
-        date=datetime(2024, 4, 10, tzinfo=timezone.utc),
+        date=datetime(2024, 4, 10, tzinfo=UTC),
         body_plain=body,
         snippet=body[:80],
     )
@@ -50,7 +50,9 @@ async def test_descubrir_evidencias_full_flow():
 
     gmail = MagicMock()
     gmail.search_messages = AsyncMock(
-        return_value=[_email("m1", "Informe mensual actividades", "Adjunto informe mensual de actividades del contrato de abril")]
+        return_value=[
+            _email("m1", "Informe mensual actividades", "Adjunto informe mensual de actividades del contrato de abril")
+        ]
     )
 
     drive_adapter = MagicMock()
@@ -63,7 +65,9 @@ async def test_descubrir_evidencias_full_flow():
     matcher_llm = AsyncMock()
     matcher_llm.complete = AsyncMock(return_value=MagicMock(content="[1]", total_tokens=5))
     justify_llm = AsyncMock()
-    justify_llm.complete = AsyncMock(return_value=MagicMock(content="Elaboré y entregué el informe mensual de actividades del contrato."))
+    justify_llm.complete = AsyncMock(
+        return_value=MagicMock(content="Elaboré y entregué el informe mensual de actividades del contrato.")
+    )
 
     with (
         patch.object(eds.gws, "get_integration_status", AsyncMock(return_value=_connected_status())),
@@ -143,8 +147,8 @@ async def test_descubrir_evidencias_filters_promo_emails():
 
 @pytest.mark.asyncio
 async def test_descubrir_evidencias_requires_google_connected():
-    from app.services import evidence_discovery_service as eds
     from app.core.exceptions import ExternalServiceError
+    from app.services import evidence_discovery_service as eds
 
     req = EvidenceDiscoveryRequest(
         obligaciones=[{"descripcion": "Asistir a reuniones"}],
@@ -161,8 +165,8 @@ async def test_descubrir_evidencias_requires_google_connected():
 
 @pytest.mark.asyncio
 async def test_descubrir_evidencias_requires_obligaciones_or_contrato():
-    from app.services import evidence_discovery_service as eds
     from app.core.exceptions import ValidationError
+    from app.services import evidence_discovery_service as eds
 
     req = EvidenceDiscoveryRequest(fecha_inicio="2024-04-01", fecha_fin="2024-04-30")
 
@@ -353,9 +357,7 @@ async def test_descubrir_evidencias_contrato_id_ajeno_lanza_not_found(db: AsyncS
     victim_contrato = await _make_contrato(db, victim.id)
     await db.commit()
 
-    req = EvidenceDiscoveryRequest(
-        contrato_id=victim_contrato.id, fecha_inicio="2024-04-01", fecha_fin="2024-04-30"
-    )
+    req = EvidenceDiscoveryRequest(contrato_id=victim_contrato.id, fecha_inicio="2024-04-01", fecha_fin="2024-04-30")
 
     with pytest.raises(NotFoundError):
         await eds.descubrir_evidencias(db, attacker.id, req)
@@ -506,6 +508,163 @@ async def test_descubrir_evidencias_local_only_true_zero_google_calls(db: AsyncS
     assert resp.fuentes["calendar"] == 0
     assert resp.fuentes["local_file"] == 1
     assert resp.total_evidencias == 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Discovery-result cache (radicar-ui-ux-improvements C.1 / design §5)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_descubrir_evidencias_second_call_same_window_hits_cache_no_google_calls(
+    db: AsyncSession,
+) -> None:
+    """A second call for the same cuenta_id + fecha_inicio/fecha_fin within TTL must
+    be served from the cache and MUST NOT re-invoke Gmail/Drive/Calendar adapters
+    (design §5: consulted BEFORE the Gmail→Drive→Calendar chain runs)."""
+    from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
+    from app.services import discovery_cache
+    from app.services import evidence_discovery_service as eds
+
+    discovery_cache.clear()
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+    cuenta = CuentaCobro(contrato_id=contrato.id, mes=4, anio=2024, estado=EstadoCuentaCobro.BORRADOR, valor=1_000_000)
+    db.add(cuenta)
+    await db.commit()
+
+    req = EvidenceDiscoveryRequest(
+        obligaciones=[{"id": "ob1", "descripcion": "Entregar informe mensual de actividades"}],
+        cuenta_id=cuenta.id,
+        fecha_inicio="2024-04-01",
+        fecha_fin="2024-04-30",
+    )
+
+    gmail = MagicMock()
+    gmail.search_messages = AsyncMock(return_value=[])
+    drive_adapter = MagicMock()
+    drive_adapter.search_files = AsyncMock(return_value=[])
+    cal_adapter = MagicMock()
+    cal_adapter.search_events = AsyncMock(return_value=[])
+    justify_llm = AsyncMock()
+    justify_llm.complete = AsyncMock(return_value=MagicMock(content="No hay evidencia."))
+
+    gmail_ctor = MagicMock(return_value=gmail)
+    drive_ctor = MagicMock(return_value=drive_adapter)
+    cal_ctor = MagicMock(return_value=cal_adapter)
+
+    with (
+        patch.object(eds.gws, "get_integration_status", AsyncMock(return_value=_connected_status())),
+        patch.object(eds, "GmailAdapter", gmail_ctor),
+        patch("app.agent.nodes.drive_fetch.DriveAdapter", drive_ctor),
+        patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", cal_ctor),
+        patch("app.agent.nodes.evidence_justify.get_llm", return_value=justify_llm),
+    ):
+        first = await eds.descubrir_evidencias(db, user.id, req)
+        second = await eds.descubrir_evidencias(db, user.id, req)
+
+    assert gmail_ctor.call_count == 1
+    assert drive_ctor.call_count == 1
+    assert cal_ctor.call_count == 1
+    assert second.resumen == first.resumen
+
+
+@pytest.mark.asyncio
+async def test_descubrir_evidencias_different_window_forces_fresh_discovery(db: AsyncSession) -> None:
+    """A different fecha_inicio/fecha_fin for the same cuenta_id is a cache miss —
+    the Gmail/Drive/Calendar chain runs again."""
+    from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
+    from app.services import discovery_cache
+    from app.services import evidence_discovery_service as eds
+
+    discovery_cache.clear()
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+    cuenta = CuentaCobro(contrato_id=contrato.id, mes=4, anio=2024, estado=EstadoCuentaCobro.BORRADOR, valor=1_000_000)
+    db.add(cuenta)
+    await db.commit()
+
+    gmail = MagicMock()
+    gmail.search_messages = AsyncMock(return_value=[])
+    drive_adapter = MagicMock()
+    drive_adapter.search_files = AsyncMock(return_value=[])
+    cal_adapter = MagicMock()
+    cal_adapter.search_events = AsyncMock(return_value=[])
+    justify_llm = AsyncMock()
+    justify_llm.complete = AsyncMock(return_value=MagicMock(content="No hay evidencia."))
+
+    gmail_ctor = MagicMock(return_value=gmail)
+
+    with (
+        patch.object(eds.gws, "get_integration_status", AsyncMock(return_value=_connected_status())),
+        patch.object(eds, "GmailAdapter", gmail_ctor),
+        patch("app.agent.nodes.drive_fetch.DriveAdapter", return_value=drive_adapter),
+        patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", return_value=cal_adapter),
+        patch("app.agent.nodes.evidence_justify.get_llm", return_value=justify_llm),
+    ):
+        req1 = EvidenceDiscoveryRequest(
+            obligaciones=[{"id": "ob1", "descripcion": "Entregar informe mensual"}],
+            cuenta_id=cuenta.id,
+            fecha_inicio="2024-04-01",
+            fecha_fin="2024-04-30",
+        )
+        req2 = EvidenceDiscoveryRequest(
+            obligaciones=[{"id": "ob1", "descripcion": "Entregar informe mensual"}],
+            cuenta_id=cuenta.id,
+            fecha_inicio="2024-05-01",
+            fecha_fin="2024-05-31",
+        )
+        await eds.descubrir_evidencias(db, user.id, req1)
+        await eds.descubrir_evidencias(db, user.id, req2)
+
+    assert gmail_ctor.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_descubrir_evidencias_refresh_true_bypasses_and_repopulates_cache(db: AsyncSession) -> None:
+    """`refresh=True` bypasses a warm cache entry, re-runs the Gmail/Drive/Calendar
+    chain, and repopulates the cache with the fresh result."""
+    from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
+    from app.services import discovery_cache
+    from app.services import evidence_discovery_service as eds
+
+    discovery_cache.clear()
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+    cuenta = CuentaCobro(contrato_id=contrato.id, mes=4, anio=2024, estado=EstadoCuentaCobro.BORRADOR, valor=1_000_000)
+    db.add(cuenta)
+    await db.commit()
+
+    req = EvidenceDiscoveryRequest(
+        obligaciones=[{"id": "ob1", "descripcion": "Entregar informe mensual"}],
+        cuenta_id=cuenta.id,
+        fecha_inicio="2024-04-01",
+        fecha_fin="2024-04-30",
+    )
+
+    gmail = MagicMock()
+    gmail.search_messages = AsyncMock(return_value=[])
+    drive_adapter = MagicMock()
+    drive_adapter.search_files = AsyncMock(return_value=[])
+    cal_adapter = MagicMock()
+    cal_adapter.search_events = AsyncMock(return_value=[])
+    justify_llm = AsyncMock()
+    justify_llm.complete = AsyncMock(return_value=MagicMock(content="No hay evidencia."))
+
+    gmail_ctor = MagicMock(return_value=gmail)
+
+    with (
+        patch.object(eds.gws, "get_integration_status", AsyncMock(return_value=_connected_status())),
+        patch.object(eds, "GmailAdapter", gmail_ctor),
+        patch("app.agent.nodes.drive_fetch.DriveAdapter", return_value=drive_adapter),
+        patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", return_value=cal_adapter),
+        patch("app.agent.nodes.evidence_justify.get_llm", return_value=justify_llm),
+    ):
+        await eds.descubrir_evidencias(db, user.id, req)
+        await eds.descubrir_evidencias(db, user.id, req)  # served from cache
+        await eds.descubrir_evidencias(db, user.id, req, refresh=True)  # bypass + repopulate
+
+    assert gmail_ctor.call_count == 2
 
 
 @pytest.mark.asyncio

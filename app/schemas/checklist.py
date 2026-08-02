@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from decimal import Decimal
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -130,6 +131,24 @@ class ArbolObligacionItem(BaseModel):
     actividades: list[ArbolActividadItem] = Field(default_factory=list)
 
 
+EstadoScanSecop = Literal["ok", "parcial", "fallido", "no_ejecutado"]
+
+
+class ScanSecopStatus(BaseModel):
+    """Top-level aggregate status of the last auto-SECOP scan / auto-link pass
+    that ran within the current request.
+
+    This aggregates ``RequisitoChecklistItem.deteccion_error`` (already
+    surfaced per-requisito) into ONE signal so the frontend can show a single
+    "auto-scan failed, retry" banner instead of the user having to notice
+    per-row states.
+    """
+
+    estado: EstadoScanSecop
+    mensaje: str | None = None
+    requisitos_con_error: int = 0
+
+
 class ChecklistResponse(BaseModel):
     """Full checklist payload for one cuenta de cobro.
 
@@ -143,6 +162,7 @@ class ChecklistResponse(BaseModel):
     items: list[RequisitoChecklistItem]
     resumen: ChecklistResumen
     arbol_evidencias: list[ArbolObligacionItem] = Field(default_factory=list)
+    scan_secop: ScanSecopStatus | None = None
 
 
 class PatchRequisitoBody(BaseModel):

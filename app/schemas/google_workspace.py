@@ -203,6 +203,14 @@ class EvidenceDiscoveryRequest(BaseModel):
         default=None, description="Correo del supervisor (mejora la búsqueda en Gmail)"
     )
     entidad: str | None = Field(default=None, description="Nombre de la entidad contratante")
+    refresh: bool = Field(
+        default=False,
+        description=(
+            "Si es True, ignora el discovery-result cache (cuenta_id + ventana) y "
+            "vuelve a explorar Gmail/Drive/Calendar, repoblando el cache con el "
+            "resultado fresco. Por defecto False (sirve el valor cacheado si existe)."
+        ),
+    )
 
 
 class EvidenceLink(BaseModel):

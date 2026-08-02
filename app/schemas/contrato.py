@@ -137,6 +137,7 @@ class ContratoResponse(BaseModel):
     direccion_ejecucion: str | None = None
     obligaciones: list[ObligacionResponse]
     url_proceso: str | None = None
+    obligaciones_extraidas: bool | None = None
     created_at: datetime
     updated_at: datetime
 

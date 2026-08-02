@@ -83,7 +83,15 @@ async def refrescar_secop(
     """
     cuenta = await cuenta_cobro_service._get_cuenta_con_ownership(db, user.id, cuenta_id)
     await checklist_service.asegurar_checklist(db, cuenta)
-    await checklist_service.detectar_desde_secop(db, cuenta)
+    try:
+        await checklist_service.detectar_desde_secop(db, cuenta)
+    except Exception as exc:  # surface as scan_secop.fallido instead of a raw 500
+        await logger.aerror("refresh_secop_fallo", cuenta_id=str(cuenta_id), error=str(exc))
+        await db.rollback()
+        cuenta = await cuenta_cobro_service._get_cuenta_con_ownership(db, user.id, cuenta_id)
+        checklist_service.marcar_scan_secop_fallido(
+            db, cuenta.id, "No se pudo completar el escaneo automático de SECOP."
+        )
     payload = await checklist_service.construir_checklist_completo(db, cuenta)
     await db.commit()
     return ChecklistResponse(**payload)
