@@ -37,11 +37,15 @@ _IS_PG = TEST_DATABASE_URL.startswith("postgresql")
 # Fail fast at import, before any test runs.
 if _IS_PG:
     _test_db_name = TEST_DATABASE_URL.rsplit("/", 1)[-1].split("?")[0]
-    if "test" not in _test_db_name.lower():
+    _n = _test_db_name.lower()
+    # Require "test" at a name boundary, not just any substring — so a real DB
+    # coincidentally containing the letters (attestation, contest_backup, …) is
+    # NOT accepted, while the usual test-DB conventions (cashin_test, test_db) are.
+    if not (_n == "test" or _n.startswith("test_") or _n.endswith("_test") or "_test_" in _n):
         raise RuntimeError(
             f"Refusing destructive test setup (DROP SCHEMA CASCADE) against database "
-            f"'{_test_db_name}': its name must contain 'test'. Point TEST_DATABASE_URL "
-            f"at a disposable test database (e.g. cashin_test)."
+            f"'{_test_db_name}': its name must be a disposable test DB (exact 'test', or "
+            f"prefixed 'test_' / suffixed '_test', e.g. cashin_test). Point TEST_DATABASE_URL there."
         )
 
 # asyncpg breaks on the Windows ProactorEventLoop (Python 3.12 default): rapid

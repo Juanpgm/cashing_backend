@@ -95,14 +95,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 # If the table already existed (any DB provisioned before this fix),
                 # CREATE IF NOT EXISTS is a no-op and version_num is still alembic's
                 # default VARCHAR(32) — widen it so long revision ids don't truncate on
-                # stamp/upgrade. ALTER ... TYPE is idempotent (already-255 → no change).
+                # stamp/upgrade. Widen ONLY when actually narrower than 255 so we don't
+                # take an ACCESS EXCLUSIVE lock on every boot (multi-replica rolling
+                # deploys on Cloud SQL would otherwise serialize on it each startup).
                 if engine.dialect.name == "postgresql":
-                    await conn.execute(
-                        _text(
-                            "ALTER TABLE alembic_version "
-                            "ALTER COLUMN version_num TYPE VARCHAR(255)"
+                    current_len = (
+                        await conn.execute(
+                            _text(
+                                "SELECT character_maximum_length FROM information_schema.columns "
+                                "WHERE table_name = 'alembic_version' AND column_name = 'version_num'"
+                            )
                         )
-                    )
+                    ).scalar()
+                    if current_len is not None and current_len < 255:
+                        await conn.execute(
+                            _text(
+                                "ALTER TABLE alembic_version "
+                                "ALTER COLUMN version_num TYPE VARCHAR(255)"
+                            )
+                        )
         except Exception as exc:
             log.warning("alembic_version_prepare_failed", error=str(exc))
 
