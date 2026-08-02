@@ -9,7 +9,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 from app.agent.tools.document_parser import parse_document
-from app.core.text_match import keyword_score, normalize
+from app.core.text_match import keyword_score
 from app.models.categoria_documento import CategoriaDocumento
 
 # Minimum score to assign a non-OTROS category.
@@ -23,8 +23,8 @@ CONTENIDO_SCORE_AMBIGUO = Decimal("0.600")
 # Real SECOP documents legitimately mention sibling categories (an RPC always
 # cites its CDP, a contrato cites its condiciones) — demanding exclusivity made
 # CONTENIDO_SCORE_UNICO unreachable in practice. A category dominates instead
-# of needing to be the only one hit: top keyword-hit count must be at least
-# this many times the runner-up's (runner-up 0 hits is automatically dominant).
+# of needing to be the only one hit: top keyword_score must be at least this
+# many times the runner-up's (runner-up score 0 is automatically dominant).
 CONTENIDO_DOMINANCIA_FACTOR = 2
 # Only the head of the document decides — titles/headers carry the signal.
 _CONTENIDO_MAX_CHARS = 1500
@@ -35,34 +35,64 @@ TEXTO_EXTRAIDO_MAX_CHARS = 20_000
 # Order matters only for tie-breaking (first match wins if scores are equal).
 CATEGORIA_KEYWORDS: dict[CategoriaDocumento, list[str]] = {
     CategoriaDocumento.CONTRATO: [
-        "contrato", "cto", "clausulado", "minuta", "contract", "condiciones generales",
-        "condiciones especiales", "acuerdo de prestacion", "prestacion de servicios",
+        "contrato",
+        "cto",
+        "clausulado",
+        "minuta",
+        "contract",
+        "condiciones generales",
+        "condiciones especiales",
+        "acuerdo de prestacion",
+        "prestacion de servicios",
     ],
     CategoriaDocumento.REGISTRO_PRESUPUESTAL: [
-        "rpc", "rp ", "registro presupuestal", "compromiso presupuestal",
+        "rpc",
+        "rp ",
+        "registro presupuestal",
+        "compromiso presupuestal",
         "registro de compromiso",
     ],
     CategoriaDocumento.CDP: [
-        "cdp", "certificado de disponibilidad", "disponibilidad presupuestal",
+        "cdp",
+        "certificado de disponibilidad",
+        "disponibilidad presupuestal",
     ],
     CategoriaDocumento.ACTA_INICIO: [
-        "acta de inicio", "acta inicio", "inicio del contrato", "acta de arranque",
+        "acta de inicio",
+        "acta inicio",
+        "inicio del contrato",
+        "acta de arranque",
     ],
     CategoriaDocumento.RUT: [
-        "rut", "registro tributario", "registro unico tributario",
+        "rut",
+        "registro tributario",
+        "registro unico tributario",
         "registro único tributario",
     ],
     CategoriaDocumento.CEDULA: [
-        "cedula", "cédula", "cc ", "cedula ciudadania", "documento de identidad",
+        "cedula",
+        "cédula",
+        "cc ",
+        "cedula ciudadania",
+        "documento de identidad",
         "tarjeta de identidad",
     ],
     CategoriaDocumento.SEGURIDAD_SOCIAL: [
-        "seguridad social", "planilla", "pila", "aportes seguridad",
+        "seguridad social",
+        "planilla",
+        "pila",
+        "aportes seguridad",
         "aportes parafiscales",
     ],
     CategoriaDocumento.EVIDENCIAS: [
-        "evidencia", "soporte", "registro fotografico", "registro fotográfico",
-        "entregable", "producto", "acta de entrega", "acta entrega",
+        "evidencia",
+        "soporte",
+        "registro fotografico",
+        "registro fotográfico",
+        "entregable",
+        "producto",
+        "acta de entrega",
+        "acta entrega",
     ],
     # OTROS has no keywords — it is the fallback
 }
@@ -129,41 +159,40 @@ def clasificar(
     return best_cat, best_score
 
 
-def _keyword_hits(blob: str, keywords: list[str]) -> int:
-    """Count of distinct keywords (normalized) present in an already-normalized blob."""
-    norm_kws = [normalize(k).strip() for k in keywords if k and k.strip()]
-    return sum(1 for k in norm_kws if k and k in blob)
-
-
 def clasificar_contenido(texto: str | None) -> tuple[CategoriaDocumento | None, Decimal]:
     """Content-based re-score for the borderline sniff (no LLM, no embeddings).
 
-    Scores the first ~1500 chars of extracted text against CATEGORIA_KEYWORDS by
-    keyword-hit count per category. The top category is unambiguous (0.850) when
-    its hit count dominates the runner-up by CONTENIDO_DOMINANCIA_FACTOR (a
-    runner-up of 0 is automatically dominant); otherwise it's ambiguous, candidate
-    only (0.600). No hit at all → (None, 0.000). Real documents routinely mention
-    a sibling category once or twice (an RPC always cites its CDP) — dominance,
-    not exclusivity, is what should decide.
+    Scores the first ~1500 chars of extracted text against CATEGORIA_KEYWORDS using
+    the same fractional/weighted keyword_score as clasificar() — hits divided by
+    that category's OWN keyword-list length, not a raw hit count. This is what makes
+    a specific phrase beat a frequent generic word: RPC's list is short (5 phrases),
+    so each hit counts for more; CONTRATO's is long (9), so the same hit count means
+    less. A prior version ranked by raw hit count instead, which let CONTRATO's long,
+    generic keyword list out-count RPC's short, specific one on real documents that
+    legitimately cite their contract (regression, commit 8ba8ac9).
+    The top category is unambiguous (0.850) when its score dominates the runner-up's
+    by CONTENIDO_DOMINANCIA_FACTOR (a runner-up of 0 is automatically dominant);
+    otherwise it's ambiguous, candidate only (0.600). No hit at all → (None, 0.000).
+    Real documents routinely mention a sibling category once or twice (an RPC always
+    cites its CDP) — dominance, not exclusivity, is what should decide.
     """
     if not texto:
         return None, Decimal("0.000")
     fragmento = texto[:_CONTENIDO_MAX_CHARS]
-    blob = normalize(fragmento)
 
-    hits: dict[CategoriaDocumento, int] = {}
+    scored: list[tuple[CategoriaDocumento, Decimal]] = []
     for cat, keywords in CATEGORIA_KEYWORDS.items():
-        n = _keyword_hits(blob, keywords)
-        if n > 0:
-            hits[cat] = n
+        score = keyword_score([fragmento], keywords)
+        if score > Decimal("0.000"):
+            scored.append((cat, score))
 
-    if not hits:
+    if not scored:
         return None, Decimal("0.000")
 
-    ranked = sorted(hits.items(), key=lambda kv: kv[1], reverse=True)
-    best_cat, best_hits = ranked[0]
-    runner_up_hits = ranked[1][1] if len(ranked) > 1 else 0
-    if runner_up_hits == 0 or best_hits >= CONTENIDO_DOMINANCIA_FACTOR * runner_up_hits:
+    ranked = sorted(scored, key=lambda kv: kv[1], reverse=True)
+    best_cat, best_score = ranked[0]
+    runner_up_score = ranked[1][1] if len(ranked) > 1 else Decimal("0.000")
+    if runner_up_score == 0 or best_score >= CONTENIDO_DOMINANCIA_FACTOR * runner_up_score:
         return best_cat, CONTENIDO_SCORE_UNICO
     return best_cat, CONTENIDO_SCORE_AMBIGUO
 

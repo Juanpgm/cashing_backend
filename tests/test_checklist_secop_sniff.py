@@ -106,11 +106,12 @@ TEXTO_CONTRATO = (
     "Entre la entidad y el contratista se celebra el presente contrato, cuyo clausulado se detalla."
 )
 TEXTO_RPC = "REGISTRO PRESUPUESTAL DEL COMPROMISO No. 555\nRegistro de compromiso presupuestal."
-# Genuinely tied signals under the dominance rule: 2 CONTRATO hits (contrato,
-# clausulado) vs 2 RPC hits (registro presupuestal, compromiso presupuestal) —
-# neither dominates the other by CONTENIDO_DOMINANCIA_FACTOR, so it stays
-# ambiguous. The original 2-vs-1 wording became CONTRATO-dominant (unambiguous)
-# once clasificar_contenido moved from exclusivity to dominance scoring.
+# 2 CONTRATO hits (contrato, clausulado) vs 2 RPC hits (registro presupuestal,
+# compromiso presupuestal). Winner is by fractional/weighted keyword_score, not
+# raw hit count: RPC's shorter keyword list (5 phrases) makes an equal hit
+# count worth more than CONTRATO's (9 phrases) — RPC 2/5=0.400 beats CONTRATO
+# 2/9=0.222 — but 0.400 doesn't reach CONTENIDO_DOMINANCIA_FACTOR (2x) over
+# 0.222, so it stays ambiguous (candidate only, no auto-link).
 TEXTO_AMBIGUO = (
     "contrato con clausulado y registro presupuestal de la vigencia, "
     "con cargo al compromiso presupuestal correspondiente"
@@ -258,16 +259,17 @@ async def test_memoizacion_segundo_scan_cero_descargas(
     await db.refresh(doc)
     assert doc.texto_estado == "ok"
     # Ambiguous content → 0.600: candidate only, no auto-link.
-    fila = await _fila(db, cuenta.id, "CONTRATO")
+    # Winner is RPC (fractional score 0.400 vs CONTRATO's 0.222 — see TEXTO_AMBIGUO).
+    fila = await _fila(db, cuenta.id, "RPC")
     assert fila.estado == EstadoRequisito.PENDIENTE
-    cands = await _candidatos(db, cuenta.id, "CONTRATO")
+    cands = await _candidatos(db, cuenta.id, "RPC")
     assert [(c.score, c.score_origen) for c in cands] == [(Decimal("0.600"), "contenido")]
 
     # Second scan: re-scores the STORED text — zero new downloads, same result.
     await checklist_service.detectar_desde_secop(db, cuenta)
     await db.commit()
     assert descargas["llamadas"] == [url]
-    cands = await _candidatos(db, cuenta.id, "CONTRATO")
+    cands = await _candidatos(db, cuenta.id, "RPC")
     assert [(c.score, c.score_origen) for c in cands] == [(Decimal("0.600"), "contenido")]
 
 

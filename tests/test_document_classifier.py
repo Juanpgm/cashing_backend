@@ -18,6 +18,7 @@ from app.services.document_classifier import (
 
 # ── CDP first-class category (clasificacion-documentos-secop, D1) ───────────
 
+
 def test_categoria_cdp_es_primera_clase():
     assert CategoriaDocumento.CDP.value == "cdp"
     assert "cdp" in CATEGORIA_KEYWORDS[CategoriaDocumento.CDP]
@@ -120,6 +121,30 @@ def test_clasificar_contenido_empate_real_da_0600():
     assert score == Decimal("0.600")
 
 
+def test_clasificar_contenido_rpc_real_no_pierde_confianza_ante_mencion_generica_de_contrato():
+    """Regression (commit 8ba8ac9): winner selection moved from fractional/weighted
+    keyword_score to raw keyword-hit COUNT. RPC's keyword list is short and specific
+    (5 phrases); CONTRATO's is long and generic (9 phrases) — a real RPC document that
+    also cites its underlying contract (routine, e.g. "de conformidad con las
+    condiciones generales del contrato") racks up CONTRATO hits fast even though each
+    one is weak/generic, while RPC's few hits are strong/specific. Under hit-COUNT
+    dominance this real text scores only 0.600 (5 RPC hits vs 3 CONTRATO hits fails
+    the >=2x-count bar) — below AUTO_LINK_THRESHOLD (0.700), blocking auto-link.
+    Under the restored fractional score (RPC 5/5=1.000 vs CONTRATO 3/9=0.333, a 3x
+    dominance) it correctly scores 0.850 and stays auto-linkable.
+    """
+    texto = (
+        "MUNICIPIO SANTIAGO DE CALI SECRETARIA DE SEGURIDAD Y JUSTICIA Registro "
+        "Presupuestal de Compromiso RPC No. 4500379639 Fecha de Contabilizacion: "
+        "23.08.2025. En virtud del contrato No. 2025-01, y de conformidad con las "
+        "condiciones generales del contrato, cuyo clausulado ampara la presente "
+        "afectacion, se expide el registro de compromiso presupuestal."
+    )
+    cat, score = clasificar_contenido(texto)
+    assert cat == CategoriaDocumento.REGISTRO_PRESUPUESTAL
+    assert score == Decimal("0.850")
+
+
 def test_clasificar_contenido_sin_hit():
     cat, score = clasificar_contenido("texto administrativo sin senales relevantes para el checklist")
     assert cat is None
@@ -139,6 +164,7 @@ def test_clasificar_contenido_solo_primeros_1500_chars():
 
 
 # ── extraer_texto_contenido (extraction helper, no OCR) ─────────────────────
+
 
 def test_extraer_texto_contenido_docx():
     data = (FIXTURES / "contrato.docx").read_bytes()
@@ -170,6 +196,7 @@ def test_extraer_texto_contenido_bytes_invalidos_devuelve_vacio():
 
 
 # ── clasificar ──────────────────────────────────────────────────────────────
+
 
 @pytest.mark.parametrize(
     "nombre, descripcion, expected_cat",
@@ -228,6 +255,7 @@ def test_clasificar_score_range():
 
 
 # ── aplicar_clasificacion ───────────────────────────────────────────────────
+
 
 class _FakeDoc:
     def __init__(self, nombre_archivo=None, descripcion=None, categoria_override=False):
