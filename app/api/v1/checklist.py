@@ -82,13 +82,14 @@ async def refrescar_secop(
     No sobreescribe documentos cargados manualmente (estado=cargado).
     """
     cuenta = await cuenta_cobro_service._get_cuenta_con_ownership(db, user.id, cuenta_id)
+    user_id = user.id  # captured before any rollback expires the session-bound `user`
     await checklist_service.asegurar_checklist(db, cuenta)
     try:
         await checklist_service.detectar_desde_secop(db, cuenta)
     except Exception as exc:  # surface as scan_secop.fallido instead of a raw 500
         await logger.aerror("refresh_secop_fallo", cuenta_id=str(cuenta_id), error=str(exc))
         await db.rollback()
-        cuenta = await cuenta_cobro_service._get_cuenta_con_ownership(db, user.id, cuenta_id)
+        cuenta = await cuenta_cobro_service._get_cuenta_con_ownership(db, user_id, cuenta_id)  # use captured user_id
         checklist_service.marcar_scan_secop_fallido(
             db, cuenta.id, "No se pudo completar el escaneo automático de SECOP."
         )

@@ -341,3 +341,139 @@ class TestObligacionesExtraidasFlag:
         contrato = await crear_contrato(db, test_user["user"].id, data)
 
         assert contrato.obligaciones_extraidas is None
+
+
+class TestObligacionesExtraidasFlagOnReimport:
+    """Bug: re-importing a contract that already exists (the UPSERT/duplicate
+    branch of `importar_contratos_secop`) never reconsidered obligaciones — a
+    contract first imported with zero obligaciones stayed stuck forever, even
+    when a later SECOP snapshot's `objeto` yields obligaciones on verbatim
+    extraction. Fix: when the existing contrato currently has empty obligaciones
+    and the new import yields obligaciones, add them and flip the flag to True;
+    an already-True flag must never be clobbered back to False/None."""
+
+    @pytest.mark.asyncio
+    async def test_reimport_flips_false_to_true_when_obligaciones_now_appear(
+        self, db: AsyncSession, test_user: dict[str, Any]
+    ) -> None:
+        from app.services.secop_service import importar_contratos_secop
+
+        row_sin_obligaciones = _make_row(numero_contrato="CO1.PCCNTR.REIMPORT001")
+        llm_response = LLMResponse(content="", model="test", total_tokens=5)
+        with (
+            patch(
+                "app.services.secop_service._query_socrata",
+                new_callable=AsyncMock,
+                return_value=[row_sin_obligaciones],
+            ),
+            patch(_PATCH_GET_LLM) as mock_get_llm,
+        ):
+            mock_llm = AsyncMock()
+            mock_llm.complete = AsyncMock(return_value=llm_response)
+            mock_get_llm.return_value = mock_llm
+            first = await importar_contratos_secop(db, "1016019452", test_user["user"].id, confirmar=True)
+        assert first.contratos[0].obligaciones_extraidas is False
+
+        objeto_con_obligaciones = (
+            "Prestación de servicios profesionales. OBLIGACIONES ESPECIFICAS DEL CONTRATISTA: "
+            "1. Elaborar informes mensuales de las actividades desarrolladas en el marco del contrato. "
+            "2. Apoyar la atención al ciudadano y la gestión documental de la dependencia. "
+            "Las demás actividades que le sean asignadas por el supervisor del contrato."
+        )
+        row_con_obligaciones = _make_row(
+            numero_contrato="CO1.PCCNTR.REIMPORT001", objeto_del_contrato=objeto_con_obligaciones
+        )
+        with patch(
+            "app.services.secop_service._query_socrata",
+            new_callable=AsyncMock,
+            return_value=[row_con_obligaciones],
+        ):
+            second = await importar_contratos_secop(db, "1016019452", test_user["user"].id, confirmar=True)
+
+        contrato = second.contratos[0]
+        assert len(contrato.obligaciones) >= 2
+        assert contrato.obligaciones_extraidas is True
+
+    @pytest.mark.asyncio
+    async def test_reimport_never_clobbers_an_existing_true_flag(
+        self, db: AsyncSession, test_user: dict[str, Any]
+    ) -> None:
+        from app.services.secop_service import importar_contratos_secop
+
+        objeto_con_obligaciones = (
+            "Prestación de servicios profesionales. OBLIGACIONES ESPECIFICAS DEL CONTRATISTA: "
+            "1. Elaborar informes mensuales de las actividades desarrolladas en el marco del contrato. "
+            "2. Apoyar la atención al ciudadano y la gestión documental de la dependencia. "
+            "Las demás actividades que le sean asignadas por el supervisor del contrato."
+        )
+        row_con_obligaciones = _make_row(
+            numero_contrato="CO1.PCCNTR.REIMPORT002", objeto_del_contrato=objeto_con_obligaciones
+        )
+        with patch(
+            "app.services.secop_service._query_socrata",
+            new_callable=AsyncMock,
+            return_value=[row_con_obligaciones],
+        ):
+            first = await importar_contratos_secop(db, "1016019452", test_user["user"].id, confirmar=True)
+        assert first.contratos[0].obligaciones_extraidas is True
+
+        row_reimport_sin_obligaciones = _make_row(
+            numero_contrato="CO1.PCCNTR.REIMPORT002", valor_del_contrato="15000000"
+        )
+        with patch(
+            "app.services.secop_service._query_socrata",
+            new_callable=AsyncMock,
+            return_value=[row_reimport_sin_obligaciones],
+        ):
+            second = await importar_contratos_secop(db, "1016019452", test_user["user"].id, confirmar=True)
+
+        contrato = second.contratos[0]
+        assert contrato.obligaciones_extraidas is True
+        assert len(contrato.obligaciones) >= 2
+
+    @pytest.mark.asyncio
+    async def test_llm_raises_path_sets_flag_false_not_none(self, db: AsyncSession, test_user: dict[str, Any]) -> None:
+        from app.services.secop_service import importar_contratos_secop
+
+        row = _make_row(numero_contrato="CO1.PCCNTR.REIMPORT003")
+        with (
+            patch(
+                "app.services.secop_service._query_socrata",
+                new_callable=AsyncMock,
+                return_value=[row],
+            ),
+            patch(_PATCH_GET_LLM, side_effect=RuntimeError("LLM unavailable")),
+        ):
+            result = await importar_contratos_secop(db, "1016019452", test_user["user"].id, confirmar=True)
+
+        contrato = result.contratos[0]
+        assert contrato.obligaciones == []
+        assert contrato.obligaciones_extraidas is False
+
+    @pytest.mark.asyncio
+    async def test_llm_timeout_path_sets_flag_false_not_none(
+        self, db: AsyncSession, test_user: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import app.services.secop_service as secop_service_module
+        from app.services.secop_service import importar_contratos_secop
+
+        monkeypatch.setattr(secop_service_module, "SECOP_OBLIGACIONES_LLM_TIMEOUT_S", 0.05)
+
+        row = _make_row(numero_contrato="CO1.PCCNTR.REIMPORT004")
+
+        async def _slow_extraer(*args: Any, **kwargs: Any) -> None:
+            await asyncio.sleep(1)
+
+        with (
+            patch(
+                "app.services.secop_service._query_socrata",
+                new_callable=AsyncMock,
+                return_value=[row],
+            ),
+            patch("app.services.document_service.extraer_obligaciones_texto", new=_slow_extraer),
+        ):
+            result = await importar_contratos_secop(db, "1016019452", test_user["user"].id, confirmar=True)
+
+        contrato = result.contratos[0]
+        assert contrato.obligaciones == []
+        assert contrato.obligaciones_extraidas is False

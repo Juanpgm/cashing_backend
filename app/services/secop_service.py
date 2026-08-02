@@ -1347,6 +1347,33 @@ async def importar_contratos_secop(
                 if data.entidad:
                     existing_contrato.entidad = data.entidad
                 await db.flush()
+
+                # C.3 reimport guard: a contract first imported with zero
+                # obligaciones must not stay stuck forever — if this reimport's
+                # objeto now yields obligaciones (verbatim), add them and flip
+                # the flag. NEVER clobber an already-True flag/existing obligaciones.
+                db.expire(existing_contrato, ["obligaciones"])
+                await db.refresh(existing_contrato, ["obligaciones"])
+                if not existing_contrato.obligaciones and data.obligaciones:
+                    for ob in data.obligaciones:
+                        db.add(
+                            Obligacion(
+                                contrato_id=existing_contrato.id,
+                                descripcion=ob.descripcion,
+                                tipo=TipoObligacion(ob.tipo),
+                                orden=ob.orden,
+                                etiqueta=ob.etiqueta,
+                            )
+                        )
+                    existing_contrato.obligaciones_extraidas = True
+                    await db.flush()
+                    # The `obligaciones` collection just added above was already
+                    # marked "loaded" (empty) by the refresh() a few lines up —
+                    # without expiring it again, the `selectinload` in the final
+                    # re-select below skips reloading it (already-loaded relationships
+                    # aren't re-fetched) and would return the stale empty list.
+                    db.expire(existing_contrato, ["obligaciones"])
+
                 result = await db.execute(
                     select(Contrato)
                     .options(selectinload(Contrato.obligaciones))
