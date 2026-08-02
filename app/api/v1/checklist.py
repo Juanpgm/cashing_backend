@@ -14,6 +14,7 @@ from app.core.exceptions import ValidationError
 from app.schemas.checklist import (
     ChecklistResponse,
     ChecklistResumen,
+    DocumentoContextoItem,
     PatchRequisitoBody,
     RequisitoChecklistItem,
 )
@@ -68,6 +69,25 @@ async def obtener_checklist(
     payload = await checklist_service.construir_checklist_completo(db, cuenta)
     await db.commit()
     return ChecklistResponse(**payload)
+
+
+@router.get("/contexto-docs", response_model=list[DocumentoContextoItem])
+async def listar_contexto_docs(
+    cuenta_id: uuid.UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> list[DocumentoContextoItem]:
+    """Documentos de contexto del contrato (clasificacion-documentos-secop, D4).
+
+    Lista de solo lectura: documentos SECOP del contrato + cargas a nivel de
+    contrato cuya categoría es OTROS o no mapea a ningún requisito, y que no
+    están vinculados a ninguna fila del checklist de esta cuenta. Incluye un
+    `snippet` (≤500 caracteres) del texto ya extraído cuando existe — nunca
+    descarga archivos.
+    """
+    cuenta = await cuenta_cobro_service._get_cuenta_con_ownership(db, user.id, cuenta_id)
+    items = await checklist_service.listar_documentos_contexto(db, cuenta)
+    return [DocumentoContextoItem(**item) for item in items]
 
 
 @router.post("/refresh-secop", response_model=ChecklistResponse)

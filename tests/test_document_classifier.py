@@ -1,18 +1,202 @@
 """Unit tests for document_classifier — category inference from filename/description."""
 
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
-
 from app.models.categoria_documento import CategoriaDocumento
 from app.services.document_classifier import (
+    CATEGORIA_A_REQUISITO,
+    CATEGORIA_KEYWORDS,
     CATEGORIA_MIN_THRESHOLD,
+    TIPO_A_REQUISITO,
     aplicar_clasificacion,
     clasificar,
+    clasificar_contenido,
+    extraer_texto_contenido,
 )
+
+# ── CDP first-class category (clasificacion-documentos-secop, D1) ───────────
+
+
+def test_categoria_cdp_es_primera_clase():
+    assert CategoriaDocumento.CDP.value == "cdp"
+    assert "cdp" in CATEGORIA_KEYWORDS[CategoriaDocumento.CDP]
+    assert "certificado de disponibilidad" in CATEGORIA_KEYWORDS[CategoriaDocumento.CDP]
+    assert "disponibilidad presupuestal" in CATEGORIA_KEYWORDS[CategoriaDocumento.CDP]
+
+
+def test_cdp_mapeos_a_requisito():
+    assert CATEGORIA_A_REQUISITO[CategoriaDocumento.CDP] == "CDP"
+    assert TIPO_A_REQUISITO["cdp"] == "CDP"
+
+
+@pytest.mark.parametrize(
+    "nombre",
+    [
+        "CDP_2024.pdf",
+        "Certificado de Disponibilidad Presupuestal.pdf",
+        "disponibilidad presupuestal 001.pdf",
+    ],
+)
+def test_clasificar_cdp_por_nombre(nombre):
+    cat, score = clasificar(nombre, None)
+    assert cat == CategoriaDocumento.CDP
+    assert score >= CATEGORIA_MIN_THRESHOLD
+
+
+def test_clasificar_rpc_no_se_confunde_con_cdp():
+    cat, _ = clasificar("RPC registro presupuestal compromiso.pdf", None)
+    assert cat == CategoriaDocumento.REGISTRO_PRESUPUESTAL
+
+
+# ── clasificar_contenido (borderline content sniff, D2) ─────────────────────
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+@pytest.mark.parametrize(
+    "texto, expected_cat",
+    [
+        (
+            "CONTRATO DE PRESTACIÓN DE SERVICIOS PROFESIONALES No. 123-2024\n"
+            "Entre la entidad y el contratista se celebra el presente contrato, cuyo clausulado se detalla.",
+            CategoriaDocumento.CONTRATO,
+        ),
+        (
+            "CERTIFICADO DE DISPONIBILIDAD PRESUPUESTAL No. 2024-001\n"
+            "La entidad certifica la disponibilidad presupuestal del rubro.",
+            CategoriaDocumento.CDP,
+        ),
+        (
+            "REGISTRO PRESUPUESTAL DEL COMPROMISO No. 555\n"
+            "Registro de compromiso presupuestal a favor del contratista.",
+            CategoriaDocumento.REGISTRO_PRESUPUESTAL,
+        ),
+    ],
+)
+def test_clasificar_contenido_hit_inequivoco_da_0850(texto, expected_cat):
+    cat, score = clasificar_contenido(texto)
+    assert cat == expected_cat
+    assert score == Decimal("0.850")
+
+
+def test_clasificar_contenido_ambiguo_multicategoria_da_0600():
+    texto = (
+        "El presente contrato se suscribe con cargo al registro presupuestal "
+        "expedido por la entidad para amparar el compromiso."
+    )
+    cat, score = clasificar_contenido(texto)
+    assert cat in (CategoriaDocumento.CONTRATO, CategoriaDocumento.REGISTRO_PRESUPUESTAL)
+    assert score == Decimal("0.600")
+
+
+def test_clasificar_contenido_rpc_dominante_con_mencion_de_cdp_da_0850():
+    """Real SECOP RPC docs always cite their CDP once — that must not block 0.850.
+
+    Modeled on live E2E evidence: an RPC document body legitimately repeats RPC
+    signals (rpc/registro presupuestal/compromiso presupuestal/registro de
+    compromiso) while mentioning CDP only once (certificado de disponibilidad).
+    RPC hits (4) dominate the CDP runner-up (1) by >= CONTENIDO_DOMINANCIA_FACTOR,
+    so the category must be unambiguous despite the sibling-category mention.
+    """
+    texto = (
+        "MUNICIPIO SANTIAGO DE CALI\n"
+        "Registro Presupuestal de Compromiso RPC No. 4500379639\n"
+        "Fecha de Contabilizacion: 2024-05-10\n"
+        "El presente registro de compromiso corresponde al compromiso presupuestal "
+        "derivado del contrato, y se afecta el certificado de disponibilidad "
+        "expedido previamente."
+    )
+    cat, score = clasificar_contenido(texto)
+    assert cat == CategoriaDocumento.REGISTRO_PRESUPUESTAL
+    assert score == Decimal("0.850")
+
+
+def test_clasificar_contenido_empate_real_da_0600():
+    """Genuinely tied signals (one RPC keyword, one CDP keyword) stay ambiguous."""
+    texto = "El registro presupuestal fue expedido junto con el certificado de disponibilidad correspondiente."
+    cat, score = clasificar_contenido(texto)
+    assert cat in (CategoriaDocumento.REGISTRO_PRESUPUESTAL, CategoriaDocumento.CDP)
+    assert score == Decimal("0.600")
+
+
+def test_clasificar_contenido_rpc_real_no_pierde_confianza_ante_mencion_generica_de_contrato():
+    """Regression (commit 8ba8ac9): winner selection moved from fractional/weighted
+    keyword_score to raw keyword-hit COUNT. RPC's keyword list is short and specific
+    (5 phrases); CONTRATO's is long and generic (9 phrases) — a real RPC document that
+    also cites its underlying contract (routine, e.g. "de conformidad con las
+    condiciones generales del contrato") racks up CONTRATO hits fast even though each
+    one is weak/generic, while RPC's few hits are strong/specific. Under hit-COUNT
+    dominance this real text scores only 0.600 (5 RPC hits vs 3 CONTRATO hits fails
+    the >=2x-count bar) — below AUTO_LINK_THRESHOLD (0.700), blocking auto-link.
+    Under the restored fractional score (RPC 5/5=1.000 vs CONTRATO 3/9=0.333, a 3x
+    dominance) it correctly scores 0.850 and stays auto-linkable.
+    """
+    texto = (
+        "MUNICIPIO SANTIAGO DE CALI SECRETARIA DE SEGURIDAD Y JUSTICIA Registro "
+        "Presupuestal de Compromiso RPC No. 4500379639 Fecha de Contabilizacion: "
+        "23.08.2025. En virtud del contrato No. 2025-01, y de conformidad con las "
+        "condiciones generales del contrato, cuyo clausulado ampara la presente "
+        "afectacion, se expide el registro de compromiso presupuestal."
+    )
+    cat, score = clasificar_contenido(texto)
+    assert cat == CategoriaDocumento.REGISTRO_PRESUPUESTAL
+    assert score == Decimal("0.850")
+
+
+def test_clasificar_contenido_sin_hit():
+    cat, score = clasificar_contenido("texto administrativo sin senales relevantes para el checklist")
+    assert cat is None
+    assert score == Decimal("0.000")
+
+
+def test_clasificar_contenido_texto_vacio():
+    assert clasificar_contenido(None) == (None, Decimal("0.000"))
+    assert clasificar_contenido("") == (None, Decimal("0.000"))
+
+
+def test_clasificar_contenido_solo_primeros_1500_chars():
+    texto = ("x" * 2000) + " contrato de prestacion de servicios"
+    cat, score = clasificar_contenido(texto)
+    assert cat is None
+    assert score == Decimal("0.000")
+
+
+# ── extraer_texto_contenido (extraction helper, no OCR) ─────────────────────
+
+
+def test_extraer_texto_contenido_docx():
+    data = (FIXTURES / "contrato.docx").read_bytes()
+    texto = extraer_texto_contenido(data, "contrato.docx")
+    assert "CONTRATO DE PRESTACI" in texto
+    cat, score = clasificar_contenido(texto)
+    assert cat == CategoriaDocumento.CONTRATO
+    assert score == Decimal("0.850")
+
+
+def test_extraer_texto_contenido_pdf():
+    data = (FIXTURES / "cdp.pdf").read_bytes()
+    texto = extraer_texto_contenido(data, "cdp.pdf")
+    assert "DISPONIBILIDAD PRESUPUESTAL" in texto
+    cat, score = clasificar_contenido(texto)
+    assert cat == CategoriaDocumento.CDP
+    assert score == Decimal("0.850")
+
+
+def test_extraer_texto_contenido_pdf_rpc():
+    data = (FIXTURES / "rpc.pdf").read_bytes()
+    cat, score = clasificar_contenido(extraer_texto_contenido(data, "rpc.pdf"))
+    assert cat == CategoriaDocumento.REGISTRO_PRESUPUESTAL
+    assert score == Decimal("0.850")
+
+
+def test_extraer_texto_contenido_bytes_invalidos_devuelve_vacio():
+    assert extraer_texto_contenido(b"\x00\x01\x02\x03\xff\xfe", "binario.exe") == ""
 
 
 # ── clasificar ──────────────────────────────────────────────────────────────
+
 
 @pytest.mark.parametrize(
     "nombre, descripcion, expected_cat",
@@ -71,6 +255,7 @@ def test_clasificar_score_range():
 
 
 # ── aplicar_clasificacion ───────────────────────────────────────────────────
+
 
 class _FakeDoc:
     def __init__(self, nombre_archivo=None, descripcion=None, categoria_override=False):

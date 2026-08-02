@@ -6,6 +6,7 @@ import enum
 class CategoriaDocumento(enum.StrEnum):
     CONTRATO = "contrato"
     REGISTRO_PRESUPUESTAL = "registro_presupuestal"
+    CDP = "cdp"
     ACTA_INICIO = "acta_inicio"
     RUT = "rut"
     CEDULA = "cedula"

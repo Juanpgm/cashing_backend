@@ -161,6 +161,9 @@ class DocumentoChecklistCandidato(UUIDMixin, TimestampMixin, Base):
         Uuid, ForeignKey("secop_documentos.id", ondelete="CASCADE"), nullable=False
     )
     score: Mapped[Decimal] = mapped_column(Numeric(4, 3), nullable=False)
+    # Which signal produced the final score: 'nombre' (filename/descripcion
+    # keywords) or 'contenido' (borderline content sniff). NULL on legacy rows.
+    score_origen: Mapped[str | None] = mapped_column(String(10), nullable=True)
 
     # Relationship to fetch document details
     secop_documento: Mapped[SecopDocumento] = relationship(  # type: ignore[name-defined]  # noqa: F821

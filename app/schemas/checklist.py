@@ -42,10 +42,30 @@ class SecopCandidatoOut(BaseModel):
     nombre_archivo: str | None = None
     descripcion: str | None = None
     score: Decimal
+    # 'nombre' (filename/descripcion keywords) | 'contenido' (borderline content
+    # sniff) | None (legacy rows / on-the-fly custom candidates).
+    score_origen: str | None = None
     url_descarga: str | None = None
     categoria: CategoriaDocumento | None = None
     categoria_confianza: Decimal | None = None
     categoria_override: bool = False
+
+
+class DocumentoContextoItem(BaseModel):
+    """Contract-level context doc (clasificacion-documentos-secop, D4).
+
+    A SECOP doc or contract-level upload whose categoria is OTROS/unmapped and
+    that is not linked to any checklist row of the cuenta — surfaced as context
+    for Justificaciones and the paquete, never silently dropped.
+    """
+
+    id: uuid.UUID
+    fuente: str  # 'secop' | 'upload'
+    nombre: str
+    descripcion: str | None = None
+    categoria: CategoriaDocumento | None = None
+    snippet: str | None = None  # <= 500 chars of texto_extraido, when available
+    url_descarga: str | None = None
 
 
 class DocumentoFuenteRef(BaseModel):

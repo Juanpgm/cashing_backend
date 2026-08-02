@@ -382,6 +382,140 @@ async def test_cruzar_clears_existing_actividades_before_run(db: AsyncSession) -
     assert len(actividades_after) == 0
 
 
+# ---------------------------------------------------------------------------
+# Contract-level context block (clasificacion-documentos-secop, design D4)
+# ---------------------------------------------------------------------------
+
+
+def _ctx_item(nombre: str, snippet: str | None, categoria: str = "otros") -> dict:
+    return {
+        "id": uuid.uuid4(),
+        "fuente": "secop",
+        "nombre": nombre,
+        "descripcion": None,
+        "categoria": categoria,
+        "snippet": snippet,
+        "url_descarga": None,
+        "storage_key": None,
+    }
+
+
+def test_contexto_contrato_bloque_vacio_es_cadena_vacia() -> None:
+    """Zero context docs → empty string, so prompts stay byte-identical."""
+    assert cruzar_service._contexto_contrato_bloque([]) == ""
+
+
+def test_contexto_contrato_bloque_acotado_5_docs_y_400_chars() -> None:
+    docs = [_ctx_item(f"doc-{i}.pdf", "s" * 1000) for i in range(8)]
+    bloque = cruzar_service._contexto_contrato_bloque(docs)
+    # Only the first 5 docs make it in, snippets truncated to 400 chars.
+    assert bloque.count("doc-") <= 5
+    assert "doc-0.pdf" in bloque
+    assert "s" * 401 not in bloque
+    assert len(bloque) <= 2500
+
+
+def test_contexto_contrato_bloque_linea_solo_metadata_sin_texto() -> None:
+    bloque = cruzar_service._contexto_contrato_bloque([_ctx_item("anexo_sin_texto.pdf", None)])
+    assert "anexo_sin_texto.pdf" in bloque
+    assert "sin texto extra" in bloque  # metadata-only line, never downloads
+
+
+def test_contexto_contrato_bloque_total_menor_a_2500() -> None:
+    docs = [_ctx_item("n" * 300 + f"{i}.pdf", "s" * 400) for i in range(5)]
+    bloque = cruzar_service._contexto_contrato_bloque(docs)
+    assert 0 < len(bloque) <= 2500
+
+
+@pytest.mark.asyncio
+async def test_cruzar_incluye_bloque_de_contexto_en_prompts(db: AsyncSession) -> None:
+    """Context docs reach BOTH writer prompts (actividad + justificación)."""
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+    await _make_obligacion(db, contrato.id, 1, descripcion="Elaborar informes técnicos mensuales de consultoría")
+    cuenta = await _make_cuenta(db, contrato.id)
+    await _make_documento(
+        db,
+        user.id,
+        contrato.id,
+        texto_extraido="Informe técnico mensual de consultoría del período con actividades realizadas.",
+    )
+    await db.commit()
+
+    mock_llm = AsyncMock()
+    mock_llm.complete = AsyncMock(
+        side_effect=[
+            _make_llm_response("[1]"),
+            _make_llm_response("Actividad generada."),
+            _make_llm_response("Justificación generada."),
+        ]
+    )
+    contexto = [_ctx_item("acta_secop_interna.pdf", "Detalle operativo del acta de contexto")]
+
+    with (
+        patch("app.services.cruzar_service.get_llm", return_value=mock_llm),
+        patch("app.services.cruzar_service.quality_gate_node", new_callable=AsyncMock) as mock_gate,
+        patch.object(
+            cruzar_service.checklist_service,
+            "listar_documentos_contexto",
+            new=AsyncMock(return_value=contexto),
+        ),
+    ):
+        mock_gate.return_value = {"quality_gate_passed": True, "quality_issues": []}
+        await cruzar_service.cruzar_documentos(db, user.id, cuenta.id)
+
+    # Calls: [0] relevance batch (no context), [1] actividad, [2] justificación.
+    prompts_escritores = [call.args[0][1].content for call in mock_llm.complete.await_args_list[1:]]
+    assert len(prompts_escritores) == 2
+    for prompt in prompts_escritores:
+        assert "acta_secop_interna.pdf" in prompt
+        assert "Detalle operativo del acta de contexto" in prompt
+    # Relevance batch prompt stays untouched.
+    assert "acta_secop_interna.pdf" not in mock_llm.complete.await_args_list[0].args[0][1].content
+
+
+@pytest.mark.asyncio
+async def test_cruzar_sin_contexto_prompts_identicos_al_actual(db: AsyncSession) -> None:
+    """Zero context docs → writer prompts do NOT gain any context section.
+
+    The evidence doc gets a MAPPED categoria (EVIDENCIAS) so it does not qualify
+    as OTROS/unmapped context — the contract genuinely has zero context docs.
+    """
+    from app.models.categoria_documento import CategoriaDocumento
+
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+    await _make_obligacion(db, contrato.id, 1, descripcion="Elaborar informes técnicos mensuales de consultoría")
+    cuenta = await _make_cuenta(db, contrato.id)
+    doc = await _make_documento(
+        db,
+        user.id,
+        contrato.id,
+        texto_extraido="Informe técnico mensual de consultoría del período con actividades realizadas.",
+    )
+    doc.categoria = CategoriaDocumento.EVIDENCIAS
+    await db.commit()
+
+    mock_llm = AsyncMock()
+    mock_llm.complete = AsyncMock(
+        side_effect=[
+            _make_llm_response("[1]"),
+            _make_llm_response("Actividad generada."),
+            _make_llm_response("Justificación generada."),
+        ]
+    )
+
+    with (
+        patch("app.services.cruzar_service.get_llm", return_value=mock_llm),
+        patch("app.services.cruzar_service.quality_gate_node", new_callable=AsyncMock) as mock_gate,
+    ):
+        mock_gate.return_value = {"quality_gate_passed": True, "quality_issues": []}
+        await cruzar_service.cruzar_documentos(db, user.id, cuenta.id)
+
+    for call in mock_llm.complete.await_args_list[1:]:
+        assert "Documentos de contexto" not in call.args[0][1].content
+
+
 @pytest.mark.asyncio
 async def test_cruzar_reuses_actividad_stub_with_evidencia_instead_of_deleting_it(db: AsyncSession) -> None:
     """A stub Actividad created by the upload-first evidence flow (Evidencia

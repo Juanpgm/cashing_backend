@@ -1195,6 +1195,101 @@ async def _texto_para_scan(contenido: bytes, nombre_archivo: str) -> str | None:
     return texto
 
 
+async def _agregar_documentos_contrato(
+    db: AsyncSession,
+    cuenta: CuentaCobro,
+    miembros_zip: list[tuple[str, bytes]],
+    miembros_scan: list[tuple[str, bytes]],
+) -> None:
+    """DOCUMENTOS_CONTRATO/ section of the paquete (clasificacion-documentos-secop, D5).
+
+    - ``DOCUMENTOS_CONTRATO/{REQUISITO_CODIGO}/``: real bytes of docs linked via
+      ``DocumentoRequisitoVinculo`` to the cuenta's contract-level checklist rows
+      (uploads via storage, SECOP via ``url_descarga``).
+    - ``DOCUMENTOS_CONTRATO/CONTEXTO/``: remaining context docs
+      (``listar_documentos_contexto`` — OTROS/unmapped, unlinked).
+
+    Same skip-on-error semantics as the evidencias section: one failing download
+    never sinks the package. Every added member also joins ``miembros_scan`` so
+    the mandatory secret scan covers it. Read-only: zero link-table writers.
+    """
+    from app.models.documento_cuenta_cobro import DocumentoCuentaCobro, DocumentoRequisitoVinculo
+    from app.services import checklist_service
+
+    storage_docs = _get_storage(settings.S3_BUCKET_DOCUMENTOS)
+
+    async def _agregar_miembro(arcname: str, contenido: bytes, nombre: str) -> None:
+        miembros_zip.append((arcname, contenido))
+        texto_scan = await _texto_para_scan(contenido, nombre)
+        if texto_scan:
+            miembros_scan.append((arcname, texto_scan.encode("utf-8")))
+
+    async def _bytes_upload(storage_key: str, nombre: str) -> bytes | None:
+        try:
+            return await storage_docs.download(storage_key)
+        except Exception as exc:  # one missing file must not sink the whole package
+            await logger.awarning(
+                "zip_documentos_contrato_download_failed", storage_key=storage_key, nombre=nombre, error=str(exc)
+            )
+            return None
+
+    async def _bytes_secop(url: str | None, nombre: str) -> bytes | None:
+        if not url:
+            return None
+        try:
+            return await checklist_service._descargar_secop_bytes(url)
+        except Exception as exc:
+            await logger.awarning("zip_documentos_contrato_secop_failed", url=url, nombre=nombre, error=str(exc))
+            return None
+
+    rows = (
+        (
+            await db.execute(
+                select(DocumentoCuentaCobro)
+                .options(
+                    selectinload(DocumentoCuentaCobro.vinculos).selectinload(
+                        DocumentoRequisitoVinculo.documento_fuente
+                    ),
+                    selectinload(DocumentoCuentaCobro.vinculos).selectinload(DocumentoRequisitoVinculo.secop_documento),
+                )
+                .where(DocumentoCuentaCobro.cuenta_cobro_id == cuenta.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    # ponytail: a doc linked to several contract-level rows (e.g. RPC+CDP alias)
+    # is fetched once per link; cache per-scan if checklist sizes ever grow.
+    for fila in rows:
+        codigo = fila.requisito_codigo
+        if codigo is None or not checklist_service.es_nivel_contrato(codigo):
+            continue
+        for v in fila.vinculos:
+            if v.documento_fuente is not None:
+                nombre = v.documento_fuente.nombre
+                contenido = await _bytes_upload(v.documento_fuente.storage_key, nombre)
+            elif v.secop_documento is not None:
+                nombre = v.secop_documento.nombre_archivo or v.secop_documento.id_documento_secop
+                contenido = await _bytes_secop(v.secop_documento.url_descarga, nombre)
+            else:
+                continue
+            if contenido is None:
+                continue
+            await _agregar_miembro(
+                f"DOCUMENTOS_CONTRATO/{codigo}/{_safe_dirname(nombre, max_len=150)}", contenido, nombre
+            )
+
+    for item in await checklist_service.listar_documentos_contexto(db, cuenta):
+        nombre = item["nombre"]
+        if item["fuente"] == "upload" and item.get("storage_key"):
+            contenido = await _bytes_upload(item["storage_key"], nombre)
+        else:
+            contenido = await _bytes_secop(item.get("url_descarga"), nombre)
+        if contenido is None:
+            continue
+        await _agregar_miembro(f"DOCUMENTOS_CONTRATO/CONTEXTO/{_safe_dirname(nombre, max_len=150)}", contenido, nombre)
+
+
 async def generar_zip_evidencias(
     db: AsyncSession,
     usuario_id: uuid.UUID,
@@ -1345,6 +1440,10 @@ async def generar_zip_evidencias(
             lines.append(f"   Fecha: {_formato_fecha(act.fecha_realizacion)}")
             lines.append("")
         _agregar_texto("99_otras_actividades/LEEME.txt", "\n".join(lines))
+
+    # Contract-level docs ship classified in the paquete (D5) — before the scan
+    # gate so every new member is covered by it.
+    await _agregar_documentos_contrato(db, cuenta, miembros_zip, miembros_scan)
 
     if settings.SECRET_SCAN_GATE_ENABLED:
         hallazgos = await secret_scan_service.escanear_paquete(miembros_scan)
