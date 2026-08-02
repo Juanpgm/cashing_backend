@@ -33,6 +33,10 @@ class TokenResponse(BaseModel):
     access_token: str
     refresh_token: str
     token_type: str = "bearer"
+    # True only on a first-time Google sign-up (account just created). The frontend
+    # uses it to auto-launch the Google integration consent once, at signup. Always
+    # false for email login / refresh.
+    is_new: bool = False
 
 
 class RefreshRequest(BaseModel):

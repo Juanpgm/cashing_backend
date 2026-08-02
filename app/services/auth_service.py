@@ -207,6 +207,7 @@ async def google_auth(
     )
     user = result.scalar_one_or_none()
 
+    is_new = user is None
     if user is None:
         # First-time Google sign-in — gated account creation
         await _consume_invite_code(db, invite_code)
@@ -247,7 +248,7 @@ async def google_auth(
 
     access_token = create_access_token(str(user.id), user.rol.value)
     refresh_token = create_refresh_token(str(user.id))
-    return TokenResponse(access_token=access_token, refresh_token=refresh_token)
+    return TokenResponse(access_token=access_token, refresh_token=refresh_token, is_new=is_new)
 
 
 async def refresh_tokens(db: AsyncSession, refresh_token_str: str) -> TokenResponse:

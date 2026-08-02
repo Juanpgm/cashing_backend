@@ -44,6 +44,9 @@ async def test_google_auth_creates_new_user(db: AsyncSession) -> None:
 
     assert tokens.access_token
     assert tokens.refresh_token
+    # First-time sign-up flags the account as new so the frontend launches the
+    # Google integration consent once at signup.
+    assert tokens.is_new is True
 
     result = await db.execute(select(Usuario).where(Usuario.email == "google@example.com"))
     user = result.scalar_one()
@@ -61,10 +64,14 @@ async def test_google_auth_returns_tokens_on_second_login(db: AsyncSession) -> N
     claims = _google_claims()
     mock = AsyncMock(return_value=claims)
     with patch("app.core.firebase_admin.verify_firebase_token", new=mock):
-        await auth_service.google_auth(db, "token-1")
+        tokens1 = await auth_service.google_auth(db, "token-1")
         tokens2 = await auth_service.google_auth(db, "token-2")
 
     assert tokens2.access_token
+    # is_new is true only on the first sign-up, false on every later login — so the
+    # integration consent auto-launches exactly once.
+    assert tokens1.is_new is True
+    assert tokens2.is_new is False
 
     result = await db.execute(
         select(Usuario).where(Usuario.google_id == "google-uid-123")
