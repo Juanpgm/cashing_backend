@@ -10,12 +10,14 @@ fired for manual links.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import uuid
 from datetime import date
 from typing import Any
 
 import pytest
+import structlog
 from app.models.categoria_documento import CategoriaDocumento
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
@@ -292,3 +294,107 @@ async def test_doc_sin_texto_degrada_sin_extraccion(
     assert doc.texto_estado == "error"  # no url_descarga → unrecoverable, memoized
     assert extraccion["llamadas"] == []
     assert await _obligaciones(db, contrato.id) == []
+
+
+# ── deadline on the auto-trigger extraction (RES-P2-001 / REL-P2-001) ──────
+
+
+@pytest.fixture
+def extraccion_lenta(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Spy on the extraction seam that sleeps past a short deadline, then
+    persists an Obligacion like the real fn — lets a test control whether the
+    call finishes inside or outside the caller's timeout."""
+    from app.services import document_service
+
+    llamadas: list[tuple[str, uuid.UUID]] = []
+
+    async def _fake(texto: str, contrato_id: uuid.UUID | None, db: AsyncSession):
+        llamadas.append((texto, contrato_id))
+        await asyncio.sleep(0.15)
+        db.add(
+            Obligacion(
+                contrato_id=contrato_id,
+                descripcion="Obligación extraída del contrato SECOP",
+                tipo=TipoObligacion.GENERAL,
+                orden=1,
+            )
+        )
+        await db.flush()
+        return [], []
+
+    monkeypatch.setattr(document_service, "extraer_obligaciones_texto", _fake)
+    return {"llamadas": llamadas}
+
+
+async def test_extraccion_supera_deadline_degrada_sin_obligaciones(
+    db: AsyncSession,
+    contrato: Contrato,
+    descargas: dict[str, Any],
+    extraccion_lenta: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow extraction (e.g. LLM chain past its budget) must not hang the
+    synchronous SECOP scan request: past the deadline, detection completes,
+    the auto-link stands, obligaciones stay empty, and a structured timeout
+    event is emitted."""
+    monkeypatch.setattr(checklist_service, "_AUTO_OBLIGACIONES_TIMEOUT_SEGUNDOS", 0.01)
+    url = "https://s/generico.docx"
+    descargas["payloads"][url] = _docx_bytes(TEXTO_CONTRATO)
+    doc = _secop_doc(contrato, "documento_generico.docx", url_descarga=url)
+    db.add(doc)
+    await db.commit()
+    cuenta = await _make_cuenta(db, contrato)
+
+    with structlog.testing.capture_logs() as captured:
+        resultado = await checklist_service.detectar_desde_secop(db, cuenta)
+    await db.commit()
+
+    assert "CONTRATO" in resultado
+    fila = await _fila_contrato(db, cuenta.id)
+    assert fila.estado == EstadoRequisito.DETECTADO
+    assert fila.secop_documento_id == doc.id
+    assert len(extraccion_lenta["llamadas"]) == 1  # attempted
+    assert await _obligaciones(db, contrato.id) == []  # cancelled before it persisted
+
+    timeout_events = [e for e in captured if e.get("event") == "auto_obligaciones_timeout"]
+    assert timeout_events, "expected a structured timeout log"
+    assert timeout_events[0]["contrato_id"] == str(contrato.id)
+
+
+async def test_timeout_no_bloquea_reintento_en_siguiente_scan(
+    db: AsyncSession,
+    contrato: Contrato,
+    descargas: dict[str, Any],
+    extraccion_lenta: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once a timed-out attempt leaves the contrato with zero obligaciones,
+    the trigger's existing idempotency guard (`existente is None`) means a
+    later scan retries the extraction naturally — the deadline never
+    permanently blocks it."""
+    monkeypatch.setattr(checklist_service, "_AUTO_OBLIGACIONES_TIMEOUT_SEGUNDOS", 0.01)
+    url = "https://s/generico.docx"
+    descargas["payloads"][url] = _docx_bytes(TEXTO_CONTRATO)
+    doc = _secop_doc(contrato, "documento_generico.docx", url_descarga=url)
+    db.add(doc)
+    await db.commit()
+    cuenta = await _make_cuenta(db, contrato)
+
+    await checklist_service.detectar_desde_secop(db, cuenta)
+    await db.commit()
+    assert len(extraccion_lenta["llamadas"]) == 1
+    assert await _obligaciones(db, contrato.id) == []
+
+    # Widen the deadline (past the fake's 0.15s sleep) and force a re-scan by
+    # unlinking, same as test_rerun_no_duplica_obligaciones — but this time
+    # obligaciones is still empty, so the retry must fire (not skip).
+    monkeypatch.setattr(checklist_service, "_AUTO_OBLIGACIONES_TIMEOUT_SEGUNDOS", 5.0)
+    await checklist_service.desvincular(db, cuenta.id, "CONTRATO")
+    await db.commit()
+    await checklist_service.detectar_desde_secop(db, cuenta)
+    await db.commit()
+
+    assert len(extraccion_lenta["llamadas"]) == 2  # retried
+    fila = await _fila_contrato(db, cuenta.id)
+    assert fila.estado == EstadoRequisito.DETECTADO
+    assert len(await _obligaciones(db, contrato.id)) == 1

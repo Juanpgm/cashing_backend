@@ -9,6 +9,7 @@ never copied from a previous cuenta.
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from collections.abc import Sequence
@@ -705,6 +706,12 @@ _SNIFF_EPSILON_SEGUNDOS = 0.5
 # must impersonate a browser or every download fails and content stays unscored.
 _SNIFF_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 
+# Deadline for the auto-trigger obligaciones extraction (below): the LLM chain
+# underneath (litellm_adapter) can try up to 3 models sequentially at 120s
+# each, far past the synchronous request's client-side window. Kept well
+# under that window alongside the sniff budget above (~20s sniff + this ≲ 60s).
+_AUTO_OBLIGACIONES_TIMEOUT_SEGUNDOS = 25.0
+
 
 @dataclass
 class _PresupuestoSniff:
@@ -869,7 +876,24 @@ async def _auto_extraer_obligaciones_contrato(
         # own functions — a module-level import here would be circular.
         from app.services import document_service
 
-        obligaciones, _avisos = await document_service.extraer_obligaciones_texto(doc.texto_extraido, contrato.id, db)
+        try:
+            obligaciones, _avisos = await asyncio.wait_for(
+                document_service.extraer_obligaciones_texto(doc.texto_extraido, contrato.id, db),
+                timeout=_AUTO_OBLIGACIONES_TIMEOUT_SEGUNDOS,
+            )
+        except TimeoutError:
+            # Deterministic verbatim extraction (document_service.py) finishes
+            # in ms; only the LLM fallback chain can run this long. Degrade:
+            # obligaciones stay empty, the auto-link stands, and the next scan
+            # retries naturally (existente is None still holds above).
+            await logger.awarning(
+                "auto_obligaciones_timeout",
+                contrato_id=str(contrato.id),
+                secop_documento_id=str(doc.id),
+                timeout_segundos=_AUTO_OBLIGACIONES_TIMEOUT_SEGUNDOS,
+            )
+            return
+
         await logger.ainfo(
             "secop_contrato_auto_obligaciones",
             contrato_id=str(contrato.id),
