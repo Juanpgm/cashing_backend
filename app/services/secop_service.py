@@ -1338,7 +1338,13 @@ async def importar_contratos_secop(
             existing_contrato = upd_result.scalar_one_or_none()
             if existing_contrato is not None:
                 existing_contrato.valor_total = float(data.valor_total)
-                existing_contrato.valor_adicion = float(data.valor_adicion) if data.valor_adicion else None
+                # SUGGESTION A-002: only overwrite when the re-import actually
+                # carries a value — a re-import whose row lacks a fresh
+                # valor_adicion (falsy/None) must never wipe a previously
+                # recorded non-null value. Mirrors the obligaciones
+                # never-clobber-good-data pattern below.
+                if data.valor_adicion:
+                    existing_contrato.valor_adicion = float(data.valor_adicion)
                 existing_contrato.valor_mensual = float(data.valor_mensual)
                 existing_contrato.fecha_inicio = data.fecha_inicio
                 existing_contrato.fecha_fin = data.fecha_fin
@@ -1352,27 +1358,88 @@ async def importar_contratos_secop(
                 # obligaciones must not stay stuck forever — if this reimport's
                 # objeto now yields obligaciones (verbatim), add them and flip
                 # the flag. NEVER clobber an already-True flag/existing obligaciones.
-                db.expire(existing_contrato, ["obligaciones"])
-                await db.refresh(existing_contrato, ["obligaciones"])
-                if not existing_contrato.obligaciones and data.obligaciones:
-                    for ob in data.obligaciones:
-                        db.add(
-                            Obligacion(
-                                contrato_id=existing_contrato.id,
-                                descripcion=ob.descripcion,
-                                tipo=TipoObligacion(ob.tipo),
-                                orden=ob.orden,
-                                etiqueta=ob.etiqueta,
+                #
+                # WARNING A-001/B-001: re-select with_for_update() so two
+                # concurrent re-imports of the same numero_contrato serialize
+                # on this row instead of both observing empty obligaciones and
+                # both inserting (duplicate Obligacion rows). No-op on
+                # SQLite/aiosqlite (tests); real row lock on Postgres (prod).
+                lock_result = await db.execute(
+                    select(Contrato)
+                    .options(selectinload(Contrato.obligaciones))
+                    .where(Contrato.id == existing_contrato.id)
+                    .with_for_update()
+                )
+                existing_contrato = lock_result.scalar_one()
+                if not existing_contrato.obligaciones:
+                    if data.obligaciones:
+                        for ob in data.obligaciones:
+                            db.add(
+                                Obligacion(
+                                    contrato_id=existing_contrato.id,
+                                    descripcion=ob.descripcion,
+                                    tipo=TipoObligacion(ob.tipo),
+                                    orden=ob.orden,
+                                    etiqueta=ob.etiqueta,
+                                )
                             )
+                        existing_contrato.obligaciones_extraidas = True
+                        await db.flush()
+                        # The `obligaciones` collection just added above was
+                        # already marked "loaded" (empty) by the locked
+                        # re-select above — without expiring it again, the
+                        # `selectinload` in the final re-select below skips
+                        # reloading it (already-loaded relationships aren't
+                        # re-fetched) and would return the stale empty list.
+                        db.expire(existing_contrato, ["obligaciones"])
+                    elif llm_obligaciones_intentos >= SECOP_OBLIGACIONES_LLM_MAX_CONTRATOS:
+                        log.info(
+                            "secop_obligaciones_llm_skipped_cap",
+                            contrato_id=str(existing_contrato.id),
+                            numero_contrato=data.numero_contrato,
+                            max_contratos=SECOP_OBLIGACIONES_LLM_MAX_CONTRATOS,
                         )
-                    existing_contrato.obligaciones_extraidas = True
-                    await db.flush()
-                    # The `obligaciones` collection just added above was already
-                    # marked "loaded" (empty) by the refresh() a few lines up —
-                    # without expiring it again, the `selectinload` in the final
-                    # re-select below skips reloading it (already-loaded relationships
-                    # aren't re-fetched) and would return the stale empty list.
-                    db.expire(existing_contrato, ["obligaciones"])
+                    else:
+                        # B-002: the deterministic verbatim pass found nothing
+                        # (data.obligaciones empty) and the existing contrato
+                        # is still stuck at zero obligaciones — mirror the
+                        # new-contract branch's LLM fallback exactly (same
+                        # helper, timeout, cap) instead of leaving it stuck
+                        # forever. Only reached when BOTH sides are empty, so
+                        # this never runs against — or duplicates onto — a
+                        # contrato that already has obligaciones.
+                        llm_obligaciones_intentos += 1
+                        try:
+                            from app.services.document_service import extraer_obligaciones_texto
+
+                            await asyncio.wait_for(
+                                extraer_obligaciones_texto(data.objeto, existing_contrato.id, db),
+                                timeout=SECOP_OBLIGACIONES_LLM_TIMEOUT_S,
+                            )
+                        except TimeoutError:
+                            log.warning(
+                                "secop_obligaciones_extraction_timeout",
+                                contrato_id=str(existing_contrato.id),
+                                numero_contrato=data.numero_contrato,
+                                timeout_s=SECOP_OBLIGACIONES_LLM_TIMEOUT_S,
+                            )
+                        except Exception as exc:
+                            log.warning(
+                                "secop_obligaciones_extraction_failed",
+                                contrato_id=str(existing_contrato.id),
+                                numero_contrato=data.numero_contrato,
+                                error=str(exc),
+                            )
+                        # C.3 under-report guard (7a.4), mirrored: reconcile
+                        # AFTER the LLM-fallback branch resolves — obligaciones
+                        # inserted only by the fallback must still flip the
+                        # flag to True. Never clobbers here since we're
+                        # already inside `if not existing_contrato.obligaciones`.
+                        db.expire(existing_contrato, ["obligaciones"])
+                        await db.refresh(existing_contrato, ["obligaciones"])
+                        if existing_contrato.obligaciones:
+                            existing_contrato.obligaciones_extraidas = True
+                            await db.flush()
 
                 result = await db.execute(
                     select(Contrato)

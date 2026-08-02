@@ -12,6 +12,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -477,3 +478,246 @@ class TestObligacionesExtraidasFlagOnReimport:
         contrato = result.contratos[0]
         assert contrato.obligaciones == []
         assert contrato.obligaciones_extraidas is False
+
+
+class TestReimportValorAdicionPreserved:
+    """SUGGESTION A-002: `valor_adicion` was unconditionally overwritten on
+    every re-import (`existing_contrato.valor_adicion = float(data.valor_adicion)
+    if data.valor_adicion else None`) — a re-import whose row lacks a fresh
+    valor_adicion signal (falsy/None) wiped a previously-recorded non-null
+    value. Fix mirrors the obligaciones "never clobber good data on a later
+    empty run" pattern: only overwrite when the new value actually has one."""
+
+    @pytest.mark.asyncio
+    async def test_reimport_preserves_valor_adicion_when_new_value_is_falsy(
+        self, db: AsyncSession, test_user: dict[str, Any]
+    ) -> None:
+        from app.services.secop_service import importar_contratos_secop
+
+        row_con_adicion = _make_row(numero_contrato="CO1.PCCNTR.VALADIC001", valor_adicion="500000")
+        llm_response = LLMResponse(content="", model="test", total_tokens=5)
+
+        with (
+            patch(
+                "app.services.secop_service._query_socrata",
+                new_callable=AsyncMock,
+                return_value=[row_con_adicion],
+            ),
+            patch(_PATCH_GET_LLM) as mock_get_llm,
+        ):
+            mock_llm = AsyncMock()
+            mock_llm.complete = AsyncMock(return_value=llm_response)
+            mock_get_llm.return_value = mock_llm
+            first = await importar_contratos_secop(db, "1016019452", test_user["user"].id, confirmar=True)
+        assert first.contratos[0].valor_adicion == Decimal("500000.00")
+
+        row_sin_adicion = _make_row(numero_contrato="CO1.PCCNTR.VALADIC001")
+        with (
+            patch(
+                "app.services.secop_service._query_socrata",
+                new_callable=AsyncMock,
+                return_value=[row_sin_adicion],
+            ),
+            patch(_PATCH_GET_LLM) as mock_get_llm,
+        ):
+            mock_llm = AsyncMock()
+            mock_llm.complete = AsyncMock(return_value=llm_response)
+            mock_get_llm.return_value = mock_llm
+            second = await importar_contratos_secop(db, "1016019452", test_user["user"].id, confirmar=True)
+
+        assert second.contratos[0].valor_adicion == Decimal("500000.00")
+
+
+class TestReimportObligacionesRowLock:
+    """WARNING A-001/B-001 (corroborated by both judges): the re-import
+    obligaciones-insert is a read-then-write with no row lock and no unique
+    constraint, so two concurrent re-imports of the same contrato could both
+    observe empty obligaciones and both insert, duplicating rows. True
+    concurrency isn't unit-testable against a single aiosqlite connection, so
+    this pins the two observable layers instead:
+      1. the UPSERT branch re-selects the existing contrato with
+         `with_for_update()` before the obligaciones read-then-write
+         (verified at SQL-construction level, since SQLite silently no-ops
+         FOR UPDATE at execution time), and
+      2. sequential re-imports that both yield obligaciones never duplicate
+         the guard's insert (the guard's correctness is otherwise
+         unaffected by adding the lock).
+    """
+
+    @pytest.mark.asyncio
+    async def test_upsert_branch_locks_existing_contrato_row(self, db: AsyncSession, test_user: dict[str, Any]) -> None:
+        from app.services.secop_service import importar_contratos_secop
+        from sqlalchemy.dialects import postgresql
+
+        row = _make_row(numero_contrato="CO1.PCCNTR.LOCK001")
+        llm_response = LLMResponse(content="", model="test", total_tokens=5)
+
+        with (
+            patch(
+                "app.services.secop_service._query_socrata",
+                new_callable=AsyncMock,
+                return_value=[row],
+            ),
+            patch(_PATCH_GET_LLM) as mock_get_llm,
+        ):
+            mock_llm = AsyncMock()
+            mock_llm.complete = AsyncMock(return_value=llm_response)
+            mock_get_llm.return_value = mock_llm
+            await importar_contratos_secop(db, "1016019452", test_user["user"].id, confirmar=True)
+
+        captured_selects: list[Any] = []
+        original_execute = db.execute
+
+        async def _spy_execute(stmt: Any, *args: Any, **kwargs: Any) -> Any:
+            captured_selects.append(stmt)
+            return await original_execute(stmt, *args, **kwargs)
+
+        db.execute = _spy_execute  # type: ignore[method-assign]
+        try:
+            with (
+                patch(
+                    "app.services.secop_service._query_socrata",
+                    new_callable=AsyncMock,
+                    return_value=[row],
+                ),
+                patch(_PATCH_GET_LLM) as mock_get_llm,
+            ):
+                mock_llm = AsyncMock()
+                mock_llm.complete = AsyncMock(return_value=llm_response)
+                mock_get_llm.return_value = mock_llm
+                await importar_contratos_secop(db, "1016019452", test_user["user"].id, confirmar=True)
+        finally:
+            db.execute = original_execute  # type: ignore[method-assign]
+
+        locked = [
+            stmt
+            for stmt in captured_selects
+            if hasattr(stmt, "compile") and "FOR UPDATE" in str(stmt.compile(dialect=postgresql.dialect()))
+        ]
+        assert locked, "expected the UPSERT branch to re-select existing_contrato with with_for_update()"
+
+    @pytest.mark.asyncio
+    async def test_sequential_reimports_do_not_duplicate_obligaciones(
+        self, db: AsyncSession, test_user: dict[str, Any]
+    ) -> None:
+        from app.services.secop_service import importar_contratos_secop
+
+        objeto_con_obligaciones = (
+            "Prestación de servicios profesionales. OBLIGACIONES ESPECIFICAS DEL CONTRATISTA: "
+            "1. Elaborar informes mensuales de las actividades desarrolladas en el marco del contrato. "
+            "2. Apoyar la atención al ciudadano y la gestión documental de la dependencia. "
+            "Las demás actividades que le sean asignadas por el supervisor del contrato."
+        )
+        row = _make_row(numero_contrato="CO1.PCCNTR.LOCK002", objeto_del_contrato=objeto_con_obligaciones)
+
+        with patch(
+            "app.services.secop_service._query_socrata",
+            new_callable=AsyncMock,
+            return_value=[row],
+        ):
+            first = await importar_contratos_secop(db, "1016019452", test_user["user"].id, confirmar=True)
+        assert len(first.contratos[0].obligaciones) >= 2
+        count_after_first = len(first.contratos[0].obligaciones)
+
+        with patch(
+            "app.services.secop_service._query_socrata",
+            new_callable=AsyncMock,
+            return_value=[row],
+        ):
+            second = await importar_contratos_secop(db, "1016019452", test_user["user"].id, confirmar=True)
+
+        assert len(second.contratos[0].obligaciones) == count_after_first
+
+
+class TestReimportLlmFallback:
+    """Judgment finding B-002: the re-import UPSERT branch only retried the
+    DETERMINISTIC verbatim extractor to decide whether to add obligaciones —
+    unlike the new-contract path, it never fell back to the LLM extractor.
+    A re-imported contract whose `objeto` never enumerates obligaciones
+    verbatim stayed stuck at `obligaciones_extraidas=False` forever, even
+    though the LLM could extract them. Fix: wire the same LLM-fallback flow
+    (`extraer_obligaciones_texto`, same timeout/cap) into the re-import
+    branch, only reached when BOTH the existing contrato and the fresh
+    verbatim pass are empty — never touching a contrato that already has
+    obligaciones."""
+
+    @pytest.mark.asyncio
+    async def test_reimport_llm_fallback_flips_flag_and_inserts_obligaciones(
+        self, db: AsyncSession, test_user: dict[str, Any]
+    ) -> None:
+        from app.services.secop_service import importar_contratos_secop
+
+        row = _make_row(numero_contrato="CO1.PCCNTR.LLMREIMPORT001")
+        empty_llm_response = LLMResponse(content="", model="test", total_tokens=5)
+
+        with (
+            patch(
+                "app.services.secop_service._query_socrata",
+                new_callable=AsyncMock,
+                return_value=[row],
+            ),
+            patch(_PATCH_GET_LLM) as mock_get_llm,
+        ):
+            mock_llm = AsyncMock()
+            mock_llm.complete = AsyncMock(return_value=empty_llm_response)
+            mock_get_llm.return_value = mock_llm
+            first = await importar_contratos_secop(db, "1016019452", test_user["user"].id, confirmar=True)
+
+        assert first.contratos[0].obligaciones == []
+        assert first.contratos[0].obligaciones_extraidas is False
+
+        found_llm_response = LLMResponse(
+            content="OBLIGACION|especifica|Apoyar la gestión administrativa de la dependencia\n",
+            model="test",
+            total_tokens=30,
+        )
+        with (
+            patch(
+                "app.services.secop_service._query_socrata",
+                new_callable=AsyncMock,
+                return_value=[row],
+            ),
+            patch(_PATCH_GET_LLM) as mock_get_llm,
+        ):
+            mock_llm = AsyncMock()
+            mock_llm.complete = AsyncMock(return_value=found_llm_response)
+            mock_get_llm.return_value = mock_llm
+            second = await importar_contratos_secop(db, "1016019452", test_user["user"].id, confirmar=True)
+
+        contrato = second.contratos[0]
+        assert len(contrato.obligaciones) == 1
+        assert contrato.obligaciones_extraidas is True
+
+    @pytest.mark.asyncio
+    async def test_reimport_skips_llm_when_existing_contrato_already_has_obligaciones(
+        self, db: AsyncSession, test_user: dict[str, Any]
+    ) -> None:
+        from app.services.secop_service import importar_contratos_secop
+
+        objeto_con_obligaciones = (
+            "Prestación de servicios profesionales. OBLIGACIONES ESPECIFICAS DEL CONTRATISTA: "
+            "1. Elaborar informes mensuales de las actividades desarrolladas en el marco del contrato. "
+            "2. Apoyar la atención al ciudadano y la gestión documental de la dependencia. "
+            "Las demás actividades que le sean asignadas por el supervisor del contrato."
+        )
+        row = _make_row(numero_contrato="CO1.PCCNTR.LLMREIMPORT002", objeto_del_contrato=objeto_con_obligaciones)
+
+        with patch(
+            "app.services.secop_service._query_socrata",
+            new_callable=AsyncMock,
+            return_value=[row],
+        ):
+            first = await importar_contratos_secop(db, "1016019452", test_user["user"].id, confirmar=True)
+        assert len(first.contratos[0].obligaciones) >= 2
+
+        with (
+            patch(
+                "app.services.secop_service._query_socrata",
+                new_callable=AsyncMock,
+                return_value=[row],
+            ),
+            patch(_PATCH_GET_LLM) as mock_get_llm,
+        ):
+            await importar_contratos_secop(db, "1016019452", test_user["user"].id, confirmar=True)
+
+        mock_get_llm.assert_not_called()
