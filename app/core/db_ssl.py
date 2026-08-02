@@ -37,7 +37,23 @@ def prepare_pg_url(url: str) -> tuple[str, dict]:
     # An explicit ``sslmode=disable`` wins over the host heuristic: a Docker Compose
     # service host like ``db`` is a plain local Postgres with SSL off, but it isn't in
     # _LOCAL_HOSTS, so without this it would be forced into a (rejected) SSL upgrade.
-    if sslmode == "disable" or (parts.hostname or "") in _LOCAL_HOSTS:
+    # SAFETY: never honor sslmode=disable in PRODUCTION — a leftover/copy-pasted
+    # disable in a real DATABASE_URL must not silently drop TLS to a managed DB.
+    if sslmode == "disable":
+        from app.core.config import settings
+
+        if getattr(settings, "is_production", False):
+            import structlog
+
+            structlog.get_logger("core.db_ssl").warning(
+                "ignoring_sslmode_disable_in_production",
+                note="Refusing to disable TLS for a production database connection.",
+            )
+            # fall through to the SSL path below
+        else:
+            return clean, {"ssl": False}
+
+    if (parts.hostname or "") in _LOCAL_HOSTS:
         return clean, {"ssl": False}
 
     ctx = ssl.create_default_context()

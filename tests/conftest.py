@@ -31,6 +31,19 @@ if len(settings.TOKEN_ENCRYPTION_KEY) != 44:
 TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 _IS_PG = TEST_DATABASE_URL.startswith("postgresql")
 
+# SAFETY: the autouse setup fixture runs `DROP SCHEMA public CASCADE` before every
+# test. Refuse to do that unless the target database name marks it as disposable —
+# a stray TEST_DATABASE_URL pointing at a real dev/staging DB must never be wiped.
+# Fail fast at import, before any test runs.
+if _IS_PG:
+    _test_db_name = TEST_DATABASE_URL.rsplit("/", 1)[-1].split("?")[0]
+    if "test" not in _test_db_name.lower():
+        raise RuntimeError(
+            f"Refusing destructive test setup (DROP SCHEMA CASCADE) against database "
+            f"'{_test_db_name}': its name must contain 'test'. Point TEST_DATABASE_URL "
+            f"at a disposable test database (e.g. cashin_test)."
+        )
+
 # asyncpg breaks on the Windows ProactorEventLoop (Python 3.12 default): rapid
 # connect/close over TCP loopback raises "WinError 64 / connection was closed in
 # the middle of operation". SelectorEventLoop is asyncpg's supported loop on Windows.

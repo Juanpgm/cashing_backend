@@ -50,15 +50,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # 1. Base schema — create_all is the source of truth (idempotent).
     #    Migrations do NOT build the base schema; they only carry ALTER deltas.
     db_ready = False
+    from sqlalchemy import text as _text
+
+    # pgvector is needed only for semantic-search QUERIES (the `embedding` column is
+    # Text, so create_all itself does NOT need the type). Create it in its own
+    # best-effort block so a role without CREATE EXTENSION privilege — e.g. a
+    # locked-down GCP Cloud SQL user — still boots with a fully provisioned schema;
+    # only semantic search degrades, instead of the whole app starting with no schema.
+    if engine.dialect.name == "postgresql":
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(_text("CREATE EXTENSION IF NOT EXISTS vector"))
+        except Exception as exc:
+            log.warning("pgvector_extension_skipped", error=str(exc))
+
     try:
         async with engine.begin() as conn:
-            # pgvector must exist before create_all / semantic-search queries that cast
-            # embeddings to vector(1536). Idempotent; ignored on SQLite. On a Postgres
-            # image without the extension available this raises and is caught below.
-            if engine.dialect.name == "postgresql":
-                from sqlalchemy import text as _text
-
-                await conn.execute(_text("CREATE EXTENSION IF NOT EXISTS vector"))
             await conn.run_sync(Base.metadata.create_all)
         db_ready = True
         log.info("database_ready")
@@ -76,8 +83,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     #     error, leaving the DB unversioned. Pre-creating the table makes alembic reuse
     #     it instead of creating the narrow default.
     if db_ready:
-        from sqlalchemy import text as _text
-
         try:
             async with engine.begin() as conn:
                 await conn.execute(
@@ -87,6 +92,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                         "CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num))"
                     )
                 )
+                # If the table already existed (any DB provisioned before this fix),
+                # CREATE IF NOT EXISTS is a no-op and version_num is still alembic's
+                # default VARCHAR(32) — widen it so long revision ids don't truncate on
+                # stamp/upgrade. ALTER ... TYPE is idempotent (already-255 → no change).
+                if engine.dialect.name == "postgresql":
+                    await conn.execute(
+                        _text(
+                            "ALTER TABLE alembic_version "
+                            "ALTER COLUMN version_num TYPE VARCHAR(255)"
+                        )
+                    )
         except Exception as exc:
             log.warning("alembic_version_prepare_failed", error=str(exc))
 

@@ -209,21 +209,23 @@ async def test_purgar_huerfanos_cuentas(db: AsyncSession) -> None:
     is_pg = db.bind.dialect.name == "postgresql"
     if is_pg:
         await db.execute(text("SET session_replication_role = 'replica'"))
+    try:
+        # A dangling EvidenciaObligacion — its evidencia was already physically deleted
+        # by some prior partial cleanup, but this link row was left behind.
+        dangling_enlace = EvidenciaObligacion(
+            evidencia_id=uuid.uuid4(), obligacion_id=healthy["obligacion"].id, confianza="media", status="proposed"
+        )
+        db.add(dangling_enlace)
 
-    # A dangling EvidenciaObligacion — its evidencia was already physically deleted
-    # by some prior partial cleanup, but this link row was left behind.
-    dangling_enlace = EvidenciaObligacion(
-        evidencia_id=uuid.uuid4(), obligacion_id=healthy["obligacion"].id, confianza="media", status="proposed"
-    )
-    db.add(dangling_enlace)
-
-    # An orphan Actividad whose cuenta is entirely gone (not even a tombstone row).
-    orphan_actividad = Actividad(cuenta_cobro_id=uuid.uuid4(), descripcion="Actividad huérfana")
-    db.add(orphan_actividad)
-    await db.flush()
-
-    if is_pg:
-        await db.execute(text("SET session_replication_role = 'origin'"))
+        # An orphan Actividad whose cuenta is entirely gone (not even a tombstone row).
+        orphan_actividad = Actividad(cuenta_cobro_id=uuid.uuid4(), descripcion="Actividad huérfana")
+        db.add(orphan_actividad)
+        await db.flush()
+    finally:
+        # Always restore FK enforcement, even if the seeding flush raised, so it
+        # can't stay disabled for the rest of this connection's statements.
+        if is_pg:
+            await db.execute(text("SET session_replication_role = 'origin'"))
 
     await db.commit()
 
