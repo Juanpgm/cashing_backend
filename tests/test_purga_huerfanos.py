@@ -37,7 +37,7 @@ from app.models.requisito_documento import RequisitoDocumento
 from app.models.secop import SecopDocumento
 from app.models.usuario import Usuario
 from app.services import cuenta_cobro_service
-from sqlalchemy import Delete, Update, select
+from sqlalchemy import Delete, Update, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 pytestmark = pytest.mark.asyncio
@@ -203,6 +203,13 @@ async def test_purgar_huerfanos_cuentas(db: AsyncSession) -> None:
     healthy = await _seed_full_tree(db, user, contrato, mes=1, tombstoned=False)
     tombstoned = await _seed_full_tree(db, user, contrato, mes=2, tombstoned=True)
 
+    # The next two rows have intentionally broken FKs — the corrupt state the purge
+    # exists to clean. Postgres enforces FKs on insert, so disable FK triggers for this
+    # session while seeding them (standard pg technique); SQLite ignores FKs anyway.
+    is_pg = db.bind.dialect.name == "postgresql"
+    if is_pg:
+        await db.execute(text("SET session_replication_role = 'replica'"))
+
     # A dangling EvidenciaObligacion — its evidencia was already physically deleted
     # by some prior partial cleanup, but this link row was left behind.
     dangling_enlace = EvidenciaObligacion(
@@ -213,6 +220,10 @@ async def test_purgar_huerfanos_cuentas(db: AsyncSession) -> None:
     # An orphan Actividad whose cuenta is entirely gone (not even a tombstone row).
     orphan_actividad = Actividad(cuenta_cobro_id=uuid.uuid4(), descripcion="Actividad huérfana")
     db.add(orphan_actividad)
+    await db.flush()
+
+    if is_pg:
+        await db.execute(text("SET session_replication_role = 'origin'"))
 
     await db.commit()
 

@@ -32,6 +32,7 @@ from app.core.secop_agentic_quota import _reset
 from app.models.contrato import Contrato
 from app.models.documento_fuente import DocumentoFuente
 from app.models.secop import SecopContrato, SecopDocumento
+from app.models.usuario import Usuario
 from app.services import document_service as ds
 from app.services import secop_scraper_service
 from sqlalchemy import select
@@ -82,6 +83,20 @@ def _mock_httpx_download_failure(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 async def _seed_contrato_usuario(db: AsyncSession, user_id: uuid.UUID, numero: str = _NUMERO) -> Contrato:
+    # Create the parent Usuario so contratos.usuario_id has a valid referent. SQLite
+    # ignores the FK, but Postgres enforces it (contratos_usuario_id_fkey).
+    db.add(
+        Usuario(
+            id=user_id,
+            email=f"{user_id.hex}@t.com",
+            nombre="Test",
+            password_hash="x",
+            rol="contratista",
+            activo=True,
+            creditos_disponibles=0,
+        )
+    )
+    await db.flush()
     contrato = Contrato(
         usuario_id=user_id,
         numero_contrato=numero,
