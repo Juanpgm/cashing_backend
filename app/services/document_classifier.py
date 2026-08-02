@@ -9,7 +9,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 from app.agent.tools.document_parser import parse_document
-from app.core.text_match import keyword_score
+from app.core.text_match import keyword_score, normalize
 from app.models.categoria_documento import CategoriaDocumento
 
 # Minimum score to assign a non-OTROS category.
@@ -20,6 +20,12 @@ CATEGORIA_MIN_THRESHOLD = Decimal("0.001")
 # ambiguous hit → candidate only (below AUTO_LINK_THRESHOLD 0.700).
 CONTENIDO_SCORE_UNICO = Decimal("0.850")
 CONTENIDO_SCORE_AMBIGUO = Decimal("0.600")
+# Real SECOP documents legitimately mention sibling categories (an RPC always
+# cites its CDP, a contrato cites its condiciones) — demanding exclusivity made
+# CONTENIDO_SCORE_UNICO unreachable in practice. A category dominates instead
+# of needing to be the only one hit: top keyword-hit count must be at least
+# this many times the runner-up's (runner-up 0 hits is automatically dominant).
+CONTENIDO_DOMINANCIA_FACTOR = 2
 # Only the head of the document decides — titles/headers carry the signal.
 _CONTENIDO_MAX_CHARS = 1500
 # Persisted extraction cap for memoization on secop_documentos.texto_extraido.
@@ -123,27 +129,41 @@ def clasificar(
     return best_cat, best_score
 
 
+def _keyword_hits(blob: str, keywords: list[str]) -> int:
+    """Count of distinct keywords (normalized) present in an already-normalized blob."""
+    norm_kws = [normalize(k).strip() for k in keywords if k and k.strip()]
+    return sum(1 for k in norm_kws if k and k in blob)
+
+
 def clasificar_contenido(texto: str | None) -> tuple[CategoriaDocumento | None, Decimal]:
     """Content-based re-score for the borderline sniff (no LLM, no embeddings).
 
-    Scores the first ~1500 chars of extracted text against CATEGORIA_KEYWORDS:
-    exactly one category hit → (category, 0.850); hits in several categories →
-    (best category, 0.600) — candidate only; no hit → (None, 0.000).
+    Scores the first ~1500 chars of extracted text against CATEGORIA_KEYWORDS by
+    keyword-hit count per category. The top category is unambiguous (0.850) when
+    its hit count dominates the runner-up by CONTENIDO_DOMINANCIA_FACTOR (a
+    runner-up of 0 is automatically dominant); otherwise it's ambiguous, candidate
+    only (0.600). No hit at all → (None, 0.000). Real documents routinely mention
+    a sibling category once or twice (an RPC always cites its CDP) — dominance,
+    not exclusivity, is what should decide.
     """
     if not texto:
         return None, Decimal("0.000")
     fragmento = texto[:_CONTENIDO_MAX_CHARS]
+    blob = normalize(fragmento)
 
-    hits: list[tuple[CategoriaDocumento, Decimal]] = []
+    hits: dict[CategoriaDocumento, int] = {}
     for cat, keywords in CATEGORIA_KEYWORDS.items():
-        score = keyword_score([fragmento], keywords)
-        if score > Decimal("0.000"):
-            hits.append((cat, score))
+        n = _keyword_hits(blob, keywords)
+        if n > 0:
+            hits[cat] = n
 
     if not hits:
         return None, Decimal("0.000")
-    best_cat = max(hits, key=lambda x: x[1])[0]
-    if len(hits) == 1:
+
+    ranked = sorted(hits.items(), key=lambda kv: kv[1], reverse=True)
+    best_cat, best_hits = ranked[0]
+    runner_up_hits = ranked[1][1] if len(ranked) > 1 else 0
+    if runner_up_hits == 0 or best_hits >= CONTENIDO_DOMINANCIA_FACTOR * runner_up_hits:
         return best_cat, CONTENIDO_SCORE_UNICO
     return best_cat, CONTENIDO_SCORE_AMBIGUO
 

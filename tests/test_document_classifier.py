@@ -90,6 +90,36 @@ def test_clasificar_contenido_ambiguo_multicategoria_da_0600():
     assert score == Decimal("0.600")
 
 
+def test_clasificar_contenido_rpc_dominante_con_mencion_de_cdp_da_0850():
+    """Real SECOP RPC docs always cite their CDP once — that must not block 0.850.
+
+    Modeled on live E2E evidence: an RPC document body legitimately repeats RPC
+    signals (rpc/registro presupuestal/compromiso presupuestal/registro de
+    compromiso) while mentioning CDP only once (certificado de disponibilidad).
+    RPC hits (4) dominate the CDP runner-up (1) by >= CONTENIDO_DOMINANCIA_FACTOR,
+    so the category must be unambiguous despite the sibling-category mention.
+    """
+    texto = (
+        "MUNICIPIO SANTIAGO DE CALI\n"
+        "Registro Presupuestal de Compromiso RPC No. 4500379639\n"
+        "Fecha de Contabilizacion: 2024-05-10\n"
+        "El presente registro de compromiso corresponde al compromiso presupuestal "
+        "derivado del contrato, y se afecta el certificado de disponibilidad "
+        "expedido previamente."
+    )
+    cat, score = clasificar_contenido(texto)
+    assert cat == CategoriaDocumento.REGISTRO_PRESUPUESTAL
+    assert score == Decimal("0.850")
+
+
+def test_clasificar_contenido_empate_real_da_0600():
+    """Genuinely tied signals (one RPC keyword, one CDP keyword) stay ambiguous."""
+    texto = "El registro presupuestal fue expedido junto con el certificado de disponibilidad correspondiente."
+    cat, score = clasificar_contenido(texto)
+    assert cat in (CategoriaDocumento.REGISTRO_PRESUPUESTAL, CategoriaDocumento.CDP)
+    assert score == Decimal("0.600")
+
+
 def test_clasificar_contenido_sin_hit():
     cat, score = clasificar_contenido("texto administrativo sin senales relevantes para el checklist")
     assert cat is None

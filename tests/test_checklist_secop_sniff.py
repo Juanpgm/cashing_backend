@@ -106,7 +106,15 @@ TEXTO_CONTRATO = (
     "Entre la entidad y el contratista se celebra el presente contrato, cuyo clausulado se detalla."
 )
 TEXTO_RPC = "REGISTRO PRESUPUESTAL DEL COMPROMISO No. 555\nRegistro de compromiso presupuestal."
-TEXTO_AMBIGUO = "contrato con clausulado y registro presupuestal de la vigencia"
+# Genuinely tied signals under the dominance rule: 2 CONTRATO hits (contrato,
+# clausulado) vs 2 RPC hits (registro presupuestal, compromiso presupuestal) —
+# neither dominates the other by CONTENIDO_DOMINANCIA_FACTOR, so it stays
+# ambiguous. The original 2-vs-1 wording became CONTRATO-dominant (unambiguous)
+# once clasificar_contenido moved from exclusivity to dominance scoring.
+TEXTO_AMBIGUO = (
+    "contrato con clausulado y registro presupuestal de la vigencia, "
+    "con cargo al compromiso presupuestal correspondiente"
+)
 TEXTO_IRRELEVANTE = "acta administrativa interna de la dependencia sin datos utiles"
 
 
