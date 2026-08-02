@@ -1,0 +1,50 @@
+# Keep production images lean and free of anything that isn't the app itself.
+# Dev/test still works: docker-compose mounts the source as a volume at runtime,
+# so the dev container sees tests/ live even though they are never baked into an image.
+
+# Python bytecode & tool caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+.coverage.*
+
+# Virtualenvs — a host .venv (Windows binaries) must never enter a Linux image
+.venv/
+venv/
+env/
+
+# Tests & fixtures — not part of the running app; dev gets them via the compose mount
+tests/
+
+# Local databases & scratch data
+*.db
+*.sqlite
+*.sqlite3
+local_dev.db
+dev.db
+
+# Secrets & local env — injected at runtime (Railway/compose env_file), never baked
+.env
+.env.local
+.env.*.local
+
+# Version control & CI
+.git/
+.gitignore
+.github/
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Docker files themselves don't need to be inside the image
+docker-compose*.yml
+Dockerfile*
+.dockerignore

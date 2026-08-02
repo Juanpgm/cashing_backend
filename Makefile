@@ -1,4 +1,4 @@
-.PHONY: setup lock run dev up down migrate test lint security clean start-local kill-local
+.PHONY: setup lock run dev up down migrate test test-pg lint security clean start-local kill-local
 
 # Setup — installs runtime + dev deps from pyproject.toml via the uv.lock (single source of truth)
 setup:
@@ -43,6 +43,11 @@ migration:
 # Testing
 test:
 	uv run pytest -v --tb=short
+
+# Run the suite against real PostgreSQL, in Linux containers (see scripts/test-postgres.sh).
+# Pass args through: make test-pg ARGS="tests/test_auth_service.py -q"
+test-pg:
+	bash scripts/test-postgres.sh $(ARGS)
 
 test-cov:
 	uv run pytest --cov=app --cov-report=html --cov-report=term-missing

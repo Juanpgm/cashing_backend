@@ -1,6 +1,10 @@
 services:
   db:
-    image: postgres:16-alpine
+    # pgvector/pgvector:pg16 = Postgres 16 (Debian) with the pgvector extension bundled.
+    # The app's semantic search casts embeddings to vector(1536); plain postgres:16 lacks
+    # the `vector` type. Debian (glibc) also matches the production runtime more closely
+    # than Alpine (musl).
+    image: pgvector/pgvector:pg16
     environment:
       POSTGRES_USER: cashin
       POSTGRES_PASSWORD: cashin_local
@@ -41,7 +45,7 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql+asyncpg://cashin:cashin_local@db:5432/cashin
+      DATABASE_URL: postgresql+asyncpg://cashin:cashin_local@db:5432/cashin?sslmode=disable
       S3_ENDPOINT_URL: http://minio:9000
     volumes:
       - .:/app
