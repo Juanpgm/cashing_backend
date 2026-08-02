@@ -700,6 +700,10 @@ _SNIFF_MAX_BYTES = 25 * 1024 * 1024
 # Below this much remaining budget, skip the download rather than fire a
 # near-zero-timeout request that's doomed to fail anyway.
 _SNIFF_EPSILON_SEGUNDOS = 0.5
+# community.secop.gov.co returns 403 text/html for UA-less requests and 200
+# application/pdf with a browser UA (verified manually) — the sniff download
+# must impersonate a browser or every download fails and content stays unscored.
+_SNIFF_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 
 
 @dataclass
@@ -731,7 +735,7 @@ async def _descargar_secop_bytes(url: str, timeout: float = _SNIFF_HTTP_TIMEOUT)
     bounded by ``_SNIFF_PRESUPUESTO_SEGUNDOS``, not the fixed HTTP timeout.
     """
     async with (
-        httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client,
+        httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers={"User-Agent": _SNIFF_USER_AGENT}) as client,
         client.stream("GET", url) as resp,
     ):
         resp.raise_for_status()

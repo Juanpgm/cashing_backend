@@ -565,6 +565,44 @@ async def test_descargar_secop_bytes_rechaza_content_length_temprano(monkeypatch
     assert leido == []
 
 
+async def test_descargar_secop_bytes_envia_user_agent_de_navegador(monkeypatch: pytest.MonkeyPatch) -> None:
+    """community.secop.gov.co returns 403 for UA-less requests and 200 with a
+    browser User-Agent (verified manually) — the sniff download must send one."""
+    headers_recibidos: dict[str, str] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        headers_recibidos.update(request.headers)
+        return httpx.Response(200, content=b"contenido")
+
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(httpx, "AsyncClient", _client_con_transport(transport))
+
+    await checklist_service._descargar_secop_bytes("https://s/normal.docx")
+
+    assert "mozilla" in headers_recibidos.get("user-agent", "").lower()
+
+
+async def test_descargar_secop_bytes_403_no_persiste_texto(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 403 (UA-less rejection) must fail the download — not be parsed as
+    document text — and _asegurar_texto_extraido must persist 'error'."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, headers={"content-type": "text/html"}, content=b"<html>forbidden</html>")
+
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(httpx, "AsyncClient", _client_con_transport(transport))
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await checklist_service._descargar_secop_bytes("https://s/bloqueado.docx")
+
+    doc = _doc_suelto("https://s/bloqueado.docx")
+    presupuesto = checklist_service._PresupuestoSniff()
+    await checklist_service._asegurar_texto_extraido(doc, presupuesto)
+
+    assert doc.texto_estado == "error"
+    assert doc.texto_extraido is None
+
+
 # ── 2.5 per-download timeout clamped to remaining budget (RES-001) ─────────
 #
 # Unit-level: exercises _asegurar_texto_extraido directly with a spy replacing
