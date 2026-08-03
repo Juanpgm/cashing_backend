@@ -18,12 +18,13 @@ import json
 import mimetypes
 import re
 import uuid
+from collections.abc import Callable
 from datetime import date
 from pathlib import Path
 from typing import Any
 
 import structlog
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -39,7 +40,7 @@ from app.core.exceptions import DomainError
 from app.core.file_validation import _EXT_TO_MIME
 from app.models.conversacion import Conversacion
 from app.models.usuario import Usuario
-from app.schemas.agent import AgentChatResult, DocumentoAdjuntoResumen, LLMMessage, LLMToolCall, ToolEvent
+from app.schemas.agent import AgentChatResult, DocumentoAdjuntoResumen, LLMMessage, LLMToolCall, ToolEvent, UiAction
 from app.services import contrato_service
 from app.tools.context import ToolAttachment, ToolContext
 from app.tools.invoke import invoke_tool
@@ -51,8 +52,15 @@ logger = structlog.get_logger("services.agent_chat")
 MAX_TOOL_ITERATIONS = 8
 
 # Tool results fed back to the LLM are truncated so a single verbose tool output
-# (e.g. a full checklist dump) doesn't blow past the model's context window.
-_MAX_TOOL_RESULT_CHARS = 3000
+# (e.g. a full checklist dump) doesn't blow past the model's context window. Live
+# bug this bound caused at 3000: a 9-contrato `listar_contratos` list got cut off
+# mid-array, so the LLM answered "no encontré ese contrato" for one that WAS in
+# the (truncated-away) tail; `resumen_checklist` got cut off and the LLM literally
+# told the user "el resumen está truncado". 12000 gives real headroom while still
+# bounding a single tool result; the two chattiest list tools additionally get a
+# COMPACT serializer below (`_COMPACT_SERIALIZERS`) so they fit comfortably even
+# at this limit regardless of how many contratos/items a user has.
+_MAX_TOOL_RESULT_CHARS = 12000
 
 # Per-attachment text excerpt injected into the system prompt.
 _MAX_ATTACHMENT_CHARS = 4000
@@ -493,7 +501,56 @@ def _summarize_tool_result(dumped: Any) -> str:
     return text[:200]
 
 
-def _serialize_tool_result(payload: Any) -> str:
+def _compact_listar_contratos(output: BaseModel) -> str:
+    """One line per contrato: numero_contrato | entidad | valor_mensual | id.
+
+    Drops `objeto`/`fecha_inicio`/`fecha_fin` (the LLM only needs these fields to
+    disambiguate/identify a contract) so the full list — not just a truncated
+    prefix — always reaches the model.
+    """
+    contratos = output.contratos  # type: ignore[attr-defined]
+    if not contratos:
+        return "(el usuario no tiene contratos)"
+    lines = [f"{c.numero_contrato} | {c.entidad or 'sin entidad'} | {c.valor_mensual} | {c.id}" for c in contratos]
+    return "\n".join(lines)
+
+
+def _compact_resumen_checklist(output: BaseModel) -> str:
+    """Resumen line + one `codigo estado` line per checklist item.
+
+    Drops candidatos/documentos-fuente/SECOP detail (not needed for the LLM to
+    tell the user which requisitos are pendientes) so every item — not just a
+    truncated prefix — always reaches the model.
+    """
+    resumen = output.resumen  # type: ignore[attr-defined]
+    lines = [
+        f"resumen: total={resumen.total} cumplidos={resumen.cumplidos} "
+        f"pendientes={resumen.pendientes} radicacion_lista={resumen.radicacion_lista}"
+    ]
+    lines.extend(f"{item.requisito.codigo} {item.estado}" for item in output.items)  # type: ignore[attr-defined]
+    return "\n".join(lines)
+
+
+# Per-tool compact serializer, consulted by `_serialize_tool_result` BEFORE the
+# generic `model_dump` + truncate path. Only for the chattiest list-shaped read
+# tools, where truncating the generic JSON dump can cut off real data the LLM
+# needs (see `_MAX_TOOL_RESULT_CHARS` history above). Every other tool keeps the
+# generic path unchanged — these builders never touch the same output object the
+# `_UI_ACTION_BUILDERS` above read from, only read it.
+_COMPACT_SERIALIZERS: dict[str, Callable[[BaseModel], str]] = {
+    "listar_contratos": _compact_listar_contratos,
+    "resumen_checklist": _compact_resumen_checklist,
+}
+
+
+def _serialize_tool_result(payload: Any, tool_name: str | None = None, output_model: BaseModel | None = None) -> str:
+    compact_fn = _COMPACT_SERIALIZERS.get(tool_name) if tool_name else None
+    if compact_fn is not None and output_model is not None:
+        try:
+            return compact_fn(output_model)
+        except Exception as exc:
+            logger.warning("agent_chat_compact_serialize_failed", tool=tool_name, error=str(exc))
+
     serialized = json.dumps(payload, ensure_ascii=False, default=str)
     if len(serialized) > _MAX_TOOL_RESULT_CHARS:
         serialized = serialized[:_MAX_TOOL_RESULT_CHARS] + "... (truncado)"
@@ -546,6 +603,146 @@ def _format_tool_error(exc: Exception, tool_name: str) -> tuple[str, str]:
         return exc.detail, llm_detail
 
     return f"Ocurrió un error al ejecutar {tool_name}.", str(exc)[:300]
+
+
+# --- Deterministic UI actions ---
+#
+# After a SUCCESSFUL tool call, the loop below derives an optional `UiAction` from
+# the tool's real output model — no LLM involvement, so the frontend gets a
+# stable, machine-shaped hint (e.g. "here are the contratos to pick from") instead
+# of parsing prose. Builders are best-effort: an exception is logged and treated
+# as "no action" (see `_run_ui_action_builder`), never breaking the tool loop.
+
+_MAX_UI_ACTIONS = 8
+
+
+def _build_seleccionar_contrato(output: BaseModel) -> UiAction | None:
+    contratos = output.contratos[:10]  # type: ignore[attr-defined]
+    if not contratos:
+        return None
+    return UiAction(
+        type="seleccionar_contrato",
+        payload={
+            "contratos": [
+                {
+                    "id": str(c.id),
+                    "numero_contrato": c.numero_contrato,
+                    "entidad": c.entidad,
+                    # ContratoResumen has no `valor_total` — the closest real field
+                    # is `valor_mensual` (see app/tools/catalog/listar_contratos.py).
+                    "valor_mensual": str(c.valor_mensual),
+                }
+                for c in contratos
+            ]
+        },
+    )
+
+
+def _build_abrir_radicacion(output: BaseModel) -> UiAction | None:
+    return UiAction(
+        type="abrir_radicacion",
+        payload={"cuenta_id": str(output.id), "mes": output.mes, "anio": output.anio},  # type: ignore[attr-defined]
+    )
+
+
+def _build_checklist_resumen(output: BaseModel) -> UiAction | None:
+    items = [
+        {"codigo": item.requisito.codigo, "etiqueta": item.requisito.etiqueta, "estado": str(item.estado)}
+        for item in output.items[:20]  # type: ignore[attr-defined]
+    ]
+    resumen = output.resumen  # type: ignore[attr-defined]
+    return UiAction(
+        type="checklist_resumen",
+        payload={
+            "cuenta_id": str(output.cuenta_cobro_id),  # type: ignore[attr-defined]
+            "cumplidos": resumen.cumplidos,
+            "pendientes": resumen.pendientes,
+            "lista_pendientes": resumen.lista_pendientes,
+            "items": items,
+        },
+    )
+
+
+def _build_evidencias_descubiertas(output: BaseModel) -> UiAction | None:
+    return UiAction(
+        type="evidencias_descubiertas",
+        payload={
+            "total_evidencias": output.total_evidencias,  # type: ignore[attr-defined]
+            "obligaciones_justificadas": len(output.obligaciones),  # type: ignore[attr-defined]
+            "fuentes": output.fuentes,  # type: ignore[attr-defined]
+            "resumen": output.resumen,  # type: ignore[attr-defined]
+        },
+    )
+
+
+def _build_paquete_listo_desde_preparacion(output: BaseModel) -> UiAction | None:
+    return UiAction(
+        type="paquete_listo",
+        payload={
+            "cuenta_id": str(output.cuenta_cobro_id),  # type: ignore[attr-defined]
+            "filename": output.filename,  # type: ignore[attr-defined]
+            "listo_para_radicar": output.listo_para_radicar,  # type: ignore[attr-defined]
+            "pendientes": output.pendientes,  # type: ignore[attr-defined]
+        },
+    )
+
+
+def _build_paquete_listo_desde_paquete(output: BaseModel) -> UiAction | None:
+    # PaqueteGeneradoResponse (unlike PreparaRadicacionResponse) has no
+    # `listo_para_radicar` field — derive it from `pendientes == 0`.
+    pendientes = output.pendientes  # type: ignore[attr-defined]
+    return UiAction(
+        type="paquete_listo",
+        payload={
+            "cuenta_id": str(output.cuenta_cobro_id),  # type: ignore[attr-defined]
+            "filename": output.filename,  # type: ignore[attr-defined]
+            "listo_para_radicar": pendientes == 0,
+            "pendientes": pendientes,
+        },
+    )
+
+
+def _build_cuenta_radicada(output: BaseModel) -> UiAction | None:
+    return UiAction(
+        type="cuenta_radicada",
+        payload={"cuenta_id": str(output.id), "estado": str(output.estado)},  # type: ignore[attr-defined]
+    )
+
+
+# Whitelist of tool name -> builder. Deliberately NOT every tool: only the ones
+# whose output is worth surfacing as an interactive element in the Radicar flow.
+_UI_ACTION_BUILDERS: dict[str, Any] = {
+    "listar_contratos": _build_seleccionar_contrato,
+    "crear_cuenta_cobro": _build_abrir_radicacion,
+    "resumen_checklist": _build_checklist_resumen,
+    "descubrir_evidencias": _build_evidencias_descubiertas,
+    "preparar_radicacion": _build_paquete_listo_desde_preparacion,
+    "generar_paquete_evidencias": _build_paquete_listo_desde_paquete,
+    "radicar_cuenta": _build_cuenta_radicada,
+}
+
+
+def _run_ui_action_builder(tool_name: str, output: BaseModel) -> UiAction | None:
+    """Look up and run the builder for `tool_name`, if any. Never raises."""
+    builder = _UI_ACTION_BUILDERS.get(tool_name)
+    if builder is None:
+        return None
+    try:
+        return builder(output)
+    except Exception as exc:
+        logger.warning("agent_chat_ui_action_build_failed", tool=tool_name, error=str(exc))
+        return None
+
+
+def _record_ui_action(ui_actions: list[UiAction], action: UiAction) -> None:
+    """Append `action`, collapsing a consecutive same-type entry and capping the
+    total at `_MAX_UI_ACTIONS` (dropping the oldest, keeping the latest)."""
+    if ui_actions and ui_actions[-1].type == action.type:
+        ui_actions[-1] = action
+    else:
+        ui_actions.append(action)
+    while len(ui_actions) > _MAX_UI_ACTIONS:
+        ui_actions.pop(0)
 
 
 async def _load_or_create_conversation(db: AsyncSession, usuario: Usuario, session_id: str | None) -> Conversacion:
@@ -626,6 +823,7 @@ async def chat_with_tools(
     tool_ctx = ToolContext(db=db, usuario=usuario, attachments=expanded_attachments)
 
     tool_events: list[ToolEvent] = []
+    ui_actions: list[UiAction] = []
     tokens_used = 0
     final_content = ""
 
@@ -670,6 +868,7 @@ async def chat_with_tools(
 
         for call in calls:
             spec = TOOL_REGISTRY.get(call.name)
+            output_model: BaseModel | None = None
             if spec is None:
                 llm_detail = f"Unknown tool: {call.name}"
                 user_resumen = f"No reconozco la herramienta solicitada ({call.name})."
@@ -680,9 +879,13 @@ async def chat_with_tools(
                     output = await invoke_tool(call.name, tool_ctx, _normalize_tool_args(call.arguments))
                     if "write" in spec.tags:
                         await db.commit()
+                    output_model = output
                     dumped = output.model_dump(mode="json")
                     result_payload = dumped
                     tool_events.append(ToolEvent(tool=call.name, status="ok", resumen=_summarize_tool_result(dumped)))
+                    action = _run_ui_action_builder(call.name, output)
+                    if action is not None:
+                        _record_ui_action(ui_actions, action)
                 except Exception as exc:
                     # Broad by design: a tool doing real I/O can raise anything (DomainError,
                     # pydantic ValidationError, KeyError/ValueError/TypeError from bad
@@ -706,7 +909,11 @@ async def chat_with_tools(
                     await logger.awarning("agent_chat_tool_error", tool=call.name, error=str(exc))
 
             messages.append(
-                LLMMessage(role="tool", tool_call_id=call.id, content=_serialize_tool_result(result_payload))
+                LLMMessage(
+                    role="tool",
+                    tool_call_id=call.id,
+                    content=_serialize_tool_result(result_payload, call.name, output_model),
+                )
             )
     else:
         final_content = (
@@ -742,4 +949,5 @@ async def chat_with_tools(
         tool_events=tool_events,
         documentos=documentos,
         tokens_used=tokens_used,
+        ui_actions=ui_actions,
     )

@@ -205,6 +205,20 @@ class ToolEvent(BaseModel):
     resumen: str
 
 
+class UiAction(BaseModel):
+    """One interactive UI element the frontend should render under a chat reply.
+
+    Derived deterministically (no LLM involvement) from a successful tool call's
+    output — see `app.services.agent_chat_service._UI_ACTION_BUILDERS`. `type`
+    selects the renderer (`components/agent/ui-actions.tsx` on the frontend);
+    `payload` is renderer-specific and intentionally untyped here since each
+    builder shapes it from a different tool output model.
+    """
+
+    type: str
+    payload: dict[str, Any]
+
+
 class DocumentoAdjuntoResumen(BaseModel):
     """Summary of one file attachment processed during the chat turn."""
 
@@ -218,6 +232,7 @@ class AgentChatResult(BaseModel):
     tool_events: list[ToolEvent] = Field(default_factory=list)
     documentos: list[DocumentoAdjuntoResumen] = Field(default_factory=list)
     tokens_used: int = 0
+    ui_actions: list[UiAction] = Field(default_factory=list)
 
 
 # --- Agent state schemas ---

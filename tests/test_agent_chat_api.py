@@ -41,7 +41,7 @@ async def test_chat_with_file_matches_frozen_contract(client: AsyncClient, test_
 
     assert response.status_code == 200
     body = response.json()
-    assert set(body.keys()) == {"session_id", "content", "tool_events", "documentos", "tokens_used"}
+    assert set(body.keys()) == {"session_id", "content", "tool_events", "documentos", "tokens_used", "ui_actions"}
     assert isinstance(body["session_id"], str)
     assert body["content"] == "Hola, recibí tu contrato."
     assert body["tool_events"] == []
@@ -129,7 +129,7 @@ async def test_chat_with_contrato_id_form_field_returns_200(client: AsyncClient,
 
     assert response.status_code == 200
     body = response.json()
-    assert set(body.keys()) == {"session_id", "content", "tool_events", "documentos", "tokens_used"}
+    assert set(body.keys()) == {"session_id", "content", "tool_events", "documentos", "tokens_used", "ui_actions"}
 
 
 @pytest.mark.asyncio
