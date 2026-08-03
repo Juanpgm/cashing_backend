@@ -27,7 +27,7 @@ from app.agent.tools.contract_parser import (
 from app.models.contrato import Contrato
 from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
 from app.models.obligacion import Obligacion
-from app.schemas.agent import LLMResponse
+from app.schemas.agent import LLMResponse, ObligacionExtraida
 from app.services import document_service
 
 # Solo los tests async necesitan el marker; los unitarios síncronos no.
@@ -428,3 +428,155 @@ async def test_dedup_no_altera_texto_obligacion(
     assert len(rows) == 5  # no duplicados
     for ob in rows:
         assert ob.descripcion in TEXTO_CONTRATO
+
+
+@asyncio_test
+async def test_persist_obligaciones_dedup_ignora_acentos_y_espacios(
+    db: AsyncSession, test_user: dict[str, Any]
+) -> None:
+    """`_persist_obligaciones` dedups via `text_match.normalize` (accent/case-insensitive,
+    whitespace-collapsed) — a re-extraction worded with different accents or doubled
+    spaces must not slip past the old `.lower().strip()` key as a "new" obligación."""
+    contrato = Contrato(
+        usuario_id=test_user["user"].id,
+        numero_contrato="CTR-DEDUP-NORM-001",
+        objeto="Prestación de servicios",
+        valor_total=12_000_000,
+        valor_mensual=1_000_000,
+        fecha_inicio=date(2024, 1, 1),
+        fecha_fin=date(2024, 12, 31),
+        entidad="MinTIC",
+        dependencia="Sistemas",
+        supervisor_nombre="Sup",
+    )
+    db.add(contrato)
+    await db.commit()
+    await db.refresh(contrato)
+
+    primera = ObligacionExtraida(descripcion="Elaborar informes de gestión mensuales", tipo="especifica", orden=1)
+    extraidas, _ = await document_service._persist_obligaciones([primera], contrato.id, db, [])
+    await db.commit()
+    assert len(extraidas) == 1
+
+    # Same obligation, re-extracted with a stripped accent and a doubled space —
+    # must be recognized as the SAME obligación, not appended as a duplicate.
+    variante = ObligacionExtraida(descripcion="Elaborar informes de gestion  mensuales", tipo="especifica", orden=1)
+    await document_service._persist_obligaciones([variante], contrato.id, db, [])
+    await db.commit()
+
+    rows = (await db.execute(select(Obligacion).where(Obligacion.contrato_id == contrato.id))).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].descripcion == "Elaborar informes de gestión mensuales"  # original text preserved
+
+
+@asyncio_test
+async def test_persist_obligaciones_no_deduplica_obligaciones_de_otro_documento(
+    db: AsyncSession, test_user: dict[str, Any]
+) -> None:
+    """Dedup is text-based only: obligaciones with genuinely DIFFERENT text (e.g. from
+    an unrelated document) are never treated as duplicates and are both persisted —
+    text dedup alone cannot detect cross-document contamination (see FIX-3 notes:
+    that requires the auto-path's skip-if-nonempty guard, not text matching)."""
+    contrato = Contrato(
+        usuario_id=test_user["user"].id,
+        numero_contrato="CTR-DEDUP-XDOC-001",
+        objeto="Prestación de servicios",
+        valor_total=12_000_000,
+        valor_mensual=1_000_000,
+        fecha_inicio=date(2024, 1, 1),
+        fecha_fin=date(2024, 12, 31),
+        entidad="MinTIC",
+        dependencia="Sistemas",
+        supervisor_nombre="Sup",
+    )
+    db.add(contrato)
+    await db.commit()
+    await db.refresh(contrato)
+
+    foranea = ObligacionExtraida(descripcion="Obligación foránea A del otro contrato", tipo="especifica", orden=1)
+    await document_service._persist_obligaciones([foranea], contrato.id, db, [])
+    await db.commit()
+
+    real = ObligacionExtraida(descripcion="Entregar informe mensual real", tipo="especifica", orden=1)
+    await document_service._persist_obligaciones([real], contrato.id, db, [])
+    await db.commit()
+
+    rows = (await db.execute(select(Obligacion).where(Obligacion.contrato_id == contrato.id))).scalars().all()
+    assert len(rows) == 2
+
+
+@asyncio_test
+async def test_persist_obligaciones_dedup_dentro_del_mismo_batch(db: AsyncSession, test_user: dict[str, Any]) -> None:
+    """A single `_persist_obligaciones` call with two accent/whitespace-variant entries
+    for the SAME obligation must insert exactly one row — `existing_norm` must grow as
+    rows are inserted, not just be seeded once from pre-existing DB rows, otherwise two
+    same-normalized entries in one `extraidas` list both get persisted."""
+    contrato = Contrato(
+        usuario_id=test_user["user"].id,
+        numero_contrato="CTR-DEDUP-BATCH-001",
+        objeto="Prestación de servicios",
+        valor_total=12_000_000,
+        valor_mensual=1_000_000,
+        fecha_inicio=date(2024, 1, 1),
+        fecha_fin=date(2024, 12, 31),
+        entidad="MinTIC",
+        dependencia="Sistemas",
+        supervisor_nombre="Sup",
+    )
+    db.add(contrato)
+    await db.commit()
+    await db.refresh(contrato)
+
+    primera = ObligacionExtraida(descripcion="Elaborar informes de gestión mensuales", tipo="especifica", orden=1)
+    variante = ObligacionExtraida(descripcion="Elaborar informes de gestion  mensuales", tipo="especifica", orden=2)
+    extraidas, _ = await document_service._persist_obligaciones([primera, variante], contrato.id, db, [])
+    await db.commit()
+
+    assert len(extraidas) == 2  # both returned to the caller...
+    rows = (await db.execute(select(Obligacion).where(Obligacion.contrato_id == contrato.id))).scalars().all()
+    assert len(rows) == 1  # ...but only the first-occurrence survives persistence
+    assert rows[0].descripcion == "Elaborar informes de gestión mensuales"
+
+
+@asyncio_test
+async def test_extraer_obligaciones_chunk_merge_dedup_ignora_acentos(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cross-chunk merge (LLM fallback path) must dedup with `text_match.normalize`,
+    not the weaker `.lower().strip()` key — two chunks describing the same obligation
+    with only an accent/whitespace difference must merge into a single survivor before
+    `_persist_obligaciones` ever runs."""
+    import app.adapters.llm as llm_pkg
+
+    monkeypatch.setattr(
+        document_service,
+        "_extract_obligation_sections",
+        lambda texto: ["fragmento uno", "fragmento dos"],
+    )
+
+    respuestas = iter(
+        [
+            '{"obligaciones": [{"descripcion": "Elaborar informes de gestión mensuales", "tipo": "especifica"}]}',
+            '{"obligaciones": [{"descripcion": "Elaborar informes de gestion  mensuales", "tipo": "especifica"}]}',
+        ]
+    )
+
+    class _FakeChunkLLM:
+        async def complete(self, messages, temperature=0.3, max_tokens=4096, response_format=None):
+            return LLMResponse(
+                content=next(respuestas),
+                model="fake/chunked",
+                prompt_tokens=0,
+                completion_tokens=0,
+                total_tokens=0,
+            )
+
+    monkeypatch.setattr(llm_pkg, "get_llm", lambda model=None: _FakeChunkLLM(), raising=True)
+
+    extraidas, avisos = await document_service.extraer_obligaciones_texto(
+        "texto de contrato sin sección de obligaciones detectable por regex", None, db
+    )
+
+    assert avisos == []
+    assert len(extraidas) == 1
+    assert extraidas[0].descripcion == "Elaborar informes de gestión mensuales"

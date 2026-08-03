@@ -398,9 +398,9 @@ def _mock_evidencia_storage() -> Any:
 async def test_endpoint_sube_multiples_archivos(
     client: AsyncClient, test_user: dict[str, Any], actividad: Actividad
 ) -> None:
-    from app.api.v1.evidencias import get_evidencia_storage
+    from app.api.deps import get_pdf_storage
 
-    fastapi_app.dependency_overrides[get_evidencia_storage] = _mock_evidencia_storage
+    fastapi_app.dependency_overrides[get_pdf_storage] = _mock_evidencia_storage
     try:
         resp = await client.post(
             f"/api/v1/evidencias/actividades/{actividad.id}",
@@ -411,7 +411,7 @@ async def test_endpoint_sube_multiples_archivos(
             ],
         )
     finally:
-        fastapi_app.dependency_overrides.pop(get_evidencia_storage, None)
+        fastapi_app.dependency_overrides.pop(get_pdf_storage, None)
 
     assert resp.status_code == 201
     data = resp.json()
@@ -423,9 +423,9 @@ async def test_endpoint_sube_multiples_archivos(
 async def test_endpoint_single_file_still_works(
     client: AsyncClient, test_user: dict[str, Any], actividad: Actividad
 ) -> None:
-    from app.api.v1.evidencias import get_evidencia_storage
+    from app.api.deps import get_pdf_storage
 
-    fastapi_app.dependency_overrides[get_evidencia_storage] = _mock_evidencia_storage
+    fastapi_app.dependency_overrides[get_pdf_storage] = _mock_evidencia_storage
     try:
         resp = await client.post(
             f"/api/v1/evidencias/actividades/{actividad.id}",
@@ -433,7 +433,7 @@ async def test_endpoint_single_file_still_works(
             files=[("files", ("informe.pdf", _PDF_MAGIC, "application/pdf"))],
         )
     finally:
-        fastapi_app.dependency_overrides.pop(get_evidencia_storage, None)
+        fastapi_app.dependency_overrides.pop(get_pdf_storage, None)
 
     assert resp.status_code == 201
     data = resp.json()
@@ -445,9 +445,9 @@ async def test_endpoint_single_file_still_works(
 async def test_endpoint_rechaza_ejecutable_con_nombre_de_archivo_en_detalle(
     client: AsyncClient, test_user: dict[str, Any], actividad: Actividad
 ) -> None:
-    from app.api.v1.evidencias import get_evidencia_storage
+    from app.api.deps import get_pdf_storage
 
-    fastapi_app.dependency_overrides[get_evidencia_storage] = _mock_evidencia_storage
+    fastapi_app.dependency_overrides[get_pdf_storage] = _mock_evidencia_storage
     try:
         resp = await client.post(
             f"/api/v1/evidencias/actividades/{actividad.id}",
@@ -455,7 +455,7 @@ async def test_endpoint_rechaza_ejecutable_con_nombre_de_archivo_en_detalle(
             files=[("files", ("virus.exe", b"MZ-fake-binary", "application/octet-stream"))],
         )
     finally:
-        fastapi_app.dependency_overrides.pop(get_evidencia_storage, None)
+        fastapi_app.dependency_overrides.pop(get_pdf_storage, None)
 
     assert resp.status_code == 422
     assert "virus.exe" in resp.json()["detail"]
@@ -464,9 +464,9 @@ async def test_endpoint_rechaza_ejecutable_con_nombre_de_archivo_en_detalle(
 async def test_endpoint_un_archivo_invalido_en_lote_rechaza_todo(
     client: AsyncClient, db: AsyncSession, test_user: dict[str, Any], actividad: Actividad
 ) -> None:
-    from app.api.v1.evidencias import get_evidencia_storage
+    from app.api.deps import get_pdf_storage
 
-    fastapi_app.dependency_overrides[get_evidencia_storage] = _mock_evidencia_storage
+    fastapi_app.dependency_overrides[get_pdf_storage] = _mock_evidencia_storage
     try:
         resp = await client.post(
             f"/api/v1/evidencias/actividades/{actividad.id}",
@@ -477,7 +477,7 @@ async def test_endpoint_un_archivo_invalido_en_lote_rechaza_todo(
             ],
         )
     finally:
-        fastapi_app.dependency_overrides.pop(get_evidencia_storage, None)
+        fastapi_app.dependency_overrides.pop(get_pdf_storage, None)
 
     assert resp.status_code == 422
     result = await db.execute(select(Evidencia).where(Evidencia.actividad_id == actividad.id))
@@ -489,9 +489,9 @@ async def test_endpoint_rechaza_mas_de_10_archivos(
 ) -> None:
     """More than MAX_EVIDENCE_FILES_PER_REQUEST files in one request must 422
     BEFORE any file content is read/stored."""
-    from app.api.v1.evidencias import get_evidencia_storage
+    from app.api.deps import get_pdf_storage
 
-    fastapi_app.dependency_overrides[get_evidencia_storage] = _mock_evidencia_storage
+    fastapi_app.dependency_overrides[get_pdf_storage] = _mock_evidencia_storage
     try:
         files = [
             ("files", (f"foto{i}.heic", b"\x00\x00\x00\x18ftypheic", "image/heic"))
@@ -503,7 +503,7 @@ async def test_endpoint_rechaza_mas_de_10_archivos(
             files=files,
         )
     finally:
-        fastapi_app.dependency_overrides.pop(get_evidencia_storage, None)
+        fastapi_app.dependency_overrides.pop(get_pdf_storage, None)
 
     assert resp.status_code == 422
 
@@ -511,9 +511,9 @@ async def test_endpoint_rechaza_mas_de_10_archivos(
 async def test_endpoint_acepta_exactamente_el_limite_de_archivos(
     client: AsyncClient, test_user: dict[str, Any], actividad: Actividad
 ) -> None:
-    from app.api.v1.evidencias import get_evidencia_storage
+    from app.api.deps import get_pdf_storage
 
-    fastapi_app.dependency_overrides[get_evidencia_storage] = _mock_evidencia_storage
+    fastapi_app.dependency_overrides[get_pdf_storage] = _mock_evidencia_storage
     try:
         files = [
             ("files", (f"foto{i}.heic", b"\x00\x00\x00\x18ftypheic", "image/heic"))
@@ -525,7 +525,7 @@ async def test_endpoint_acepta_exactamente_el_limite_de_archivos(
             files=files,
         )
     finally:
-        fastapi_app.dependency_overrides.pop(get_evidencia_storage, None)
+        fastapi_app.dependency_overrides.pop(get_pdf_storage, None)
 
     assert resp.status_code == 201
     assert len(resp.json()) == MAX_EVIDENCE_FILES_PER_REQUEST
@@ -535,9 +535,9 @@ async def test_endpoint_subir_evidencia_actividad_de_otro_usuario_da_404(
     client: AsyncClient, test_user: dict[str, Any], actividad_ajena: Actividad
 ) -> None:
     """User A must not be able to upload evidence to user B's actividad."""
-    from app.api.v1.evidencias import get_evidencia_storage
+    from app.api.deps import get_pdf_storage
 
-    fastapi_app.dependency_overrides[get_evidencia_storage] = _mock_evidencia_storage
+    fastapi_app.dependency_overrides[get_pdf_storage] = _mock_evidencia_storage
     try:
         resp = await client.post(
             f"/api/v1/evidencias/actividades/{actividad_ajena.id}",
@@ -545,7 +545,7 @@ async def test_endpoint_subir_evidencia_actividad_de_otro_usuario_da_404(
             files=[("files", ("informe.pdf", _PDF_MAGIC, "application/pdf"))],
         )
     finally:
-        fastapi_app.dependency_overrides.pop(get_evidencia_storage, None)
+        fastapi_app.dependency_overrides.pop(get_pdf_storage, None)
 
     assert resp.status_code == 404
 
@@ -562,12 +562,75 @@ async def test_endpoint_listar_evidencias_actividad_de_otro_usuario_da_404(
     assert resp.status_code == 404
 
 
+async def test_subir_evidencias_storage_error_mapped_to_external_service_error(
+    db: AsyncSession, test_user: dict[str, Any], actividad: Actividad
+) -> None:
+    """A raw storage adapter failure (e.g. boto's NoSuchBucket) must never leak to the
+    caller — it maps to `ExternalServiceError` (502), same convention as Google/Wompi/
+    SECOP failures, nothing gets persisted, and the raw adapter text is logged
+    server-side (not returned in the HTTP-facing detail)."""
+    import structlog
+    from app.core.exceptions import ExternalServiceError
+
+    user = test_user["user"]
+    storage = _mock_storage()
+    storage.upload.side_effect = Exception("An error occurred (NoSuchBucket) when calling the PutObject operation")
+
+    with structlog.testing.capture_logs() as captured, pytest.raises(ExternalServiceError) as exc_info:
+        await evidencia_service.subir_evidencias(
+            db=db,
+            storage=storage,
+            usuario_id=user.id,
+            actividad_id=actividad.id,
+            archivos=[("informe.pdf", "application/pdf", _PDF_MAGIC)],
+        )
+
+    detail = str(exc_info.value.detail)
+    assert "No se pudo guardar el archivo de evidencia" in detail
+    assert "NoSuchBucket" not in detail
+
+    error_events = [e for e in captured if e.get("event") == "evidencia_storage_upload_failed"]
+    assert error_events, "expected the raw storage failure to be logged"
+    assert "NoSuchBucket" in error_events[0].get("error", "")
+
+    result = await db.execute(select(Evidencia).where(Evidencia.actividad_id == actividad.id))
+    assert result.scalars().all() == []
+
+
+async def test_endpoint_honra_storage_provider_local_sin_override(
+    client: AsyncClient, test_user: dict[str, Any], actividad: Actividad, tmp_path: Any, monkeypatch: Any
+) -> None:
+    """Regression for the broken seam: the endpoint's storage dependency must resolve
+    through `app.adapters.storage.get_storage` (honoring STORAGE_PROVIDER), not a
+    hardcoded `S3StorageAdapter` that ignores it — verified WITHOUT overriding the
+    dependency, so the real factory in `app.api.deps.get_pdf_storage` runs. The
+    uploaded bytes must be retrievable back through that same seam (the storage_key
+    the response returns is exactly what a download call needs)."""
+    from app.adapters.storage import get_storage
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "STORAGE_PROVIDER", "local")
+    monkeypatch.setattr(settings, "LOCAL_STORAGE_PATH", str(tmp_path))
+
+    resp = await client.post(
+        f"/api/v1/evidencias/actividades/{actividad.id}",
+        headers=test_user["headers"],
+        files=[("files", ("informe.pdf", _PDF_MAGIC, "application/pdf"))],
+    )
+
+    assert resp.status_code == 201
+    storage_key = resp.json()[0]["storage_key"]
+
+    local_storage = get_storage(settings.S3_BUCKET_PDFS)
+    assert await local_storage.download(storage_key) == _PDF_MAGIC  # type: ignore[attr-defined]
+
+
 async def test_endpoint_rechaza_archivo_muy_grande(
     client: AsyncClient, test_user: dict[str, Any], actividad: Actividad
 ) -> None:
-    from app.api.v1.evidencias import get_evidencia_storage
+    from app.api.deps import get_pdf_storage
 
-    fastapi_app.dependency_overrides[get_evidencia_storage] = _mock_evidencia_storage
+    fastapi_app.dependency_overrides[get_pdf_storage] = _mock_evidencia_storage
     try:
         archivo_grande = b"x" * (MAX_EVIDENCE_FILE_SIZE_BYTES + 1)
         resp = await client.post(
@@ -576,6 +639,6 @@ async def test_endpoint_rechaza_archivo_muy_grande(
             files=[("files", ("grande.mp4", archivo_grande, "video/mp4"))],
         )
     finally:
-        fastapi_app.dependency_overrides.pop(get_evidencia_storage, None)
+        fastapi_app.dependency_overrides.pop(get_pdf_storage, None)
 
     assert resp.status_code == 422

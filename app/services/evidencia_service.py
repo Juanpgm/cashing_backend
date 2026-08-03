@@ -14,7 +14,7 @@ from app.adapters.llm import get_llm
 from app.adapters.storage.port import StoragePort
 from app.agent.nodes.evidence_matcher import clasificar_evidencia, confidence_bucket, evidence_matcher_node
 from app.agent.state import AgentState
-from app.core.exceptions import NotFoundError, ValidationError
+from app.core.exceptions import ExternalServiceError, NotFoundError, ValidationError
 from app.core.file_validation import (
     sanitize_filename,
     validate_evidence_file,
@@ -205,7 +205,23 @@ async def subir_evidencias(
         # attacker-controlled and evidence allows arbitrary extensions/characters.
         safe_filename = sanitize_filename(filename)
         key = f"evidencias/{usuario_id}/{actividad_id}/{uuid.uuid4()}_{safe_filename}"
-        await storage.upload(key=key, data=data, content_type=content_type)
+        try:
+            await storage.upload(key=key, data=data, content_type=content_type)
+        except Exception as exc:
+            # Never leak raw adapter errors (e.g. boto's NoSuchBucket) to the client —
+            # same convention as other external-dependency failures (Google/Wompi/SECOP).
+            # The raw exception text is logged server-side only; the client gets a
+            # safe, generic message with no adapter internals in it.
+            logger.error(
+                "evidencia_storage_upload_failed",
+                key=key,
+                actividad_id=str(actividad_id),
+                usuario_id=str(usuario_id),
+                error=str(exc),
+            )
+            raise ExternalServiceError(
+                "Storage", "No se pudo guardar el archivo de evidencia. Intentá de nuevo más tarde."
+            ) from exc
 
         evidencia = Evidencia(
             id=uuid.uuid4(),

@@ -9,8 +9,7 @@ from fastapi import APIRouter, Depends, File, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.storage.s3_adapter import S3StorageAdapter
-from app.api.deps import CurrentUser
-from app.core.config import settings
+from app.api.deps import CurrentUser, get_pdf_storage
 from app.core.database import get_db
 from app.core.exceptions import ValidationError
 from app.core.file_validation import MAX_EVIDENCE_FILES_PER_REQUEST
@@ -20,11 +19,6 @@ from app.services import evidencia_service
 logger = structlog.get_logger("api.evidencias")
 
 router = APIRouter(prefix="/evidencias", tags=["evidencias"])
-
-
-def get_evidencia_storage() -> S3StorageAdapter:
-    """Storage adapter scoped to the evidencias bucket."""
-    return S3StorageAdapter(bucket=settings.S3_BUCKET_PDFS)
 
 
 @router.post(
@@ -37,7 +31,7 @@ async def subir_evidencia(
     user: CurrentUser,
     files: list[UploadFile] = File(...),
     db: AsyncSession = Depends(get_db),
-    storage: S3StorageAdapter = Depends(get_evidencia_storage),
+    storage: S3StorageAdapter = Depends(get_pdf_storage),
 ) -> list[EvidenciaUploadResponse]:
     """Sube uno o varios archivos de evidencia para una actividad (cualquier formato).
 
@@ -81,7 +75,7 @@ async def descargar_evidencia(
     evidencia_id: uuid.UUID,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
-    storage: S3StorageAdapter = Depends(get_evidencia_storage),
+    storage: S3StorageAdapter = Depends(get_pdf_storage),
 ) -> EvidenciaPresignedResponse:
     """Genera una URL pre-firmada para descargar una evidencia."""
     return await evidencia_service.obtener_url_descarga(db, storage, user.id, evidencia_id)
@@ -96,7 +90,7 @@ async def eliminar_evidencia(
     evidencia_id: uuid.UUID,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
-    storage: S3StorageAdapter = Depends(get_evidencia_storage),
+    storage: S3StorageAdapter = Depends(get_pdf_storage),
 ) -> None:
     """Elimina una evidencia y su archivo del almacenamiento."""
     await evidencia_service.eliminar_evidencia(db, storage, user.id, evidencia_id)

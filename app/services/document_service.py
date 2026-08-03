@@ -39,6 +39,7 @@ from app.agent.tools.ocr import ocr_available
 from app.core.config import settings
 from app.core.exceptions import NotFoundError
 from app.core.file_validation import get_safe_filename
+from app.core.text_match import normalize as _normalize_texto
 from app.models.categoria_documento import CategoriaDocumento
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro
@@ -172,7 +173,7 @@ async def _extraer_obligaciones(
     seen_norm: set[str] = set()
     for chunk_obs in chunk_results:
         for ob in chunk_obs:
-            norm = ob.descripcion.lower().strip()
+            norm = _normalize_texto(ob.descripcion)
             if norm not in seen_norm:
                 seen_norm.add(norm)
                 all_raw.append(ob)
@@ -224,9 +225,11 @@ async def _persist_obligaciones(
 ) -> tuple[list[ObligacionExtraida], list[str]]:
     """Upsert extracted obligations into the DB (or return as-is if no contrato).
 
-    Deduplicates by normalized (lowercased+stripped) descripcion against any
-    obligations already attached to ``contrato_id``. New rows are appended
-    with an ``orden`` continuing the existing sequence.
+    Deduplicates against any obligations already attached to ``contrato_id`` by
+    ``text_match.normalize`` (accent/case-insensitive, whitespace-collapsed) —
+    catches re-extractions worded with different accents/spacing, not just exact
+    matches (the old ``.lower().strip()`` key). New rows are appended with an
+    ``orden`` continuing the existing sequence.
     """
     # When contrato_id is None (auto-create failed), return extracted
     # obligations for display only — no DB persistence.
@@ -235,27 +238,31 @@ async def _persist_obligaciones(
 
     existing_result = await db.execute(select(Obligacion).where(Obligacion.contrato_id == contrato_id))
     existing_obs = existing_result.scalars().all()
-    existing_norm = {ob.descripcion.lower().strip(): ob for ob in existing_obs}
+    existing_norm = {_normalize_texto(ob.descripcion): ob for ob in existing_obs}
 
     next_orden = max((ob.orden for ob in existing_obs), default=0) + 1
 
     nuevas = 0
     for ob in extraidas:
-        norm_key = ob.descripcion.lower().strip()
+        norm_key = _normalize_texto(ob.descripcion)
         if norm_key in existing_norm:
             existing_ob = existing_norm[norm_key]
             if existing_ob.tipo.value != ob.tipo:
                 existing_ob.tipo = TipoObligacion(ob.tipo)
         else:
-            db.add(
-                Obligacion(
-                    contrato_id=contrato_id,
-                    descripcion=ob.descripcion,
-                    tipo=TipoObligacion(ob.tipo),
-                    orden=next_orden,
-                    etiqueta=ob.etiqueta,
-                )
+            nueva_ob = Obligacion(
+                contrato_id=contrato_id,
+                descripcion=ob.descripcion,
+                tipo=TipoObligacion(ob.tipo),
+                orden=next_orden,
+                etiqueta=ob.etiqueta,
             )
+            db.add(nueva_ob)
+            # Record immediately so a later duplicate within this same batch
+            # (extraidas can contain repeats, e.g. re-merged LLM chunks) skips
+            # instead of inserting a second row — existing_norm was previously
+            # only seeded from already-persisted rows and never grew mid-loop.
+            existing_norm[norm_key] = nueva_ob
             nuevas += 1
             next_orden += 1
 
