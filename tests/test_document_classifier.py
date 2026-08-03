@@ -9,6 +9,7 @@ from app.services.document_classifier import (
     CATEGORIA_A_REQUISITO,
     CATEGORIA_KEYWORDS,
     CATEGORIA_MIN_THRESHOLD,
+    CONTENIDO_SCORE_AMBIGUO,
     TIPO_A_REQUISITO,
     aplicar_clasificacion,
     clasificar,
@@ -21,9 +22,9 @@ from app.services.document_classifier import (
 
 def test_categoria_cdp_es_primera_clase():
     assert CategoriaDocumento.CDP.value == "cdp"
-    assert "cdp" in CATEGORIA_KEYWORDS[CategoriaDocumento.CDP]
-    assert "certificado de disponibilidad" in CATEGORIA_KEYWORDS[CategoriaDocumento.CDP]
-    assert "disponibilidad presupuestal" in CATEGORIA_KEYWORDS[CategoriaDocumento.CDP]
+    assert "cdp" in CATEGORIA_KEYWORDS[CategoriaDocumento.CDP]["primary"]
+    assert "certificado de disponibilidad" in CATEGORIA_KEYWORDS[CategoriaDocumento.CDP]["primary"]
+    assert "disponibilidad presupuestal" in CATEGORIA_KEYWORDS[CategoriaDocumento.CDP]["primary"]
 
 
 def test_cdp_mapeos_a_requisito():
@@ -48,6 +49,153 @@ def test_clasificar_cdp_por_nombre(nombre):
 def test_clasificar_rpc_no_se_confunde_con_cdp():
     cat, _ = clasificar("RPC registro presupuestal compromiso.pdf", None)
     assert cat == CategoriaDocumento.REGISTRO_PRESUPUESTAL
+
+
+# ── R2: primary/secondary scoring ────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "nombre, expected_cat",
+    [
+        ("CDP.pdf", CategoriaDocumento.CDP),
+        ("REGISTRO PRESUPUESTAL.pdf", CategoriaDocumento.REGISTRO_PRESUPUESTAL),
+        ("CONTRATO DE PRESTACION DE SERVICIOS.pdf", CategoriaDocumento.CONTRATO),
+    ],
+)
+def test_clasificar_primary_filename_clears_auto_link_threshold(nombre, expected_cat):
+    cat, score = clasificar(nombre, None)
+    assert cat == expected_cat
+    assert score >= Decimal("0.700")
+
+
+def test_clasificar_secondary_only_stays_below_auto_link_threshold():
+    """'condiciones generales' is a CONTRATO SECONDARY keyword only — no PRIMARY hit."""
+    cat, score = clasificar("CONDICIONES GENERALES.pdf", None)
+    assert cat == CategoriaDocumento.CONTRATO
+    assert score < Decimal("0.700")
+
+
+def test_clasificar_score_nunca_alcanza_el_cap_de_1000():
+    # Every primary + secondary keyword of CONTRATO in one filename.
+    nombre = (
+        "contrato cto minuta clausulado contract condiciones generales condiciones especiales "
+        "acuerdo de prestacion prestacion de servicios.pdf"
+    )
+    cat, score = clasificar(nombre, None)
+    assert cat == CategoriaDocumento.CONTRATO
+    assert score == Decimal("0.950")
+    assert score < Decimal("1.000")
+
+
+# ── R2/R3: realistic-filename sanity check (T2.5, design open question) ─────
+
+
+@pytest.mark.parametrize(
+    "nombre, expected_cat",
+    [
+        ("CONTRATO DE PRESTACION.pdf", CategoriaDocumento.CONTRATO),
+        ("RPC 12345.pdf", CategoriaDocumento.REGISTRO_PRESUPUESTAL),
+        ("REGISTRO PRESUPUESTAL.pdf", CategoriaDocumento.REGISTRO_PRESUPUESTAL),
+        ("CDP-2025.pdf", CategoriaDocumento.CDP),
+        ("9. CLAUSULADO.PDF.pdf", CategoriaDocumento.CONTRATO),
+        ("Certificado de Disponibilidad.pdf", CategoriaDocumento.CDP),
+    ],
+)
+def test_clasificar_nombres_reales_secop_clasifican_y_superan_umbral(nombre, expected_cat):
+    """T2.5: real SECOP filename sample — every one clears AUTO_LINK_THRESHOLD
+    and is correctly distinguished. No constant adjustment was needed for these
+    (all land exactly on PRIMARY_BASE=0.750); see CATEGORIA_KEYWORDS docstring
+    for the one adjustment this sanity check DID surface (ACTA_INICIO vs
+    CONTRATO on "acta de inicio del contrato"-style names)."""
+    cat, score = clasificar(nombre, None)
+    assert cat == expected_cat
+    assert score >= Decimal("0.700")
+
+
+def test_clasificar_acta_inicio_del_contrato_no_se_confunde_con_contrato():
+    """Real SECOP pattern: 'ACTA DE INICIO DEL CONTRATO No. XXX' must classify
+    as ACTA_INICIO, not CONTRATO, despite legitimately mentioning 'contrato'."""
+    cat, _ = clasificar("ACTA DE INICIO DEL CONTRATO No 123.pdf", None)
+    assert cat == CategoriaDocumento.ACTA_INICIO
+
+
+# ── correction (RELIABILITY-001): R3 dominance guard must not defeat R2 when
+# the runner-up's only signal is CONTRATO's generic "contrato" keyword ───────
+
+
+@pytest.mark.parametrize(
+    "nombre, expected_cat",
+    [
+        ("ACTA DE INICIO DEL CONTRATO No 123.pdf", CategoriaDocumento.ACTA_INICIO),
+        ("ACTA INICIO CONTRATO.pdf", CategoriaDocumento.ACTA_INICIO),
+        ("REGISTRO PRESUPUESTAL DEL CONTRATO 123.pdf", CategoriaDocumento.REGISTRO_PRESUPUESTAL),
+        ("CDP DEL CONTRATO 2025.pdf", CategoriaDocumento.CDP),
+    ],
+)
+def test_clasificar_no_se_demuestra_por_co_ocurrencia_generica_de_contrato(nombre, expected_cat):
+    """A legitimate PRIMARY winner must clear AUTO_LINK_THRESHOLD even when the
+    filename also contains CONTRATO's generic bare 'contrato' keyword — that
+    keyword alone is not a genuine ambiguity threat (RELIABILITY-001)."""
+    cat, score = clasificar(nombre, None)
+    assert cat == expected_cat
+    assert score >= Decimal("0.700")
+
+
+def test_clasificar_rp_cdp_ambiguedad_genuina_sigue_demorada():
+    """The genuine RP<->CDP confusion the R3 guard exists for must still demote."""
+    cat, score = clasificar("REGISTRO PRESUPUESTAL Y CERTIFICADO DE DISPONIBILIDAD.pdf", None)
+    assert cat in (CategoriaDocumento.REGISTRO_PRESUPUESTAL, CategoriaDocumento.CDP)
+    assert score < Decimal("0.700")
+
+
+# ── R3: import-time dominance guard ──────────────────────────────────────────
+
+
+def test_clasificar_rp_cdp_ambiguo_sin_dominancia_da_0600():
+    """Both RP and CDP PRIMARY keywords present, neither dominates -> ambiguous."""
+    cat, score = clasificar("RPC anexo certificado de disponibilidad.pdf", None)
+    assert cat in (CategoriaDocumento.REGISTRO_PRESUPUESTAL, CategoriaDocumento.CDP)
+    assert score == CONTENIDO_SCORE_AMBIGUO
+
+
+def test_clasificar_rp_dominante_sin_cdp_mantiene_confianza_alta():
+    cat, score = clasificar("RPC 12345 registro presupuestal.pdf", None)
+    assert cat == CategoriaDocumento.REGISTRO_PRESUPUESTAL
+    assert score >= Decimal("0.750")
+
+
+# ── R4: SECOP metadata priors ────────────────────────────────────────────────
+
+
+def test_clasificar_tipo_origen_modificacion_reduce_score_contrato():
+    _, score_mod = clasificar("contrato.pdf", None, tipo_origen="modificacion")
+    _, score_base = clasificar("contrato.pdf", None, tipo_origen="contrato")
+    assert score_mod < score_base
+    assert score_base == Decimal("0.750")
+    assert score_mod == Decimal("0.600")
+
+
+def test_clasificar_tipo_hint_boosts_categoria_score():
+    _, base = clasificar("condiciones generales.pdf", None)
+    _, con_hint = clasificar("condiciones generales.pdf", None, tipo_hint="contrato")
+    assert con_hint > base
+    assert base == Decimal("0.400")
+    assert con_hint == Decimal("0.500")
+
+
+def test_clasificar_extension_imagen_nudges_evidencias():
+    _, base = clasificar("soporte visita.jpg", None)
+    _, con_ext = clasificar("soporte visita.jpg", None, extension="jpg")
+    assert con_ext > base
+    assert base == Decimal("0.750")
+    assert con_ext == Decimal("0.800")
+
+
+def test_clasificar_sin_metadata_secop_es_no_op():
+    """Absent extension/tipo_origen/tipo_hint (non-SECOP upload) never changes the result."""
+    assert clasificar("contrato.pdf", None) == clasificar(
+        "contrato.pdf", None, extension=None, tipo_origen=None, tipo_hint=None
+    )
 
 
 # ── clasificar_contenido (borderline content sniff, D2) ─────────────────────

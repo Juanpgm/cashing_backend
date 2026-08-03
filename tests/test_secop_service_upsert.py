@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import uuid
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
 from app.core.exceptions import ValidationError
 
 
@@ -119,3 +117,31 @@ class TestUpsertDocumento:
         mock_db = AsyncMock()
         result = await _upsert_documento(mock_db, {})
         assert result is None
+
+    @pytest.mark.asyncio
+    async def test_wires_extension_and_tipo_origen_into_clasificacion(self) -> None:
+        """R4: _upsert_documento already sets obj.extension/obj.datos_raw (with
+        _tipo_origen staged by the caller) BEFORE calling aplicar_clasificacion —
+        so the R4 metadata prior (modificacion demotes CONTRATO) applies without
+        any extra wiring in this file. Regression guard for that wiring staying
+        intact as document_classifier.clasificar()'s signature grows."""
+        from app.models.categoria_documento import CategoriaDocumento
+        from app.services.secop_service import _upsert_documento
+
+        mock_result = MagicMock()
+        mock_result.scalar_one_or_none.return_value = None
+        mock_db = AsyncMock()
+        mock_db.execute.return_value = mock_result
+
+        row = {
+            "id_documento": "DOC-PRIORS-1",
+            "nombre_archivo": "contrato.pdf",
+            "extensi_n": "pdf",
+            "_tipo_origen": "modificacion",
+        }
+        obj = await _upsert_documento(mock_db, row)
+
+        assert obj is not None
+        assert obj.categoria == CategoriaDocumento.CONTRATO
+        # PRIMARY_BASE (0.750) - ADJ_MODIFICACION_CONTRATO (0.150) = 0.600
+        assert obj.categoria_confianza == pytest.approx(0.600)

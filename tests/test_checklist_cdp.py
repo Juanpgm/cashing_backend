@@ -127,6 +127,24 @@ async def test_catalogo_seed_incluye_cdp_no_obligatorio_orden_25(db: AsyncSessio
     assert cdp.orden == 25
 
 
+async def test_catalogo_seed_cdp_tiene_keywords_deteccion(db: AsyncSession) -> None:
+    """R5 regression guard (clasificacion-documentos-refuerzo): the approved
+    design initially assumed CDP was NOT seeded — false against merged code
+    (_CATALOGO_SEED already has a full CDP row). This asserts that stays true:
+    listar_catalogo() (after the additive _seed_catalogo_si_vacio backfill)
+    returns a CDP row with non-empty keywords_deteccion, so the CDP sniff/
+    candidate/auto-link path works end to end without a new migration."""
+    catalogo = await checklist_service.listar_catalogo(db)
+    cdp = next((c for c in catalogo if c.codigo == "CDP"), None)
+    assert cdp is not None
+    assert cdp.keywords_deteccion == [
+        "cdp",
+        "certificado de disponibilidad",
+        "disponibilidad presupuestal",
+        "cdp-",
+    ]
+
+
 async def test_catalogo_seed_insertar_si_ausente_cuando_catalogo_ya_sembrado(db: AsyncSession) -> None:
     """Simulates a catalog already seeded WITHOUT CDP (e.g. an older
     deployment). Seeding must be additive: the empty-table early-return in
