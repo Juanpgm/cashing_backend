@@ -20,6 +20,7 @@ from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
 from app.models.obligacion import Obligacion, TipoObligacion
 from app.models.plantilla_organismo import PlantillaOrganismo
 from app.services import informe_service
+from app.services.informe_constants import SENTINEL_SIN_EVIDENCIAS
 from docx import Document
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -163,6 +164,24 @@ async def test_valores_plantilla_acumulado_saldo_y_letras(
     assert valores["contratista.cedula"] == "123456789"
     # cargo_supervisor is None on this contrato → key omitted, not empty.
     assert "contrato.cargo_supervisor" not in valores
+    # consecutivo_ds unset on this cuota (G4) → key omitted, not empty/None.
+    assert "cuota.consecutivo_ds" not in valores
+
+
+async def test_valores_plantilla_incluye_consecutivo_ds_cuando_esta_definido(
+    db: AsyncSession, contrato: Contrato, cuenta_tercera: CuentaCobro
+) -> None:
+    """G4: cuota.consecutivo_ds resolves from CuentaCobro.consecutivo_ds when set
+    (real SYJ packages radicate a "DS-4161-<consecutivo>" xlsx whose consecutive
+    changes per cuota)."""
+    cuenta_tercera.consecutivo_ds = "1768"
+    db.add(cuenta_tercera)
+    await db.commit()
+    await db.refresh(cuenta_tercera)
+
+    valores = await informe_service._valores_plantilla(db, cuenta_tercera, contrato)
+
+    assert valores["cuota.consecutivo_ds"] == "1768"
 
 
 # ── Fail-open fallback ──────────────────────────────────────────────────────
@@ -421,7 +440,11 @@ async def test_justificaciones_sobrantes_quedan_en_blanco(
     cuenta_tercera: CuentaCobro,
 ) -> None:
     """RELI-002: template with 3 justificacion campos + contract with 2
-    obligaciones → the 3rd row's example narrative is blanked, not retained."""
+    obligaciones → the 3rd row's example narrative is blanked, not retained.
+
+    Both actividades here have no evidencia and no justificación (billing-
+    resilience-templates E2E finding A/B fix) — the sentinel renders instead
+    of echoing `act.descripcion`."""
     doc = Document()
     t = doc.add_table(rows=3, cols=1)
     t.cell(0, 0).text = "Narrativa ejemplo uno"
@@ -452,11 +475,74 @@ async def test_justificaciones_sobrantes_quedan_en_blanco(
 
     assert resultado is not None
     out = Document(BytesIO(resultado))
-    assert out.tables[0].cell(0, 0).text == "Trabajo obligación 1"
-    assert out.tables[0].cell(1, 0).text == "Trabajo obligación 2"
+    assert out.tables[0].cell(0, 0).text == SENTINEL_SIN_EVIDENCIAS
+    assert out.tables[0].cell(1, 0).text == SENTINEL_SIN_EVIDENCIAS
     assert out.tables[0].cell(2, 0).text == ""  # example narrative blanked
     eventos = [e for e in captured if e.get("event") == "informe_clonado_justificaciones_blanqueadas"]
     assert eventos and eventos[0]["n"] == 1
+
+
+async def test_generar_docx_clonado_justificacion_evidencia_sentinel_prioridad(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    contrato: Contrato,
+    cuenta_tercera: CuentaCobro,
+) -> None:
+    """E2E finding A/B fix — per obligación, `justificacion.{n}` renders:
+    real justificación text when present (ob 1); `act.descripcion` when
+    justificación is empty but the obligación HAS evidencia (ob 2, unchanged
+    prior behavior); the sentinel when there is NEITHER (ob 3)."""
+    from app.models.evidencia import Evidencia
+
+    doc = Document()
+    doc.add_table(rows=3, cols=1)
+    buf = BytesIO()
+    doc.save(buf)
+    campos = [
+        {
+            "direccion": f"T0.R{i}.C0",
+            "etiqueta": f"Justificación {i + 1}",
+            "campo": f"justificacion.{i + 1}",
+            "valor_ejemplo": "",
+            "modo": "justificacion",
+        }
+        for i in range(3)
+    ]
+    plantilla = await _crear_plantilla(db, contrato, campos)
+    storage = AsyncMock()
+    storage.download = AsyncMock(return_value=buf.getvalue())
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: storage)
+
+    obs = [
+        Obligacion(
+            id=uuid.uuid4(),
+            contrato_id=contrato.id,
+            descripcion=f"Obligación {i}",
+            tipo=TipoObligacion.GENERAL,
+            orden=i,
+        )
+        for i in range(1, 4)
+    ]
+    obligaciones_by_id = {ob.id: ob for ob in obs}
+
+    act_justificada = Actividad(
+        id=uuid.uuid4(), obligacion_id=obs[0].id, descripcion="Trabajo 1", justificacion="Justificación real 1"
+    )
+    act_con_evidencia = Actividad(id=uuid.uuid4(), obligacion_id=obs[1].id, descripcion="Trabajo 2", justificacion=None)
+    act_con_evidencia.evidencias = [
+        Evidencia(id=uuid.uuid4(), storage_key="k", nombre_archivo="f.jpg", tipo_archivo="image/jpeg", tamano_bytes=1)
+    ]
+    act_sin_nada = Actividad(id=uuid.uuid4(), obligacion_id=obs[2].id, descripcion="Trabajo 3", justificacion=None)
+
+    resultado = await informe_service._generar_docx_clonado(
+        db, plantilla, cuenta_tercera, contrato, [act_justificada, act_con_evidencia, act_sin_nada], obligaciones_by_id
+    )
+
+    assert resultado is not None
+    out = Document(BytesIO(resultado))
+    assert out.tables[0].cell(0, 0).text == "Justificación real 1"
+    assert out.tables[0].cell(1, 0).text == "Trabajo 2"
+    assert out.tables[0].cell(2, 0).text == SENTINEL_SIN_EVIDENCIAS
 
 
 async def test_campos_sin_dato_quedan_en_blanco(

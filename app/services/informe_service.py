@@ -52,6 +52,7 @@ from app.models.plantilla_organismo import PlantillaOrganismo
 from app.models.usuario import Usuario
 from app.schemas.agent import LLMMessage
 from app.services import document_service, secret_scan_service
+from app.services.informe_constants import SENTINEL_SIN_EVIDENCIAS, SENTINEL_SIN_EVIDENCIAS_TERCERA_PERSONA
 
 logger = structlog.get_logger("service.informe")
 
@@ -553,9 +554,10 @@ async def _valores_plantilla(db: AsyncSession, cuenta: CuentaCobro, contrato: Co
         "computed.valor_total_con_adiciones": _formato_valor_pesos(total_con_adiciones),
         "computed.valor_letras": valor_en_letras(valor_cuota),
         "computed.cuota_ordinal_letras": ordinal_letras(numero_cuota),
-        # Documento Soporte consecutive (xlsx clone, phase 4): user-supplied per
-        # cuota, no source field exists yet — always omitted so fill-time skips it.
-        "cuota.consecutivo_ds": None,
+        # Documento Soporte consecutive (xlsx clone, phase 4; G4 migration 034):
+        # user-supplied per cuota via CuentaCobro.consecutivo_ds — omitted (None)
+        # when not set, so fill-time skips the campo (existing blank-field behavior).
+        "cuota.consecutivo_ds": cuenta.consecutivo_ds,
     }
     return {k: v for k, v in valores.items() if v}
 
@@ -619,18 +621,31 @@ def _justificaciones_tercera_por_orden(
 ) -> dict[int, str]:
     """Third-person justification text per obligación orden (1-based), from the
     `_convertir_actividades_tercera_persona` overrides — for the cloned
-    supervisión path."""
+    supervisión path.
+
+    An actividad with no justificación AND whose obligación has no evidencia
+    is exempted from the LLM tercera-persona conversion — the sentinel is a
+    fixed deterministic string, not user prose, and the LLM could mangle its
+    exact wording. It renders as `SENTINEL_SIN_EVIDENCIAS_TERCERA_PERSONA`
+    directly instead.
+    """
     actividades_por_ob: dict[uuid.UUID | None, list[Actividad]] = {}
     for act in actividades_visibles:
         actividades_por_ob.setdefault(act.obligacion_id, []).append(act)
 
     por_orden: dict[int, str] = {}
     for n, ob in enumerate(sorted(obligaciones_by_id.values(), key=lambda o: o.orden), start=1):
+        acts_ob = actividades_por_ob.get(ob.id, [])
+        tiene_evidencia = any(act.evidencias for act in acts_ob)
         partes: list[str] = []
-        for act in actividades_por_ob.get(ob.id, []):
-            ov = overrides.get(act.id)
-            texto = (ov[1] if ov[1] and ov[1] != "—" else ov[0]) if ov else (act.justificacion or act.descripcion)
-            texto = (texto or "").strip()
+        for act in acts_ob:
+            justificacion = (act.justificacion or "").strip()
+            if justificacion == SENTINEL_SIN_EVIDENCIAS or (not justificacion and not tiene_evidencia):
+                texto = SENTINEL_SIN_EVIDENCIAS_TERCERA_PERSONA
+            else:
+                ov = overrides.get(act.id)
+                texto = (ov[1] if ov[1] and ov[1] != "—" else ov[0]) if ov else (act.justificacion or act.descripcion)
+                texto = (texto or "").strip()
             if texto:
                 partes.append(texto)
         if partes:
@@ -696,10 +711,26 @@ async def _generar_docx_clonado(
             if justificaciones_override is not None and n in justificaciones_override:
                 texto = justificaciones_override[n]
             else:
-                partes = [
-                    (act.justificacion or act.descripcion or "").strip() for act in actividades_por_ob.get(ob.id, [])
-                ]
-                texto = "\n\n".join(p for p in partes if p)
+                acts_ob = actividades_por_ob.get(ob.id, [])
+                # An obligación with no evidencia anywhere and no written
+                # justificación would otherwise echo `act.descripcion` here —
+                # meaningless in a real informe (it just repeats the
+                # obligación's own seeded activity text). Render the sentinel
+                # instead; keep the descripcion fallback ONLY when the
+                # obligación has real evidencia (unchanged prior behavior).
+                tiene_evidencia = any(act.evidencias for act in acts_ob)
+                partes: list[str] = []
+                for act in acts_ob:
+                    justificacion = (act.justificacion or "").strip()
+                    if justificacion:
+                        partes.append(justificacion)
+                    elif not tiene_evidencia:
+                        partes.append(SENTINEL_SIN_EVIDENCIAS)
+                    else:
+                        descripcion = (act.descripcion or "").strip()
+                        if descripcion:
+                            partes.append(descripcion)
+                texto = "\n\n".join(partes)
             if texto:
                 valores[f"justificacion.{n}"] = texto
 
@@ -1200,6 +1231,7 @@ async def _agregar_documentos_contrato(
     cuenta: CuentaCobro,
     miembros_zip: list[tuple[str, bytes]],
     miembros_scan: list[tuple[str, bytes]],
+    omitir_codigos: set[str] | frozenset[str] = frozenset(),
 ) -> None:
     """DOCUMENTOS_CONTRATO/ section of the paquete (clasificacion-documentos-secop, D5).
 
@@ -1208,6 +1240,9 @@ async def _agregar_documentos_contrato(
       (uploads via storage, SECOP via ``url_descarga``).
     - ``DOCUMENTOS_CONTRATO/CONTEXTO/``: remaining context docs
       (``listar_documentos_contexto`` — OTROS/unmapped, unlinked).
+    - ``omitir_codigos``: requisito codes excluded from the package — the caller
+      passes the catalog's ``solo_primera_cuenta`` codes on a non-first cuota
+      (differential package: those docs were already radicated with cuota 1).
 
     Same skip-on-error semantics as the evidencias section: one failing download
     never sinks the package. Every added member also joins ``miembros_scan`` so
@@ -1264,6 +1299,8 @@ async def _agregar_documentos_contrato(
         codigo = fila.requisito_codigo
         if codigo is None or not checklist_service.es_nivel_contrato(codigo):
             continue
+        if codigo in omitir_codigos:
+            continue  # first-cuota-only doc on a later cuota — already radicated in cuota 1
         for v in fila.vinculos:
             if v.documento_fuente is not None:
                 nombre = v.documento_fuente.nombre
@@ -1288,6 +1325,92 @@ async def _agregar_documentos_contrato(
         if contenido is None:
             continue
         await _agregar_miembro(f"DOCUMENTOS_CONTRATO/CONTEXTO/{_safe_dirname(nombre, max_len=150)}", contenido, nombre)
+
+
+async def _hay_plantilla_organismo(db: AsyncSession, contrato: Contrato, tipo_documento: str) -> bool:
+    """Whether this organism's ingested plantilla actually satisfies its generator's
+    real preconditions — not just "a plantilla row exists". Mirrors:
+    - `generar_cuenta_cobro_docx` (tipo_documento="cuenta_cobro"): plantilla + clonable.
+    - `generar_documento_soporte_xlsx` (tipo_documento="documento_soporte"): plantilla +
+      clonable + formato xlsx + non-empty campos + fuente_documento_id.
+
+    A plantilla that exists but fails these must be pre-check-skipped with the
+    truthful "Sin plantilla..." aviso — not fall through to the generic
+    "No se pudo generar" failure AVISO in `_generar_documentos_paquete`.
+    """
+    plantilla = await _resolver_layout_organismo(db, contrato, tipo_documento)
+    if plantilla is None:
+        return False
+    estructura = plantilla.estructura_json or {}
+    if not estructura.get("clonable"):
+        return False
+    if tipo_documento == "documento_soporte":
+        return bool(plantilla.formato == "xlsx" and estructura.get("campos") and plantilla.fuente_documento_id)
+    return True
+
+
+async def _generar_documentos_paquete(
+    db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: uuid.UUID, contrato: Contrato
+) -> tuple[list[tuple[str, bytes]], list[str]]:
+    """Root-level generated documents of the radicated package, numbered like the
+    real approved packages (1. CUENTA DE COBRO ... 4. DOCUMENTO SOPORTE).
+
+    Reuses EXACTLY the generators behind the download endpoints. Clone-only
+    documents (cuenta de cobro / documento soporte) only exist as the organism's
+    ingested plantilla — when none is ingested (a NORMAL state, not a failure)
+    they are skipped up front with a truthful "Sin plantilla" line pointing at
+    the plantilla ingestion, not at a re-download that would hit the same error.
+    Genuine generation errors (clone error, LLM failure, ...) stay FAIL-OPEN per
+    document: they skip ONLY that file and yield the "No se pudo generar" AVISO.
+    Packaging never fails because a generated document failed. Returns
+    ``(miembros, avisos)``.
+    """
+    # (arcname, generator, clone-only plantilla tipo — None for docs with a built-from-scratch fallback)
+    generadores = [
+        ("1. CUENTA DE COBRO.docx", generar_cuenta_cobro_docx, "cuenta_cobro"),
+        ("2. INFORME DE ACTIVIDADES.docx", generar_informe_actividades_docx, None),
+        ("3. INFORME DE SUPERVISION.docx", generar_informe_supervision_docx, None),
+        ("4. DOCUMENTO SOPORTE.xlsx", generar_documento_soporte_xlsx, "documento_soporte"),
+    ]
+    miembros: list[tuple[str, bytes]] = []
+    avisos: list[str] = []
+    for arcname, generador, tipo_clone_only in generadores:
+        if tipo_clone_only is not None and not await _hay_plantilla_organismo(db, contrato, tipo_clone_only):
+            avisos.append(
+                f"Sin plantilla del organismo para {arcname} — "
+                "ingresá la plantilla en el paso Formato para incluirlo en el paquete."
+            )
+            continue
+        try:
+            contenido, _filename = await generador(db, usuario_id, cuenta_id)
+        except Exception as exc:  # one failed generated doc must not sink the package
+            await logger.awarning(
+                "zip_documento_generado_fallo", cuenta_id=str(cuenta_id), documento=arcname, error=str(exc)
+            )
+            avisos.append(f"AVISO: No se pudo generar {arcname} — descargalo por separado desde el paso Formato.")
+            continue
+        miembros.append((arcname, contenido))
+    return miembros, avisos
+
+
+def get_evidencia_storage() -> object:
+    """Storage adapter for evidencia BYTES (photos, PDFs, etc. attached to an
+    actividad) — same bucket the upload endpoints write to (`S3_BUCKET_PDFS`,
+    see `api.deps.get_pdf_storage`). Every evidencia-bytes READ must go through
+    this helper so the read bucket can never silently drift from the upload
+    bucket again: it previously pointed at `S3_BUCKET_EVIDENCIAS`, which the
+    upload endpoints never write to, so every uploaded evidencia was fetched
+    with a wrong key prefix, failed with `FileNotFoundError`, and was dropped
+    from the generated ZIP by the fail-open `except` below — silently, since
+    that fallback only logs a warning.
+
+    `S3_BUCKET_EVIDENCIAS` remains correct for the PACKAGE ARTIFACT itself
+    (the generated zip stored under `paquetes/...` — see
+    `radicacion_prep_service.preparar_radicacion`, `paquete_service`,
+    `tools/catalog/paquete.py`). Do not repoint those; only evidencia-bytes
+    reads belong behind this helper.
+    """
+    return _get_storage(settings.S3_BUCKET_PDFS)
 
 
 async def generar_zip_evidencias(
@@ -1326,7 +1449,39 @@ async def generar_zip_evidencias(
     estados = _calcular_estado_obligaciones(obligaciones, actividades_por_ob)
     pendientes_desc = [e.descripcion for e in estados if not e.listo]
 
-    storage = _get_storage(settings.S3_BUCKET_EVIDENCIAS)
+    # Ground truth (real approved SYJ cuotas): partial evidencia coverage is the
+    # NORM, not a defect — an obligación with no evidencia files still radicates
+    # fine as long as SOME actividad carries a real justificación (the sentinel
+    # or user-written text). The LEEME LISTO/PENDIENTE split above stays
+    # evidence-based (unchanged); this separate split decides the modo="final"
+    # gate below and only blocks obligaciones with NEITHER evidencia NOR
+    # justificación.
+    def _tiene_justificacion(ob_id: uuid.UUID | None) -> bool:
+        return any((act.justificacion or "").strip() for act in actividades_por_ob.get(ob_id, []))
+
+    justificadas_sin_evidencia_desc = [
+        e.descripcion for e in estados if not e.listo and _tiene_justificacion(e.obligacion_id)
+    ]
+    sin_evidencia_ni_justificacion_desc = [
+        e.descripcion for e in estados if not e.listo and not _tiene_justificacion(e.obligacion_id)
+    ]
+
+    # Generated documents at the package root (ground truth: the real radicated
+    # bundle carries them alongside evidencias + contract docs). Generated BEFORE
+    # the root LEEME so it can report which are included / pending.
+    docs_generados, avisos_generados = await _generar_documentos_paquete(db, usuario_id, cuenta_id, contrato)
+
+    # Differential package: on a non-first cuota, first-cuota-only contract docs
+    # (catalog rows with solo_primera_cuenta) were already radicated with cuota 1.
+    # "First" reuses the checklist's own persisted-posicion predicate.
+    from app.services import checklist_service
+
+    codigos_solo_primera: set[str] = set()
+    if not checklist_service._is_first_cuenta(cuenta):
+        catalogo = await checklist_service.listar_catalogo(db)
+        codigos_solo_primera = {req.codigo for req in catalogo if req.solo_primera_cuenta}
+
+    storage = get_evidencia_storage()
 
     miembros_zip: list[tuple[str, bytes]] = []
     miembros_scan: list[tuple[str, bytes]] = []
@@ -1363,8 +1518,38 @@ async def generar_zip_evidencias(
         root_readme_lines += [f"  - {d}" for d in pendientes_desc]
     else:
         root_readme_lines.append("Obligaciones SIN evidencia (PENDIENTE): (ninguna)")
+    if justificadas_sin_evidencia_desc:
+        # Clarifies the split above: these PENDIENTE-by-evidencia obligaciones
+        # are still radicables — they carry a justificación (sentinel or texto
+        # propio) that satisfies the modo="final" gate on its own.
+        root_readme_lines.append("  (de las anteriores, justificadas sin evidencia — no bloquean la radicación):")
+        root_readme_lines += [f"    - {d}" for d in justificadas_sin_evidencia_desc]
+    root_readme_lines += [
+        "",
+        "Documentos generados (raíz del paquete)",
+        "========================================",
+        "",
+    ]
+    if docs_generados:
+        root_readme_lines += [f"  - {arcname}" for arcname, _contenido in docs_generados]
+    else:
+        root_readme_lines.append("  (ninguno)")
+    root_readme_lines += avisos_generados
+    if codigos_solo_primera:
+        root_readme_lines += [
+            "",
+            "Documentos de primera cuota omitidos: ya radicados en la cuota 1 ("
+            + ", ".join(sorted(codigos_solo_primera))
+            + ").",
+        ]
     root_readme_lines.append("")
     _agregar_texto("LEEME.txt", "\n".join(root_readme_lines))
+
+    for arcname, contenido in docs_generados:
+        miembros_zip.append((arcname, contenido))
+        texto_scan = await _texto_para_scan(contenido, arcname)
+        if texto_scan:
+            miembros_scan.append((arcname, texto_scan.encode("utf-8")))
 
     if not obligaciones:
         _agregar_texto(
@@ -1400,6 +1585,12 @@ async def generar_zip_evidencias(
                 lines.append("")
         else:
             lines.append("(sin actividades reportadas)")
+            lines.append("")
+        # Link-only evidencias carry no bytes to package — document them here.
+        enlaces = [ev for act in acts for ev in act.evidencias if ev.storage_key is None and ev.url]
+        if enlaces:
+            lines.append("Enlaces:")
+            lines += [f"- {ev.fuente or 'enlace'}: {ev.url}" for ev in enlaces]
             lines.append("")
         lines += [
             "Coloque aquí los archivos de soporte (correos, capturas, PDFs,",
@@ -1443,7 +1634,7 @@ async def generar_zip_evidencias(
 
     # Contract-level docs ship classified in the paquete (D5) — before the scan
     # gate so every new member is covered by it.
-    await _agregar_documentos_contrato(db, cuenta, miembros_zip, miembros_scan)
+    await _agregar_documentos_contrato(db, cuenta, miembros_zip, miembros_scan, omitir_codigos=codigos_solo_primera)
 
     if settings.SECRET_SCAN_GATE_ENABLED:
         hallazgos = await secret_scan_service.escanear_paquete(miembros_scan)
@@ -1461,9 +1652,10 @@ async def generar_zip_evidencias(
                 code=SECRET_DETECTED_IN_PACKAGE,
             )
 
-    if modo == "final" and pendientes_desc:
+    if modo == "final" and sin_evidencia_ni_justificacion_desc:
         raise ValidationError(
-            f"No se puede finalizar la radicación: {len(pendientes_desc)} obligación(es) sin evidencia.",
+            f"No se puede finalizar la radicación: {len(sin_evidencia_ni_justificacion_desc)} "
+            "obligación(es) sin evidencia ni justificación.",
             code=PACKAGE_PENDIENTE,
         )
 

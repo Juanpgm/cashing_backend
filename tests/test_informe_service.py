@@ -282,6 +282,72 @@ async def test_zip_evidencias_usa_bytes_reales_de_storage(
     storage.download.assert_any_call(ev.storage_key)
 
 
+async def test_zip_evidencias_incluye_bytes_subidos_por_el_seam_real(
+    db: AsyncSession,
+    test_user: dict[str, Any],
+    cuenta: CuentaCobro,
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for the evidencia-bytes bucket mismatch: uploads a real file
+    through `evidencia_service.subir_evidencias` with the SAME storage seam the
+    upload endpoints use (`get_storage(settings.S3_BUCKET_PDFS)`, mirroring
+    `api.deps.get_pdf_storage`), then calls `generar_zip_evidencias` with NO
+    storage mock at all — the real `get_evidencia_storage()` must resolve to
+    the same bucket, or the file silently goes missing from the zip (the exact
+    bug: the packager used to read `S3_BUCKET_EVIDENCIAS`, a bucket the upload
+    endpoints never write to).
+
+    `test_zip_evidencias_usa_bytes_reales_de_storage` above could NOT have
+    caught this: it monkeypatches `_get_storage` with a bucket-agnostic fake
+    that returns the same object regardless of which bucket string is passed.
+    """
+    from app.adapters.storage import get_storage
+    from app.services import evidencia_service
+
+    monkeypatch.setattr(settings, "STORAGE_PROVIDER", "local")
+    monkeypatch.setattr(settings, "LOCAL_STORAGE_PATH", str(tmp_path))
+
+    user = test_user["user"]
+    res = await db.execute(
+        select(Actividad).where(Actividad.cuenta_cobro_id == cuenta.id).order_by(Actividad.fecha_realizacion.asc())
+    )
+    act = res.scalars().first()
+    assert act is not None
+
+    # `.bin` has no registered magic-byte signature (`_EXT_TO_MIME` in
+    # `file_validation.py`) — evidencia accepts any extension outside the
+    # blocklist, so arbitrary bytes are valid here without faking a real
+    # JPEG header.
+    contenido_real = b"contenido-binario-real-subido-por-el-endpoint"
+    upload_storage = get_storage(settings.S3_BUCKET_PDFS)
+    subidas = await evidencia_service.subir_evidencias(
+        db=db,
+        storage=upload_storage,
+        usuario_id=user.id,
+        actividad_id=act.id,
+        archivos=[("foto.bin", "application/octet-stream", contenido_real)],
+    )
+    storage_key = subidas[0].storage_key
+
+    # `Actividad.evidencias` is `lazy="selectin"` — the query above already
+    # loaded (and cached, empty) that collection on this same session's
+    # identity-mapped `act`. Expire just that attribute so
+    # `generar_zip_evidencias`'s own query re-fetches it instead of reusing
+    # the stale pre-upload snapshot (a same-session-reuse test artifact; a
+    # real request always gets a fresh session per call). `expire_all()`
+    # would be too broad here — it forces implicit lazy-loads outside an
+    # awaited context elsewhere in the call chain (`MissingGreenlet`).
+    db.expire(act, ["evidencias"])
+
+    content, _filename = await informe_service.generar_zip_evidencias(db, user.id, cuenta.id)
+
+    with zipfile.ZipFile(io.BytesIO(content)) as zf:
+        arcnames = [n for n in zf.namelist() if "evidencias/" in n and "foto.bin" in n]
+        assert arcnames, f"uploaded evidencia {storage_key} missing from zip — packager read the wrong bucket"
+        assert zf.read(arcnames[0]) == contenido_real
+
+
 async def test_resolver_estructura_organismo_returns_none_when_not_ingested(
     db: AsyncSession, contrato: Contrato
 ) -> None:
@@ -401,29 +467,67 @@ async def test_zip_evidencias_modo_final_raises_package_pendiente(
     cuenta: CuentaCobro,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """No evidencia AND no justificación on any obligación → still PACKAGE_PENDIENTE
+    (ground truth fix: a bare absence of evidencia alone is NOT blocking — see
+    `test_zip_evidencias_modo_final_justificacion_sin_evidencia_emite_zip` below)."""
     user = test_user["user"]
     monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: _fake_storage())
+    res = await db.execute(
+        select(Actividad).where(Actividad.cuenta_cobro_id == cuenta.id).order_by(Actividad.fecha_realizacion.asc())
+    )
+    for act in res.scalars().all():
+        act.justificacion = ""
+    await db.commit()
 
     with pytest.raises(ValidationError) as exc_info:
         await informe_service.generar_zip_evidencias(db, user.id, cuenta.id, modo="final")
     assert exc_info.value.code == "PACKAGE_PENDIENTE"
 
 
-async def test_zip_evidencias_modo_final_sin_pendientes_emite_zip(
+async def test_zip_evidencias_modo_final_justificacion_sin_evidencia_emite_zip(
     db: AsyncSession,
     test_user: dict[str, Any],
     cuenta: CuentaCobro,
     actividad_con_evidencia: Actividad,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Only the first obligación has evidence in this fixture — modo="final" must
-    still raise PACKAGE_PENDIENTE for the remaining pending obligaciones."""
+    """Obligación 1 has evidencia; obligaciones 2/3 only carry justificación text
+    (no evidencia, from the base `cuenta` fixture) — modo="final" must still
+    emit the package: real approved cuentas radicate with partial evidencia
+    coverage as long as every obligación has evidencia OR a justificación."""
     user = test_user["user"]
     monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: _fake_storage())
+
+    content, filename = await informe_service.generar_zip_evidencias(db, user.id, cuenta.id, modo="final")
+
+    assert filename.endswith(".zip")
+    with zipfile.ZipFile(io.BytesIO(content)) as zf:
+        root = zf.read("LEEME.txt").decode("utf-8")
+        assert "justificadas sin evidencia" in root
+
+
+async def test_zip_evidencias_modo_final_obligacion_sin_nada_bloquea_aunque_otras_justificadas(
+    db: AsyncSession,
+    test_user: dict[str, Any],
+    cuenta: CuentaCobro,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mixed cuenta: 2 obligaciones keep their justificación (base fixture), the
+    3rd is blanked to neither evidencia nor justificación — modo="final" must
+    still raise PACKAGE_PENDIENTE for that one obligación."""
+    user = test_user["user"]
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: _fake_storage())
+    res = await db.execute(
+        select(Actividad).where(Actividad.cuenta_cobro_id == cuenta.id).order_by(Actividad.fecha_realizacion.asc())
+    )
+    actos = res.scalars().all()
+    actos[-1].justificacion = ""
+    await db.commit()
 
     with pytest.raises(ValidationError) as exc_info:
         await informe_service.generar_zip_evidencias(db, user.id, cuenta.id, modo="final")
     assert exc_info.value.code == "PACKAGE_PENDIENTE"
+    assert "1 obligación" in str(exc_info.value)
 
 
 async def test_zip_evidencias_secreto_detectado_bloquea_paquete(
@@ -627,6 +731,292 @@ async def test_obtener_estado_listo_pendiente_sin_zip(
     assert len(listos) == 1
     assert estado.pendientes == 2
     assert estado.listo_para_radicar is False
+
+
+# ── Paquete radicado completo (G1 docs generados, G3 enlaces, G5 diferencial) ──
+
+
+def _mock_llm_offline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`generar_informe_supervision_docx` (generated for every paquete) rewrites
+    justificaciones to third person via the LLM — mock it to keep these tests
+    offline and deterministic (fails open if unmocked, but must never hit the
+    network)."""
+    mock_llm = AsyncMock()
+    mock_llm.complete = AsyncMock(return_value=MagicMock(content="Narrativa de prueba."))
+    monkeypatch.setattr(informe_service, "get_llm", lambda: mock_llm)
+
+
+async def test_zip_incluye_informes_generados_en_raiz(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The always-available generated docs (informe de actividades / supervisión)
+    ship at the ZIP root numbered like the real radicated packages; the clone-only
+    docs (cuenta de cobro / documento soporte) have no ingested plantilla here →
+    skipped up front with a truthful "Sin plantilla" line (NOT the failure AVISO,
+    whose re-download advice would hit the same missing-plantilla error)."""
+    user = test_user["user"]
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: _fake_storage())
+    _mock_llm_offline(monkeypatch)
+
+    content, _filename = await informe_service.generar_zip_evidencias(db, user.id, cuenta.id)
+
+    with zipfile.ZipFile(io.BytesIO(content)) as zf:
+        names = zf.namelist()
+        assert "2. INFORME DE ACTIVIDADES.docx" in names
+        assert "3. INFORME DE SUPERVISION.docx" in names
+        # Valid DOCX bytes — the exact same generator the download endpoint uses
+        Document(io.BytesIO(zf.read("2. INFORME DE ACTIVIDADES.docx")))
+        assert "1. CUENTA DE COBRO.docx" not in names  # clone-only, sin plantilla
+        assert "4. DOCUMENTO SOPORTE.xlsx" not in names
+        root = zf.read("LEEME.txt").decode("utf-8")
+        assert "2. INFORME DE ACTIVIDADES.docx" in root
+        assert "Sin plantilla del organismo para 1. CUENTA DE COBRO.docx" in root
+        assert "Sin plantilla del organismo para 4. DOCUMENTO SOPORTE.xlsx" in root
+        assert "AVISO: No se pudo generar" not in root  # normal state, not a failure
+
+
+async def test_zip_incluye_los_cuatro_documentos_cuando_hay_plantillas(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With clonable plantillas for the organism (generators mocked at the same
+    service seam) the package carries all 4 numbered docs and no AVISO."""
+    user = test_user["user"]
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: _fake_storage())
+    _mock_llm_offline(monkeypatch)
+    monkeypatch.setattr(informe_service, "_hay_plantilla_organismo", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        informe_service, "generar_cuenta_cobro_docx", AsyncMock(return_value=(b"docx-cuenta-cobro", "cc.docx"))
+    )
+    monkeypatch.setattr(
+        informe_service, "generar_documento_soporte_xlsx", AsyncMock(return_value=(b"xlsx-soporte", "ds.xlsx"))
+    )
+
+    content, _filename = await informe_service.generar_zip_evidencias(db, user.id, cuenta.id)
+
+    with zipfile.ZipFile(io.BytesIO(content)) as zf:
+        names = zf.namelist()
+        for esperado in (
+            "1. CUENTA DE COBRO.docx",
+            "2. INFORME DE ACTIVIDADES.docx",
+            "3. INFORME DE SUPERVISION.docx",
+            "4. DOCUMENTO SOPORTE.xlsx",
+        ):
+            assert esperado in names
+        assert zf.read("1. CUENTA DE COBRO.docx") == b"docx-cuenta-cobro"
+        assert zf.read("4. DOCUMENTO SOPORTE.xlsx") == b"xlsx-soporte"
+        root = zf.read("LEEME.txt").decode("utf-8")
+        assert "AVISO: No se pudo generar" not in root
+        assert "Sin plantilla del organismo" not in root
+
+
+async def test_zip_plantilla_no_clonable_se_omite_como_sin_plantilla(
+    db: AsyncSession,
+    test_user: dict[str, Any],
+    contrato: Contrato,
+    cuenta: CuentaCobro,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FIX-4: a plantilla ROW that exists but isn't clonable must be treated the same
+    as "no plantilla ingested" — the truthful "Sin plantilla del organismo..." skip,
+    NOT the generic "No se pudo generar" failure AVISO (`generar_cuenta_cobro_docx`
+    itself would raise `ValidationError` on a non-clonable plantilla; the pre-check
+    must predict that instead of letting it fall through to the catch-all)."""
+    from app.core.text_match import normalize
+    from app.models.plantilla_organismo import PlantillaOrganismo
+
+    user = test_user["user"]
+    plantilla = PlantillaOrganismo(
+        usuario_id=user.id,
+        entidad=contrato.entidad,
+        entidad_normalizada=normalize(contrato.entidad),
+        tipo_documento="cuenta_cobro",
+        formato="docx",
+        estructura_json={"clonable": False},
+    )
+    db.add(plantilla)
+    await db.commit()
+
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: _fake_storage())
+    _mock_llm_offline(monkeypatch)
+    spy = AsyncMock(side_effect=AssertionError("generator must not run for a non-clonable plantilla"))
+    monkeypatch.setattr(informe_service, "generar_cuenta_cobro_docx", spy)
+
+    content, _filename = await informe_service.generar_zip_evidencias(db, user.id, cuenta.id)
+
+    spy.assert_not_called()
+    with zipfile.ZipFile(io.BytesIO(content)) as zf:
+        names = zf.namelist()
+        assert "1. CUENTA DE COBRO.docx" not in names
+        root = zf.read("LEEME.txt").decode("utf-8")
+        assert "Sin plantilla del organismo para 1. CUENTA DE COBRO.docx" in root
+        assert "AVISO: No se pudo generar 1. CUENTA DE COBRO.docx" not in root
+
+
+async def test_hay_plantilla_organismo_documento_soporte_requiere_condiciones_completas(
+    db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
+) -> None:
+    """FIX-4: `_hay_plantilla_organismo("documento_soporte")` must mirror
+    `generar_documento_soporte_xlsx`'s FULL precondition (clonable AND formato=xlsx
+    AND non-empty campos AND fuente_documento_id) — a plantilla missing any one of
+    these must read as "no usable plantilla", same as the generator would reject it."""
+    from app.core.text_match import normalize
+    from app.models.plantilla_organismo import PlantillaOrganismo
+
+    user = test_user["user"]
+
+    # clonable=True but no campos + no fuente_documento_id — real generator would raise.
+    plantilla = PlantillaOrganismo(
+        usuario_id=user.id,
+        entidad=contrato.entidad,
+        entidad_normalizada=normalize(contrato.entidad),
+        tipo_documento="documento_soporte",
+        formato="xlsx",
+        estructura_json={"clonable": True},
+    )
+    db.add(plantilla)
+    await db.commit()
+
+    assert await informe_service._hay_plantilla_organismo(db, contrato, "documento_soporte") is False
+
+
+async def test_zip_documento_generado_fallo_no_hunde_paquete(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FAIL-OPEN: a generator raising (e.g. LLM failure) skips ONLY that doc —
+    the package is still emitted and the root LEEME carries the genuine-failure
+    AVISO (wording preserved: this is a real error, not a missing plantilla)."""
+    user = test_user["user"]
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: _fake_storage())
+    _mock_llm_offline(monkeypatch)
+    monkeypatch.setattr(
+        informe_service, "generar_informe_actividades_docx", AsyncMock(side_effect=RuntimeError("LLM caído"))
+    )
+
+    content, filename = await informe_service.generar_zip_evidencias(db, user.id, cuenta.id)
+
+    assert filename.endswith(".zip")
+    with zipfile.ZipFile(io.BytesIO(content)) as zf:
+        names = zf.namelist()
+        assert "2. INFORME DE ACTIVIDADES.docx" not in names
+        assert "3. INFORME DE SUPERVISION.docx" in names  # the healthy doc survives
+        root = zf.read("LEEME.txt").decode("utf-8")
+        assert (
+            "AVISO: No se pudo generar 2. INFORME DE ACTIVIDADES.docx — "
+            "descargalo por separado desde el paso Formato." in root
+        )
+
+
+async def test_zip_documentos_generados_entran_al_secret_scan(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A leak-shaped payload inside a generated root doc must halt the package —
+    the generated docs join the mandatory secret scan exactly like the
+    DOCUMENTOS_CONTRATO members (`test_zip_documentos_contrato_entra_al_secret_scan`)."""
+    user = test_user["user"]
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: _fake_storage())
+    _mock_llm_offline(monkeypatch)
+    monkeypatch.setattr(
+        informe_service,
+        "generar_informe_actividades_docx",
+        AsyncMock(return_value=(_LEAK_CORPUS_TEXTO.encode("utf-8"), "informe.docx")),
+    )
+
+    with pytest.raises(ValidationError) as exc_info:
+        await informe_service.generar_zip_evidencias(db, user.id, cuenta.id)
+    assert exc_info.value.code == "SECRET_DETECTED_IN_PACKAGE"
+
+
+async def test_zip_leeme_obligacion_lista_enlaces_de_evidencias_link(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Link-only evidencias (fuente/url, no storage_key) contribute no bytes —
+    the obligación LEEME documents them under an "Enlaces:" section."""
+    user = test_user["user"]
+    res = await db.execute(
+        select(Actividad).where(Actividad.cuenta_cobro_id == cuenta.id).order_by(Actividad.fecha_realizacion.asc())
+    )
+    act = res.scalars().first()
+    assert act is not None
+    ev = Evidencia(
+        actividad_id=act.id,
+        storage_key=None,
+        nombre_archivo="correo de aprobación",
+        fuente="gmail",
+        url="https://mail.google.com/mail/u/0/#inbox/abc123",
+    )
+    db.add(ev)
+    await db.commit()
+    await db.refresh(act)
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: _fake_storage())
+
+    content, _filename = await informe_service.generar_zip_evidencias(db, user.id, cuenta.id)
+
+    with zipfile.ZipFile(io.BytesIO(content)) as zf:
+        leemes = [n for n in zf.namelist() if n.endswith("LEEME.txt") and "/" in n]
+        body = zf.read(next(n for n in leemes if n.startswith("01_"))).decode("utf-8")
+    assert "Enlaces:" in body
+    assert "- gmail: https://mail.google.com/mail/u/0/#inbox/abc123" in body
+
+
+async def _vincular_cedula(db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro) -> None:
+    """Checklist + an uploaded CEDULA doc linked to its (nivel-contrato,
+    solo_primera_cuenta) checklist row."""
+    from app.models.categoria_documento import CategoriaDocumento
+    from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
+    from app.services import checklist_service
+
+    await checklist_service.asegurar_checklist(db, cuenta)
+    doc = DocumentoFuente(
+        usuario_id=test_user["user"].id,
+        contrato_id=cuenta.contrato_id,
+        storage_key=f"docs/{uuid.uuid4()}/cedula.pdf",
+        nombre="cedula.pdf",
+        tipo=TipoDocumentoFuente.CEDULA,
+        categoria=CategoriaDocumento.CEDULA,
+    )
+    db.add(doc)
+    await db.commit()
+    await checklist_service.vincular_documento_fuente(db, cuenta.id, "CEDULA", doc.id)
+    await db.commit()
+
+
+async def test_zip_omite_docs_solo_primera_en_cuota_no_primera(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Differential package: the fixture cuenta is posicion=RECURRENTE (not first)
+    — solo_primera_cuenta docs (CEDULA...) are omitted and the root LEEME says so."""
+    user = test_user["user"]
+    assert cuenta.posicion == PosicionCuota.RECURRENTE
+    await _vincular_cedula(db, test_user, cuenta)
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: _fake_storage())
+
+    content, _filename = await informe_service.generar_zip_evidencias(db, user.id, cuenta.id)
+
+    with zipfile.ZipFile(io.BytesIO(content)) as zf:
+        names = zf.namelist()
+        root = zf.read("LEEME.txt").decode("utf-8")
+    assert not any(n.startswith("DOCUMENTOS_CONTRATO/CEDULA/") for n in names)
+    assert "Documentos de primera cuota omitidos: ya radicados en la cuota 1" in root
+    assert "CEDULA" in root
+
+
+async def test_zip_incluye_docs_solo_primera_en_cuota_primera(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On the first cuota the solo_primera docs ship normally — no omission note."""
+    user = test_user["user"]
+    cuenta.posicion = PosicionCuota.PRIMERA
+    await db.commit()
+    await _vincular_cedula(db, test_user, cuenta)
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: _fake_storage())
+
+    content, _filename = await informe_service.generar_zip_evidencias(db, user.id, cuenta.id)
+
+    with zipfile.ZipFile(io.BytesIO(content)) as zf:
+        names = zf.namelist()
+        root = zf.read("LEEME.txt").decode("utf-8")
+    assert "DOCUMENTOS_CONTRATO/CEDULA/cedula.pdf" in names
+    assert "Documentos de primera cuota omitidos" not in root
 
 
 # ── Adaptive generation (billing-resilience-templates, slice #6) ───────────

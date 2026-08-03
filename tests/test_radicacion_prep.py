@@ -10,12 +10,15 @@ Mirrors the fixture/mocking conventions of `tests/test_coherence_gate.py` and
 
 from __future__ import annotations
 
+import io
+import zipfile
 from datetime import date
 from typing import Any
 from unittest.mock import AsyncMock
 
 import app.tools.catalog  # noqa: F401 — import-for-side-effect: registers every catalog tool
 import pytest
+from app.core.config import settings
 from app.core.exceptions import ValidationError
 from app.models.actividad import Actividad
 from app.models.contrato import Contrato
@@ -181,6 +184,93 @@ async def test_preparar_radicacion_full_success_returns_package_location_and_lis
     assert resultado.advertencias_coherencia == []
     assert resultado.es_borrador is True
     storage.upload.assert_awaited_once()
+
+
+async def test_preparar_radicacion_evidencia_bucket_consistency_no_mock(
+    db: AsyncSession,
+    client: AsyncClient,
+    test_user: dict[str, Any],
+    contrato: Contrato,
+    obligacion: Obligacion,
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end regression: NO storage mock anywhere in this test.
+
+    Uploads evidencia bytes through the real production seam
+    (`evidencia_service.subir_evidencias` + `get_storage(S3_BUCKET_PDFS)`,
+    exactly what the `/evidencias/...` upload endpoints use), then runs the
+    full `preparar_radicacion` orchestrator and asserts:
+
+    1. The uploaded bytes reach the generated package (the packager's
+       evidencia-bytes READ must resolve to the same bucket the upload wrote
+       to — `informe_service.get_evidencia_storage()`).
+    2. The FINAL package artifact write target is UNCHANGED: still uploaded to
+       `S3_BUCKET_EVIDENCIAS` under `paquetes/...` — package-artifact writes
+       are intentionally untouched by this fix.
+    """
+    from app.adapters.storage import get_storage
+    from app.services import evidencia_service
+
+    monkeypatch.setattr(settings, "STORAGE_PROVIDER", "local")
+    monkeypatch.setattr(settings, "LOCAL_STORAGE_PATH", str(tmp_path))
+
+    cuenta = await _make_cuenta(db, contrato, mes=3)
+    await _completar_checklist(client, test_user["headers"], cuenta.id)
+
+    act = Actividad(
+        cuenta_cobro_id=cuenta.id,
+        obligacion_id=obligacion.id,
+        descripcion="Actividad realizada",
+        justificacion="Justificación",
+        fecha_realizacion=date(2024, 3, 10),
+    )
+    db.add(act)
+    await db.commit()
+    await db.refresh(act)
+
+    # `.bin` has no registered magic-byte signature — evidencia accepts any
+    # extension outside the blocklist, so plain bytes pass validation here.
+    contenido_real = b"contenido-binario-real-subido-por-el-endpoint"
+    upload_storage = get_storage(settings.S3_BUCKET_PDFS)
+    await evidencia_service.subir_evidencias(
+        db=db,
+        storage=upload_storage,
+        usuario_id=test_user["user"].id,
+        actividad_id=act.id,
+        archivos=[("foto.bin", "application/octet-stream", contenido_real)],
+    )
+
+    # Both `CuentaCobro.actividades` and `Actividad.evidencias` are
+    # `lazy="selectin"` and got cached (empty, or missing this `act` entirely)
+    # on this same session's identity-mapped objects by earlier queries
+    # (`_completar_checklist` ran before `act`/its evidencia existed). Expire
+    # just those two attributes so the packager's own query re-fetches them
+    # instead of reusing the stale pre-upload snapshot — a same-session-reuse
+    # test artifact; a real request always gets a fresh session per call.
+    # `expire_all()` would be too broad — it forces implicit lazy-loads
+    # outside an awaited context elsewhere in the call chain
+    # (`MissingGreenlet`).
+    db.expire(cuenta, ["actividades"])
+    db.expire(act, ["evidencias"])
+
+    resultado = await radicacion_prep_service.preparar_radicacion(db, test_user["user"].id, cuenta.id)
+
+    assert resultado.listo_para_radicar is True
+    assert resultado.pendientes == 0
+
+    # 2. Package artifact write target is UNCHANGED: still S3_BUCKET_EVIDENCIAS.
+    assert resultado.storage_key.startswith("paquetes/")
+    paquetes_storage = get_storage(settings.S3_BUCKET_EVIDENCIAS)
+    paquete_bytes = await paquetes_storage.download(resultado.storage_key)
+    assert len(paquete_bytes) > 0
+
+    # 1. Evidencia bytes reached the package (the actual bug: previously
+    # silently dropped because the packager read the wrong bucket).
+    with zipfile.ZipFile(io.BytesIO(paquete_bytes)) as zf:
+        arcnames = [n for n in zf.namelist() if "foto.bin" in n]
+        assert arcnames, "uploaded evidencia bytes missing from the radicated package"
+        assert zf.read(arcnames[0]) == contenido_real
 
 
 # ── Checklist gate (runs FIRST) ──────────────────────────────────────────────

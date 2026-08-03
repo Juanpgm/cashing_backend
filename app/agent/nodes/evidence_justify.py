@@ -22,6 +22,7 @@ from app.agent.prompts.actividad_generation import (
 from app.agent.prompts.evidence_justification import format_evidencias_for_prompt
 from app.agent.state import AgentState
 from app.schemas.agent import LLMMessage
+from app.services.informe_constants import SENTINEL_SIN_EVIDENCIAS
 
 logger = structlog.get_logger("agent.nodes.evidence_justify")
 
@@ -164,9 +165,14 @@ async def evidence_justify_node(state: AgentState) -> AgentState:
         ob_texto = _obligation_text(ob)
         evidencias = matched.get(ob_id, [])
 
-        actividad, justificacion = await _generate_actividad_justificacion(
-            ob_texto, evidencias, contrato_contexto, actividades_previas, contexto_usuario
-        )
+        if not evidencias:
+            # Sin evidencia para esta obligación en el período: sentinel determinístico,
+            # sin gastar una llamada LLM (que solo produciría meta-texto sobre la ausencia).
+            actividad, justificacion = _deterministic_actividad(evidencias), SENTINEL_SIN_EVIDENCIAS
+        else:
+            actividad, justificacion = await _generate_actividad_justificacion(
+                ob_texto, evidencias, contrato_contexto, actividades_previas, contexto_usuario
+            )
         justificaciones.append(
             {
                 "obligacion_id": ob_id,

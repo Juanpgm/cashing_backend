@@ -65,11 +65,14 @@ async def test_evidence_justify_generates_text_and_links():
 
 
 @pytest.mark.asyncio
-async def test_evidence_justify_no_evidence_uses_fallback():
+async def test_evidence_justify_no_evidence_uses_sentinel_without_llm_call():
+    """Zero evidencias for the period → deterministic sentinel verbatim, LLM never invoked
+    (previously the LLM was called anyway and produced useless meta-text about the
+    absence of evidence)."""
     from app.agent.nodes import evidence_justify as mod
 
     mock_llm = AsyncMock()
-    mock_llm.complete = AsyncMock(side_effect=RuntimeError("llm down"))
+    mock_llm.complete = AsyncMock(side_effect=AssertionError("LLM must not be called with 0 evidencias"))
 
     state = {
         "obligaciones_contexto": [{"id": "ob1", "descripcion": "Asistir a reuniones"}],
@@ -80,7 +83,8 @@ async def test_evidence_justify_no_evidence_uses_fallback():
         result = await mod.evidence_justify_node(state)
 
     assert result["justificaciones"][0]["evidencias"] == []
-    assert "No se encontraron evidencias" in result["justificaciones"][0]["justificacion"]
+    assert result["justificaciones"][0]["justificacion"] == mod.SENTINEL_SIN_EVIDENCIAS
+    mock_llm.complete.assert_not_called()
     # Fallback actividad must never echo the obligación's own text.
     assert result["justificaciones"][0]["actividad"] != "Asistir a reuniones"
     assert result["justificaciones"][0]["actividad"] != result["justificaciones"][0]["justificacion"]
