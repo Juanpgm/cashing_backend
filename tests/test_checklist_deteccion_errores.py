@@ -102,7 +102,11 @@ async def test_detectar_desde_secop_isolates_per_requisito_failures(
             id_documento_secop="DOC-RPC-OK",
             numero_contrato=contrato.numero_contrato,
             nombre_archivo="Registro Presupuestal RPC 123.pdf",
-            descripcion="RPC",
+            # Mentions "compromiso presupuestal" too (RPC = Registro Presupuestal del
+            # Compromiso) so this genuinely hits 3/4 RPC keywords post-R1 boundary
+            # matching (word-boundary "rpc" hit no longer double-counts a bare "rp"
+            # substring inside "rpc" the way pre-R1 substring matching did).
+            descripcion="RPC - Compromiso Presupuestal",
             datos_raw={},
         )
     )
