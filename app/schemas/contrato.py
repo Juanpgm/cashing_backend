@@ -39,6 +39,12 @@ class ObligacionResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class VincularSecopDocumentoRequest(BaseModel):
+    """Body for POST /contratos/{id}/vincular-secop-documento."""
+
+    secop_documento_id: uuid.UUID
+
+
 class ContratoCreate(BaseModel):
     numero_contrato: str = Field(min_length=1, max_length=100)
     objeto: str = Field(min_length=10, max_length=2000)

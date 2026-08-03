@@ -19,7 +19,11 @@ from __future__ import annotations
 from alembic import op
 
 revision = "032_categoria_cdp"
-down_revision = "031_clasificacion_job"
+# Linearized after 032_contrato_obligaciones_extraidas (both branched off
+# 031_clasificacion_job pre-merge, creating two alembic heads). Chaining here
+# keeps a single head (033_sniff_contenido) so `alembic upgrade head` / make
+# migrate / CI / fresh Postgres do not fail with "Multiple head revisions".
+down_revision = "032_contrato_obligaciones_extraidas"
 branch_labels = None
 depends_on = None
 

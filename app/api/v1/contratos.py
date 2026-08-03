@@ -21,6 +21,7 @@ from app.schemas.contrato import (
     ObligacionCreate,
     ObligacionResponse,
     PeriodoPendienteResponse,
+    VincularSecopDocumentoRequest,
 )
 from app.schemas.documento_fuente import ContratoConfiguracionResponse
 from app.services import contrato_service, document_service, semantic_search_service
@@ -164,6 +165,31 @@ async def extraer_obligaciones(
     """
     obligaciones, avisos = await document_service.extraer_obligaciones_documento(
         contrato_id, user.id, db
+    )
+    return ObligacionesExtraerResponse(
+        contrato_id=contrato_id,
+        obligaciones=obligaciones,
+        total=len(obligaciones),
+        avisos=avisos,
+    )
+
+
+@router.post("/{contrato_id}/vincular-secop-documento", response_model=ObligacionesExtraerResponse)
+async def vincular_secop_documento(
+    contrato_id: uuid.UUID,
+    data: VincularSecopDocumentoRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ObligacionesExtraerResponse:
+    """Vincula manualmente un documento SECOP al contrato y extrae sus obligaciones.
+
+    Recovery path para un contrato importado de SECOP sin obligaciones: valida que
+    el documento pertenezca al contrato (mismo `numero_contrato`), descarga y
+    extrae su texto, y corre el mismo pipeline de extracción de
+    `POST /{id}/obligaciones/extraer`. Repetir la llamada no duplica obligaciones.
+    """
+    obligaciones, avisos = await contrato_service.vincular_secop_documento(
+        db, user.id, contrato_id, data.secop_documento_id
     )
     return ObligacionesExtraerResponse(
         contrato_id=contrato_id,

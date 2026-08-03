@@ -13,10 +13,11 @@ from sqlalchemy.orm import selectinload
 from app.core.exceptions import NotFoundError, ValidationError
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
-from app.models.secop import SecopContrato
+from app.models.secop import SecopContrato, SecopDocumento
 from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
 from app.models.obligacion import Obligacion
 from app.models.usuario import Usuario
+from app.schemas.agent import ObligacionExtraida
 from app.schemas.contrato import (
     ContratoContextoAgenteResponse,
     ContratoCreate,
@@ -520,3 +521,40 @@ async def obtener_contexto_agente(
         listo=listo,
         faltantes=faltantes,
     )
+
+
+async def vincular_secop_documento(
+    db: AsyncSession,
+    usuario_id: uuid.UUID,
+    contrato_id: uuid.UUID,
+    secop_documento_id: uuid.UUID,
+) -> tuple[list[ObligacionExtraida], list[str]]:
+    """Manually link a SECOP document to a contrato and extract its obligaciones.
+
+    Recovery path for a contrato imported from SECOP with no obligaciones
+    (design-technical.md): validates the document belongs to the contrato, then
+    delegates to the raising core (``checklist_service.extraer_obligaciones_desde_secop_doc``).
+    A `TimeoutError` from the extraction pipeline maps to the same 4xx failure as
+    any other extraction error — the scan's degraded wrapper keeps its own
+    specific timeout log/degrade branch, this manual path always surfaces failures.
+    """
+    contrato = await _get_contrato_con_ownership(db, usuario_id, contrato_id)
+
+    doc_result = await db.execute(select(SecopDocumento).where(SecopDocumento.id == secop_documento_id))
+    doc = doc_result.scalar_one_or_none()
+    if doc is None:
+        raise NotFoundError("SecopDocumento", str(secop_documento_id))
+
+    # ponytail: naive numero_contrato equality; broaden to the referencia/proceso
+    # predicate only if a legit doc is ever rejected (design-technical.md D5).
+    if doc.numero_contrato != contrato.numero_contrato:
+        raise ValidationError("El documento SECOP no pertenece a este contrato.")
+
+    # Function-level import: avoids a checklist_service <-> contrato_service
+    # import cycle if one is ever introduced (existing codebase convention).
+    from app.services import checklist_service
+
+    try:
+        return await checklist_service.extraer_obligaciones_desde_secop_doc(db, contrato, doc)
+    except TimeoutError as exc:
+        raise ValidationError("La extracción de obligaciones tardó demasiado, inténtalo de nuevo.") from exc

@@ -25,7 +25,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.core.exceptions import NotFoundError
+from app.core.exceptions import NotFoundError, ValidationError
 from app.core.text_match import keyword_score as _keyword_score
 from app.core.text_match import similar as _similar
 from app.core.text_match import solo_digitos as _solo_digitos
@@ -44,6 +44,7 @@ from app.models.obligacion import Obligacion
 from app.models.requisito_cuenta import RequisitoCuenta
 from app.models.requisito_documento import RequisitoDocumento
 from app.models.secop import SecopContrato, SecopDocumento
+from app.schemas.agent import ObligacionExtraida
 from app.services.document_classifier import (
     CATEGORIA_A_REQUISITO,
     TIPO_A_REQUISITO,
@@ -845,6 +846,35 @@ async def _sniff_requisito(
     return resultado
 
 
+async def extraer_obligaciones_desde_secop_doc(
+    db: AsyncSession,
+    contrato: Contrato,
+    doc: SecopDocumento,
+    presupuesto: _PresupuestoSniff | None = None,
+) -> tuple[list[ObligacionExtraida], list[str]]:
+    """Core: ensure text + extract obligaciones from a SECOP doc. RAISES on failure.
+
+    Shared by the scan's degraded wrapper (``_auto_extraer_obligaciones_contrato``,
+    below) and the manual Vincular endpoint (``contrato_service.vincular_secop_documento``).
+    Unlike the scan wrapper, this function never swallows: callers decide how to
+    degrade (scan: log + return ``None``) or surface (Vincular: 4xx via the domain
+    exception, ``TimeoutError`` mapped by the caller too).
+    """
+    presupuesto = presupuesto or _PresupuestoSniff()
+    await _asegurar_texto_extraido(doc, presupuesto)
+    if doc.texto_estado != "ok" or not doc.texto_extraido:
+        raise ValidationError("No se pudo descargar o extraer el texto del documento SECOP.")
+
+    # Function-level import: document_service imports this module inside its own
+    # functions — a module-level import here would be circular.
+    from app.services import document_service
+
+    return await asyncio.wait_for(
+        document_service.extraer_obligaciones_texto(doc.texto_extraido, contrato.id, db),
+        timeout=_AUTO_OBLIGACIONES_TIMEOUT_SEGUNDOS,
+    )
+
+
 async def _auto_extraer_obligaciones_contrato(
     db: AsyncSession,
     contrato: Contrato,
@@ -853,9 +883,9 @@ async def _auto_extraer_obligaciones_contrato(
 ) -> None:
     """Auto-trigger obligaciones extraction on SECOP Contrato auto-assign (task 3.9).
 
-    Mirrors what an uploaded contrato gets: the same
-    ``document_service.extraer_obligaciones_texto`` pipeline, fed with the SECOP
-    doc's persisted ``texto_extraido`` (extracted here with the bounded sniff
+    Mirrors what an uploaded contrato gets: delegates the ensure-text + extract
+    pipeline to ``extraer_obligaciones_desde_secop_doc`` (above), fed with the SECOP
+    doc's persisted ``texto_extraido`` (extracted there with the bounded sniff
     helpers when the doc was never sniffed). Guards:
     - idempotent: skipped when the contrato already has obligaciones;
     - degraded: any failure logs a warning and returns — never breaks the scan;
@@ -867,20 +897,15 @@ async def _auto_extraer_obligaciones_contrato(
         ).scalar_one_or_none()
         if existente is not None:
             return
-        if doc.texto_estado is None:
-            await _asegurar_texto_extraido(doc, presupuesto)
-        if doc.texto_estado != "ok" or not doc.texto_extraido:
-            return
-
-        # Function-level import: document_service imports this module inside its
-        # own functions — a module-level import here would be circular.
-        from app.services import document_service
 
         try:
-            obligaciones, _avisos = await asyncio.wait_for(
-                document_service.extraer_obligaciones_texto(doc.texto_extraido, contrato.id, db),
-                timeout=_AUTO_OBLIGACIONES_TIMEOUT_SEGUNDOS,
-            )
+            obligaciones, _avisos = await extraer_obligaciones_desde_secop_doc(db, contrato, doc, presupuesto)
+        except ValidationError:
+            # Ensure-text failed (download/parse error or no usable text) —
+            # same as before the refactor: degrade silently, no log
+            # (`_asegurar_texto_extraido` already memoized the failure on the
+            # SecopDocumento row itself).
+            return
         except TimeoutError:
             # Deterministic verbatim extraction (document_service.py) finishes
             # in ms; only the LLM fallback chain can run this long. Degrade:
