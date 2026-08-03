@@ -713,6 +713,11 @@ _SNIFF_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 # under that window alongside the sniff budget above (~20s sniff + this ≲ 60s).
 _AUTO_OBLIGACIONES_TIMEOUT_SEGUNDOS = 25.0
 
+# Manual Vincular action (deliberate single-document user click, not a bulk
+# scan): a generous, unclamped HTTP timeout — the frontend allows up to 300s
+# for this request. Deliberately NOT reused by the scan's `_asegurar_texto_extraido`.
+_VINCULAR_HTTP_TIMEOUT = 60.0
+
 
 @dataclass
 class _PresupuestoSniff:
@@ -799,6 +804,46 @@ async def _asegurar_texto_extraido(doc: SecopDocumento, presupuesto: _Presupuest
         await logger.awarning("secop_sniff_descarga_error", secop_documento_id=str(doc.id), error=str(exc))
 
 
+async def _asegurar_texto_extraido_manual(doc: SecopDocumento) -> None:
+    """Download + extract text for the MANUAL Vincular action. RAISES a specific
+    domain error per failure instead of memoizing a swallowed 'error'/'sin_texto'
+    (unlike the scan's ``_asegurar_texto_extraido``, above).
+
+    Reuses an already-'ok' memoized text (no need to re-download), but a
+    'sin_texto'/'error' verdict from a PRIOR scan does NOT block this fresh
+    attempt — the user explicitly asked. Uses a generous, unclamped timeout
+    (``_VINCULAR_HTTP_TIMEOUT``) instead of the scan's stingy budget.
+    """
+    if doc.texto_estado == "ok" and doc.texto_extraido:
+        return
+    if not doc.url_descarga:
+        raise ValidationError("El documento SECOP no tiene una URL de descarga disponible.")
+
+    try:
+        data = await _descargar_secop_bytes(doc.url_descarga, _VINCULAR_HTTP_TIMEOUT)
+    except httpx.TimeoutException as exc:
+        raise ValidationError("La descarga del documento de SECOP superó el tiempo límite.") from exc
+    except httpx.HTTPStatusError as exc:
+        status_code = exc.response.status_code
+        raise ValidationError(f"No se pudo descargar el documento de SECOP (HTTP {status_code}).") from exc
+    except ValueError as exc:
+        raise ValidationError("El documento de SECOP supera el tamaño máximo permitido (25 MB).") from exc
+    except Exception as exc:
+        await logger.awarning("secop_vincular_descarga_error", secop_documento_id=str(doc.id), error=str(exc))
+        raise ValidationError("No se pudo descargar el documento SECOP.") from exc
+
+    texto = extraer_texto_contenido(data, doc.nombre_archivo or "documento")
+    if not texto.strip():
+        doc.texto_extraido = None
+        doc.texto_estado = "sin_texto"
+        raise ValidationError(
+            "El documento no tiene texto extraíble (posible PDF escaneado sin OCR); "
+            "subí el documento del contrato manualmente para extraer las obligaciones."
+        )
+    doc.texto_extraido = texto
+    doc.texto_estado = "ok"
+
+
 def _score_contenido_para_requisito(doc: SecopDocumento, req_codigo: str) -> Decimal | None:
     """Content score for THIS requisito, or None when text is unusable or the
     content classifies to a different requisito."""
@@ -851,6 +896,8 @@ async def extraer_obligaciones_desde_secop_doc(
     contrato: Contrato,
     doc: SecopDocumento,
     presupuesto: _PresupuestoSniff | None = None,
+    *,
+    manual: bool = False,
 ) -> tuple[list[ObligacionExtraida], list[str]]:
     """Core: ensure text + extract obligaciones from a SECOP doc. RAISES on failure.
 
@@ -859,11 +906,19 @@ async def extraer_obligaciones_desde_secop_doc(
     Unlike the scan wrapper, this function never swallows: callers decide how to
     degrade (scan: log + return ``None``) or surface (Vincular: 4xx via the domain
     exception, ``TimeoutError`` mapped by the caller too).
+
+    ``manual=True`` (the Vincular action) uses ``_asegurar_texto_extraido_manual``
+    instead of the scan's ``_asegurar_texto_extraido``: a generous timeout, a
+    fresh attempt even over a stale scan verdict, and a specific message per
+    failure mode — a deliberate single-document user click is not a bulk sniff.
     """
-    presupuesto = presupuesto or _PresupuestoSniff()
-    await _asegurar_texto_extraido(doc, presupuesto)
-    if doc.texto_estado != "ok" or not doc.texto_extraido:
-        raise ValidationError("No se pudo descargar o extraer el texto del documento SECOP.")
+    if manual:
+        await _asegurar_texto_extraido_manual(doc)
+    else:
+        presupuesto = presupuesto or _PresupuestoSniff()
+        await _asegurar_texto_extraido(doc, presupuesto)
+        if doc.texto_estado != "ok" or not doc.texto_extraido:
+            raise ValidationError("No se pudo descargar o extraer el texto del documento SECOP.")
 
     # Function-level import: document_service imports this module inside its own
     # functions — a module-level import here would be circular.

@@ -6,7 +6,7 @@ import uuid
 from datetime import UTC, date, datetime
 
 import structlog
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -545,16 +545,38 @@ async def vincular_secop_documento(
     if doc is None:
         raise NotFoundError("SecopDocumento", str(secop_documento_id))
 
-    # ponytail: naive numero_contrato equality; broaden to the referencia/proceso
-    # predicate only if a legit doc is ever rejected (design-technical.md D5).
+    # ponytail: D5 predicted this — broadened. SecopDocumento.numero_contrato
+    # actually stores the SECOP referencia_del_contrato/proceso, not
+    # Contrato.numero_contrato, so the naive equality rejected legit docs
+    # (buscar_documentos_contrato already resolves SecopContrato by
+    # numero_contrato/referencia_del_contrato/proceso_de_compra — mirror that
+    # here). Accept when EITHER the naive match OR the resolved-SecopContrato
+    # predicate passes; reject only when both fail.
     if doc.numero_contrato != contrato.numero_contrato:
-        raise ValidationError("El documento SECOP no pertenece a este contrato.")
+        secop_result = await db.execute(
+            select(SecopContrato).where(
+                or_(
+                    SecopContrato.numero_contrato == contrato.numero_contrato,
+                    SecopContrato.referencia_del_contrato == contrato.numero_contrato,
+                    SecopContrato.proceso_de_compra == contrato.numero_contrato,
+                )
+            )
+        )
+        secop_contratos = secop_result.scalars().all()
+        secop_ids = {sc.id for sc in secop_contratos}
+        keys = {contrato.numero_contrato}
+        for sc in secop_contratos:
+            keys.update(k for k in (sc.numero_contrato, sc.referencia_del_contrato, sc.id_contrato_secop) if k)
+        procesos = {sc.proceso_de_compra for sc in secop_contratos if sc.proceso_de_compra}
+        pertenece = doc.secop_contrato_id in secop_ids or doc.numero_contrato in keys or doc.proceso in procesos
+        if not pertenece:
+            raise ValidationError("El documento SECOP no pertenece a este contrato.")
 
     # Function-level import: avoids a checklist_service <-> contrato_service
     # import cycle if one is ever introduced (existing codebase convention).
     from app.services import checklist_service
 
     try:
-        return await checklist_service.extraer_obligaciones_desde_secop_doc(db, contrato, doc)
+        return await checklist_service.extraer_obligaciones_desde_secop_doc(db, contrato, doc, manual=True)
     except TimeoutError as exc:
         raise ValidationError("La extracción de obligaciones tardó demasiado, inténtalo de nuevo.") from exc

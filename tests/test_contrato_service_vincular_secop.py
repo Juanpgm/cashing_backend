@@ -15,7 +15,7 @@ from typing import Any
 import pytest
 from app.core.exceptions import NotFoundError, ValidationError
 from app.models.contrato import Contrato
-from app.models.secop import SecopDocumento
+from app.models.secop import SecopContrato, SecopDocumento
 from app.schemas.agent import ObligacionExtraida
 from app.services import checklist_service, contrato_service
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -96,6 +96,75 @@ async def test_numero_contrato_no_coincide_lanza_validation_error(
         await contrato_service.vincular_secop_documento(db, test_user["user"].id, contrato.id, doc.id)
 
     assert called["core"] is False
+
+
+async def test_doc_numero_contrato_es_referencia_secop_contrato_permite_vincular(
+    db: AsyncSession, contrato: Contrato, test_user: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Validator 2 (D5): a SecopDocumento whose ``numero_contrato`` stores the
+    SecopContrato's referencia_del_contrato (≠ Contrato.numero_contrato) is
+    accepted once a SecopContrato row resolves that referencia back to this
+    contrato via its own ``numero_contrato`` field."""
+    called = {"core": False}
+
+    async def _core_spy(*args: Any, **kwargs: Any) -> tuple[list[ObligacionExtraida], list[str]]:
+        called["core"] = True
+        return [], []
+
+    monkeypatch.setattr(checklist_service, "extraer_obligaciones_desde_secop_doc", _core_spy)
+
+    secop_contrato = SecopContrato(
+        id_contrato_secop=f"SECOP-{uuid.uuid4().hex[:10]}",
+        cedula_contratista="123456789",
+        numero_contrato=contrato.numero_contrato,
+        referencia_del_contrato="REF-99887766",
+        datos_raw={},
+    )
+    db.add(secop_contrato)
+    await db.commit()
+
+    doc = _secop_doc("REF-99887766")
+    db.add(doc)
+    await db.commit()
+    await db.refresh(doc)
+
+    await contrato_service.vincular_secop_documento(db, test_user["user"].id, contrato.id, doc.id)
+
+    assert called["core"] is True
+
+
+async def test_doc_vinculado_por_secop_contrato_id_via_proceso_permite_vincular(
+    db: AsyncSession, contrato: Contrato, test_user: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Validator 2 (D5): a SecopDocumento linked via ``secop_contrato_id`` FK to
+    a SecopContrato resolved through ``proceso_de_compra`` is accepted even
+    though the doc's own ``numero_contrato`` field is unrelated."""
+    called = {"core": False}
+
+    async def _core_spy(*args: Any, **kwargs: Any) -> tuple[list[ObligacionExtraida], list[str]]:
+        called["core"] = True
+        return [], []
+
+    monkeypatch.setattr(checklist_service, "extraer_obligaciones_desde_secop_doc", _core_spy)
+
+    secop_contrato = SecopContrato(
+        id_contrato_secop=f"SECOP-{uuid.uuid4().hex[:10]}",
+        cedula_contratista="123456789",
+        proceso_de_compra=contrato.numero_contrato,
+        datos_raw={},
+    )
+    db.add(secop_contrato)
+    await db.commit()
+    await db.refresh(secop_contrato)
+
+    doc = _secop_doc("UNRELATED-NUM", secop_contrato_id=secop_contrato.id)
+    db.add(doc)
+    await db.commit()
+    await db.refresh(doc)
+
+    await contrato_service.vincular_secop_documento(db, test_user["user"].id, contrato.id, doc.id)
+
+    assert called["core"] is True
 
 
 async def test_happy_path_delega_al_core_y_retorna_resultado(

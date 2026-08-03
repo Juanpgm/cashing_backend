@@ -14,6 +14,7 @@ import uuid
 from datetime import date
 from typing import Any
 
+import httpx
 import pytest
 from app.core.exceptions import ValidationError
 from app.models.contrato import Contrato
@@ -126,3 +127,149 @@ async def test_timeout_de_extraccion_lanza_timeouterror(
 
     with pytest.raises(TimeoutError):
         await checklist_service.extraer_obligaciones_desde_secop_doc(db, contrato, doc)
+
+
+# ── manual=True: dedicated acquisition for the user-facing Vincular action ──
+#
+# The manual path must NOT reuse the scan-oriented `_asegurar_texto_extraido`
+# (stingy 10s/20s-clamped budget, memoizes 'sin_texto'/'error' as final) — a
+# deliberate single-document user action gets a generous timeout, a fresh
+# attempt even over a stale scan verdict, and a specific message per failure.
+
+
+async def test_manual_reutiliza_texto_ya_extraido_sin_descargar(
+    db: AsyncSession, contrato: Contrato, extraccion: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`texto_estado='ok'` with text already persisted: no download, straight
+    to extraction (manual and scan-default agree on this happy path)."""
+
+    async def _no_deberia_llamarse(*args: Any, **kwargs: Any) -> bytes:
+        raise AssertionError("no debería descargarse: el texto ya está persistido")
+
+    monkeypatch.setattr(checklist_service, "_descargar_secop_bytes", _no_deberia_llamarse)
+    doc = _secop_doc(contrato, "contrato.docx", texto_estado="ok", texto_extraido=TEXTO_CONTRATO)
+    db.add(doc)
+    await db.commit()
+
+    obligaciones, avisos = await checklist_service.extraer_obligaciones_desde_secop_doc(db, contrato, doc, manual=True)
+
+    assert (obligaciones, avisos) == extraccion["resultado"]
+
+
+async def test_manual_ignora_sin_texto_memoizado_y_reintenta_descarga(
+    db: AsyncSession, contrato: Contrato, extraccion: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `texto_estado='sin_texto'` memoized by a PRIOR scan must NOT block a
+    fresh manual attempt (this is the bug: a stale scan verdict blocking the
+    user's deliberate action) -- the manual path re-downloads and succeeds."""
+
+    async def _fake_descarga(url: str, timeout: float = 0.0) -> bytes:
+        assert timeout == checklist_service._VINCULAR_HTTP_TIMEOUT
+        return b"contenido"
+
+    monkeypatch.setattr(checklist_service, "_descargar_secop_bytes", _fake_descarga)
+    monkeypatch.setattr(checklist_service, "extraer_texto_contenido", lambda data, nombre: TEXTO_CONTRATO)
+    doc = _secop_doc(
+        contrato,
+        "contrato.docx",
+        texto_estado="sin_texto",
+        texto_extraido=None,
+        url_descarga="https://s/contrato.docx",
+    )
+    db.add(doc)
+    await db.commit()
+
+    obligaciones, avisos = await checklist_service.extraer_obligaciones_desde_secop_doc(db, contrato, doc, manual=True)
+
+    assert (obligaciones, avisos) == extraccion["resultado"]
+    assert doc.texto_estado == "ok"
+    assert doc.texto_extraido == TEXTO_CONTRATO
+
+
+async def test_manual_sin_url_descarga_lanza_mensaje_especifico(db: AsyncSession, contrato: Contrato) -> None:
+    doc = _secop_doc(contrato, "contrato.docx", texto_estado="error", texto_extraido=None, url_descarga=None)
+    db.add(doc)
+    await db.commit()
+
+    with pytest.raises(ValidationError, match="URL de descarga"):
+        await checklist_service.extraer_obligaciones_desde_secop_doc(db, contrato, doc, manual=True)
+
+
+async def test_manual_timeout_de_descarga_lanza_mensaje_especifico(
+    db: AsyncSession, contrato: Contrato, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def _fake_descarga(url: str, timeout: float = 0.0) -> bytes:
+        raise httpx.TimeoutException("timed out")
+
+    monkeypatch.setattr(checklist_service, "_descargar_secop_bytes", _fake_descarga)
+    doc = _secop_doc(contrato, "contrato.docx", url_descarga="https://s/contrato.docx")
+    db.add(doc)
+    await db.commit()
+
+    with pytest.raises(ValidationError, match="tiempo límite"):
+        await checklist_service.extraer_obligaciones_desde_secop_doc(db, contrato, doc, manual=True)
+
+
+async def test_manual_error_http_lanza_mensaje_con_status(
+    db: AsyncSession, contrato: Contrato, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def _fake_descarga(url: str, timeout: float = 0.0) -> bytes:
+        request = httpx.Request("GET", url)
+        response = httpx.Response(403, request=request)
+        raise httpx.HTTPStatusError("forbidden", request=request, response=response)
+
+    monkeypatch.setattr(checklist_service, "_descargar_secop_bytes", _fake_descarga)
+    doc = _secop_doc(contrato, "contrato.docx", url_descarga="https://s/contrato.docx")
+    db.add(doc)
+    await db.commit()
+
+    with pytest.raises(ValidationError, match="HTTP 403"):
+        await checklist_service.extraer_obligaciones_desde_secop_doc(db, contrato, doc, manual=True)
+
+
+async def test_manual_documento_demasiado_grande_lanza_mensaje_especifico(
+    db: AsyncSession, contrato: Contrato, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def _fake_descarga(url: str, timeout: float = 0.0) -> bytes:
+        raise ValueError("documento excede 26214400 bytes")
+
+    monkeypatch.setattr(checklist_service, "_descargar_secop_bytes", _fake_descarga)
+    doc = _secop_doc(contrato, "contrato.docx", url_descarga="https://s/contrato.docx")
+    db.add(doc)
+    await db.commit()
+
+    with pytest.raises(ValidationError, match="25 MB"):
+        await checklist_service.extraer_obligaciones_desde_secop_doc(db, contrato, doc, manual=True)
+
+
+async def test_manual_texto_no_extraible_lanza_mensaje_de_pdf_escaneado(
+    db: AsyncSession, contrato: Contrato, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def _fake_descarga(url: str, timeout: float = 0.0) -> bytes:
+        return b"%PDF-escaneado-sin-texto"
+
+    monkeypatch.setattr(checklist_service, "_descargar_secop_bytes", _fake_descarga)
+    monkeypatch.setattr(checklist_service, "extraer_texto_contenido", lambda data, nombre: "")
+    doc = _secop_doc(contrato, "contrato.pdf", url_descarga="https://s/contrato.pdf")
+    db.add(doc)
+    await db.commit()
+
+    with pytest.raises(ValidationError, match="PDF escaneado"):
+        await checklist_service.extraer_obligaciones_desde_secop_doc(db, contrato, doc, manual=True)
+
+    assert doc.texto_estado == "sin_texto"
+
+
+async def test_manual_error_inesperado_lanza_mensaje_generico_y_loguea(
+    db: AsyncSession, contrato: Contrato, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def _fake_descarga(url: str, timeout: float = 0.0) -> bytes:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(checklist_service, "_descargar_secop_bytes", _fake_descarga)
+    doc = _secop_doc(contrato, "contrato.docx", url_descarga="https://s/contrato.docx")
+    db.add(doc)
+    await db.commit()
+
+    with pytest.raises(ValidationError):
+        await checklist_service.extraer_obligaciones_desde_secop_doc(db, contrato, doc, manual=True)
