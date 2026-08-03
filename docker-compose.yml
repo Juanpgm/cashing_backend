@@ -1,62 +1,38 @@
+# Backend stack — INDEPENDENT lifecycle. Always published on host port 8000.
+#
+# Infra (Postgres / Redis / MinIO) lives in docker-compose.infra.yml and must
+# be up first (scripts/up-infra.ps1). This stack connects to it over the shared
+# external network `cashing-net` — so `scripts/restart-backend.ps1` restarts
+# ONLY the backend and never touches the database.
+#
+# The source tree is bind-mounted (`.:/app`) and Dockerfile.dev runs
+# uvicorn --reload, so local code edits are picked up without a rebuild.
+name: cashing-backend
+
 services:
-  db:
-    # pgvector/pgvector:pg16 = Postgres 16 (Debian) with the pgvector extension bundled.
-    # The app's semantic search casts embeddings to vector(1536); plain postgres:16 lacks
-    # the `vector` type. Debian (glibc) also matches the production runtime more closely
-    # than Alpine (musl).
-    image: pgvector/pgvector:pg16
-    environment:
-      POSTGRES_USER: cashin
-      POSTGRES_PASSWORD: cashin_local
-      POSTGRES_DB: cashin
-    ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U cashin"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-
-  minio:
-    image: minio/minio:latest
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-    ports:
-      - "9000:9000"
-      - "9001:9001"
-    volumes:
-      - miniodata:/data
-
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-
   app:
     build:
       context: .
       dockerfile: Dockerfile.dev
+    # Backend is ALWAYS on 8000 (host) -> 8000 (container).
     ports:
       - "8000:8000"
     env_file:
       - .env
     environment:
+      # `db` / `minio` resolve over the shared `cashing-net` network to the
+      # independent infra stack (docker-compose.infra.yml).
       DATABASE_URL: postgresql+asyncpg://cashin:cashin_local@db:5432/cashin?sslmode=disable
       S3_ENDPOINT_URL: http://minio:9000
     volumes:
       - .:/app
-    depends_on:
-      db:
-        condition: service_healthy
-      minio:
-        condition: service_started
-      redis:
-        condition: service_started
+    networks:
+      default:
+        aliases: [app]
 
-volumes:
-  pgdata:
-  miniodata:
+# Shared external network (created by scripts/up-infra.ps1). The infra stack
+# owns its lifecycle; this stack only joins it.
+networks:
+  default:
+    name: cashing-net
+    external: true

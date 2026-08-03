@@ -1,0 +1,71 @@
+# Infra stack — INDEPENDENT lifecycle: Postgres + Redis + MinIO.
+#
+# Brought up ONCE (scripts/up-infra.ps1) and left running. The backend stack
+# (docker-compose.yml) is a SEPARATE compose project that connects to these
+# services over the shared external network `cashing-net`, so restarting the
+# backend never tears down the database.
+#
+# Data persists in the PRE-EXISTING external volumes (cashing-backend_pgdata /
+# cashing-backend_miniodata) so splitting the stacks does not wipe the current
+# local database or object store.
+name: cashing-infra
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: cashin
+      POSTGRES_PASSWORD: cashin_local
+      POSTGRES_DB: cashin
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      default:
+        aliases: [db]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cashin"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - miniodata:/data
+    networks:
+      default:
+        aliases: [minio]
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    networks:
+      default:
+        aliases: [redis]
+
+# Shared network created out-of-band (scripts/up-infra.ps1 runs
+# `docker network create cashing-net`). Both stacks reference it as external.
+networks:
+  default:
+    name: cashing-net
+    external: true
+
+# Reuse the volumes the single-stack compose already created, so the existing
+# Postgres data and MinIO objects survive the split.
+volumes:
+  pgdata:
+    external: true
+    name: cashing-backend_pgdata
+  miniodata:
+    external: true
+    name: cashing-backend_miniodata
