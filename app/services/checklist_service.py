@@ -10,6 +10,7 @@ never copied from a previous cuenta.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 import uuid
 from collections.abc import Sequence
@@ -26,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.exceptions import NotFoundError, ValidationError
+from app.core.secop_http import SECOP_BROWSER_USER_AGENT
 from app.core.text_match import keyword_score as _keyword_score
 from app.core.text_match import similar as _similar
 from app.core.text_match import solo_digitos as _solo_digitos
@@ -690,6 +692,82 @@ async def _secop_documentos_del_contrato(db: AsyncSession, contrato: Contrato) -
     return list(pool.values())
 
 
+async def verificar_pertenencia_secop_documento(db: AsyncSession, contrato: Contrato, doc: SecopDocumento) -> bool:
+    """Whether a SecopDocumento's metadata belongs to `contrato` (multi-field, format-tolerant).
+
+    Shared by the explicit Vincular action (`contrato_service.vincular_secop_documento`,
+    which blocks on ``False``) and the SECOP auto-link guard below. SecopDocumento.numero_contrato
+    actually stores the SECOP referencia_del_contrato/proceso, not Contrato.numero_contrato, so a
+    naive equality rejects legit docs — accept when EITHER the naive match OR the
+    resolved-SecopContrato predicate passes (mirrors `_secop_documentos_del_contrato`'s own
+    identifier resolution); reject only when both fail.
+    """
+    if doc.numero_contrato == contrato.numero_contrato:
+        return True
+    secop_result = await db.execute(
+        select(SecopContrato).where(
+            or_(
+                SecopContrato.numero_contrato == contrato.numero_contrato,
+                SecopContrato.referencia_del_contrato == contrato.numero_contrato,
+                SecopContrato.proceso_de_compra == contrato.numero_contrato,
+            )
+        )
+    )
+    secop_contratos = secop_result.scalars().all()
+    secop_ids = {sc.id for sc in secop_contratos}
+    keys = {contrato.numero_contrato}
+    for sc in secop_contratos:
+        keys.update(k for k in (sc.numero_contrato, sc.referencia_del_contrato, sc.id_contrato_secop) if k)
+    procesos = {sc.proceso_de_compra for sc in secop_contratos if sc.proceso_de_compra}
+    return doc.secop_contrato_id in secop_ids or doc.numero_contrato in keys or doc.proceso in procesos
+
+
+# Mentions like "CONTRATO ... No. 4161.010.26.1.155.2026" or "Contrato No. CTR-001"
+# — captures the token following a "no"/"numero" marker within 80 chars of the
+# word "contrato", tolerant of accents/case (see TEXTO_CONTRATO fixtures).
+_CONTRATO_NUMERO_TEXTO_RE = re.compile(
+    r"contrato[^\n]{0,80}?\bn(?:o|[uú]mero)\.?\s*[:\-]?\s*([a-z0-9][\w./-]{1,60})",
+    re.IGNORECASE,
+)
+
+
+def _detectar_pertenencia_por_texto(texto: str | None, numero_contrato: str | None) -> bool | None:
+    """Scan free text for a contract-number mention near the word "contrato".
+
+    Returns ``True`` when a detected token fuzzy-matches ``numero_contrato``, ``False``
+    when a token is found but does NOT match (the text plausibly belongs to a DIFFERENT
+    contract), or ``None`` when no such token is detectable at all — UNDETERMINABLE,
+    callers must not block on this (do not over-block).
+    """
+    if not texto or not numero_contrato:
+        return None
+    candidatos = _CONTRATO_NUMERO_TEXTO_RE.findall(texto)
+    # ponytail: a short token (<4 chars, e.g. "No. 99") usually a generic
+    # sequential/internal doc number, not a real contract identifier — ignore
+    # it rather than false-positive block; revisit with a smarter identifier
+    # heuristic if short SECOP numbers ever legitimately collide here.
+    candidatos = [c for c in candidatos if len(c) >= 4]
+    if not candidatos:
+        return None
+    return any(_similar(numero_contrato, c) >= _SECOP_ID_SIMIL_THRESHOLD for c in candidatos)
+
+
+async def _verificar_pertenencia_documento_auto(db: AsyncSession, contrato: Contrato, doc: SecopDocumento) -> bool:
+    """Auto-link pertenencia guard (root cause of the DAGMA incident: a foreign contract's
+    document was auto-linked as CONTRATO and its obligaciones extracted wholesale).
+
+    Unlike ``verificar_pertenencia_secop_documento`` (the explicit Vincular action, which
+    blocks whenever pertenencia can't be confirmed), this ONLY blocks when a DIFFERENT
+    contract is positively detected — via doc metadata or a contract-number mention in its
+    extracted text. When nothing is detectable at all it returns ``True`` (do not over-block;
+    preserves current behavior for docs that simply carry no identifier).
+    """
+    tiene_metadata = bool(doc.numero_contrato or doc.secop_contrato_id or doc.proceso)
+    if tiene_metadata and not await verificar_pertenencia_secop_documento(db, contrato, doc):
+        return False
+    return _detectar_pertenencia_por_texto(doc.texto_extraido, contrato.numero_contrato) is not False
+
+
 # ── borderline content sniff (clasificacion-documentos-secop, design D2) ───
 
 # Full contract-level tier: the sniff runs for these requisitos only.
@@ -705,7 +783,9 @@ _SNIFF_EPSILON_SEGUNDOS = 0.5
 # community.secop.gov.co returns 403 text/html for UA-less requests and 200
 # application/pdf with a browser UA (verified manually) — the sniff download
 # must impersonate a browser or every download fails and content stays unscored.
-_SNIFF_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+# Shared with secop_service.py and secop_scraper_service.py (app/core/secop_http.py)
+# so every SECOP document download site sends the same header.
+_SNIFF_USER_AGENT = SECOP_BROWSER_USER_AGENT
 
 # Deadline for the auto-trigger obligaciones extraction (below): the LLM chain
 # underneath (litellm_adapter) can try up to 3 models sequentially at 120s
@@ -943,6 +1023,8 @@ async def _auto_extraer_obligaciones_contrato(
     doc's persisted ``texto_extraido`` (extracted there with the bounded sniff
     helpers when the doc was never sniffed). Guards:
     - idempotent: skipped when the contrato already has obligaciones;
+    - pertenencia: skipped (DAGMA incident) when the doc's metadata or extracted text
+      positively detects a DIFFERENT contract's number (`_verificar_pertenencia_documento_auto`);
     - degraded: any failure logs a warning and returns — never breaks the scan;
     - zero new ``DocumentoRequisitoVinculo`` writers.
     """
@@ -951,6 +1033,17 @@ async def _auto_extraer_obligaciones_contrato(
             await db.execute(select(Obligacion.id).where(Obligacion.contrato_id == contrato.id).limit(1))
         ).scalar_one_or_none()
         if existente is not None:
+            return
+
+        await _asegurar_texto_extraido(doc, presupuesto)
+        if not await _verificar_pertenencia_documento_auto(db, contrato, doc):
+            await logger.awarning(
+                "checklist_auto_extraccion_pertenencia_rechazada",
+                contrato_id=str(contrato.id),
+                numero_contrato=contrato.numero_contrato,
+                secop_documento_id=str(doc.id),
+                doc_numero_contrato=doc.numero_contrato,
+            )
             return
 
         try:
@@ -1897,9 +1990,13 @@ def computar_resumen(
     filas: list[DocumentoCuentaCobro],
     catalogo: list[RequisitoDocumento],
     custom_by_id: dict[uuid.UUID, RequisitoCuenta] | None = None,
+    estado_overrides: dict[str, EstadoRequisito] | None = None,
 ) -> dict:
+    """`estado_overrides` maps requisito_codigo → effective estado for rows whose
+    persisted estado is derived (e.g. EVIDENCIAS coverage) rather than stored."""
     cat_by_codigo = {c.codigo: c for c in catalogo}
     custom_by_id = custom_by_id or {}
+    estado_overrides = estado_overrides or {}
     total = 0
     cumplidos = 0
     pendientes: list[str] = []
@@ -1910,10 +2007,11 @@ def computar_resumen(
         obligatorio, ref = meta
         if not obligatorio:
             continue
-        if fila.estado == EstadoRequisito.NO_APLICA:
+        estado = estado_overrides.get(fila.requisito_codigo or "", fila.estado)
+        if estado == EstadoRequisito.NO_APLICA:
             continue
         total += 1
-        if fila.estado in (
+        if estado in (
             EstadoRequisito.CARGADO,
             EstadoRequisito.DETECTADO,
             EstadoRequisito.CUMPLIDO_MANUAL,
@@ -2024,6 +2122,21 @@ async def construir_checklist_completo(
         .where(DocumentoCuentaCobro.cuenta_cobro_id == cuenta.id)
     )
     filas = list(rows_res.scalars().all())
+
+    # EVIDENCIAS is derived state: no evidencia-attachment path updates its
+    # persisted row, so derive its effective estado from actual coverage —
+    # same LISTO semantics as informe_service._calcular_estado_obligaciones:
+    # every obligación has >= 1 evidencia (uploaded file or external link)
+    # across its actividades. In-memory only (nothing persisted): a manual
+    # NO_APLICA/CUMPLIDO_MANUAL override wins, and losing coverage later
+    # simply stops the override (the row is still PENDIENTE on disk).
+    arbol = await listar_arbol_evidencias(db, cuenta)
+    estado_overrides: dict[str, EstadoRequisito] = {}
+    cobertura_completa = bool(arbol) and all(any(act["evidencias"] for act in ob["actividades"]) for ob in arbol)
+    if cobertura_completa and any(
+        f.requisito_codigo == "EVIDENCIAS" and f.estado == EstadoRequisito.PENDIENTE for f in filas
+    ):
+        estado_overrides["EVIDENCIAS"] = EstadoRequisito.CARGADO
 
     cand_res = await db.execute(
         select(DocumentoChecklistCandidato)
@@ -2188,7 +2301,7 @@ async def construir_checklist_completo(
         items.append(
             {
                 "requisito": requisito_block,
-                "estado": fila.estado,
+                "estado": estado_overrides.get(fila.requisito_codigo or "", fila.estado),
                 "documento_fuente": _ref_documento_fuente(df) if df is not None else None,
                 "secop_documento": _ref_secop_documento(sd) if sd is not None else None,
                 "documentos_fuente": _todos_los_documentos_fuente(fila),
@@ -2226,8 +2339,7 @@ async def construir_checklist_completo(
             }
         )
 
-    resumen = computar_resumen(filas, catalogo, custom_by_id)
-    arbol = await listar_arbol_evidencias(db, cuenta)
+    resumen = computar_resumen(filas, catalogo, custom_by_id, estado_overrides)
     requisitos_con_error = sum(1 for it in items if it["deteccion_error"] is not None)
 
     return {

@@ -7,6 +7,7 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
+from app.models.actividad import Actividad
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
 from app.models.documento_cuenta_cobro import (
@@ -15,6 +16,8 @@ from app.models.documento_cuenta_cobro import (
     EstadoRequisito,
 )
 from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
+from app.models.evidencia import Evidencia
+from app.models.obligacion import Obligacion, TipoObligacion
 from app.models.secop import SecopDocumento
 from app.services import checklist_service
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -524,6 +527,150 @@ async def test_vincular_secop_no_limpia_documento_fuente(
     item = next(i for i in payload["items"] if i["requisito"]["codigo"] == "RPC")
     assert len(item["documentos_fuente"]) == 1
     assert len(item["secop_documentos"]) == 1
+
+
+# ── EVIDENCIAS derived from real coverage ───────────────────────────────────
+# Regression: attaching evidencias to actividades never updates the persisted
+# EVIDENCIAS row, so it stayed PENDIENTE forever and blocked radicación even
+# with full coverage. construir_checklist_completo now derives its effective
+# estado from the arbol (same LISTO semantics as the evidence packager).
+
+
+async def _make_obligacion(db: AsyncSession, contrato: Contrato, orden: int) -> Obligacion:
+    ob = Obligacion(
+        contrato_id=contrato.id, descripcion=f"Obligación {orden}", tipo=TipoObligacion.GENERAL, orden=orden
+    )
+    db.add(ob)
+    await db.flush()
+    return ob
+
+
+async def _make_actividad_con_evidencia(
+    db: AsyncSession,
+    cuenta: CuentaCobro,
+    obligacion: Obligacion,
+    *,
+    evidencia: bool = True,
+    solo_enlace: bool = False,
+) -> Actividad:
+    act = Actividad(cuenta_cobro_id=cuenta.id, obligacion_id=obligacion.id, descripcion="Actividad")
+    db.add(act)
+    await db.flush()
+    if evidencia:
+        if solo_enlace:
+            ev = Evidencia(
+                actividad_id=act.id, nombre_archivo="Correo soporte", fuente="gmail", url="https://mail.example.com/x"
+            )
+        else:
+            ev = Evidencia(
+                actividad_id=act.id,
+                storage_key=f"evidencias/{act.id}/soporte.pdf",
+                nombre_archivo="soporte.pdf",
+                tipo_archivo="application/pdf",
+                tamano_bytes=1024,
+            )
+        db.add(ev)
+        await db.flush()
+    return act
+
+
+async def _fila_evidencias(db: AsyncSession, cuenta: CuentaCobro) -> DocumentoCuentaCobro:
+    from sqlalchemy import select
+
+    res = await db.execute(
+        select(DocumentoCuentaCobro).where(
+            DocumentoCuentaCobro.cuenta_cobro_id == cuenta.id,
+            DocumentoCuentaCobro.requisito_codigo == "EVIDENCIAS",
+        )
+    )
+    return res.scalar_one()
+
+
+async def _marcar_resto_cumplido(db: AsyncSession, cuenta: CuentaCobro) -> None:
+    """Satisfy every checklist row EXCEPT the EVIDENCIAS one (left PENDIENTE)."""
+    from sqlalchemy import select
+
+    catalogo = await checklist_service.listar_catalogo(db)
+    res = await db.execute(select(DocumentoCuentaCobro).where(DocumentoCuentaCobro.cuenta_cobro_id == cuenta.id))
+    for fila in res.scalars().all():
+        if fila.requisito_codigo == "EVIDENCIAS":
+            continue
+        req = next(c for c in catalogo if c.codigo == fila.requisito_codigo)
+        fila.estado = EstadoRequisito.CUMPLIDO_MANUAL if req.obligatorio else EstadoRequisito.NO_APLICA
+    await db.commit()
+
+
+async def test_evidencias_cobertura_completa_desbloquea_radicacion(db: AsyncSession, contrato: Contrato) -> None:
+    """Full coverage → EVIDENCIAS counts as cumplido and radicacion_lista is True,
+    without persisting anything on the row (derived, read-only GET)."""
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    await checklist_service.asegurar_checklist(db, cuenta)
+    ob1 = await _make_obligacion(db, contrato, 1)
+    ob2 = await _make_obligacion(db, contrato, 2)
+    await _make_actividad_con_evidencia(db, cuenta, ob1)
+    await _make_actividad_con_evidencia(db, cuenta, ob2)
+    await db.commit()
+    await _marcar_resto_cumplido(db, cuenta)
+
+    payload = await checklist_service.construir_checklist_completo(db, cuenta)
+    await db.commit()
+
+    item = next(i for i in payload["items"] if i["requisito"]["codigo"] == "EVIDENCIAS")
+    assert item["estado"] == EstadoRequisito.CARGADO
+    assert "EVIDENCIAS" not in payload["resumen"]["lista_pendientes"]
+    assert payload["resumen"]["radicacion_lista"] is True
+    # Derived, not persisted: the row on disk stays PENDIENTE.
+    assert (await _fila_evidencias(db, cuenta)).estado == EstadoRequisito.PENDIENTE
+
+
+async def test_evidencias_cobertura_parcial_sigue_pendiente(db: AsyncSession, contrato: Contrato) -> None:
+    """One obligación without evidencias → EVIDENCIAS stays PENDIENTE."""
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    await checklist_service.asegurar_checklist(db, cuenta)
+    ob1 = await _make_obligacion(db, contrato, 1)
+    ob2 = await _make_obligacion(db, contrato, 2)
+    await _make_actividad_con_evidencia(db, cuenta, ob1)
+    await _make_actividad_con_evidencia(db, cuenta, ob2, evidencia=False)
+    await db.commit()
+
+    payload = await checklist_service.construir_checklist_completo(db, cuenta)
+
+    item = next(i for i in payload["items"] if i["requisito"]["codigo"] == "EVIDENCIAS")
+    assert item["estado"] == EstadoRequisito.PENDIENTE
+    assert "EVIDENCIAS" in payload["resumen"]["lista_pendientes"]
+    assert payload["resumen"]["radicacion_lista"] is False
+
+
+async def test_evidencias_solo_enlace_cuenta_como_cobertura(db: AsyncSession, contrato: Contrato) -> None:
+    """A link-only evidencia (no stored file) counts as coverage — packager parity."""
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    await checklist_service.asegurar_checklist(db, cuenta)
+    ob1 = await _make_obligacion(db, contrato, 1)
+    await _make_actividad_con_evidencia(db, cuenta, ob1, solo_enlace=True)
+    await db.commit()
+
+    payload = await checklist_service.construir_checklist_completo(db, cuenta)
+
+    item = next(i for i in payload["items"] if i["requisito"]["codigo"] == "EVIDENCIAS")
+    assert item["estado"] == EstadoRequisito.CARGADO
+    assert "EVIDENCIAS" not in payload["resumen"]["lista_pendientes"]
+
+
+async def test_evidencias_cumplido_manual_se_preserva(db: AsyncSession, contrato: Contrato) -> None:
+    """A manual override on the EVIDENCIAS row wins over the derived estado."""
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    await checklist_service.asegurar_checklist(db, cuenta)
+    ob1 = await _make_obligacion(db, contrato, 1)
+    await _make_actividad_con_evidencia(db, cuenta, ob1)
+    await db.commit()
+    await checklist_service.marcar_cumplido_manual(db, cuenta.id, "EVIDENCIAS")
+    await db.commit()
+
+    payload = await checklist_service.construir_checklist_completo(db, cuenta)
+
+    item = next(i for i in payload["items"] if i["requisito"]["codigo"] == "EVIDENCIAS")
+    assert item["estado"] == EstadoRequisito.CUMPLIDO_MANUAL
+    assert "EVIDENCIAS" not in payload["resumen"]["lista_pendientes"]
 
 
 async def test_desvincular_uno_no_afecta_los_demas(
