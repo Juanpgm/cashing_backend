@@ -55,6 +55,7 @@ from app.adapters.secop_scraper.dto import CaptchaRequiredError, ScrapedDocDTO, 
 from app.adapters.secop_scraper.port import SecopScraperPort
 from app.agent.tools.multimodal_parser import guess_mime_type
 from app.core.secop_agentic_quota import enforce_scraper_quota
+from app.core.secop_http import SECOP_BROWSER_USER_AGENT
 from app.models.contrato import Contrato
 from app.models.documento_fuente import TipoDocumentoFuente
 from app.models.secop import SecopContrato
@@ -288,13 +289,15 @@ async def _persistir_documento_scrapeado(
         return response, f"'{dto.nombre_archivo}' ya fue persistido previamente (mismo documento).", None
 
     try:
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        async with httpx.AsyncClient(
+            timeout=30.0, follow_redirects=True, headers={"User-Agent": SECOP_BROWSER_USER_AGENT}
+        ) as client:
             http_response = await client.get(dto.url_descarga)
             http_response.raise_for_status()
             content = http_response.content
     except Exception as exc:
         await log.awarning("secop_scraper_download_failed", nombre_archivo=dto.nombre_archivo, error=str(exc))
-        return response, f"No se pudo descargar '{dto.nombre_archivo}': {exc}", None
+        return response, f"No se pudo descargar '{dto.nombre_archivo}': SECOP rechazó la descarga (ver logs).", None
 
     if len(content) > _MAX_SCRAPED_DOC_SIZE_BYTES:
         await log.awarning("secop_scraper_doc_too_large", nombre_archivo=dto.nombre_archivo, size=len(content))

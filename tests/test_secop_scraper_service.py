@@ -29,6 +29,7 @@ from app.adapters.secop_scraper.dto import (
 from app.core.config import settings
 from app.core.exceptions import RateLimitExceededError
 from app.core.secop_agentic_quota import _reset
+from app.core.secop_http import SECOP_BROWSER_USER_AGENT
 from app.models.contrato import Contrato
 from app.models.documento_fuente import DocumentoFuente
 from app.models.secop import SecopContrato, SecopDocumento
@@ -247,6 +248,24 @@ class TestExplorarDocumentosAgentico:
         # the scraper fallback in any slice.
         persisted = (await db.execute(select(SecopDocumento))).scalars().all()
         assert persisted == []
+
+    async def test_download_sends_browser_user_agent(self, db: AsyncSession, monkeypatch: pytest.MonkeyPatch) -> None:
+        """community.secop.gov.co 403s UA-less requests (bug fix, see
+        app/core/secop_http.py) — the scraper's own download client must send
+        the shared browser User-Agent, not just the checklist sniff path."""
+        user_id = uuid.uuid4()
+        await _seed_contrato(db)
+        await _seed_contrato_usuario(db, user_id)
+        _mock_httpx_download(monkeypatch, b"contenido")
+
+        await secop_scraper_service.explorar_documentos_agentico(db, _OkScraper(), user_id, _NUMERO)
+
+        # `_mock_httpx_download` patches `httpx.AsyncClient` itself with the class mock;
+        # inspect its constructor call args directly (the helper returns the client
+        # instance mock, not the class). Use the FIRST call: persistence's own
+        # OCR/LLM fallback (litellm) also constructs an httpx.AsyncClient afterwards.
+        _, kwargs = httpx.AsyncClient.call_args_list[0]
+        assert kwargs["headers"]["User-Agent"] == SECOP_BROWSER_USER_AGENT
 
     async def test_multi_doc_result_warns_eviction_risk(
         self, db: AsyncSession, monkeypatch: pytest.MonkeyPatch

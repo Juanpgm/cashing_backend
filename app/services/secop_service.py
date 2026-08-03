@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agent.tools.contract_parser import extract_obligaciones_verbatim
 from app.core.config import settings
 from app.core.exceptions import ExternalServiceError, NotFoundError, ValidationError
+from app.core.secop_http import SECOP_BROWSER_USER_AGENT
 from app.models.categoria_documento import CategoriaDocumento
 from app.models.contrato import Contrato
 from app.models.obligacion import Obligacion, TipoObligacion
@@ -1064,17 +1065,20 @@ async def listar_archivos_comprimido(
         )
 
     try:
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        async with httpx.AsyncClient(
+            timeout=30.0, follow_redirects=True, headers={"User-Agent": SECOP_BROWSER_USER_AGENT}
+        ) as client:
             response = await client.get(doc.url_descarga)
             response.raise_for_status()
         content = response.content
     except httpx.HTTPError as exc:
+        log.warning("secop_archivo_comprimido_download_failed", doc_id=str(doc_id), error=str(exc))
         return ArchivoComprimidoResponse(
             doc_id=str(doc_id),
             nombre_archivo=doc.nombre_archivo,
             extension=doc.extension,
             archivos=[],
-            error=f"No se pudo descargar el archivo: {exc}",
+            error="No se pudo descargar el archivo: SECOP rechazó la descarga (ver logs para el detalle técnico).",
         )
 
     try:
