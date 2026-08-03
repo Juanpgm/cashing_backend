@@ -112,6 +112,15 @@ class CuentaCobroUpdate(BaseModel):
             "text): the service keys off model_fields_set, like fecha_transaccion."
         ),
     )
+    consecutivo_ds: str | None = Field(
+        default=None,
+        max_length=50,
+        description=(
+            "Entity payment consecutive for the Documento Soporte xlsx (G4). Editable in "
+            "stepper step-5 (Formato). Null is meaningful (clears it): the service keys off "
+            "model_fields_set, like fecha_transaccion."
+        ),
+    )
 
     model_config = {"json_schema_extra": {"example": {"mes": 4, "anio": 2026, "valor": "2500000.00"}}}
 
@@ -130,6 +139,7 @@ class CuentaCobroResponse(BaseModel):
     informe_final: bool
     fecha_transaccion: date | None
     contexto_usuario: str | None
+    consecutivo_ds: str | None
     actividades: list[ActividadResponse]
     created_at: datetime
     updated_at: datetime
@@ -159,6 +169,7 @@ class CuentaCobroListItem(BaseModel):
     posicion: PosicionCuota
     informe_final: bool
     fecha_transaccion: date | None
+    consecutivo_ds: str | None
     created_at: datetime
     updated_at: datetime
 

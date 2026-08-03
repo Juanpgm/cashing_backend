@@ -365,6 +365,70 @@ async def test_actualizar_cuenta_cobro_omitir_fecha_transaccion_no_la_toca(db: A
 
 
 # ---------------------------------------------------------------------------
+# consecutivo_ds (G4: Documento Soporte per-cuota entity payment consecutive)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_actualizar_cuenta_cobro_persiste_consecutivo_ds(db: AsyncSession) -> None:
+    """PATCH with consecutivo_ds on a BORRADOR cuota persists it, mirroring the
+    fecha_transaccion round trip (stepper step-5 Documento Soporte save)."""
+    user = await _make_user(db, creditos=100)
+    contrato = await _make_contrato(db, user.id)
+    cuenta = await _make_cuenta(db, contrato.id)
+    await db.commit()
+
+    resp = await cuenta_cobro_service.actualizar_cuenta_cobro(
+        db, user.id, cuenta.id, CuentaCobroUpdate(consecutivo_ds="1768")
+    )
+
+    assert resp.consecutivo_ds == "1768"
+    persisted = await db.get(CuentaCobro, cuenta.id)
+    assert persisted is not None
+    assert persisted.consecutivo_ds == "1768"
+
+
+@pytest.mark.asyncio
+async def test_actualizar_cuenta_cobro_limpia_consecutivo_ds_con_null(db: AsyncSession) -> None:
+    """PATCH sending consecutivo_ds=null clears an existing value — null is an
+    explicit, meaningful value, not 'omitted'."""
+    user = await _make_user(db, creditos=100)
+    contrato = await _make_contrato(db, user.id)
+    cuenta = await _make_cuenta(db, contrato.id)
+    cuenta.consecutivo_ds = "788"
+    await db.commit()
+
+    resp = await cuenta_cobro_service.actualizar_cuenta_cobro(
+        db, user.id, cuenta.id, CuentaCobroUpdate(consecutivo_ds=None)
+    )
+
+    assert resp.consecutivo_ds is None
+    persisted = await db.get(CuentaCobro, cuenta.id)
+    assert persisted is not None
+    assert persisted.consecutivo_ds is None
+
+
+@pytest.mark.asyncio
+async def test_actualizar_cuenta_cobro_omitir_consecutivo_ds_no_lo_toca(db: AsyncSession) -> None:
+    """PATCH that does NOT include consecutivo_ds leaves the existing value
+    untouched (model_fields_set distinguishes omitted from explicit null)."""
+    user = await _make_user(db, creditos=100)
+    contrato = await _make_contrato(db, user.id)
+    cuenta = await _make_cuenta(db, contrato.id)
+    cuenta.consecutivo_ds = "788"
+    await db.commit()
+
+    resp = await cuenta_cobro_service.actualizar_cuenta_cobro(
+        db, user.id, cuenta.id, CuentaCobroUpdate(valor=Decimal("4000000.00"))
+    )
+
+    assert resp.consecutivo_ds == "788"
+    persisted = await db.get(CuentaCobro, cuenta.id)
+    assert persisted is not None
+    assert persisted.consecutivo_ds == "788"
+
+
+# ---------------------------------------------------------------------------
 # listar / obtener
 # ---------------------------------------------------------------------------
 

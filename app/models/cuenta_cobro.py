@@ -80,6 +80,14 @@ class CuentaCobro(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
     # cruzar) — never required, never blocks generation when absent.
     contexto_usuario: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Entity payment consecutive for the Documento Soporte xlsx (G4, migration 034).
+    # Real SYJ packages radicate a "DS-4161-<consecutivo>" xlsx whose consecutive
+    # changes per cuota (113 -> 788 -> 1768 -> ...). Nullable, additive: set via the
+    # same stepper PATCH used for fecha_transaccion; consumed by
+    # informe_service._valores_plantilla as `cuota.consecutivo_ds`, omitted from the
+    # filled template when null (existing blank-field behavior).
+    consecutivo_ds: Mapped[str | None] = mapped_column(String(50), nullable=True)
+
     # Relationships
     contrato: Mapped["Contrato"] = relationship(back_populates="cuentas_cobro")  # type: ignore[name-defined]  # noqa: F821
     actividades: Mapped[list["Actividad"]] = relationship(back_populates="cuenta_cobro", lazy="selectin")  # type: ignore[name-defined]  # noqa: F821

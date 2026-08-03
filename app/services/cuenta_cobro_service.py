@@ -1570,6 +1570,10 @@ async def actualizar_cuenta_cobro(
     if "contexto_usuario" in data.model_fields_set:
         cuenta.contexto_usuario = data.contexto_usuario.strip() if data.contexto_usuario else None
 
+    # consecutivo_ds follows the same omitted-vs-explicit-null contract (G4).
+    if "consecutivo_ds" in data.model_fields_set:
+        cuenta.consecutivo_ds = data.consecutivo_ds.strip() if data.consecutivo_ds else None
+
     await db.flush()
     await logger.ainfo(
         "cuenta_cobro_actualizada",
