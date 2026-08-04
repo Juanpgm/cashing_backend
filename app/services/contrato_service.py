@@ -300,6 +300,7 @@ async def eliminar_obligacion(
 
     # Block if any actividad references this obligacion
     from app.models.actividad import Actividad
+    from app.models.evidencia_obligacion import EvidenciaObligacion
 
     ref = await db.execute(select(Actividad).where(Actividad.obligacion_id == obligacion_id))
     if ref.scalar_one_or_none() is not None:
@@ -307,6 +308,9 @@ async def eliminar_obligacion(
             "No se puede eliminar la obligación: hay actividades de cuentas de cobro que la referencian."
         )
 
+    # Evidence-obligation link rows have no ON DELETE cascade on obligacion_id —
+    # remove them first or the delete below violates the FK.
+    await db.execute(delete(EvidenciaObligacion).where(EvidenciaObligacion.obligacion_id == obligacion_id))
     await db.delete(ob)
     await db.flush()
 
@@ -316,20 +320,49 @@ async def limpiar_obligaciones(
     usuario_id: uuid.UUID,
     contrato_id: uuid.UUID,
 ) -> int:
-    """Bulk-delete all obligations for a contract (dev/test utility).
+    """Reset a contract's obligations: bulk-delete them all.
 
-    Nullifies FK references in actividades before deleting so no constraint
-    violation occurs. Returns the number of deleted rows.
+    Nullifies FK references in actividades and removes evidence-obligation link
+    rows before deleting so no constraint violation occurs. Also clears
+    `obligaciones_extraidas` (back to None = "no extraction signal") so the
+    contrato becomes eligible for the Vincular fallback again. Returns the
+    number of deleted rows.
     """
     from app.models.actividad import Actividad
+    from app.models.evidencia_obligacion import EvidenciaObligacion
 
-    await _get_contrato_con_ownership(db, usuario_id, contrato_id)
+    contrato = await _get_contrato_con_ownership(db, usuario_id, contrato_id)
 
     ob_ids_result = await db.execute(
         select(Obligacion.id).where(Obligacion.contrato_id == contrato_id)
     )
     ob_ids = [row[0] for row in ob_ids_result.all()]
+
+    # Guard BEFORE any mutation: same protection contrato delete has via
+    # _ESTADOS_ACTIVOS — a radicada/aprobada/pagada cuenta's actividades must
+    # keep their obligacion references.
+    if ob_ids:
+        ref = await db.execute(
+            select(Actividad.id)
+            .join(CuentaCobro, Actividad.cuenta_cobro_id == CuentaCobro.id)
+            .where(
+                Actividad.obligacion_id.in_(ob_ids),
+                CuentaCobro.estado.in_(_ESTADOS_ACTIVOS),
+            )
+            .limit(1)
+        )
+        if ref.first() is not None:
+            raise ValidationError(
+                "No se pueden reiniciar las obligaciones: hay cuentas de cobro en estado "
+                "enviada, aprobada o pagada que las referencian."
+            )
+
+    # After a reset there is genuinely no extraction signal anymore — None (not
+    # False) per the model's semantics, and `!== true` re-enables Vincular in
+    # the frontend gate either way.
+    contrato.obligaciones_extraidas = None
     if not ob_ids:
+        await db.flush()
         return 0
 
     await db.execute(
@@ -337,6 +370,7 @@ async def limpiar_obligaciones(
         .where(Actividad.obligacion_id.in_(ob_ids))
         .values(obligacion_id=None)
     )
+    await db.execute(delete(EvidenciaObligacion).where(EvidenciaObligacion.obligacion_id.in_(ob_ids)))
     result = await db.execute(
         delete(Obligacion).where(Obligacion.contrato_id == contrato_id)
     )

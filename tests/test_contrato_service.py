@@ -291,6 +291,139 @@ async def test_eliminar_obligacion_bloqueada_por_actividad(db: AsyncSession, tes
         await contrato_service.eliminar_obligacion(db, test_user["user"].id, created.id, ob_id)
 
 
+async def _seed_evidencia_con_enlace(
+    db: AsyncSession, contrato_id: uuid.UUID, obligacion_id: uuid.UUID, *, actividad_obligacion_id=None
+):
+    """CuentaCobro → Actividad → Evidencia + EvidenciaObligacion link to the given obligación."""
+    from app.models.actividad import Actividad
+    from app.models.evidencia import Evidencia
+    from app.models.evidencia_obligacion import EvidenciaObligacion
+
+    cc = CuentaCobro(contrato_id=contrato_id, mes=1, anio=2024, valor=3_000_000, estado=EstadoCuentaCobro.BORRADOR)
+    db.add(cc)
+    await db.flush()
+    actividad = Actividad(
+        cuenta_cobro_id=cc.id,
+        descripcion="Actividad de prueba para enlaces de evidencia",
+        obligacion_id=actividad_obligacion_id,
+    )
+    db.add(actividad)
+    await db.flush()
+    evidencia = Evidencia(
+        actividad_id=actividad.id, storage_key="evidencias/fake/e.pdf", nombre_archivo="e.pdf"
+    )
+    db.add(evidencia)
+    await db.flush()
+    db.add(
+        EvidenciaObligacion(
+            evidencia_id=evidencia.id, obligacion_id=obligacion_id, confianza="alta", status="confirmed"
+        )
+    )
+    await db.flush()
+    return actividad
+
+
+@pytest.mark.asyncio
+async def test_eliminar_obligacion_con_enlaces_de_evidencia(db: AsyncSession, test_user: dict[str, Any]) -> None:
+    """Delete-one no longer leaves orphaned EvidenciaObligacion rows (FK violation on Postgres)."""
+    from app.models.evidencia_obligacion import EvidenciaObligacion
+    from sqlalchemy import select
+
+    obs = [ObligacionCreate(descripcion="Obligación con evidencias vinculadas", tipo=TipoObligacion.GENERAL)]
+    created = await contrato_service.crear_contrato(db, test_user["user"].id, _make_contrato_create(obligaciones=obs))
+    ob_id = created.obligaciones[0].id
+    # Actividad deliberately NOT referencing the obligación — the Actividad
+    # guard stays intact and is covered by the bloqueada test above.
+    await _seed_evidencia_con_enlace(db, created.id, ob_id)
+
+    await contrato_service.eliminar_obligacion(db, test_user["user"].id, created.id, ob_id)
+
+    enlaces = (
+        (await db.execute(select(EvidenciaObligacion).where(EvidenciaObligacion.obligacion_id == ob_id)))
+        .scalars()
+        .all()
+    )
+    assert enlaces == []
+    refreshed = await contrato_service.obtener_contrato(db, test_user["user"].id, created.id)
+    assert len(refreshed.obligaciones) == 0
+
+
+@pytest.mark.asyncio
+async def test_limpiar_obligaciones_borra_enlaces_y_resetea_extraccion(
+    db: AsyncSession, test_user: dict[str, Any]
+) -> None:
+    """Reset clears obligaciones, evidence links, actividad refs AND obligaciones_extraidas."""
+    from app.models.evidencia_obligacion import EvidenciaObligacion
+    from sqlalchemy import select
+
+    obs = [ObligacionCreate(descripcion="Obligación a reiniciar", tipo=TipoObligacion.GENERAL)]
+    created = await contrato_service.crear_contrato(db, test_user["user"].id, _make_contrato_create(obligaciones=obs))
+    ob_id = created.obligaciones[0].id
+    contrato_row = await db.get(Contrato, created.id)
+    assert contrato_row is not None
+    contrato_row.obligaciones_extraidas = True
+    actividad = await _seed_evidencia_con_enlace(db, created.id, ob_id, actividad_obligacion_id=ob_id)
+
+    count = await contrato_service.limpiar_obligaciones(db, test_user["user"].id, created.id)
+
+    assert count == 1
+    enlaces = (
+        (await db.execute(select(EvidenciaObligacion).where(EvidenciaObligacion.obligacion_id == ob_id)))
+        .scalars()
+        .all()
+    )
+    assert enlaces == []
+    await db.refresh(actividad)
+    assert actividad.obligacion_id is None
+    # Vincular-eligible again: the frontend gate is `obligaciones_extraidas !== true`.
+    await db.refresh(contrato_row)
+    assert contrato_row.obligaciones_extraidas is None
+    refreshed = await contrato_service.obtener_contrato(db, test_user["user"].id, created.id)
+    assert len(refreshed.obligaciones) == 0
+
+
+@pytest.mark.asyncio
+async def test_limpiar_obligaciones_bloqueado_por_cuenta_activa(db: AsyncSession, test_user: dict[str, Any]) -> None:
+    """Reset is blocked when an actividad referencing an obligación belongs to an ENVIADA cuenta."""
+    from app.models.actividad import Actividad
+
+    obs = [ObligacionCreate(descripcion="Obligación de cuenta radicada", tipo=TipoObligacion.GENERAL)]
+    created = await contrato_service.crear_contrato(db, test_user["user"].id, _make_contrato_create(obligaciones=obs))
+    ob_id = created.obligaciones[0].id
+    contrato_row = await db.get(Contrato, created.id)
+    assert contrato_row is not None
+    contrato_row.obligaciones_extraidas = True
+
+    cc = CuentaCobro(contrato_id=created.id, mes=2, anio=2024, valor=3_000_000, estado=EstadoCuentaCobro.ENVIADA)
+    db.add(cc)
+    await db.flush()
+    db.add(Actividad(cuenta_cobro_id=cc.id, descripcion="Actividad de cuenta enviada", obligacion_id=ob_id))
+    await db.flush()
+
+    with pytest.raises(ValidationError):
+        await contrato_service.limpiar_obligaciones(db, test_user["user"].id, created.id)
+
+    # Nothing mutated: obligaciones and the extraction flag are intact.
+    refreshed = await contrato_service.obtener_contrato(db, test_user["user"].id, created.id)
+    assert len(refreshed.obligaciones) == 1
+    await db.refresh(contrato_row)
+    assert contrato_row.obligaciones_extraidas is True
+
+
+@pytest.mark.asyncio
+async def test_limpiar_obligaciones_sin_obligaciones_resetea_flag(db: AsyncSession, test_user: dict[str, Any]) -> None:
+    created = await contrato_service.crear_contrato(db, test_user["user"].id, _make_contrato_create())
+    contrato_row = await db.get(Contrato, created.id)
+    assert contrato_row is not None
+    contrato_row.obligaciones_extraidas = True
+
+    count = await contrato_service.limpiar_obligaciones(db, test_user["user"].id, created.id)
+
+    assert count == 0
+    await db.refresh(contrato_row)
+    assert contrato_row.obligaciones_extraidas is None
+
+
 # ---------------------------------------------------------------------------
 # Nuevos campos: ubicación, cargo_supervisor, derivación valor_total, cédula
 # ---------------------------------------------------------------------------

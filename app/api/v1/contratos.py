@@ -208,7 +208,14 @@ async def limpiar_obligaciones(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, int]:
-    """[DEV] Bulk-delete all obligations for a contract and return the count."""
+    """Reinicia las obligaciones del contrato: las elimina todas y devuelve el conteo.
+
+    Elimina también los vínculos evidencia-obligación, desasocia las actividades
+    que las referencian y limpia la marca de extracción, dejando el contrato
+    habilitado para extraer o vincular obligaciones de nuevo. Se bloquea cuando
+    una actividad que las referencia pertenece a una cuenta de cobro en estado
+    enviada/aprobada/pagada.
+    """
     count = await contrato_service.limpiar_obligaciones(db, user.id, contrato_id)
     return {"deleted": count}
 
