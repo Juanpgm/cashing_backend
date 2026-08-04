@@ -40,6 +40,17 @@ _EJEMPLOS = (
 _MIN_TEXT_CHARS = 200
 
 
+def _read_pdf_bytes(pdf: Path) -> bytes:
+    """Read a vault PDF, retrying with the extended-length prefix on Windows MAX_PATH."""
+    try:
+        return pdf.read_bytes()
+    except OSError:
+        try:
+            return Path("\\\\?\\" + str(pdf)).read_bytes()
+        except OSError:
+            pytest.skip(f"Vault PDF ilegible en este entorno: {pdf.name}")
+
+
 def _pdf_in(folder: str) -> Path | None:
     """Return the single PDF inside an EJEMPLO folder, or None if unavailable."""
     base = _EJEMPLOS / folder
@@ -62,7 +73,7 @@ def test_golden_text_pdf_obligation_count(folder: str, expected: int) -> None:
     if pdf is None:
         pytest.skip(f"Vault no disponible: {folder}")
 
-    texto = parse_pdf(pdf.read_bytes())
+    texto = parse_pdf(_read_pdf_bytes(pdf))
     if len(texto.strip()) < _MIN_TEXT_CHARS:
         pytest.skip(f"{folder}: PDF sin capa de texto (escaneado)")
 
@@ -96,6 +107,6 @@ def test_golden_scanned_pdf_goes_to_vision() -> None:
     if pdf is None:
         pytest.skip("Vault no disponible: EJEMPLO #4")
 
-    texto = parse_pdf(pdf.read_bytes())
+    texto = parse_pdf(_read_pdf_bytes(pdf))
     assert len(texto.strip()) < _MIN_TEXT_CHARS, "EJEMPLO #4 debería ser escaneado (sin texto)"
     assert extract_obligaciones_verbatim(texto) == []

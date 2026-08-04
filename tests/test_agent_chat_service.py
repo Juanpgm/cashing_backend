@@ -415,6 +415,7 @@ def _make_cuenta_cobro_response(estado: EstadoCuentaCobro) -> CuentaCobroRespons
         posicion=PosicionCuota.PRIMERA,
         informe_final=False,
         fecha_transaccion=None,
+        consecutivo_ds=None,
         contexto_usuario=None,
         actividades=[],
         created_at=now,
