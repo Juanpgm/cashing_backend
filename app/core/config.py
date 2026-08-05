@@ -93,12 +93,18 @@ class Settings(BaseSettings):
     # pages and resolution to keep payloads and latency reasonable on a dev machine.
     MULTIMODAL_MAX_PDF_PAGES: int = 8
     MULTIMODAL_RASTER_DPI: int = 150
-    # OCR tier — runs BEFORE the vision model for scanned PDFs/images: rasterizes
-    # the document and reads it with a local OCR engine (free, fast, no LLM); the
-    # deterministic extractor then runs on the recovered text. The vision model is
-    # used only if OCR text is insufficient. Set EXTRACTION_OCR_ENABLED=false to
-    # skip OCR and go straight to vision.
-    EXTRACTION_OCR_ENABLED: bool = True
+    # OCR tier — OPT-IN, disabled by default. When enabled it runs between the
+    # native-text and vision tiers for scanned PDFs/images: it rasterizes the
+    # document and reads it with a local OCR engine, and the deterministic
+    # extractor then runs on the recovered text. It is OFF by default because on
+    # a CPU-only host RapidOCR is slow (~6-12s/page) AND its concatenated output
+    # usually fails the sufficiency gate, so the ladder escalates to the vision
+    # model anyway — paying the OCR cost for nothing. Default flow is therefore
+    # native text → vision (for CONTRATO/contract-associated docs where text is
+    # genuinely needed). Set EXTRACTION_OCR_ENABLED=true to re-enable the local
+    # OCR tier — intended for on-premise/local-test hosts (esp. with a GPU or
+    # Tesseract) where a free local tier is preferable to per-doc vision calls.
+    EXTRACTION_OCR_ENABLED: bool = False
     # OCR engine: "rapidocr" (default, pip-only, no system binary) or "tesseract" (needs binary + tessdata).
     # rapidocr deps: rapidocr-onnxruntime + opencv-python-headless + onnxruntime + pyclipper + shapely
     # tesseract deps: Tesseract binary (apt install tesseract-ocr tesseract-ocr-spa) + pytesseract pip wrapper

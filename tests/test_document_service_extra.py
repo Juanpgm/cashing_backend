@@ -291,6 +291,8 @@ class TestExtraerTextoDocumentoRelaxedOcr:
         from app.services.document_service import extraer_texto_documento
 
         with (
+            # OCR is opt-in (off by default); enable it to exercise the OCR tier.
+            patch("app.services.document_service.settings.EXTRACTION_OCR_ENABLED", True),
             patch("app.services.document_service.parse_document", return_value=None),
             patch("app.services.document_service.ocr_available", return_value=True),
             patch(
@@ -308,6 +310,8 @@ class TestExtraerTextoDocumentoRelaxedOcr:
         from app.services.document_service import extraer_texto_documento
 
         with (
+            # OCR is opt-in (off by default); enable it to exercise the OCR tier.
+            patch("app.services.document_service.settings.EXTRACTION_OCR_ENABLED", True),
             patch("app.services.document_service.parse_document", return_value=None),
             patch("app.services.document_service.ocr_available", return_value=True),
             patch("app.services.document_service.ocr_extract_text", return_value="Pago"),
@@ -358,6 +362,8 @@ class TestExtraerTextoDocumentoContentSniff:
             return "obligacion contractual del contratista " * 6  # >= EXTRACTION_MIN_TEXT_CHARS, well-spaced
 
         with (
+            # OCR is opt-in (off by default); enable it to exercise the OCR tier.
+            patch("app.services.document_service.settings.EXTRACTION_OCR_ENABLED", True),
             patch("app.services.document_service.parse_document", return_value=None),
             patch("app.services.document_service.ocr_available", return_value=True),
             patch("app.services.document_service.ocr_extract_text", side_effect=_fake_ocr),
@@ -380,6 +386,28 @@ class TestExtraerTextoDocumentoContentSniff:
             patch("app.services.document_service.ocr_extract_text") as mock_ocr,
         ):
             texto, avisos = await extraer_texto_documento(b"garbage bytes", "documento_sin_extension")
+
+        mock_ocr.assert_not_called()
+        assert texto is None
+        assert any("No se pudo extraer texto legible" in a for a in avisos)
+
+    @pytest.mark.asyncio
+    async def test_ocr_tier_disabled_by_default_scan_stays_native_only(self) -> None:
+        """OCR is opt-in (EXTRACTION_OCR_ENABLED defaults to False): a scanned PDF
+        with no native text must NOT invoke the local OCR engine — the ladder is
+        native → vision, with vision reserved for the contract-extraction paths.
+        On-premise/local hosts re-enable OCR by setting EXTRACTION_OCR_ENABLED=true."""
+        from app.core.config import settings
+        from app.services.document_service import extraer_texto_documento
+
+        assert settings.EXTRACTION_OCR_ENABLED is False  # default contract
+
+        with (
+            patch("app.services.document_service.parse_document", return_value=None),
+            patch("app.services.document_service.ocr_available", return_value=True),
+            patch("app.services.document_service.ocr_extract_text") as mock_ocr,
+        ):
+            texto, avisos = await extraer_texto_documento(b"%PDF-1.4 escaneado", "escaneo.pdf")
 
         mock_ocr.assert_not_called()
         assert texto is None
