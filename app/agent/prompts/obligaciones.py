@@ -51,6 +51,15 @@ transparencia o similares) son obligaciones generales administrativas — NO las
 7. Si tu respuesta se estructura como JSON (campos "descripcion", "tipo", "etiqueta"), el \
 campo "tipo" debe ser EXACTAMENTE la palabra "especifica" en minúsculas — NUNCA "OBLIGACION \
 ESPECIFICA", "obligación específica" ni ninguna otra variante con la palabra OBLIGACION.
+8. IGNORA por completo el texto de encabezados y pies de página que pueda aparecer intercalado \
+en el documento: nombre/eslogan de la entidad, dirección, NIT, teléfono, fax, e-mail, sitio web \
+y números de página (ej. "3 de 6"). Ese texto NUNCA es una obligación y NUNCA debe aparecer \
+dentro del texto transcrito de una obligación, aunque quede intercalado en medio del enunciado \
+por un salto de página.
+9. Extrae cada ítem enumerado como una obligación SEPARADA. NUNCA combines dos ítems numerados \
+o alfabéticos consecutivos en uno solo, incluso si entre ellos aparece texto de encabezado/pie \
+de página o un salto de página — el marcador del ítem siguiente (ej. "7.", "h)") marca el inicio \
+de una NUEVA obligación, sin importar qué ruido haya antes de él.
 
 FORMATO DE RESPUESTA — una línea por obligación, sin texto adicional:
 OBLIGACION|especifica|<etiqueta>|<descripcion>
@@ -135,12 +144,39 @@ OBLIGACION|especifica|5|Gestionar el repositorio de código fuente en el servido
 OBLIGACION|especifica|6|Las demás que asigne la Oficina de Tecnología con relación directa al objeto del contrato
 """
 
+OBLIGACIONES_FEWSHOT_SCANNED = """\
+### EJEMPLO — Documento escaneado/OCR con pie de página intercalado (ruido real de producción)
+
+TEXTO (fragmento, tal como llega tras OCR — SIN limpiar aún):
+\"\"\"6. Ser designado como comité evaluador de procesos de contratación por el
+ordenador del gasto. 7. Asesorar en evaluación en coordinación con los comités
+por con todo el corazón CLL. 60 CON CRA. Sª EDIF boqus capita musicd
+FLORESTATELEFONO: 2745888 FAX: 2746410 E-MAIL: infibague@infibague.gov.co WEB:
+www.infibague.gov.co 3 de 6 BanFUTURO INFIbagué INSTITUTO DE FINANCIAMIENTO
+PROMOCION Y DESARROLLO DE IBAGUE INFIBAGUE NIT: 890.700.755-5 estructuradores
+o evaluadores respectivos. 8. Elaborar los informes técnicos requeridos por
+la supervisión.\"\"\"
+
+El bloque "por con todo el corazón CLL. 60 CON CRA. Sª EDIF boqus capita musicd
+FLORESTATELEFONO: ... NIT: 890.700.755-5" es pie de página (dirección, teléfono,
+fax, e-mail, web, marcador de página "3 de 6", eslogan/nombre de la entidad y
+ruido de OCR sin sentido) que quedó intercalado a mitad del ítem 7 por un salto
+de página. NO es una obligación y jamás debe aparecer en el texto transcrito.
+El marcador "7." antes del ruido y el "8." después marcan el inicio de ítems
+NUEVOS — el ruido entre ellos NUNCA debe fusionar dos ítems en uno.
+
+RESPUESTA CORRECTA:
+OBLIGACION|especifica|6|Ser designado como comité evaluador de procesos de contratación por el ordenador del gasto
+OBLIGACION|especifica|7|Asesorar en evaluación en coordinación con los comités estructuradores o evaluadores respectivos
+OBLIGACION|especifica|8|Elaborar los informes técnicos requeridos por la supervisión
+"""
+
 OBLIGACIONES_FEWSHOT_DEFAULT = OBLIGACIONES_FEWSHOT_ALCALDIA
 
 # Map entity_type → few-shot block
 OBLIGACIONES_FEWSHOT_MAP: dict[str, str] = {
     "sena": OBLIGACIONES_FEWSHOT_SENA,
-    "icbf": OBLIGACIONES_FEWSHOT_SENA,          # pedagogical, similar to SENA
+    "icbf": OBLIGACIONES_FEWSHOT_SENA,  # pedagogical, similar to SENA
     "ministerio": OBLIGACIONES_FEWSHOT_MINISTERIO,
     "dian": OBLIGACIONES_FEWSHOT_MINISTERIO,
     "alcaldia": OBLIGACIONES_FEWSHOT_ALCALDIA,
@@ -159,4 +195,3 @@ def get_obligaciones_fewshot(entity_type: str | None = None) -> str:
     if not entity_type:
         return OBLIGACIONES_FEWSHOT_DEFAULT
     return OBLIGACIONES_FEWSHOT_MAP.get(entity_type.lower(), OBLIGACIONES_FEWSHOT_DEFAULT)
-

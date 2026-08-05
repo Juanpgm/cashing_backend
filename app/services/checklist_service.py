@@ -937,6 +937,12 @@ async def _asegurar_texto_extraido_manual(doc: SecopDocumento) -> None:
 
         mime = sniff_multimodal_mime(data, doc.nombre_archivo or "documento")
         resultado = await document_service._extraer_contrato_multimodal(data, mime)
+        # follow-up: resultado.obligaciones (vision-structured) is discarded here —
+        # only .transcripcion is kept, so extraer_obligaciones_desde_secop_doc below
+        # re-runs the plain-text LLM extractor (extraer_obligaciones_texto) on the
+        # vision transcription instead of using the vision model's own structured
+        # obligaciones directly. Using them directly would skip a redundant LLM
+        # round-trip; out of scope this round.
         texto = resultado.transcripcion if resultado is not None else None
         if not texto or not texto.strip():
             # Structured extraction found nothing usable — a plain transcription

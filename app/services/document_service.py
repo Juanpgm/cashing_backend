@@ -27,6 +27,9 @@ from app.agent.tools.contract_parser import (
 from app.agent.tools.contract_parser import (
     parse_obligaciones_structured as _parse_obligaciones_structured,
 )
+from app.agent.tools.contract_parser import (
+    strip_page_furniture as _strip_page_furniture,
+)
 from app.agent.tools.document_parser import parse_document
 from app.agent.tools.multimodal_parser import (
     build_multimodal_content_parts,
@@ -93,15 +96,24 @@ async def _extraer_obligaciones(
     Returns ``(obligations, warnings)`` where warnings tracks LLM/parsing issues.
     """
     from app.adapters.llm import get_llm
-    from app.agent.prompts.obligaciones import OBLIGACIONES_SYSTEM, OBLIGACIONES_USER
+    from app.agent.prompts.obligaciones import (
+        OBLIGACIONES_FEWSHOT_SCANNED,
+        OBLIGACIONES_SYSTEM,
+        OBLIGACIONES_USER,
+        get_obligaciones_fewshot,
+    )
 
     avisos: list[str] = []
     # Use dedicated extraction model if configured (e.g. local Ollama), else default
     extraction_model = settings.LLM_EXTRACTION_MODEL or None
 
     # ── Step 1: try the deterministic verbatim extractor first ─────────────
-    # This preserves the EXACT wording of each obligation as it appears in
-    # the contract, instead of the LLM-paraphrased version.
+    # Runs on the ORIGINAL text so its footer-pollution guard can still see the
+    # labeled signals (NIT, teléfono/fax/e-mail/web). The extractor preserves the
+    # EXACT wording on clean (digital-PDF) contracts and returns [] when the
+    # obligations section is polluted with page furniture — a scanned/OCR'd doc
+    # whose header/footer bled into the text — so we escalate to the LLM, which
+    # can ignore letterhead/banners a regex cannot safely strip.
     verbatim = _extract_obligaciones_verbatim(texto_contrato)
     if verbatim:
         await logger.ainfo(
@@ -114,6 +126,10 @@ async def _extraer_obligaciones(
         return await _persist_obligaciones(extraidas, contrato_id, db, avisos)
 
     # ── Step 2: fall back to LLM-based extraction ──────────────────────────
+    # Strip the entity-agnostic labeled boilerplate (address, NIT,
+    # teléfono/fax/e-mail/web, page markers) so the LLM sees less noise; the
+    # hardened prompt handles residual banners/letterhead the stripper leaves.
+    texto_contrato = _strip_page_furniture(texto_contrato)
     llm = get_llm(model=extraction_model)
 
     chunks = _extract_obligation_sections(texto_contrato)
@@ -129,10 +145,18 @@ async def _extraer_obligaciones(
     llm_errors = 0
     first_error_hint: str = ""
 
+    # Few-shot guidance (entity example + noisy/OCR example) appended to the system
+    # prompt — computed once per call since it is identical across chunks. No
+    # entity_type is known at this call site, so the default (alcaldía-style)
+    # entity example is used alongside the scanned/noisy example, which teaches
+    # excising interleaved page-furniture without merging consecutive items.
+    fewshot_examples = f"{get_obligaciones_fewshot(None)}\n\n{OBLIGACIONES_FEWSHOT_SCANNED}"
+    system_with_examples = f"{OBLIGACIONES_SYSTEM}\n\n{fewshot_examples}"
+
     async def _process_chunk(i: int, chunk: str) -> list[ObligacionExtraida]:
         nonlocal llm_errors, first_error_hint
         messages = [
-            LLMMessage(role="system", content=OBLIGACIONES_SYSTEM),
+            LLMMessage(role="system", content=system_with_examples),
             LLMMessage(role="user", content=OBLIGACIONES_USER.format(texto_contrato=chunk)),
         ]
         try:

@@ -48,6 +48,13 @@ CAMPO_VALID_FIELDS = {
 MAX_CHUNK_CHARS = 8_000
 # Overlap between chunks to avoid cutting mid-clause
 CHUNK_OVERLAP = 500
+# Bound for the whole-text-as-single-chunk fallback (no section header found,
+# even OCR-tolerant) — generous enough for current vision/text models' context
+# windows alongside the system prompt + few-shots + completion budget.
+# ponytail: fixed bound, not a real per-model context lookup — upgrade to a
+# sliding multi-chunk fallback if evidence shows obligations sections beyond
+# this bound are being missed on very long noisy documents.
+WHOLE_TEXT_FALLBACK_MAX_CHARS = MAX_CHUNK_CHARS * 4
 
 # Keywords that signal the specific-obligations section (tier 1 = preferred).
 # If tier-1 keywords are found we ONLY use those sections so the LLM never
@@ -92,47 +99,62 @@ OBLIGACION_SECTION_KW_TIER2 = [
 ]
 
 
+def _keyword_pattern(kw: str) -> re.Pattern[str]:
+    """Compile a section keyword into an OCR-tolerant regex.
+
+    Scanned/OCR'd text often flattens or mangles the whitespace between the
+    words of a header (e.g. "OBLIGACIONESESPECIFICASDELCONTRATISTA" with no
+    spaces at all, or irregular spacing). Escaping the keyword and swapping
+    internal spaces for ``\\s*`` matches the header whether the spacing
+    survived, was flattened, or was doubled — no fuzzy-matching dependency
+    needed. Case is handled by matching against upper-cased text; accent loss
+    is covered by both accented/unaccented literal keyword forms already
+    present in ``OBLIGACION_SECTION_KW_TIER1``/``TIER2``.
+    """
+    return re.compile(r"\s*".join(re.escape(word) for word in kw.split(" ")))
+
+
+_OBLIGACION_SECTION_PATTERNS_TIER1 = [_keyword_pattern(kw) for kw in OBLIGACION_SECTION_KW_TIER1]
+_OBLIGACION_SECTION_PATTERNS_TIER2 = [_keyword_pattern(kw) for kw in OBLIGACION_SECTION_KW_TIER2]
+
+
 def extract_obligation_sections(texto: str) -> list[str]:
     """Extract ALL obligation-rich sections from the contract text.
 
-    Scans for every occurrence of every section keyword and builds windows around each.
-    Overlapping windows are merged. Returns a list of text chunks to process independently,
-    falling back to full-text chunking if no keywords are found.
+    Scans for every occurrence of every section keyword (OCR-tolerant: flattened
+    or irregular spacing between header words still matches) and builds windows
+    around each. Overlapping windows are merged. Returns a list of text chunks
+    to process independently.
 
     Uses a two-tier keyword strategy:
       tier-1 = "OBLIGACIONES ESPECÍFICAS" — preferred, uses ONLY these sections.
       tier-2 = broader keywords — used only when tier-1 finds nothing.
     This prevents the LLM from seeing "obligaciones generales" text.
+
+    Fallback: when NO header (even OCR-tolerant) is found anywhere in the text —
+    e.g. OCR mangling broke individual letters, not just spacing — returns the
+    whole text as a SINGLE bounded chunk instead of blind fixed-size slices, so
+    the section-aware LLM prompt (with its noisy/OCR few-shot example) is the
+    safety net instead of disconnected fragments with no section context.
     """
     texto_upper = texto.upper()
 
-    def _find_ranges(keywords: list[str]) -> list[tuple[int, int]]:
+    def _find_ranges(patterns: list[re.Pattern[str]]) -> list[tuple[int, int]]:
         ranges: list[tuple[int, int]] = []
-        for kw in keywords:
-            pos = 0
-            while True:
-                idx = texto_upper.find(kw, pos)
-                if idx == -1:
-                    break
+        for pattern in patterns:
+            for m in pattern.finditer(texto_upper):
+                idx = m.start()
                 start = max(0, idx - 300)
                 end = min(len(texto), idx + MAX_CHUNK_CHARS * 2)
                 ranges.append((start, end))
-                pos = idx + len(kw)
         return ranges
 
-    ranges = _find_ranges(OBLIGACION_SECTION_KW_TIER1)
+    ranges = _find_ranges(_OBLIGACION_SECTION_PATTERNS_TIER1)
     if not ranges:
-        ranges = _find_ranges(OBLIGACION_SECTION_KW_TIER2)
+        ranges = _find_ranges(_OBLIGACION_SECTION_PATTERNS_TIER2)
 
     if not ranges:
-        chunks: list[str] = []
-        pos = 0
-        while pos < len(texto):
-            chunks.append(texto[pos : pos + MAX_CHUNK_CHARS])
-            pos += MAX_CHUNK_CHARS - CHUNK_OVERLAP
-            if pos + CHUNK_OVERLAP >= len(texto):
-                break
-        return chunks or [texto[:MAX_CHUNK_CHARS]]
+        return [texto[:WHOLE_TEXT_FALLBACK_MAX_CHARS]]
 
     ranges.sort()
     merged: list[tuple[int, int]] = []
@@ -258,6 +280,88 @@ def parse_obligaciones_structured(raw: str) -> list[ObligacionExtraida]:
     except ValidationError:
         return parse_obligaciones_llm(raw)
     return obligacion_items_to_extraidas(parsed.obligaciones)
+
+
+# ── Page-furniture stripper (entity-agnostic header/footer boilerplate) ─────
+#
+# Scanned SECOP contracts often interleave running header/footer text (entity
+# address, NIT, phone/fax/email/web, page markers, entity banners) into the
+# OCR transcription, sometimes glued mid-word onto real content when a page
+# break lands inside a sentence. Left uncleaned, this text (a) leaks into the
+# obligation description, and (b) can hide the next item's enumeration marker
+# from the line-based splitter (`_split_items`), merging two obligations into
+# one. `strip_page_furniture` removes only LABELED fields (never unlabeled
+# prose/banners — too risky to strip generically) and turns real page markers
+# into a newline, since a page marker IS the page boundary: reinstating a line
+# break there lets `_split_items` recover a marker the page break glued onto
+# the previous line.
+
+# Anchored on the label token itself (no leading \b) so OCR joins like
+# "FLORESTATELEFONO:" still match — only the label + its value are removed,
+# never the word it happens to be glued to. Value char classes exclude "\n" so
+# a run never swallows unrelated content on a following line.
+_FURNITURE_PHONE_RE = re.compile(r"TEL[EÉ]FONOS?\s*:?\s*[\d \t.\-()/]+", re.IGNORECASE)
+_FURNITURE_FAX_RE = re.compile(r"FAX\s*:?\s*[\d \t.\-()/]+", re.IGNORECASE)
+_FURNITURE_EMAIL_RE = re.compile(r"E-?MAIL\s*:?\s*\S+@\S+", re.IGNORECASE)
+_FURNITURE_WEB_RE = re.compile(r"WEB\s*:?\s*(?:https?://)?www\.\S+", re.IGNORECASE)
+# Colombian NIT: NNN.NNN.NNN-D (check digit is always exactly one digit — the
+# `(?!\d)` keeps a glued following digit, e.g. a swallowed enumeration marker,
+# from being absorbed into the match).
+_FURNITURE_NIT_RE = re.compile(r"NIT\.?\s*:?\s*\d{1,3}(?:[.\s]\d{3}){0,3}-\d(?!\d)", re.IGNORECASE)
+_FURNITURE_INLINE_PATTERNS = (
+    _FURNITURE_PHONE_RE,
+    _FURNITURE_FAX_RE,
+    _FURNITURE_EMAIL_RE,
+    _FURNITURE_WEB_RE,
+    _FURNITURE_NIT_RE,
+)
+# Explicit "Página X de Y" / "Pág. X/Y" page markers — always a real page boundary.
+_FURNITURE_PAGE_LABELED_RE = re.compile(r"P[áa]g(?:ina)?\.?\s*\d{1,3}\s*(?:de|/)\s*\d{1,3}", re.IGNORECASE)
+# Bare "3 de 6" marker. Requires a digit IMMEDIATELY after "de" (no words in
+# between) so real prose like "3 de los 6 comités" never matches. Only applied
+# once at least one other footer signal was found in the text ("a detected
+# footer run"), to avoid false positives on unrelated bare number pairs.
+_FURNITURE_PAGE_BARE_RE = re.compile(r"\b\d{1,3}\s+de\s+\d{1,3}\b", re.IGNORECASE)
+
+# Strong footer signature used to reject a polluted verbatim result (Fix B).
+_FOOTER_SIGNATURE_RE = re.compile(
+    r"\d{3}\.\d{3}\.\d{3}-\d|\S+@\S+\.\S+|TEL[EÉ]FONOS?\s*:|FAX\s*:|E-?MAIL\s*:|WEB\s*:|NIT\.?\s*:",
+    re.IGNORECASE,
+)
+
+
+def strip_page_furniture(texto: str) -> str:
+    """Strip entity-agnostic page header/footer boilerplate from contract text.
+
+    Removes LABELED contact/identification fields (teléfono, fax, e-mail, web,
+    NIT) and explicit page markers ("Página X de Y", bare "3 de 6"). Page
+    markers are replaced with a newline instead of a space so the line-based
+    obligation splitter can recover an item marker a flattened page break
+    glued onto the previous line.
+
+    Deliberately conservative: does NOT touch unlabeled prose, ALL-CAPS entity
+    banners, or slogans — a false positive there would delete real obligation
+    wording. That residual noise is left to the hardened LLM prompt (see
+    ``app/agent/prompts/obligaciones.py``), which also receives text already
+    cleaned by this function.
+    """
+    if not texto:
+        return texto
+    cleaned = texto
+    removed_any = False
+    for pattern in _FURNITURE_INLINE_PATTERNS:
+        cleaned, n = pattern.subn(" ", cleaned)
+        removed_any = removed_any or n > 0
+    cleaned, n = _FURNITURE_PAGE_LABELED_RE.subn("\n", cleaned)
+    removed_any = removed_any or n > 0
+    if removed_any:
+        cleaned, n = _FURNITURE_PAGE_BARE_RE.subn("\n", cleaned)
+        removed_any = removed_any or n > 0
+    if not removed_any:
+        return texto
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    cleaned = re.sub(r"[ \t]*\n[ \t]*", "\n", cleaned)
+    return cleaned.strip()
 
 
 # ── Verbatim (deterministic) obligation extractor ──────────────────────────
@@ -532,6 +636,16 @@ def _extract_items_from_block(block: str) -> list[tuple[str, str]]:
     return items
 
 
+def _has_footer_pollution(items: list[tuple[str, str]]) -> bool:
+    """Return True when any item's text still carries a strong footer signature.
+
+    A NIT, an e-mail address, or a TEL/FAX/E-MAIL/WEB label inside an obligation's
+    text means page furniture leaked into the verbatim extraction — the result
+    should not be trusted and the caller must escalate to the LLM fallback instead.
+    """
+    return any(_FOOTER_SIGNATURE_RE.search(text) for _, text in items)
+
+
 def extract_obligaciones_verbatim(texto: str) -> list[ObligacionExtraida]:
     """Extract enumerated obligation items from the contract text **verbatim**.
 
@@ -546,8 +660,11 @@ def extract_obligaciones_verbatim(texto: str) -> list[ObligacionExtraida]:
     whitespace collapsed to single spaces; items shorter than 10 characters are
     dropped as noise and anything after the catch-all closer is excluded.
 
-    Returns an empty list when no usable section is found, so callers fall back
-    to the LLM extractor.
+    Returns an empty list when no usable section is found, OR when any item
+    still carries a strong footer signature (NIT / e-mail / TEL-FAX-WEB label —
+    see ``_has_footer_pollution``) — verbatim text is only trustworthy on clean
+    input, so a polluted result is discarded rather than returned as-is,
+    letting the caller escalate to the LLM extractor instead.
     """
     if not texto:
         return []
@@ -569,7 +686,9 @@ def extract_obligaciones_verbatim(texto: str) -> list[ObligacionExtraida]:
         # catch-all ("Las demás actividades…") — prefer it over a general list
         # (e.g. seguridad social) that merely happens to enumerate items first.
         if _is_catch_all(items[-1][1]):
-            return _to_obligaciones(items)
+            return [] if _has_footer_pollution(items) else _to_obligaciones(items)
         if fallback is None:
             fallback = items
-    return _to_obligaciones(fallback) if fallback else []
+    if fallback is None or _has_footer_pollution(fallback):
+        return []
+    return _to_obligaciones(fallback)
