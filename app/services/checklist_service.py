@@ -51,7 +51,6 @@ from app.services.document_classifier import (
     CATEGORIA_A_REQUISITO,
     TIPO_A_REQUISITO,
     clasificar_contenido,
-    extraer_texto_contenido,
 )
 
 logger = structlog.get_logger("service.checklist")
@@ -849,8 +848,10 @@ async def _asegurar_texto_extraido(doc: SecopDocumento, presupuesto: _Presupuest
     """Download + extract text for a SECOP doc.
 
     Memoized via ``texto_estado``: 'ok' and 'sin_texto' are final — content
-    already resolved, or genuinely absent (``extraer_texto_contenido``'s
-    documented ValueError contract). 'error' (download failure or an
+    already resolved via native parse or local OCR (tiers 1+2 of
+    ``document_service.extraer_texto_documento``; vision is NOT invoked here —
+    that escalation is manual-only, see ``_asegurar_texto_extraido_manual``),
+    or genuinely absent. 'error' (download failure or an
     unexpected parse exception) is retried on the NEXT scan, but at most once
     per scan (tracked in ``presupuesto.intentos``) so a persistently-failing
     doc never burns more than one download attempt per run. Never raises
@@ -876,9 +877,18 @@ async def _asegurar_texto_extraido(doc: SecopDocumento, presupuesto: _Presupuest
     presupuesto.intentos.add(doc.id)
     try:
         data = await _descargar_secop_bytes(doc.url_descarga, min(_SNIFF_HTTP_TIMEOUT, restante))
-        texto = extraer_texto_contenido(data, doc.nombre_archivo or "documento")
-        doc.texto_extraido = texto or None
-        doc.texto_estado = "ok" if texto.strip() else "sin_texto"
+        # Function-level import: document_service imports this module inside its
+        # own functions — a module-level import here would be circular.
+        from app.services import document_service
+        from app.services.document_classifier import TEXTO_EXTRAIDO_MAX_CHARS
+
+        texto, _avisos = await document_service.extraer_texto_documento(data, doc.nombre_archivo or "documento")
+        if texto and texto.strip():
+            doc.texto_extraido = texto[:TEXTO_EXTRAIDO_MAX_CHARS]
+            doc.texto_estado = "ok"
+        else:
+            doc.texto_extraido = None
+            doc.texto_estado = "sin_texto"
     except Exception as exc:
         doc.texto_estado = "error"
         await logger.awarning("secop_sniff_descarga_error", secop_documento_id=str(doc.id), error=str(exc))
@@ -912,15 +922,30 @@ async def _asegurar_texto_extraido_manual(doc: SecopDocumento) -> None:
         await logger.awarning("secop_vincular_descarga_error", secop_documento_id=str(doc.id), error=str(exc))
         raise ValidationError("No se pudo descargar el documento SECOP.") from exc
 
-    texto = extraer_texto_contenido(data, doc.nombre_archivo or "documento")
-    if not texto.strip():
+    # Function-level import: document_service imports this module inside its own
+    # functions — a module-level import here would be circular.
+    from app.services import document_service
+    from app.services.document_classifier import TEXTO_EXTRAIDO_MAX_CHARS
+
+    # Tiers 1+2: native parse → local OCR (shared robust ladder).
+    texto, _avisos = await document_service.extraer_texto_documento(data, doc.nombre_archivo or "documento")
+    if not texto or not texto.strip():
+        # Tier 3 (MANUAL ONLY): vision escalation for scanned/distorted contracts.
+        from app.agent.tools.multimodal_parser import guess_mime_type
+
+        mime = guess_mime_type(doc.nombre_archivo or "documento")
+        resultado = await document_service._extraer_contrato_multimodal(data, mime)
+        texto = resultado.transcripcion if resultado is not None else None
+
+    if not texto or not texto.strip():
         doc.texto_extraido = None
         doc.texto_estado = "sin_texto"
         raise ValidationError(
-            "El documento no tiene texto extraíble (posible PDF escaneado sin OCR); "
-            "subí el documento del contrato manualmente para extraer las obligaciones."
+            "No se pudo extraer texto del documento SECOP: se intentó lectura nativa, OCR y "
+            "modelo de visión sin éxito. El archivo puede estar dañado, protegido o ser una "
+            "imagen ilegible. Probá con otro documento del contrato."
         )
-    doc.texto_extraido = texto
+    doc.texto_extraido = texto[:TEXTO_EXTRAIDO_MAX_CHARS]
     doc.texto_estado = "ok"
 
 

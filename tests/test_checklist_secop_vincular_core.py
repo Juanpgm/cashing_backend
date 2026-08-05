@@ -167,8 +167,13 @@ async def test_manual_ignora_sin_texto_memoizado_y_reintenta_descarga(
         assert timeout == checklist_service._VINCULAR_HTTP_TIMEOUT
         return b"contenido"
 
+    from app.services import document_service
+
+    async def _texto_ok(content: bytes, filename: str, *, relaxed_ocr: bool = False) -> tuple[str | None, list[str]]:
+        return TEXTO_CONTRATO, []
+
     monkeypatch.setattr(checklist_service, "_descargar_secop_bytes", _fake_descarga)
-    monkeypatch.setattr(checklist_service, "extraer_texto_contenido", lambda data, nombre: TEXTO_CONTRATO)
+    monkeypatch.setattr(document_service, "extraer_texto_documento", _texto_ok)
     doc = _secop_doc(
         contrato,
         "contrato.docx",
@@ -242,19 +247,30 @@ async def test_manual_documento_demasiado_grande_lanza_mensaje_especifico(
         await checklist_service.extraer_obligaciones_desde_secop_doc(db, contrato, doc, manual=True)
 
 
-async def test_manual_texto_no_extraible_lanza_mensaje_de_pdf_escaneado(
+async def test_manual_texto_no_extraible_ni_por_vision_lanza_mensaje_final(
     db: AsyncSession, contrato: Contrato, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Native + OCR + vision all fail to recover text: raises with the new
+    terminal copy (NOT the old 'subí el documento manualmente' message)."""
+    from app.services import document_service
+
     async def _fake_descarga(url: str, timeout: float = 0.0) -> bytes:
         return b"%PDF-escaneado-sin-texto"
 
+    async def _sin_texto(content: bytes, filename: str, *, relaxed_ocr: bool = False) -> tuple[str | None, list[str]]:
+        return None, []
+
+    async def _vision_falla(content: bytes, mime_type: str) -> None:
+        return None
+
     monkeypatch.setattr(checklist_service, "_descargar_secop_bytes", _fake_descarga)
-    monkeypatch.setattr(checklist_service, "extraer_texto_contenido", lambda data, nombre: "")
+    monkeypatch.setattr(document_service, "extraer_texto_documento", _sin_texto)
+    monkeypatch.setattr(document_service, "_extraer_contrato_multimodal", _vision_falla)
     doc = _secop_doc(contrato, "contrato.pdf", url_descarga="https://s/contrato.pdf")
     db.add(doc)
     await db.commit()
 
-    with pytest.raises(ValidationError, match="PDF escaneado"):
+    with pytest.raises(ValidationError, match="modelo de visión"):
         await checklist_service.extraer_obligaciones_desde_secop_doc(db, contrato, doc, manual=True)
 
     assert doc.texto_estado == "sin_texto"

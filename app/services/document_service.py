@@ -571,7 +571,11 @@ async def extraer_texto_documento(
         and ocr_available(settings.EXTRACTION_OCR_ENGINE)
     ):
         try:
-            texto_ocr = ocr_extract_text(
+            # ocr_extract_text is CPU-bound (rasterize + OCR); off the event loop
+            # like parse_document above, so the SECOP background scan can run
+            # several OCR passes without blocking request-serving coroutines.
+            texto_ocr = await asyncio.to_thread(
+                ocr_extract_text,
                 content,
                 mime,
                 engine=settings.EXTRACTION_OCR_ENGINE,

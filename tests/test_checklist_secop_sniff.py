@@ -16,6 +16,7 @@ from typing import Any
 
 import httpx
 import pytest
+from app.core.exceptions import ValidationError
 from app.models.categoria_documento import CategoriaDocumento
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
@@ -360,12 +361,15 @@ async def test_error_transitorio_se_reintenta_y_recupera_en_scan_siguiente(
     assert fila.confianza_deteccion == Decimal("0.850")
 
 
-async def test_extraer_texto_contenido_bug_no_colapsa_a_sin_texto(
+async def test_extraer_texto_documento_bug_no_colapsa_a_sin_texto(
     db: AsyncSession, contrato: Contrato, descargas: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An unexpected parse exception (NOT the documented 'genuinely non-textual'
-    ValueError) must map to the retryable 'error' state, never to the terminal
-    'sin_texto' state."""
+    """An unexpected exception from the extraction ladder (NOT a genuine
+    no-text outcome, which ``document_service.extraer_texto_documento`` already
+    swallows internally) must map to the retryable 'error' state, never to the
+    terminal 'sin_texto' state."""
+    from app.services import document_service
+
     url = "https://s/bug-de-parseo.docx"
     descargas["payloads"][url] = b"contenido-cualquiera"
     doc = _secop_doc(contrato, "documento_generico.docx", url=url)
@@ -373,10 +377,10 @@ async def test_extraer_texto_contenido_bug_no_colapsa_a_sin_texto(
     await db.commit()
     cuenta = await _make_cuenta(db, contrato)
 
-    def _boom(data: bytes, filename: str) -> str:
+    async def _boom(content: bytes, filename: str, *, relaxed_ocr: bool = False) -> tuple[str | None, list[str]]:
         raise RuntimeError("fallo inesperado del parser")
 
-    monkeypatch.setattr(checklist_service, "extraer_texto_contenido", _boom)
+    monkeypatch.setattr(document_service, "extraer_texto_documento", _boom)
 
     await checklist_service.detectar_desde_secop(db, cuenta)
     await db.commit()
@@ -534,6 +538,158 @@ async def test_cero_llamadas_llm_y_embeddings(
 
     assert llm_calls == []
     assert descargas["llamadas"] == [url]
+
+
+# ── 2.6 native→OCR→vision ladder (robust-document-extraction-ocr) ──────────
+#
+# The manual Vincular writer (``_asegurar_texto_extraido_manual``) escalates
+# native → local OCR → vision; the background-scan writer
+# (``_asegurar_texto_extraido``) stops at native → local OCR and never calls
+# vision. Both mock ``document_service.extraer_texto_documento`` /
+# ``_extraer_contrato_multimodal`` at the source module — no real
+# Tesseract/Gemini calls in these unit tests.
+
+
+async def test_manual_vincular_scanned_pdf_recupera_via_ocr(
+    descargas: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Scanned PDF with no native text layer but OCR-readable content: manual
+    Vincular recovers text via tier 2 (local OCR) and never escalates to
+    vision (spec: 'Scanned PDF with readable quality, no text layer')."""
+    from app.services import document_service
+
+    url = "https://s/escaneado-legible.pdf"
+    descargas["payloads"][url] = b"%PDF-bytes-escaneados"
+    doc = _doc_suelto(url)
+
+    async def _ocr_ok(content: bytes, filename: str, *, relaxed_ocr: bool = False) -> tuple[str | None, list[str]]:
+        return "texto recuperado por OCR local", ["ocr_used"]
+
+    async def _vision_no_debe_llamarse(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("vision must NOT be called when local OCR already succeeded")
+
+    monkeypatch.setattr(document_service, "extraer_texto_documento", _ocr_ok)
+    monkeypatch.setattr(document_service, "_extraer_contrato_multimodal", _vision_no_debe_llamarse)
+
+    await checklist_service._asegurar_texto_extraido_manual(doc)
+
+    assert doc.texto_estado == "ok"
+    assert doc.texto_extraido == "texto recuperado por OCR local"
+
+
+async def test_manual_vincular_ocr_insuficiente_escala_a_vision(
+    descargas: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Native + OCR both fail their quality gate: manual Vincular escalates to
+    the vision model (tier 3) and consumes its transcription (spec:
+    'Badly-scanned/distorted contract fails the OCR quality gate')."""
+    from app.schemas.agent import ContratoExtractionResult
+    from app.services import document_service
+
+    url = "https://s/mal-escaneado.pdf"
+    descargas["payloads"][url] = b"%PDF-bytes-distorsionados"
+    doc = _doc_suelto(url)
+
+    async def _sin_texto(content: bytes, filename: str, *, relaxed_ocr: bool = False) -> tuple[str | None, list[str]]:
+        return None, []
+
+    async def _vision_ok(content: bytes, mime_type: str) -> ContratoExtractionResult:
+        return ContratoExtractionResult(transcripcion="transcripción recuperada por visión")
+
+    monkeypatch.setattr(document_service, "extraer_texto_documento", _sin_texto)
+    monkeypatch.setattr(document_service, "_extraer_contrato_multimodal", _vision_ok)
+
+    await checklist_service._asegurar_texto_extraido_manual(doc)
+
+    assert doc.texto_estado == "ok"
+    assert doc.texto_extraido == "transcripción recuperada por visión"
+
+
+async def test_manual_vincular_todos_los_niveles_fallan_lanza_error_nuevo(
+    descargas: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Native, OCR AND vision all fail: raises ValidationError with the new
+    copy — must NOT be the old 'subí el documento manualmente' message, since
+    that upload-manually path is the one that just ran (spec: 'Vision
+    extraction also fails')."""
+    from app.services import document_service
+
+    url = "https://s/irrecuperable.pdf"
+    descargas["payloads"][url] = b"%PDF-bytes-irrecuperables"
+    doc = _doc_suelto(url)
+
+    async def _sin_texto(content: bytes, filename: str, *, relaxed_ocr: bool = False) -> tuple[str | None, list[str]]:
+        return None, []
+
+    async def _vision_falla(content: bytes, mime_type: str) -> None:
+        return None
+
+    monkeypatch.setattr(document_service, "extraer_texto_documento", _sin_texto)
+    monkeypatch.setattr(document_service, "_extraer_contrato_multimodal", _vision_falla)
+
+    with pytest.raises(ValidationError) as excinfo:
+        await checklist_service._asegurar_texto_extraido_manual(doc)
+
+    assert "subí el documento del contrato manualmente" not in str(excinfo.value)
+    assert "modelo de visión" in str(excinfo.value)
+    assert doc.texto_estado == "sin_texto"
+    assert doc.texto_extraido is None
+
+
+async def test_scan_de_background_nunca_invoca_vision(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The background SECOP scan is strictly tier 1+2 (native + local OCR):
+    when OCR is insufficient it must persist 'sin_texto' WITHOUT ever calling
+    the vision model and WITHOUT raising (spec: 'Background SECOP scan is
+    limited to native + local OCR')."""
+    from app.services import document_service
+
+    async def _sin_texto(content: bytes, filename: str, *, relaxed_ocr: bool = False) -> tuple[str | None, list[str]]:
+        return None, []
+
+    async def _vision_no_debe_llamarse(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("vision must NEVER be called by the background scan")
+
+    monkeypatch.setattr(document_service, "extraer_texto_documento", _sin_texto)
+    monkeypatch.setattr(document_service, "_extraer_contrato_multimodal", _vision_no_debe_llamarse)
+
+    async def _fake(url: str, timeout: float = checklist_service._SNIFF_HTTP_TIMEOUT) -> bytes:
+        return b"%PDF-bytes-escaneados"
+
+    monkeypatch.setattr(checklist_service, "_descargar_secop_bytes", _fake)
+
+    doc = _doc_suelto("https://s/scan-sin-texto.pdf")
+    presupuesto = checklist_service._PresupuestoSniff()
+
+    await checklist_service._asegurar_texto_extraido(doc, presupuesto)
+
+    assert doc.texto_estado == "sin_texto"
+    assert doc.texto_extraido is None
+
+
+async def test_scan_de_background_ocr_recuperado_marca_ok(monkeypatch: pytest.MonkeyPatch) -> None:
+    """OCR-recovered text (tier 2) in the background scan also sets
+    ``texto_estado='ok'`` so ``_score_contenido_para_requisito`` re-scores it —
+    the same D3 invariant as the manual writer (spec: 'texto_estado invariant
+    across both writers')."""
+    from app.services import document_service
+
+    async def _ocr_ok(content: bytes, filename: str, *, relaxed_ocr: bool = False) -> tuple[str | None, list[str]]:
+        return "texto recuperado por OCR local", ["ocr_used"]
+
+    monkeypatch.setattr(document_service, "extraer_texto_documento", _ocr_ok)
+
+    async def _fake(url: str, timeout: float = checklist_service._SNIFF_HTTP_TIMEOUT) -> bytes:
+        return b"%PDF-bytes-escaneados"
+
+    monkeypatch.setattr(checklist_service, "_descargar_secop_bytes", _fake)
+
+    doc = _doc_suelto("https://s/scan-ocr-ok.pdf")
+    presupuesto = checklist_service._PresupuestoSniff()
+
+    await checklist_service._asegurar_texto_extraido(doc, presupuesto)
+
+    assert doc.texto_estado == "ok"
+    assert doc.texto_extraido == "texto recuperado por OCR local"
 
 
 # ── 2.4 real download seam: streamed, bounded by bytes (RISK-001) ───────────
