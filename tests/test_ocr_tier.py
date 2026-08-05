@@ -62,12 +62,12 @@ def test_extract_text_unsupported_mime_is_empty() -> None:
 
 def test_rapidocr_engine_built_once_and_reused(monkeypatch: pytest.MonkeyPatch) -> None:
     """RapidOCR() loads 3 ONNX models (expensive); OCRing a multi-page PDF must
-    construct it ONCE per thread and reuse it for every page, and a later call
-    on the same thread must reuse that instance rather than rebuilding it."""
+    construct it ONCE and reuse it for every page, and a later call must reuse
+    that same shared instance rather than rebuilding it."""
     import fitz  # PyMuPDF
     import rapidocr_onnxruntime
 
-    ocr._engine_local.engine = None
+    ocr._engine = None
 
     doc = fitz.open()
     doc.new_page()
@@ -96,7 +96,58 @@ def test_rapidocr_engine_built_once_and_reused(monkeypatch: pytest.MonkeyPatch) 
         ocr.extract_text(pdf_bytes, "application/pdf", engine="rapidocr", lang="spa", max_pages=8, dpi=72)
         assert construct_calls["n"] == 1
     finally:
-        ocr._engine_local.engine = None
+        ocr._engine = None
+
+
+def test_rapidocr_inference_is_serialized(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The shared engine mutates per-call state, so inference must be serialized:
+    two threads must never be inside engine(arr) at once. Guards against a future
+    removal of _engine_lock."""
+    import io
+    import threading
+    import time
+
+    import rapidocr_onnxruntime
+    from PIL import Image
+
+    ocr._engine = None
+
+    counter = {"now": 0, "max": 0}
+    guard = threading.Lock()
+
+    class _CountingEngine:
+        def __init__(self) -> None: ...
+
+        def __call__(self, arr: Any) -> tuple[list[list[Any]], None]:
+            with guard:
+                counter["now"] += 1
+                counter["max"] = max(counter["max"], counter["now"])
+            time.sleep(0.02)  # widen the overlap window so a missing lock would show
+            with guard:
+                counter["now"] -= 1
+            return ([[None, "ocr"]], None)
+
+    monkeypatch.setattr(rapidocr_onnxruntime, "RapidOCR", _CountingEngine)
+
+    buf = io.BytesIO()
+    Image.new("RGB", (4, 4), "white").save(buf, format="PNG")
+    png = buf.getvalue()
+
+    barrier = threading.Barrier(4)
+
+    def _run() -> None:
+        barrier.wait()  # release all threads together to force contention
+        ocr._ocr_image_rapidocr(png)
+
+    threads = [threading.Thread(target=_run) for _ in range(4)]
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert counter["max"] == 1  # _engine_lock kept them one-at-a-time
+    finally:
+        ocr._engine = None
 
 
 # ── Escalera: OCR exitoso NO llama a visión ─────────────────────────────────

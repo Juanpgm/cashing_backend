@@ -35,27 +35,29 @@ logger = structlog.get_logger("agent.tools.ocr")
 _IMAGE_MIMES = frozenset({"image/png", "image/jpeg"})
 
 
-# One RapidOCR engine per worker thread. A single process-wide instance is NOT
-# safe: OCR runs via ``asyncio.to_thread`` (a thread pool) and RapidOCR's
-# TextDetector mutates per-call instance state (``preprocess_op`` is set from the
-# current image's size, then read), so two concurrent calls on different-sized
-# images would race and silently corrupt the recovered text. Thread-local keeps
-# the build-once speed win (RapidOCR loads 3 ONNX models per construction, ~s;
-# building per page — the old behavior — dominated OCR wall time) while giving
-# each thread its own engine: no shared mutable state, no global lock, still
-# parallel across threads.
-_engine_local = threading.local()
+# One RapidOCR engine for the whole process, built once and reused. RapidOCR
+# loads 3 ONNX models per construction (~seconds); rebuilding it per page (the
+# old behavior) is what made OCR slow. The engine mutates per-call detector
+# state, so it is not safe to run concurrently — ``_engine_lock`` serializes
+# both the lazy build and every inference (see ``_ocr_image_rapidocr``). A single
+# shared engine keeps memory to one model set; OCR is CPU-bound and barely
+# concurrent here, so serializing costs less than one engine per worker thread.
+_engine_lock = threading.Lock()
+_engine: RapidOCR | None = None
 
 
 def _get_rapidocr() -> RapidOCR:
-    """Return this thread's RapidOCR engine, constructing it once per thread."""
-    engine = getattr(_engine_local, "engine", None)
-    if engine is None:
+    """Return the process-wide RapidOCR engine, building it once (lazily).
+
+    Callers MUST hold ``_engine_lock`` — the engine is shared and mutates
+    per-call state, so its build and every inference run under the lock.
+    """
+    global _engine
+    if _engine is None:
         from rapidocr_onnxruntime import RapidOCR
 
-        engine = RapidOCR()
-        _engine_local.engine = engine
-    return engine
+        _engine = RapidOCR()
+    return _engine
 
 
 def _configure_tesseract() -> None:
@@ -97,10 +99,13 @@ def _ocr_image_rapidocr(image_bytes: bytes) -> str:
     import numpy as np
     from PIL import Image
 
-    engine = _get_rapidocr()
     with Image.open(io.BytesIO(image_bytes)) as img:
         arr = np.array(img.convert("RGB"))
-    result, _ = engine(arr)
+    # Lock only the inference: the shared engine mutates per-call state, so
+    # concurrent runs would corrupt each other. The image decode above is not
+    # locked, so callers still parallelize the CPU-heavy raster/decode work.
+    with _engine_lock:
+        result, _ = _get_rapidocr()(arr)
     if not result:
         return ""
     return "\n".join(str(line[1]) for line in result)
