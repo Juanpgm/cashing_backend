@@ -624,8 +624,12 @@ async def test_manual_vincular_todos_los_niveles_fallan_lanza_error_nuevo(
     async def _vision_falla(content: bytes, mime_type: str) -> None:
         return None
 
+    async def _transcripcion_falla(content: bytes, mime_type: str) -> str | None:
+        return None
+
     monkeypatch.setattr(document_service, "extraer_texto_documento", _sin_texto)
     monkeypatch.setattr(document_service, "_extraer_contrato_multimodal", _vision_falla)
+    monkeypatch.setattr(document_service, "transcribir_documento_multimodal", _transcripcion_falla)
 
     with pytest.raises(ValidationError) as excinfo:
         await checklist_service._asegurar_texto_extraido_manual(doc)
@@ -634,6 +638,78 @@ async def test_manual_vincular_todos_los_niveles_fallan_lanza_error_nuevo(
     assert "modelo de visión" in str(excinfo.value)
     assert doc.texto_estado == "sin_texto"
     assert doc.texto_extraido is None
+
+
+async def test_manual_vincular_octet_stream_extension_reaches_vision_via_content_sniff(
+    descargas: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A SECOP filename with no/unknown extension resolves to octet-stream via
+    the extension-only guess and used to skip vision entirely (root cause).
+    Content-sniffing the actual PDF bytes must still reach vision — this is the
+    regression cover for FIX 2's effect on the manual escalation path."""
+    from app.schemas.agent import ContratoExtractionResult
+    from app.services import document_service
+
+    url = "https://s/documento-sin-extension"
+    descargas["payloads"][url] = b"%PDF-bytes-escaneados-sin-extension"
+    doc = SecopDocumento(
+        id=uuid.uuid4(),
+        id_documento_secop=f"DOC-{uuid.uuid4().hex[:10]}",
+        nombre_archivo="documento_sin_extension",  # no extension → octet-stream by guess_mime_type
+        url_descarga=url,
+        datos_raw={},
+    )
+
+    mime_recibido: list[str] = []
+
+    async def _sin_texto(content: bytes, filename: str, *, relaxed_ocr: bool = False) -> tuple[str | None, list[str]]:
+        return None, []
+
+    async def _vision_ok(content: bytes, mime_type: str) -> ContratoExtractionResult:
+        mime_recibido.append(mime_type)
+        return ContratoExtractionResult(transcripcion="transcripción recuperada por visión (octet-stream case)")
+
+    monkeypatch.setattr(document_service, "extraer_texto_documento", _sin_texto)
+    monkeypatch.setattr(document_service, "_extraer_contrato_multimodal", _vision_ok)
+
+    await checklist_service._asegurar_texto_extraido_manual(doc)
+
+    # Vision was reached with the content-sniffed PDF mime, not octet-stream.
+    assert mime_recibido == ["application/pdf"]
+    assert doc.texto_estado == "ok"
+    assert doc.texto_extraido == "transcripción recuperada por visión (octet-stream case)"
+
+
+async def test_manual_vincular_transcripcion_vacia_cae_a_transcripcion_plana(
+    descargas: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Structured vision extraction succeeds but returns an empty `transcripcion`
+    (readable scan, schema-unfriendly content): the plain-text transcription
+    fallback is decisive and its text is used."""
+    from app.schemas.agent import ContratoExtractionResult
+    from app.services import document_service
+
+    url = "https://s/transcripcion-vacia.pdf"
+    descargas["payloads"][url] = b"%PDF-bytes-legible-pero-atipico"
+    doc = _doc_suelto(url)
+
+    async def _sin_texto(content: bytes, filename: str, *, relaxed_ocr: bool = False) -> tuple[str | None, list[str]]:
+        return None, []
+
+    async def _vision_estructura_vacia(content: bytes, mime_type: str) -> ContratoExtractionResult:
+        return ContratoExtractionResult(transcripcion="")
+
+    async def _transcripcion_plana(content: bytes, mime_type: str) -> str | None:
+        return "texto transcrito de forma plana, sin estructura de contrato"
+
+    monkeypatch.setattr(document_service, "extraer_texto_documento", _sin_texto)
+    monkeypatch.setattr(document_service, "_extraer_contrato_multimodal", _vision_estructura_vacia)
+    monkeypatch.setattr(document_service, "transcribir_documento_multimodal", _transcripcion_plana)
+
+    await checklist_service._asegurar_texto_extraido_manual(doc)
+
+    assert doc.texto_estado == "ok"
+    assert doc.texto_extraido == "texto transcrito de forma plana, sin estructura de contrato"
 
 
 async def test_scan_de_background_nunca_invoca_vision(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -11,6 +11,7 @@ from app.agent.tools.multimodal_parser import (
     is_multimodal_supported,
     is_text_sufficient,
     normalize_image,
+    sniff_multimodal_mime,
 )
 
 
@@ -104,6 +105,39 @@ class TestIsMultimodalSupported:
             is_multimodal_supported("application/vnd.openxmlformats-officedocument.wordprocessingml.document") is False
         )
         assert is_multimodal_supported("application/octet-stream") is False
+
+
+class TestSniffMultimodalMime:
+    def test_pdf_magic_bytes_with_wrong_extension(self) -> None:
+        assert sniff_multimodal_mime(b"%PDF-1.4 fake", "documento.bin") == "application/pdf"
+
+    def test_pdf_magic_bytes_with_no_extension(self) -> None:
+        assert sniff_multimodal_mime(b"%PDF-1.4 fake", "documento_sin_extension") == "application/pdf"
+
+    def test_png_magic_bytes_with_wrong_extension(self) -> None:
+        assert sniff_multimodal_mime(b"\x89PNG\r\n\x1a\n fake", "foto.txt") == "image/png"
+
+    def test_jpeg_magic_bytes_with_no_extension(self) -> None:
+        assert sniff_multimodal_mime(b"\xff\xd8\xff\xe0 fake", "foto") == "image/jpeg"
+
+    def test_real_pdf_extension_short_circuits_without_reading_content(self) -> None:
+        # Garbage content that would NOT sniff as PDF — proves the extension
+        # guess wins without ever consulting the magic bytes.
+        assert sniff_multimodal_mime(b"not actually a pdf", "contrato.pdf") == "application/pdf"
+
+    def test_unknown_content_falls_back_to_extension_guess(self) -> None:
+        assert sniff_multimodal_mime(b"garbage", "archivo.bin") == "application/octet-stream"
+
+    def test_unknown_content_no_extension_falls_back_to_octet_stream(self) -> None:
+        assert sniff_multimodal_mime(b"garbage", "documento_sin_extension") == "application/octet-stream"
+
+    def test_docx_extension_with_docx_content_short_circuits(self) -> None:
+        # .docx is a real (non-multimodal) extension guess — never multimodal
+        # supported, but it's still not content-sniffed since it's not one of
+        # the 3 multimodal magic signatures either; falls back unchanged.
+        assert sniff_multimodal_mime(b"PK\x03\x04 zip bytes", "doc.docx") == (
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
 
 
 class TestBuildFileContentPart:

@@ -33,6 +33,36 @@ def is_multimodal_supported(mime_type: str) -> bool:
     return mime_type in MULTIMODAL_MIME_TYPES
 
 
+# Local magic-byte signatures for the 3 multimodal MIME types, checked only when
+# the extension guess is not already multimodal-supported (bad/missing extension,
+# e.g. an unextensioned SECOP document). Deliberately NOT importing
+# ``file_validation._MAGIC_SIGNATURES`` (private) — this is a small, focused subset.
+_MULTIMODAL_MAGIC_SIGNATURES: tuple[tuple[bytes, str], ...] = (
+    (b"%PDF", "application/pdf"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"\x89PNG", "image/png"),
+)
+
+
+def sniff_multimodal_mime(content: bytes, filename: str) -> str:
+    """Resolve the MIME type for the OCR/vision ladder, content-first when the
+    extension guess is not already multimodal-supported.
+
+    The extension-only ``guess_mime_type`` yields octet-stream for unextensioned
+    or wrongly-extensioned scanned documents (common in SECOP downloads), which
+    silently skips both the OCR tier and the vision tier. Falls back to magic-byte
+    sniffing in that case; when the content itself is not recognizable either, the
+    original extension guess is returned unchanged (byte-for-byte prior behavior).
+    """
+    ext_guess = guess_mime_type(filename)
+    if is_multimodal_supported(ext_guess):
+        return ext_guess
+    for signature, mime in _MULTIMODAL_MAGIC_SIGNATURES:
+        if content.startswith(signature):
+            return mime
+    return ext_guess
+
+
 def is_text_sufficient(texto: str | None, min_chars: int = 200) -> bool:
     """Return True when extracted text is rich enough to skip the vision path.
 

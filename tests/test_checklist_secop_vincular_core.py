@@ -263,9 +263,13 @@ async def test_manual_texto_no_extraible_ni_por_vision_lanza_mensaje_final(
     async def _vision_falla(content: bytes, mime_type: str) -> None:
         return None
 
+    async def _transcripcion_falla(content: bytes, mime_type: str) -> str | None:
+        return None
+
     monkeypatch.setattr(checklist_service, "_descargar_secop_bytes", _fake_descarga)
     monkeypatch.setattr(document_service, "extraer_texto_documento", _sin_texto)
     monkeypatch.setattr(document_service, "_extraer_contrato_multimodal", _vision_falla)
+    monkeypatch.setattr(document_service, "transcribir_documento_multimodal", _transcripcion_falla)
     doc = _secop_doc(contrato, "contrato.pdf", url_descarga="https://s/contrato.pdf")
     db.add(doc)
     await db.commit()

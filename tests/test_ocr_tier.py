@@ -60,6 +60,45 @@ def test_extract_text_unsupported_mime_is_empty() -> None:
     assert ocr.extract_text(b"x", "text/plain", engine="tesseract", lang="spa", max_pages=1, dpi=72) == ""
 
 
+def test_rapidocr_engine_built_once_and_reused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """RapidOCR() loads 3 ONNX models (expensive); OCRing a multi-page PDF must
+    construct it ONCE per thread and reuse it for every page, and a later call
+    on the same thread must reuse that instance rather than rebuilding it."""
+    import fitz  # PyMuPDF
+    import rapidocr_onnxruntime
+
+    ocr._engine_local.engine = None
+
+    doc = fitz.open()
+    doc.new_page()
+    doc.new_page()
+    doc.new_page()
+    pdf_bytes = doc.tobytes()
+    doc.close()
+
+    construct_calls = {"n": 0}
+
+    class _FakeEngine:
+        def __init__(self) -> None:
+            construct_calls["n"] += 1
+
+        def __call__(self, arr: Any) -> tuple[list[list[Any]], None]:
+            return ([[None, "texto ocr"]], None)
+
+    monkeypatch.setattr(rapidocr_onnxruntime, "RapidOCR", _FakeEngine)
+
+    try:
+        text = ocr.extract_text(pdf_bytes, "application/pdf", engine="rapidocr", lang="spa", max_pages=8, dpi=72)
+        assert construct_calls["n"] == 1
+        assert "texto ocr" in text
+
+        # A second extraction (e.g. the next document) reuses the cached engine.
+        ocr.extract_text(pdf_bytes, "application/pdf", engine="rapidocr", lang="spa", max_pages=8, dpi=72)
+        assert construct_calls["n"] == 1
+    finally:
+        ocr._engine_local.engine = None
+
+
 # ── Escalera: OCR exitoso NO llama a visión ─────────────────────────────────
 
 

@@ -33,6 +33,7 @@ from app.agent.tools.multimodal_parser import (
     guess_mime_type,
     is_multimodal_supported,
     is_text_sufficient,
+    sniff_multimodal_mime,
 )
 from app.agent.tools.ocr import extract_text as ocr_extract_text
 from app.agent.tools.ocr import ocr_available
@@ -530,6 +531,64 @@ async def _extraer_contrato_multimodal(
     return None
 
 
+async def transcribir_documento_multimodal(content: bytes, mime_type: str) -> str | None:
+    """Plain-text vision transcription — the resilient fallback when the strict
+    structured extraction (``_extraer_contrato_multimodal``) yields no usable
+    ``transcripcion``.
+
+    Same vision-model chain and resilience as ``_extraer_contrato_multimodal``
+    (tries the configured model, then curated fallbacks; one provider failing
+    falls through to the next), but with NO ``response_format`` — a plain prompt
+    asking the model to transcribe all readable text verbatim. This recovers a
+    readable-but-schema-unfriendly scan that the structured path discards.
+    Returns the first non-empty transcription, or ``None`` when every model
+    fails/returns empty or the MIME type is not vision-readable.
+    """
+    if not is_multimodal_supported(mime_type):
+        return None
+
+    from app.adapters.llm import get_llm
+    from app.agent.prompts.multimodal_extraction import (
+        MULTIMODAL_TRANSCRIPTION_SYSTEM,
+        MULTIMODAL_TRANSCRIPTION_USER,
+    )
+
+    chain = vision_model_chain()
+    if not chain:
+        await logger.awarning(
+            "multimodal_transcription_no_usable_model",
+            configured=settings.LLM_MULTIMODAL_MODEL,
+        )
+        return None
+
+    for model in chain:
+        try:
+            parts = build_multimodal_content_parts(
+                content,
+                mime_type,
+                model,
+                max_pdf_pages=settings.MULTIMODAL_MAX_PDF_PAGES,
+                dpi=settings.MULTIMODAL_RASTER_DPI,
+            )
+            messages = [
+                LLMMessage(role="system", content=MULTIMODAL_TRANSCRIPTION_SYSTEM),
+                LLMMessage(role="user", content=[{"type": "text", "text": MULTIMODAL_TRANSCRIPTION_USER}, *parts]),
+            ]
+            # fallback=False: this function manages its own vision-aware fallback
+            # across models instead of the generic text-only fallback chain.
+            resp = await get_llm(model=model).complete(messages, temperature=0.0, max_tokens=8192, fallback=False)
+        except Exception as exc:
+            await logger.awarning("multimodal_transcription_model_failed", model=model, error=str(exc)[:200])
+            continue
+
+        if resp.content and resp.content.strip():
+            await logger.ainfo("multimodal_transcription_ok", model=model, chars=len(resp.content))
+            return resp.content
+
+    await logger.awarning("multimodal_transcription_all_models_failed", tried=chain)
+    return None
+
+
 async def extraer_texto_documento(
     content: bytes, filename: str, *, relaxed_ocr: bool = False
 ) -> tuple[str | None, list[str]]:
@@ -563,7 +622,10 @@ async def extraer_texto_documento(
     if is_text_sufficient(texto, settings.EXTRACTION_MIN_TEXT_CHARS):
         return texto, avisos
 
-    mime = guess_mime_type(filename)
+    # Content-sniffed (not extension-only): recovers the OCR tier for
+    # unextensioned/mislabeled scanned documents that would otherwise resolve to
+    # octet-stream and skip OCR entirely.
+    mime = sniff_multimodal_mime(content, filename)
     texto_ocr: str | None = None
     if (
         settings.EXTRACTION_OCR_ENABLED

@@ -334,3 +334,144 @@ class TestExtraerTextoDocumentoRelaxedOcr:
         assert texto is None
         assert any("No se pudo extraer texto legible" in a for a in avisos)
         assert not any("espaciado imperfecto" in a for a in avisos)
+
+
+# ---------------------------------------------------------------------------
+# extraer_texto_documento — content-sniffed MIME reaches the OCR tier
+#
+# Root cause of the "OCR silently skipped" bug: the ladder used to gate the
+# OCR tier on `guess_mime_type(filename)` (extension-only), which resolves an
+# unextensioned SECOP document to octet-stream and skips OCR entirely even
+# though the bytes are a perfectly OCR-able PDF.
+# ---------------------------------------------------------------------------
+
+
+class TestExtraerTextoDocumentoContentSniff:
+    @pytest.mark.asyncio
+    async def test_ocr_tier_reached_for_unextensioned_pdf_bytes(self) -> None:
+        from app.services.document_service import extraer_texto_documento
+
+        ocr_calls: list[tuple[bytes, str]] = []
+
+        def _fake_ocr(content: bytes, mime: str, **kwargs: object) -> str:
+            ocr_calls.append((content, mime))
+            return "obligacion contractual del contratista " * 6  # >= EXTRACTION_MIN_TEXT_CHARS, well-spaced
+
+        with (
+            patch("app.services.document_service.parse_document", return_value=None),
+            patch("app.services.document_service.ocr_available", return_value=True),
+            patch("app.services.document_service.ocr_extract_text", side_effect=_fake_ocr),
+        ):
+            texto, avisos = await extraer_texto_documento(b"%PDF-1.4 escaneado", "documento_sin_extension")
+
+        assert ocr_calls == [(b"%PDF-1.4 escaneado", "application/pdf")]
+        assert texto is not None and texto.strip()
+        assert avisos == []
+
+    @pytest.mark.asyncio
+    async def test_ocr_tier_still_skipped_for_genuinely_unrecognized_content(self) -> None:
+        """Content that sniffs to nothing recognizable keeps the prior behavior:
+        octet-stream, OCR tier skipped."""
+        from app.services.document_service import extraer_texto_documento
+
+        with (
+            patch("app.services.document_service.parse_document", return_value=None),
+            patch("app.services.document_service.ocr_available", return_value=True),
+            patch("app.services.document_service.ocr_extract_text") as mock_ocr,
+        ):
+            texto, avisos = await extraer_texto_documento(b"garbage bytes", "documento_sin_extension")
+
+        mock_ocr.assert_not_called()
+        assert texto is None
+        assert any("No se pudo extraer texto legible" in a for a in avisos)
+
+
+# ---------------------------------------------------------------------------
+# transcribir_documento_multimodal — plain-text vision fallback resilience
+# ---------------------------------------------------------------------------
+
+
+class TestTranscribirDocumentoMultimodal:
+    @pytest.mark.asyncio
+    async def test_unsupported_mime_returns_none_without_calling_any_model(self) -> None:
+        from app.services.document_service import transcribir_documento_multimodal
+
+        with patch("app.adapters.llm.get_llm") as mock_get_llm:
+            resultado = await transcribir_documento_multimodal(b"hola", "text/plain")
+
+        assert resultado is None
+        mock_get_llm.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_first_model_fails_second_recovers_text(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from app.schemas.agent import LLMResponse
+        from app.services import document_service
+
+        monkeypatch.setattr(document_service.settings, "LLM_MULTIMODAL_MODEL", "gemini/gemini-flash-latest")
+        monkeypatch.setattr(document_service.settings, "GEMINI_API_KEY", "g")
+        monkeypatch.setattr(document_service.settings, "GROQ_API_KEY", "k")
+
+        class _FakeLLM:
+            def __init__(self, model: str) -> None:
+                self._model = model
+
+            async def complete(self, messages: list[object], **kwargs: object) -> LLMResponse:
+                if self._model == "gemini/gemini-flash-latest":
+                    raise RuntimeError("provider down")
+                return LLMResponse(content="texto transcrito por el segundo modelo", model=self._model)
+
+        import app.adapters.llm as llm_module
+
+        monkeypatch.setattr(llm_module, "get_llm", lambda model=None: _FakeLLM(model))
+
+        png = b"\x89PNG\r\n\x1a\n fake but content is ignored by the fake LLM"
+        resultado = await document_service.transcribir_documento_multimodal(png, "image/png")
+
+        assert resultado == "texto transcrito por el segundo modelo"
+
+    @pytest.mark.asyncio
+    async def test_all_models_fail_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from app.services import document_service
+
+        monkeypatch.setattr(document_service.settings, "LLM_MULTIMODAL_MODEL", "gemini/gemini-flash-latest")
+        monkeypatch.setattr(document_service.settings, "GEMINI_API_KEY", "g")
+        monkeypatch.setattr(document_service.settings, "GROQ_API_KEY", "k")
+
+        class _AlwaysFailsLLM:
+            def __init__(self, model: str) -> None: ...
+
+            async def complete(self, messages: list[object], **kwargs: object) -> None:
+                raise RuntimeError("provider down")
+
+        import app.adapters.llm as llm_module
+
+        monkeypatch.setattr(llm_module, "get_llm", lambda model=None: _AlwaysFailsLLM(model))
+
+        png = b"\x89PNG\r\n\x1a\n fake"
+        resultado = await document_service.transcribir_documento_multimodal(png, "image/png")
+
+        assert resultado is None
+
+    @pytest.mark.asyncio
+    async def test_empty_response_is_treated_as_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from app.schemas.agent import LLMResponse
+        from app.services import document_service
+
+        monkeypatch.setattr(document_service.settings, "LLM_MULTIMODAL_MODEL", "gemini/gemini-flash-latest")
+        monkeypatch.setattr(document_service.settings, "GEMINI_API_KEY", "g")
+        monkeypatch.setattr(document_service.settings, "GROQ_API_KEY", "")
+
+        class _EmptyLLM:
+            def __init__(self, model: str) -> None: ...
+
+            async def complete(self, messages: list[object], **kwargs: object) -> LLMResponse:
+                return LLMResponse(content="   ", model="gemini/gemini-flash-latest")
+
+        import app.adapters.llm as llm_module
+
+        monkeypatch.setattr(llm_module, "get_llm", lambda model=None: _EmptyLLM(model))
+
+        png = b"\x89PNG\r\n\x1a\n fake"
+        resultado = await document_service.transcribir_documento_multimodal(png, "image/png")
+
+        assert resultado is None

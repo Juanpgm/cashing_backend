@@ -931,11 +931,19 @@ async def _asegurar_texto_extraido_manual(doc: SecopDocumento) -> None:
     texto, _avisos = await document_service.extraer_texto_documento(data, doc.nombre_archivo or "documento")
     if not texto or not texto.strip():
         # Tier 3 (MANUAL ONLY): vision escalation for scanned/distorted contracts.
-        from app.agent.tools.multimodal_parser import guess_mime_type
+        # Content-sniffed mime (not extension-only) so an unextensioned/mislabeled
+        # SECOP document still reaches vision instead of resolving to octet-stream.
+        from app.agent.tools.multimodal_parser import sniff_multimodal_mime
 
-        mime = guess_mime_type(doc.nombre_archivo or "documento")
+        mime = sniff_multimodal_mime(data, doc.nombre_archivo or "documento")
         resultado = await document_service._extraer_contrato_multimodal(data, mime)
         texto = resultado.transcripcion if resultado is not None else None
+        if not texto or not texto.strip():
+            # Structured extraction found nothing usable — a plain transcription
+            # attempt is decisive before giving up: a readable-but-schema-unfriendly
+            # scan can still be transcribed even when it can't be mapped to the
+            # strict ContratoExtractionResult shape.
+            texto = await document_service.transcribir_documento_multimodal(data, mime)
 
     if not texto or not texto.strip():
         doc.texto_extraido = None

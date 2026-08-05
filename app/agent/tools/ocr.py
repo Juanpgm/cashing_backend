@@ -19,15 +19,43 @@ installed.
 from __future__ import annotations
 
 import io
+import threading
+from typing import TYPE_CHECKING
 
 import structlog
 
 from app.agent.tools.multimodal_parser import rasterize_pdf
 from app.core.config import settings
 
+if TYPE_CHECKING:
+    from rapidocr_onnxruntime import RapidOCR
+
 logger = structlog.get_logger("agent.tools.ocr")
 
 _IMAGE_MIMES = frozenset({"image/png", "image/jpeg"})
+
+
+# One RapidOCR engine per worker thread. A single process-wide instance is NOT
+# safe: OCR runs via ``asyncio.to_thread`` (a thread pool) and RapidOCR's
+# TextDetector mutates per-call instance state (``preprocess_op`` is set from the
+# current image's size, then read), so two concurrent calls on different-sized
+# images would race and silently corrupt the recovered text. Thread-local keeps
+# the build-once speed win (RapidOCR loads 3 ONNX models per construction, ~s;
+# building per page — the old behavior — dominated OCR wall time) while giving
+# each thread its own engine: no shared mutable state, no global lock, still
+# parallel across threads.
+_engine_local = threading.local()
+
+
+def _get_rapidocr() -> RapidOCR:
+    """Return this thread's RapidOCR engine, constructing it once per thread."""
+    engine = getattr(_engine_local, "engine", None)
+    if engine is None:
+        from rapidocr_onnxruntime import RapidOCR
+
+        engine = RapidOCR()
+        _engine_local.engine = engine
+    return engine
 
 
 def _configure_tesseract() -> None:
@@ -68,9 +96,8 @@ def _ocr_image_tesseract(image_bytes: bytes, lang: str) -> str:
 def _ocr_image_rapidocr(image_bytes: bytes) -> str:
     import numpy as np
     from PIL import Image
-    from rapidocr_onnxruntime import RapidOCR
 
-    engine = RapidOCR()
+    engine = _get_rapidocr()
     with Image.open(io.BytesIO(image_bytes)) as img:
         arr = np.array(img.convert("RGB"))
     result, _ = engine(arr)

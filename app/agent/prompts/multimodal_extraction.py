@@ -32,3 +32,19 @@ original del contrato (número o letra: "1", "A", "a", "iii"); deja cadena vací
 viñeta/guión.
 3. La transcripción completa del texto legible del documento en "transcripcion".
 """
+
+# Plain-text transcription fallback: used when the structured extraction above
+# yields no usable ``transcripcion`` (e.g. a distorted scan the model can still
+# read as prose but cannot map into the strict contract schema). No
+# response_format — just the raw transcription, which the deterministic
+# extractors downstream can still work with.
+MULTIMODAL_TRANSCRIPTION_SYSTEM = """\
+Eres un asistente experto en transcribir documentos escaneados en español. Recibes el \
+documento como imagen o PDF y debes transcribir TODO el texto legible, tal como aparece, \
+sin resumir ni interpretar.
+"""
+
+MULTIMODAL_TRANSCRIPTION_USER = """\
+Transcribe TEXTUALMENTE todo el texto legible del documento adjunto, en el orden en que \
+aparece. No agregues comentarios, encabezados ni resúmenes — solo el texto transcrito.
+"""
