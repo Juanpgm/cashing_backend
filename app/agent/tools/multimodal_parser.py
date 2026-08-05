@@ -157,6 +157,15 @@ def supports_native_pdf(model: str | None) -> bool:
     return model.startswith(NATIVE_PDF_MODEL_PREFIXES)
 
 
+# Defensive ceiling on a rasterized page's pixel dimensions. A crafted PDF page
+# with an oversized MediaBox combined with a normal DPI could otherwise make
+# get_pixmap allocate an unbounded buffer. Reduces zoom only for that one page;
+# ordinary pages at the requested DPI stay well under this and are unaffected.
+# ponytail: fixed cap, not per-model/context tuned — revisit if a real
+# provider ever needs bigger raster pages than this.
+_MAX_RASTER_PIXELS_PER_SIDE = 4000
+
+
 def rasterize_pdf(content: bytes, max_pages: int, dpi: int) -> list[bytes]:
     """Render the first ``max_pages`` PDF pages to PNG bytes via PyMuPDF.
 
@@ -171,7 +180,17 @@ def rasterize_pdf(content: bytes, max_pages: int, dpi: int) -> list[bytes]:
     images: list[bytes] = []
     with fitz.open(stream=content, filetype="pdf") as doc:
         for index in range(min(len(doc), max_pages)):
-            pix = doc[index].get_pixmap(matrix=matrix)
+            page = doc[index]
+            rect = page.rect
+            page_zoom = zoom
+            if rect.width * zoom > _MAX_RASTER_PIXELS_PER_SIDE or rect.height * zoom > _MAX_RASTER_PIXELS_PER_SIDE:
+                page_zoom = min(
+                    zoom,
+                    _MAX_RASTER_PIXELS_PER_SIDE / max(rect.width, 1.0),
+                    _MAX_RASTER_PIXELS_PER_SIDE / max(rect.height, 1.0),
+                )
+            page_matrix = matrix if page_zoom == zoom else fitz.Matrix(page_zoom, page_zoom)
+            pix = page.get_pixmap(matrix=page_matrix)
             images.append(pix.tobytes("png"))
     return images
 

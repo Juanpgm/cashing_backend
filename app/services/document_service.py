@@ -180,7 +180,7 @@ async def _extraer_obligaciones(
                 "obligaciones_parse_zero",
                 contrato_id=str(contrato_id),
                 chunk=i,
-                raw_response=resp.content[:500],
+                raw_len=len(resp.content),
             )
         await logger.ainfo(
             "obligaciones_chunk_done",
@@ -539,7 +539,7 @@ async def _extraer_contrato_multimodal(
                 "multimodal_parse_failed",
                 model=model,
                 error=str(exc)[:200],
-                raw=resp.content[:300],
+                raw_len=len(resp.content),
             )
             continue
 

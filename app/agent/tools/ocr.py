@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 
 import structlog
 
-from app.agent.tools.multimodal_parser import rasterize_pdf
+from app.agent.tools.multimodal_parser import normalize_image, rasterize_pdf
 from app.core.config import settings
 
 if TYPE_CHECKING:
@@ -128,7 +128,10 @@ def extract_text(
     if mime_type == "application/pdf":
         pages = rasterize_pdf(content, max_pages, dpi)
     elif mime_type in _IMAGE_MIMES:
-        pages = [content]
+        # Standalone images (e.g. a 10+ MP phone photo) skip the vision path's
+        # downscaling entirely — normalize here too so one oversized image can't
+        # stall the shared, lock-serialized OCR engine (see module docstring).
+        pages = [normalize_image(content, mime_type)]
     else:
         return ""
 

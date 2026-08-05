@@ -60,6 +60,33 @@ def test_extract_text_unsupported_mime_is_empty() -> None:
     assert ocr.extract_text(b"x", "text/plain", engine="tesseract", lang="spa", max_pages=1, dpi=72) == ""
 
 
+def test_extract_text_downscales_oversized_image_before_ocr(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A standalone image (e.g. a 10+ MP phone photo) must be downscaled via
+    `normalize_image` BEFORE it reaches the OCR engine -- mirrors the vision
+    path's downscaling so one oversized image can't stall the shared,
+    lock-serialized OCR engine."""
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (4000, 4000), "white").save(buf, format="PNG")
+    big_png = buf.getvalue()
+
+    captured: dict[str, Any] = {}
+
+    def _stub(image_bytes: bytes, lang: str) -> str:
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            captured["size"] = img.size
+        return "texto ocr"
+
+    monkeypatch.setattr(ocr, "_ocr_image_tesseract", _stub)
+    text = ocr.extract_text(big_png, "image/png", engine="tesseract", lang="spa", max_pages=1, dpi=72)
+
+    assert text == "texto ocr"
+    assert max(captured["size"]) <= 2200
+
+
 def test_rapidocr_engine_built_once_and_reused(monkeypatch: pytest.MonkeyPatch) -> None:
     """RapidOCR() loads 3 ONNX models (expensive); OCRing a multi-page PDF must
     construct it ONCE and reuse it for every page, and a later call must reuse

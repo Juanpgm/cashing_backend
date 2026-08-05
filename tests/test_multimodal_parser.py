@@ -11,8 +11,10 @@ from app.agent.tools.multimodal_parser import (
     is_multimodal_supported,
     is_text_sufficient,
     normalize_image,
+    rasterize_pdf,
     sniff_multimodal_mime,
 )
+from PIL import Image
 
 
 class TestIsTextSufficient:
@@ -72,6 +74,44 @@ class TestNormalizeImage:
         out = normalize_image(small, "image/png", max_dimension=2200)
         with Image.open(io.BytesIO(out)) as img:
             assert img.size == (800, 600)
+
+
+class TestRasterizePdfPixelCap:
+    """RISK-001: a crafted PDF page with an oversized MediaBox at a normal DPI
+    could make `get_pixmap` allocate an unbounded pixel buffer. Guard the zoom
+    per-page so no rasterized page exceeds the fixed ceiling."""
+
+    @staticmethod
+    def _pdf(width: float, height: float) -> bytes:
+        import fitz  # PyMuPDF
+
+        doc = fitz.open()
+        doc.new_page(width=width, height=height)
+        pdf_bytes = doc.tobytes()
+        doc.close()
+        return pdf_bytes
+
+    def test_extreme_mediabox_page_is_capped(self) -> None:
+        pdf_bytes = self._pdf(20000, 20000)
+
+        pages = rasterize_pdf(pdf_bytes, max_pages=1, dpi=150)
+
+        assert len(pages) == 1
+        with Image.open(io.BytesIO(pages[0])) as img:
+            assert max(img.size) <= 4000
+
+    def test_normal_page_is_unchanged(self) -> None:
+        # Default Letter-size page (612x792 pt) at 150 DPI stays well under the
+        # 4000px ceiling -- must render at the requested zoom, uncapped.
+        pdf_bytes = self._pdf(612, 792)
+
+        pages = rasterize_pdf(pdf_bytes, max_pages=1, dpi=150)
+
+        with Image.open(io.BytesIO(pages[0])) as img:
+            w, h = img.size
+        zoom = 150 / 72.0
+        assert abs(w - round(612 * zoom)) <= 2
+        assert abs(h - round(792 * zoom)) <= 2
 
 
 class TestGuessMimeType:

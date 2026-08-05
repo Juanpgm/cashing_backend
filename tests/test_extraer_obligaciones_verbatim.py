@@ -16,10 +16,6 @@ from datetime import date
 from typing import Any
 
 import pytest
-from httpx import AsyncClient
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from app.agent.tools.contract_parser import (
     extract_obligaciones_verbatim,
     parse_obligaciones_llm,
@@ -29,6 +25,9 @@ from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
 from app.models.obligacion import Obligacion
 from app.schemas.agent import LLMResponse, ObligacionExtraida
 from app.services import document_service
+from httpx import AsyncClient
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 # Solo los tests async necesitan el marker; los unitarios síncronos no.
 asyncio_test = pytest.mark.asyncio
@@ -43,10 +42,8 @@ OBLIGACIONES_VERBATIM = [
     "antes de su despliegue en el ambiente de producción",
     "Capacitar a los funcionarios de la Alcaldía de Cali en el uso del "
     "nuevo sistema mediante talleres presenciales mensuales",
-    "Documentar los procedimientos técnicos y manuales de usuario en "
-    "español, con ejemplos y capturas de pantalla",
-    "Brindar soporte técnico de segundo nivel durante los noventa (90) "
-    "días posteriores a la puesta en producción",
+    "Documentar los procedimientos técnicos y manuales de usuario en español, con ejemplos y capturas de pantalla",
+    "Brindar soporte técnico de segundo nivel durante los noventa (90) días posteriores a la puesta en producción",
 ]
 
 TEXTO_CONTRATO = f"""
@@ -108,8 +105,7 @@ def test_verbatim_extractor_captures_numeric_markers() -> None:
     expected_markers = ["1", "2", "3", "4", "5"]
     for ob, expected in zip(result, expected_markers, strict=True):
         assert ob.etiqueta == expected, (
-            f"Marcador incorrecto para '{ob.descripcion[:40]}…': "
-            f"esperado {expected!r}, obtenido {ob.etiqueta!r}"
+            f"Marcador incorrecto para '{ob.descripcion[:40]}…': esperado {expected!r}, obtenido {ob.etiqueta!r}"
         )
 
 
@@ -259,9 +255,7 @@ def test_verbatim_extractor_handles_funciones_del_contratista_tier2() -> None:
 
 def test_parse_obligaciones_llm_preserves_exact_strings() -> None:
     """El parser no altera el texto que el LLM devuelve verbatim."""
-    canned = "\n".join(
-        f"OBLIGACION|especifica|{txt}" for txt in OBLIGACIONES_VERBATIM
-    )
+    canned = "\n".join(f"OBLIGACION|especifica|{txt}" for txt in OBLIGACIONES_VERBATIM)
     parsed = parse_obligaciones_llm(canned)
     assert len(parsed) == 5
     for parsed_ob, expected in zip(parsed, OBLIGACIONES_VERBATIM, strict=True):
@@ -278,7 +272,7 @@ class _FakeLLM:
     def __init__(self) -> None:
         self.calls = 0
 
-    async def complete(self, messages, temperature=0.3, max_tokens=4096) -> LLMResponse:  # noqa: ARG002
+    async def complete(self, messages, temperature=0.3, max_tokens=4096) -> LLMResponse:
         self.calls += 1
         return LLMResponse(
             content="",
@@ -291,9 +285,7 @@ class _FakeLLM:
 
 @pytest.fixture
 @asyncio_test
-async def contrato_con_texto(
-    db: AsyncSession, test_user: dict[str, Any]
-) -> Contrato:
+async def contrato_con_texto(db: AsyncSession, test_user: dict[str, Any]) -> Contrato:
     user = test_user["user"]
     c = Contrato(
         usuario_id=user.id,
@@ -347,17 +339,17 @@ async def test_extraer_obligaciones_documento_persiste_texto_verbatim(
     assert fake.calls == 0, "El LLM no debería invocarse cuando el regex funciona"
 
     rows = (
-        await db.execute(
-            select(Obligacion)
-            .where(Obligacion.contrato_id == contrato_con_texto.id)
-            .order_by(Obligacion.orden)
+        (
+            await db.execute(
+                select(Obligacion).where(Obligacion.contrato_id == contrato_con_texto.id).order_by(Obligacion.orden)
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert len(rows) == 5
     for ob in rows:
-        assert ob.descripcion in TEXTO_CONTRATO, (
-            f"Obligación persistida no es verbatim:\n{ob.descripcion!r}"
-        )
+        assert ob.descripcion in TEXTO_CONTRATO, f"Obligación persistida no es verbatim:\n{ob.descripcion!r}"
 
 
 # ── End-to-end test: REST endpoint returns verbatim text ───────────────────
@@ -420,11 +412,7 @@ async def test_dedup_no_altera_texto_obligacion(
     )
     await db.commit()
 
-    rows = (
-        await db.execute(
-            select(Obligacion).where(Obligacion.contrato_id == contrato_con_texto.id)
-        )
-    ).scalars().all()
+    rows = (await db.execute(select(Obligacion).where(Obligacion.contrato_id == contrato_con_texto.id))).scalars().all()
     assert len(rows) == 5  # no duplicados
     for ob in rows:
         assert ob.descripcion in TEXTO_CONTRATO
@@ -580,3 +568,48 @@ async def test_extraer_obligaciones_chunk_merge_dedup_ignora_acentos(
     assert avisos == []
     assert len(extraidas) == 1
     assert extraidas[0].descripcion == "Elaborar informes de gestión mensuales"
+
+
+@asyncio_test
+async def test_obligaciones_parse_zero_no_loguea_raw_response(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A chunk whose LLM response parses to zero obligations logs the failure
+    for diagnosis, but must NOT include the raw model output (can contain
+    contract PII: cédula, dirección, valores) -- only its length."""
+    import app.adapters.llm as llm_pkg
+
+    monkeypatch.setattr(document_service, "_extract_obligation_sections", lambda texto: ["fragmento sin match"])
+
+    raw_pii_content = '{"obligaciones": [], "nota": "cédula 123456789, dirección Calle Falsa 123"}'
+
+    class _FakeEmptyChunkLLM:
+        async def complete(self, messages, temperature=0.3, max_tokens=4096, response_format=None):
+            return LLMResponse(
+                content=raw_pii_content,
+                model="fake/chunked",
+                prompt_tokens=0,
+                completion_tokens=0,
+                total_tokens=0,
+            )
+
+    monkeypatch.setattr(llm_pkg, "get_llm", lambda model=None: _FakeEmptyChunkLLM(), raising=True)
+
+    logged: list[tuple[str, dict]] = []
+
+    async def _fake_awarning(event: str, **kwargs):
+        logged.append((event, kwargs))
+
+    monkeypatch.setattr(document_service.logger, "awarning", _fake_awarning)
+
+    await document_service.extraer_obligaciones_texto(
+        "texto de contrato sin sección de obligaciones detectable por regex", None, db
+    )
+
+    parse_zero_calls = [kwargs for event, kwargs in logged if event == "obligaciones_parse_zero"]
+    assert len(parse_zero_calls) == 1
+    kwargs = parse_zero_calls[0]
+    assert "raw_response" not in kwargs
+    assert "raw" not in kwargs
+    assert kwargs.get("raw_len") == len(raw_pii_content)
+    assert "cédula" not in str(kwargs)

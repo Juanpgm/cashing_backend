@@ -797,6 +797,14 @@ _AUTO_OBLIGACIONES_TIMEOUT_SEGUNDOS = 25.0
 # for this request. Deliberately NOT reused by the scan's `_asegurar_texto_extraido`.
 _VINCULAR_HTTP_TIMEOUT = 60.0
 
+# Tier-3 vision escalation deadline for the manual Vincular action: worst case,
+# structured extraction and plain transcription each iterate up to 3 chained
+# vision models (`vision_model_chain()`), each wrapped in 2 tenacity retries at
+# up to 120s/attempt (`litellm_adapter.py`) — unbounded, that's ~24 minutes with
+# no caller-side deadline. Capped here well under the frontend's ~300s budget
+# (which also covers the download above, `_VINCULAR_HTTP_TIMEOUT`).
+_VINCULAR_VISION_TIMEOUT_SEGUNDOS = 150.0
+
 
 @dataclass
 class _PresupuestoSniff:
@@ -936,20 +944,31 @@ async def _asegurar_texto_extraido_manual(doc: SecopDocumento) -> None:
         from app.agent.tools.multimodal_parser import sniff_multimodal_mime
 
         mime = sniff_multimodal_mime(data, doc.nombre_archivo or "documento")
-        resultado = await document_service._extraer_contrato_multimodal(data, mime)
-        # follow-up: resultado.obligaciones (vision-structured) is discarded here —
-        # only .transcripcion is kept, so extraer_obligaciones_desde_secop_doc below
-        # re-runs the plain-text LLM extractor (extraer_obligaciones_texto) on the
-        # vision transcription instead of using the vision model's own structured
-        # obligaciones directly. Using them directly would skip a redundant LLM
-        # round-trip; out of scope this round.
-        texto = resultado.transcripcion if resultado is not None else None
-        if not texto or not texto.strip():
+
+        async def _escalar_vision() -> str | None:
+            resultado = await document_service._extraer_contrato_multimodal(data, mime)
+            # follow-up: resultado.obligaciones (vision-structured) is discarded here —
+            # only .transcripcion is kept, so extraer_obligaciones_desde_secop_doc below
+            # re-runs the plain-text LLM extractor (extraer_obligaciones_texto) on the
+            # vision transcription instead of using the vision model's own structured
+            # obligaciones directly. Using them directly would skip a redundant LLM
+            # round-trip; out of scope this round.
+            texto_estructurado = resultado.transcripcion if resultado is not None else None
+            if texto_estructurado and texto_estructurado.strip():
+                return texto_estructurado
             # Structured extraction found nothing usable — a plain transcription
             # attempt is decisive before giving up: a readable-but-schema-unfriendly
             # scan can still be transcribed even when it can't be mapped to the
             # strict ContratoExtractionResult shape.
-            texto = await document_service.transcribir_documento_multimodal(data, mime)
+            return await document_service.transcribir_documento_multimodal(data, mime)
+
+        try:
+            texto = await asyncio.wait_for(_escalar_vision(), timeout=_VINCULAR_VISION_TIMEOUT_SEGUNDOS)
+        except TimeoutError:
+            raise ValidationError(
+                "La extracción con el modelo de visión superó el tiempo límite; probá de nuevo "
+                "o con otro documento del contrato."
+            ) from None
 
     if not texto or not texto.strip():
         doc.texto_extraido = None

@@ -475,3 +475,53 @@ class TestTranscribirDocumentoMultimodal:
         resultado = await document_service.transcribir_documento_multimodal(png, "image/png")
 
         assert resultado is None
+
+
+# ---------------------------------------------------------------------------
+# _extraer_contrato_multimodal — raw model output must not leak into logs
+# ---------------------------------------------------------------------------
+
+
+class TestMultimodalParseFailedDoesNotLogRaw:
+    @pytest.mark.asyncio
+    async def test_parse_failure_logs_length_not_raw_content(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A response that fails schema validation logs the failure for
+        diagnosis, but must NOT include the raw model output (can contain
+        contract PII: cédula, dirección, valores) -- only its length."""
+        from app.schemas.agent import LLMResponse
+        from app.services import document_service
+
+        monkeypatch.setattr(document_service.settings, "LLM_MULTIMODAL_MODEL", "gemini/gemini-flash-latest")
+        monkeypatch.setattr(document_service.settings, "GEMINI_API_KEY", "g")
+        monkeypatch.setattr(document_service.settings, "GROQ_API_KEY", "")
+
+        raw_pii_content = "not valid json but leaks cédula 123456789, dirección Calle Falsa 123"
+
+        class _InvalidJsonLLM:
+            def __init__(self, model: str) -> None: ...
+
+            async def complete(self, messages: list[object], **kwargs: object) -> LLMResponse:
+                return LLMResponse(content=raw_pii_content, model="gemini/gemini-flash-latest")
+
+        import app.adapters.llm as llm_module
+
+        monkeypatch.setattr(llm_module, "get_llm", lambda model=None: _InvalidJsonLLM(model))
+
+        logged: list[tuple[str, dict]] = []
+
+        async def _fake_awarning(event: str, **kwargs):
+            logged.append((event, kwargs))
+
+        monkeypatch.setattr(document_service.logger, "awarning", _fake_awarning)
+
+        png = b"\x89PNG\r\n\x1a\n fake"
+        result = await document_service._extraer_contrato_multimodal(png, "image/png")
+
+        assert result is None
+        parse_failed_calls = [kwargs for event, kwargs in logged if event == "multimodal_parse_failed"]
+        assert len(parse_failed_calls) == 1
+        kwargs = parse_failed_calls[0]
+        assert "raw" not in kwargs
+        assert "raw_response" not in kwargs
+        assert kwargs.get("raw_len") == len(raw_pii_content)
+        assert "cédula" not in str(kwargs)

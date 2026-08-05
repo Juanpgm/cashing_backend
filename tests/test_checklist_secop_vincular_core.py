@@ -10,6 +10,7 @@ a user-facing endpoint (Vincular) that must report a 4xx instead of a misleading
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from datetime import date
 from typing import Any
@@ -278,6 +279,48 @@ async def test_manual_texto_no_extraible_ni_por_vision_lanza_mensaje_final(
         await checklist_service.extraer_obligaciones_desde_secop_doc(db, contrato, doc, manual=True)
 
     assert doc.texto_estado == "sin_texto"
+
+
+async def test_manual_vision_escalation_respeta_deadline_y_lanza_timeout(
+    db: AsyncSession, contrato: Contrato, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Tier-3 vision escalation (structured extraction + transcription fallback)
+    is bounded by `_VINCULAR_VISION_TIMEOUT_SEGUNDOS` -- a stuck/slow vision chain
+    must raise a specific timeout ValidationError instead of hanging for the
+    unbounded worst case (up to 3 models x 2 tenacity retries x 120s, per call,
+    across both vision calls). Must NOT resolve to 'ok'."""
+    from app.services import document_service
+
+    async def _fake_descarga(url: str, timeout: float = 0.0) -> bytes:
+        return b"%PDF-escaneado-sin-texto"
+
+    async def _sin_texto(content: bytes, filename: str, *, relaxed_ocr: bool = False) -> tuple[str | None, list[str]]:
+        return None, []
+
+    async def _vision_se_cuelga(content: bytes, mime_type: str):
+        await asyncio.sleep(10)
+        return None
+
+    async def _transcripcion_se_cuelga(content: bytes, mime_type: str) -> str | None:
+        await asyncio.sleep(10)
+        return None
+
+    monkeypatch.setattr(checklist_service, "_descargar_secop_bytes", _fake_descarga)
+    monkeypatch.setattr(checklist_service, "_VINCULAR_VISION_TIMEOUT_SEGUNDOS", 0.05)
+    monkeypatch.setattr(document_service, "extraer_texto_documento", _sin_texto)
+    monkeypatch.setattr(document_service, "_extraer_contrato_multimodal", _vision_se_cuelga)
+    monkeypatch.setattr(document_service, "transcribir_documento_multimodal", _transcripcion_se_cuelga)
+    doc = _secop_doc(contrato, "contrato.pdf", url_descarga="https://s/contrato.pdf")
+    db.add(doc)
+    await db.commit()
+
+    inicio = time.monotonic()
+    with pytest.raises(ValidationError, match="tiempo límite"):
+        await checklist_service.extraer_obligaciones_desde_secop_doc(db, contrato, doc, manual=True)
+    duracion = time.monotonic() - inicio
+
+    assert duracion < 5.0  # well under the 10s stub sleeps -- the deadline actually cancels
+    assert doc.texto_estado != "ok"
 
 
 async def test_manual_error_inesperado_lanza_mensaje_generico_y_loguea(
