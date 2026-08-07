@@ -7,24 +7,15 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from app.core.exceptions import ExternalServiceError, NotFoundError, ValidationError
+from app.models.integracion import IntegrationProvider
 from jose import jwt
 
-from app.core.exceptions import ExternalServiceError, NotFoundError, ValidationError
-
-
-class TestFernet:
-    def test_fernet_roundtrip(self) -> None:
-        """_fernet() returns a working Fernet instance that can encrypt/decrypt."""
-        from cryptography.fernet import Fernet
-
-        from app.services.google_workspace_service import _fernet
-
-        key = Fernet.generate_key()
-        with patch("app.services.google_workspace_service.settings") as mock_settings:
-            mock_settings.TOKEN_ENCRYPTION_KEY = key.decode()
-            f = _fernet()
-            encrypted = f.encrypt(b"secret")
-            assert f.decrypt(encrypted) == b"secret"
+# NOTE: `_fernet()` and the JWT state helpers moved to `integration_service.py`
+# (openspec/changes/microsoft-365-integration design D2) — `_fernet` roundtrip
+# coverage now lives in tests/test_integration_service.py::TestFernet.
+# `google_workspace_service.verify_oauth_state` is a thin wrapper that delegates
+# to `integration_service.verify_oauth_state`, so its settings live there too.
 
 
 class TestGetAuthorizationUrl:
@@ -62,80 +53,81 @@ class TestVerifyOauthState:
         return jwt.encode(claims, self._SECRET, algorithm=self._ALGO)
 
     def test_round_trip_returns_same_uuid_and_verifier(self) -> None:
-        from app.services.google_workspace_service import verify_oauth_state
+        from app.services.google_workspace_service import google_verify_oauth_state
 
         uid = uuid.uuid4()
         state = self._make_state(uid, cv=self._CV)
-        with patch("app.services.google_workspace_service.settings") as mock_settings:
+        with patch("app.services.integration_service.settings") as mock_settings:
             mock_settings.JWT_SECRET_KEY = self._SECRET
             mock_settings.JWT_ALGORITHM = self._ALGO
-            returned_uid, returned_cv = verify_oauth_state(state)
+            returned_uid, returned_cv = google_verify_oauth_state(state)
             assert returned_uid == uid
             assert returned_cv == self._CV
 
     def test_tampered_token_raises_validation_error(self) -> None:
-        from app.services.google_workspace_service import verify_oauth_state
+        from app.services.google_workspace_service import google_verify_oauth_state
 
         state = self._make_state(uuid.uuid4()) + "TAMPERED"
-        with patch("app.services.google_workspace_service.settings") as mock_settings:
+        with patch("app.services.integration_service.settings") as mock_settings:
             mock_settings.JWT_SECRET_KEY = self._SECRET
             mock_settings.JWT_ALGORITHM = self._ALGO
             with pytest.raises(ValidationError):
-                verify_oauth_state(state)
+                google_verify_oauth_state(state)
 
     def test_expired_token_raises_validation_error(self) -> None:
-        from app.services.google_workspace_service import verify_oauth_state
+        from app.services.google_workspace_service import google_verify_oauth_state
 
         state = self._make_state(uuid.uuid4(), ttl_seconds=-1)
-        with patch("app.services.google_workspace_service.settings") as mock_settings:
+        with patch("app.services.integration_service.settings") as mock_settings:
             mock_settings.JWT_SECRET_KEY = self._SECRET
             mock_settings.JWT_ALGORITHM = self._ALGO
             with pytest.raises(ValidationError):
-                verify_oauth_state(state)
+                google_verify_oauth_state(state)
 
     def test_wrong_type_raises_validation_error(self) -> None:
-        from app.services.google_workspace_service import verify_oauth_state
+        from app.services.google_workspace_service import google_verify_oauth_state
 
         uid = uuid.uuid4()
         claims = {"sub": str(uid), "type": "access", "cv": "x", "exp": datetime.now(UTC) + timedelta(minutes=5)}
         state = jwt.encode(claims, self._SECRET, algorithm=self._ALGO)
-        with patch("app.services.google_workspace_service.settings") as mock_settings:
+        with patch("app.services.integration_service.settings") as mock_settings:
             mock_settings.JWT_SECRET_KEY = self._SECRET
             mock_settings.JWT_ALGORITHM = self._ALGO
             with pytest.raises(ValidationError):
-                verify_oauth_state(state)
+                google_verify_oauth_state(state)
 
 
 class TestGetIntegrationStatus:
     @pytest.mark.asyncio
     async def test_returns_not_connected_when_no_token(self) -> None:
-        from app.services.google_workspace_service import get_integration_status
+        from app.services.google_workspace_service import google_get_integration_status
 
         mock_result = MagicMock()
-        mock_result.scalar_one_or_none.return_value = None
+        mock_result.scalars.return_value.first.return_value = None
 
         mock_db = AsyncMock()
         mock_db.execute.return_value = mock_result
 
-        status = await get_integration_status(mock_db, uuid.uuid4())
+        status = await google_get_integration_status(mock_db, uuid.uuid4())
         assert status.connected is False
 
     @pytest.mark.asyncio
     async def test_returns_connected_when_token_exists(self) -> None:
-        from app.services.google_workspace_service import get_integration_status
+        from app.services.google_workspace_service import google_get_integration_status
 
         fake_token = MagicMock()
         fake_token.scopes = "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/drive.file"
         fake_token.expires_at = None
+        fake_token.provider = IntegrationProvider.GOOGLE
         fake_token.email = "user@example.com"
 
         mock_result = MagicMock()
-        mock_result.scalar_one_or_none.return_value = fake_token
+        mock_result.scalars.return_value.first.return_value = fake_token
 
         mock_db = AsyncMock()
         mock_db.execute.return_value = mock_result
 
-        status = await get_integration_status(mock_db, uuid.uuid4())
+        status = await google_get_integration_status(mock_db, uuid.uuid4())
         assert status.connected is True
         assert status.gmail_enabled is True
         assert status.drive_enabled is True
@@ -144,29 +136,29 @@ class TestGetIntegrationStatus:
 class TestRevokeIntegration:
     @pytest.mark.asyncio
     async def test_raises_not_found_when_no_token(self) -> None:
-        from app.services.google_workspace_service import revoke_integration
+        from app.services.google_workspace_service import google_revoke_integration
 
         mock_result = MagicMock()
-        mock_result.scalar_one_or_none.return_value = None
+        mock_result.scalars.return_value.first.return_value = None
 
         mock_db = AsyncMock()
         mock_db.execute.return_value = mock_result
 
         with pytest.raises(NotFoundError):
-            await revoke_integration(mock_db, uuid.uuid4())
+            await google_revoke_integration(mock_db, uuid.uuid4())
 
     @pytest.mark.asyncio
     async def test_deletes_token_when_found(self) -> None:
-        from app.services.google_workspace_service import revoke_integration
+        from app.services.google_workspace_service import google_revoke_integration
 
         fake_token = MagicMock()
         mock_result = MagicMock()
-        mock_result.scalar_one_or_none.return_value = fake_token
+        mock_result.scalars.return_value.first.return_value = fake_token
 
         mock_db = AsyncMock()
         mock_db.execute.return_value = mock_result
 
-        await revoke_integration(mock_db, uuid.uuid4())
+        await google_revoke_integration(mock_db, uuid.uuid4())
         mock_db.delete.assert_called_once_with(fake_token)
         mock_db.commit.assert_called_once()
 
@@ -174,16 +166,16 @@ class TestRevokeIntegration:
 class TestHandleOAuthCallbackErrorPath:
     @pytest.mark.asyncio
     async def test_raises_when_not_configured(self) -> None:
-        from app.services.google_workspace_service import handle_oauth_callback
+        from app.services.google_workspace_service import google_handle_oauth_callback
 
         with patch("app.services.google_workspace_service.settings") as mock_settings:
             mock_settings.GOOGLE_OAUTH_CLIENT_ID = ""
             with pytest.raises(ExternalServiceError):
-                await handle_oauth_callback(AsyncMock(), uuid.uuid4(), "code", "verifier")
+                await google_handle_oauth_callback(AsyncMock(), uuid.uuid4(), "code", "verifier")
 
     @pytest.mark.asyncio
     async def test_raises_on_token_exchange_failure(self) -> None:
-        from app.services.google_workspace_service import handle_oauth_callback
+        from app.services.google_workspace_service import google_handle_oauth_callback
 
         with patch("app.services.google_workspace_service.settings") as mock_settings:
             mock_settings.GOOGLE_OAUTH_CLIENT_ID = "client_id"
@@ -196,7 +188,7 @@ class TestHandleOAuthCallbackErrorPath:
 
             with patch("app.services.google_workspace_service.Flow.from_client_config", return_value=mock_flow):
                 with pytest.raises(ExternalServiceError):
-                    await handle_oauth_callback(AsyncMock(), uuid.uuid4(), "bad_code", "verifier")
+                    await google_handle_oauth_callback(AsyncMock(), uuid.uuid4(), "bad_code", "verifier")
 
 
 class TestSearchEmails:
@@ -223,8 +215,9 @@ class TestSearchEmails:
         fake_message.subject = "Test"
         fake_message.sender = "a@b.com"
         fake_message.recipients = []
-        from datetime import datetime, timezone
-        fake_message.date = datetime(2024, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
+        from datetime import datetime
+
+        fake_message.date = datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC)
         fake_message.snippet = "a snippet"
         fake_message.body_plain = ""
         fake_message.body_html = ""
@@ -244,8 +237,8 @@ class TestSearchEmails:
 class TestHandleOAuthCallbackSuccess:
     @pytest.mark.asyncio
     async def test_saves_new_token_when_no_existing(self) -> None:
+        from app.services.google_workspace_service import google_handle_oauth_callback
         from cryptography.fernet import Fernet
-        from app.services.google_workspace_service import handle_oauth_callback
 
         key = Fernet.generate_key()
 
@@ -258,14 +251,17 @@ class TestHandleOAuthCallbackSuccess:
         mock_flow.fetch_token.return_value = None
         mock_flow.credentials = mock_creds
 
-        # DB: first execute for GoogleToken lookup → none; second for get_integration_status
+        # DB: first execute for GoogleToken lookup (store_credentials — still .scalar_one_or_none(),
+        # not touched by the multi-account fix) → none; second for get_integration_status (now
+        # .scalars().first() — see integration_service.get_integration_status).
         no_token_result = MagicMock()
         no_token_result.scalar_one_or_none.return_value = None
 
         status_result = MagicMock()
-        status_result.scalar_one_or_none.return_value = MagicMock(
+        status_result.scalars.return_value.first.return_value = MagicMock(
             scopes="https://www.googleapis.com/auth/gmail.readonly",
             expires_at=None,
+            provider=IntegrationProvider.GOOGLE,
             email=None,
         )
 
@@ -280,7 +276,7 @@ class TestHandleOAuthCallbackSuccess:
             mock_settings.TOKEN_ENCRYPTION_KEY = key.decode()
 
             with patch("app.services.google_workspace_service.Flow.from_client_config", return_value=mock_flow):
-                result = await handle_oauth_callback(mock_db, uuid.uuid4(), "valid_code", "test-verifier")
+                result = await google_handle_oauth_callback(mock_db, uuid.uuid4(), "valid_code", "test-verifier")
 
         assert result.connected is True
         mock_db.add.assert_called_once()
@@ -302,7 +298,10 @@ class TestUploadPdfToDrive:
         mock_adapter.upload_file = AsyncMock(return_value=mock_file)
 
         with patch("app.services.google_workspace_service.DriveAdapter", return_value=mock_adapter):
-            with patch("app.services.google_workspace_service.build_contract_drive_path", return_value=["CashIn", "Entidad", "CON-001", "2024-03"]):
+            with patch(
+                "app.services.google_workspace_service.build_contract_drive_path",
+                return_value=["CashIn", "Entidad", "CON-001", "2024-03"],
+            ):
                 result = await upload_pdf_to_drive(
                     AsyncMock(),
                     uuid.uuid4(),

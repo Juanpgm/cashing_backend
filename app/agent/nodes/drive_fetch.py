@@ -7,12 +7,17 @@ encontrados con su link (webViewLink) para soportar la cuenta de cobro.
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import structlog
 
 from app.adapters.drive.drive_adapter import DriveAdapter
+from app.adapters.drive.port import DriveQuery
+from app.adapters.microsoft.graph_adapter import MicrosoftGraphAdapter
 from app.agent.prompts.email_evidence import _extract_keywords
 from app.agent.state import AgentState
 from app.core.config import settings
+from app.models.integracion import IntegrationProvider
 
 logger = structlog.get_logger("agent.nodes.drive_fetch")
 
@@ -21,59 +26,67 @@ _GENERIC_TERMS = ("informe", "acta", "entrega", "soporte", "reporte")
 MAX_FILES_PER_QUERY = 10
 
 
-def _to_drive_datetime(date_str: str, end_of_day: bool = False) -> str:
-    """Convierte YYYY-MM-DD a RFC3339 que entiende la query de Drive (modifiedTime)."""
+def _to_drive_datetime(date_str: str, end_of_day: bool = False) -> datetime | None:
+    """Convierte YYYY-MM-DD a datetime naive (modifiedTime) para DriveQuery."""
     date_str = (date_str or "").strip().replace("/", "-")
     if not date_str:
-        return ""
+        return None
     suffix = "T23:59:59" if end_of_day else "T00:00:00"
-    return f"{date_str}{suffix}"
+    return datetime.fromisoformat(f"{date_str}{suffix}")
 
 
 def build_drive_queries(
     descripcion: str,
     fecha_inicio: str,
     fecha_fin: str,
-) -> list[str]:
-    """Construye fragmentos de query de Drive para buscar evidencia de una obligación.
+) -> list[DriveQuery]:
+    """Construye `DriveQuery` para buscar evidencia de una obligación en Drive.
 
     Args:
         descripcion: Texto de la obligación.
         fecha_inicio / fecha_fin: YYYY-MM-DD del período a cubrir.
 
     Returns:
-        Lista de fragmentos de query Drive (sin el ``trashed=false``, que agrega el adapter).
+        Una `DriveQuery` por keyword extraída (hasta 3) más una por término
+        genérico — misma granularidad que las queries crudas pre-refactor, para
+        preservar el truncado `EVIDENCE_QUERIES_PER_OBLIGACION` sin cambios.
     """
-    inicio = _to_drive_datetime(fecha_inicio)
-    fin = _to_drive_datetime(fecha_fin, end_of_day=True)
-    date_clause = ""
-    if inicio and fin:
-        date_clause = f" and modifiedTime >= '{inicio}' and modifiedTime <= '{fin}'"
+    date_from = _to_drive_datetime(fecha_inicio)
+    date_to = _to_drive_datetime(fecha_fin, end_of_day=True)
 
-    no_folders = " and mimeType != 'application/vnd.google-apps.folder'"
-    queries: list[str] = []
-    for kw in _extract_keywords(descripcion)[:3]:
-        safe = kw.replace("'", "")
-        queries.append(f"(name contains '{safe}' or fullText contains '{safe}'){date_clause}{no_folders}")
+    def _query(term: str) -> DriveQuery:
+        return DriveQuery(
+            keywords=[term],
+            date_from=date_from,
+            date_to=date_to,
+            exclude_folders=True,
+            max_results=MAX_FILES_PER_QUERY,
+        )
 
-    for term in _GENERIC_TERMS:
-        queries.append(f"name contains '{term}'{date_clause}{no_folders}")
-
+    queries = [_query(kw.replace("'", "")) for kw in _extract_keywords(descripcion)[:3]]
+    queries.extend(_query(term) for term in _GENERIC_TERMS)
     return queries
 
 
-async def drive_fetch_node(state: AgentState) -> AgentState:
-    """Busca documentos de evidencia en el Drive del usuario.
+async def drive_fetch_node(state: AgentState, provider: IntegrationProvider = IntegrationProvider.GOOGLE) -> AgentState:
+    """Busca documentos de evidencia en el Drive/OneDrive del usuario.
 
     Requiere en state: user_id, _db, contrato_contexto (fecha_inicio/fecha_fin),
     obligaciones_contexto (opcional).
 
     Produce en state: drive_evidencias (lista de dicts con title/link/date/file_id).
+
+    `provider` selects the adapter (Google Drive vs. Microsoft Graph/OneDrive).
+    Results are APPENDED to any `drive_evidencias` already in `state` — so calling
+    this once per connected provider (evidence_discovery_service.descubrir_evidencias)
+    merges every provider's files instead of the last call clobbering the rest.
     """
+    existing: list[dict] = state.get("drive_evidencias") or []
+
     user_id = state.get("user_id")
     db = state.get("_db")
     if not user_id or not db:
-        return {**state, "drive_evidencias": []}
+        return {**state, "drive_evidencias": existing}
 
     contrato = state.get("contrato_contexto") or {}
     obligaciones = state.get("obligaciones_contexto") or []
@@ -84,7 +97,7 @@ async def drive_fetch_node(state: AgentState) -> AgentState:
     max_obligaciones = settings.EVIDENCE_MAX_OBLIGACIONES_QUERIES
     obligaciones_para_query = obligaciones if max_obligaciones <= 0 else obligaciones[:max_obligaciones]
 
-    queries: list[str] = []
+    queries: list[DriveQuery] = []
     if obligaciones:
         for oblig in obligaciones_para_query:
             queries.extend(
@@ -95,18 +108,31 @@ async def drive_fetch_node(state: AgentState) -> AgentState:
     else:
         queries = build_drive_queries(state.get("user_input", ""), fecha_inicio, fecha_fin)
 
-    # Deduplicar queries preservando orden.
-    seen_q: set[str] = set()
-    unique_queries = [q for q in queries if not (q in seen_q or seen_q.add(q))]
+    # Deduplicar queries preservando orden (DriveQuery no es hasheable: se usa
+    # una tupla normalizada de sus campos como clave).
+    seen_keys: set[tuple] = set()  # type: ignore[type-arg]
+    unique_queries: list[DriveQuery] = []
+    for query in queries:
+        key = (
+            tuple(query.keywords),
+            query.date_from,
+            query.date_to,
+            query.exclude_folders,
+            tuple(query.mime_types or []),
+            query.max_results,
+        )
+        if key not in seen_keys:
+            seen_keys.add(key)
+            unique_queries.append(query)
 
-    adapter = DriveAdapter(db)
+    adapter = DriveAdapter(db) if provider == IntegrationProvider.GOOGLE else MicrosoftGraphAdapter(db)
     files_by_id: dict[str, dict] = {}
     try:
         for query in unique_queries[: settings.EVIDENCE_MAX_QUERIES_TOTAL]:
             try:
-                files = await adapter.search_files(user_id, query, MAX_FILES_PER_QUERY)
+                files = await adapter.search_files(user_id, query)
             except Exception as exc:
-                await logger.awarning("drive_query_failed", query=query, error=str(exc))
+                await logger.awarning("drive_query_failed", query=query, error=str(exc), provider=provider.value)
                 continue
             for f in files:
                 if f.id not in files_by_id:
@@ -118,15 +144,18 @@ async def drive_fetch_node(state: AgentState) -> AgentState:
                         "date": f.modified_at.isoformat() if f.modified_at else "",
                         "file_id": f.id,
                         "mime_type": f.mime_type,
+                        "provider": provider.value,
                     }
     except Exception as exc:
-        await logger.aerror("drive_fetch_error", error=str(exc), user_id=str(user_id))
+        await logger.aerror("drive_fetch_error", error=str(exc), user_id=str(user_id), provider=provider.value)
         return {
             **state,
-            "drive_evidencias": [],
-            "error": f"Error explorando Drive: {exc}. Verifica que tu cuenta de Google esté conectada.",
+            "drive_evidencias": existing,
+            "error": f"Error explorando Drive ({provider.value}): {exc}. Verifica que tu cuenta esté conectada.",
         }
 
     drive_evidencias = list(files_by_id.values())[: settings.EVIDENCE_MAX_FILES_TOTAL]
-    await logger.ainfo("drive_fetch_complete", user_id=str(user_id), files=len(drive_evidencias))
-    return {**state, "drive_evidencias": drive_evidencias}
+    await logger.ainfo(
+        "drive_fetch_complete", user_id=str(user_id), files=len(drive_evidencias), provider=provider.value
+    )
+    return {**state, "drive_evidencias": existing + drive_evidencias}

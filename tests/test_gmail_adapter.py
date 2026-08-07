@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -19,8 +20,11 @@ from app.adapters.email.gmail_adapter import (
     GmailAdapter,
     _is_rate_limit_error,
 )
-from app.core.exceptions import ExternalServiceError
+from app.core.exceptions import ExternalServiceError, NotFoundError
+from app.models.integracion import IntegrationProvider
+from cryptography.fernet import InvalidToken
 from googleapiclient.errors import HttpError as GoogleHttpError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 
 def _http_error(status: int, message: str = "error") -> GoogleHttpError:
@@ -204,3 +208,99 @@ class TestSearchMessagesConcurrency:
 
         with pytest.raises(ExternalServiceError):
             await adapter.search_messages(uuid.uuid4(), "q")
+
+
+class TestGetCredentialsAgainstRealIntegracionRow:
+    """get_credentials against a real (aiosqlite) `Integracion` row — previously every
+    test in this file stubbed `get_credentials` with an AsyncMock, so the repointing
+    from `GoogleToken` to `Integracion` (this PR) was never exercised end-to-end.
+    """
+
+    async def _store(
+        self,
+        db: AsyncSession,
+        user_id: uuid.UUID,
+        *,
+        email: str = "",
+        expires_in: int = 3600,
+    ) -> None:
+        from app.services.integration_service import store_credentials
+
+        await store_credentials(
+            db,
+            user_id,
+            IntegrationProvider.GOOGLE,
+            access_token="access-token",
+            refresh_token="refresh-token",
+            scopes=["https://www.googleapis.com/auth/gmail.readonly"],
+            expires_in=expires_in,
+            email=email,
+        )
+
+    @pytest.mark.asyncio
+    async def test_decrypts_real_row_and_returns_credentials(self, db: AsyncSession, test_user: dict[str, Any]) -> None:
+        user = test_user["user"]
+        await self._store(db, user.id)
+
+        adapter = GmailAdapter(db)
+        creds = await adapter.get_credentials(user.id)
+
+        assert creds.token == "access-token"
+        assert creds.refresh_token == "refresh-token"
+
+    @pytest.mark.asyncio
+    async def test_raises_not_found_when_no_row(self, db: AsyncSession, test_user: dict[str, Any]) -> None:
+        user = test_user["user"]
+        adapter = GmailAdapter(db)
+
+        with pytest.raises(NotFoundError):
+            await adapter.get_credentials(user.id)
+
+    @pytest.mark.asyncio
+    async def test_refreshes_expired_token(self, db: AsyncSession, test_user: dict[str, Any]) -> None:
+        from google.oauth2.credentials import Credentials
+
+        user = test_user["user"]
+        await self._store(db, user.id, expires_in=-10)  # already expired
+
+        def _fake_refresh(self: Credentials, request: object) -> None:
+            self.token = "refreshed-token"  # type: ignore[misc]
+
+        adapter = GmailAdapter(db)
+        with patch.object(Credentials, "refresh", _fake_refresh):
+            creds = await adapter.get_credentials(user.id)
+
+        assert creds.token == "refreshed-token"
+
+    @pytest.mark.asyncio
+    async def test_invalid_token_on_decrypt_raises_external_service_error(
+        self, db: AsyncSession, test_user: dict[str, Any]
+    ) -> None:
+        """A rotated/corrupted TOKEN_ENCRYPTION_KEY must surface as the domain
+        ExternalServiceError pattern (reconnect-your-account), not a raw 500 from an
+        unhandled cryptography.fernet.InvalidToken."""
+        user = test_user["user"]
+        await self._store(db, user.id)
+
+        adapter = GmailAdapter(db)
+        with (
+            patch.object(adapter._fernet, "decrypt", side_effect=InvalidToken("bad key")),
+            pytest.raises(ExternalServiceError),
+        ):
+            await adapter.get_credentials(user.id)
+
+    @pytest.mark.asyncio
+    async def test_multiple_accounts_does_not_raise_multiple_results_found(
+        self, db: AsyncSession, test_user: dict[str, Any]
+    ) -> None:
+        """Regression guard for the multi-account crash: 2 Integracion rows for the same
+        (usuario_id, provider), distinguished only by email, must not raise
+        sqlalchemy.exc.MultipleResultsFound (previously used .scalar_one_or_none())."""
+        user = test_user["user"]
+        await self._store(db, user.id, email="first@example.com")
+        await self._store(db, user.id, email="second@example.com")
+
+        adapter = GmailAdapter(db)
+        creds = await adapter.get_credentials(user.id)
+
+        assert creds.token == "access-token"

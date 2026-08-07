@@ -95,7 +95,7 @@ async def main() -> None:
 
     async with async_session_factory() as db:
         user = await _get_or_create_demo_user(db)
-        await gws.store_credentials(
+        await gws.google_store_credentials(
             db,
             user.id,
             access_token=creds.token,

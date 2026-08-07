@@ -527,6 +527,76 @@ def is_noise_drive(mime_type: str) -> bool:
     return (mime_type or "") == "application/vnd.google-apps.folder"
 
 
+# ── Microsoft Graph noise heuristics (mirror the Google ones above) ───────────
+#
+# microsoft-noise-heuristics spec: same conservative (over-include) behavior,
+# dispatched by (source, provider) — see app/agent/nodes/evidence_filter.py.
+
+
+def score_non_personal_ms_email(
+    sender: str,
+    subject: str,
+    categories: list[str] | None = None,
+    inference_classification: str = "",
+) -> tuple[int, str]:
+    """Mirrors score_non_personal_email for Outlook mail using Graph signals.
+
+    `inferenceClassification: "other"` is Graph's own ML classifier flag for
+    non-focused/likely-clutter mail — same confidence tier as Gmail's
+    CATEGORY_* labels (immediate filter-worthy score). Domain/subject/sender
+    signals are provider-agnostic, so they're reused as-is via
+    score_non_personal_email rather than re-implemented. Ambiguous senders (no
+    matching signal at all) fall through with a low score so they still reach
+    the LLM layer instead of being silently discarded (spec: "Ambiguous email
+    defaults to LLM review").
+    """
+    domain = _extract_domain(sender)
+    if domain and _is_whitelisted(domain):
+        return 0, ""
+
+    if (inference_classification or "").strip().lower() == "other":
+        return 5, "inferenceClassification:other"
+
+    return score_non_personal_email(sender, subject, categories or [], headers=None)
+
+
+def is_noise_ms_calendar(title: str, metadata: dict) -> bool:
+    """Mirrors is_noise_calendar using Graph's responseStatus/isAllDay equivalents.
+
+    The neutral CalendarAttendee shape has no reliable Microsoft equivalent of
+    Google's "is this attendee me" flag (`CalendarAttendee.is_self` is
+    Google-only — see app/adapters/calendar/port.py), so unlike
+    `is_noise_calendar` this doesn't check for a self-declined RSVP; it mirrors
+    the isAllDay + attendee-response-recorded check, which does have a direct
+    Graph equivalent (`responseStatus.response`).
+    """
+    attendees: list[dict] = metadata.get("attendees") or []
+    is_all_day: bool = metadata.get("is_all_day", False)
+
+    has_recorded_response = any(
+        (att.get("responseStatus") or "").lower() not in ("", "none", "notresponded") for att in attendees
+    )
+    if is_all_day and not has_recorded_response:
+        return True
+
+    return any(p.search(title or "") for p in _NOISE_CALENDAR_SUMMARY_PATTERNS)
+
+
+def is_noise_ms_drive(mime_type: str) -> bool:
+    """Mirrors is_noise_drive — True if the OneDrive item is a folder (not evidence).
+
+    OneDrive driveItems signal "this is a folder" via a `folder` facet key on
+    the raw Graph resource (see FOLDER_FACET in graph_adapter.py), not a MIME
+    type string like Google Drive's `application/vnd.google-apps.folder`. The
+    normalized `DriveFile.mime_type` is populated from the Graph `file` facet
+    only (`_parse_drive_file`), which is absent on folder items — an empty
+    mime_type is therefore OneDrive's folder signal in this normalized shape.
+    Defense-in-depth: `MicrosoftGraphAdapter.search_files` already excludes
+    folders server-side when `exclude_folders=True` (the default).
+    """
+    return not (mime_type or "").strip()
+
+
 # ── LLM classification prompt ─────────────────────────────────────────────────
 
 WORK_NOISE_SYSTEM_PROMPT = """\

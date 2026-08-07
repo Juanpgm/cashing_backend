@@ -8,7 +8,10 @@ from fastapi import HTTPException, status
 # Frontend recovery paths should match on `code` instead of sniffing `detail`
 # or the HTTP status code.
 ACTIVIDADES_MISSING = "ACTIVIDADES_MISSING"
-GOOGLE_NOT_CONNECTED = "GOOGLE_NOT_CONNECTED"
+# Replaces GOOGLE_NOT_CONNECTED (microsoft-365-integration Slice C2, Reconciliation
+# Note #1: no alias kept — the gate is provider-agnostic now, google-specific code
+# is gone).
+NO_PROVIDER_CONNECTED = "NO_PROVIDER_CONNECTED"
 CHECKLIST_INCOMPLETE = "CHECKLIST_INCOMPLETE"
 # Pre-radicación coherence validator (billing-resilience-templates, slice #1): one or
 # more HARD findings from `coherence_validator_service` block `radicar_cuenta`.

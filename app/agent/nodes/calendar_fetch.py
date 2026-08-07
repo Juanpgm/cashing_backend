@@ -13,9 +13,12 @@ from __future__ import annotations
 import structlog
 
 from app.adapters.calendar.calendar_adapter import GoogleCalendarAdapter
+from app.adapters.calendar.port import CalendarEvent
+from app.adapters.microsoft.graph_adapter import MicrosoftGraphAdapter
 from app.agent.prompts.email_evidence import _extract_keywords
 from app.agent.state import AgentState
 from app.core.config import settings
+from app.models.integracion import IntegrationProvider
 
 logger = structlog.get_logger("agent.nodes.calendar_fetch")
 
@@ -31,9 +34,12 @@ def _to_rfc3339(date_str: str, end_of_day: bool = False) -> str:
     return f"{date_str}{suffix}"
 
 
-def _event_start(event: dict) -> str:
-    start = event.get("start") or {}
-    return start.get("dateTime") or start.get("date") or ""
+def _event_start(event: CalendarEvent) -> str:
+    if event.start is not None:
+        return event.start.isoformat()
+    if event.start_date is not None:
+        return event.start_date.isoformat()
+    return ""
 
 
 def _build_calendar_query(obligaciones: list[dict]) -> str | None:
@@ -52,66 +58,81 @@ def _build_calendar_query(obligaciones: list[dict]) -> str | None:
     return " ".join(unique) if unique else None
 
 
-def _extract_event_metadata(ev: dict) -> dict:
-    """Extrae metadatos de asistencia del evento raw de Google Calendar."""
-    start = ev.get("start") or {}
-    is_all_day = "date" in start and "dateTime" not in start
+def _extract_event_metadata(event: CalendarEvent) -> dict:
+    """Extrae metadatos de asistencia del CalendarEvent normalizado.
+
+    Preserva el shape crudo de Google (attendees[].self/responseStatus) que
+    ``evidence_filter.is_noise_calendar`` espera, aunque ahora se construya
+    desde ``CalendarAttendee`` en vez del dict crudo de la API.
+    """
     return {
-        "attendees": ev.get("attendees") or [],
-        "organizer": ev.get("organizer") or {},
-        "event_type": ev.get("eventType") or "default",
-        "is_all_day": is_all_day,
+        "attendees": [
+            {"self": a.is_self, "responseStatus": a.response_status, "email": a.email} for a in event.attendees
+        ],
+        "organizer": {"email": event.organizer_email} if event.organizer_email else {},
+        "event_type": event.event_type,
+        "is_all_day": event.is_all_day,
     }
 
 
-async def calendar_fetch_node(state: AgentState) -> AgentState:
-    """Lista eventos del Calendar del usuario en el período del contrato como evidencia.
+async def calendar_fetch_node(
+    state: AgentState, provider: IntegrationProvider = IntegrationProvider.GOOGLE
+) -> AgentState:
+    """Lista eventos del Calendar/Outlook del usuario en el período del contrato como evidencia.
 
     Requiere en state: user_id, _db, contrato_contexto (fecha_inicio/fecha_fin).
     Produce en state: calendar_evidencias (lista de dicts con title/link/date/event_id/metadata).
+
+    `provider` selects the adapter (Google Calendar vs. Microsoft Graph). Results
+    are APPENDED to any `calendar_evidencias` already in `state` — so calling this
+    once per connected provider (evidence_discovery_service.descubrir_evidencias)
+    merges every provider's events instead of the last call clobbering the rest.
     """
+    existing: list[dict] = state.get("calendar_evidencias") or []
+
     user_id = state.get("user_id")
     db = state.get("_db")
     if not user_id or not db:
-        return {**state, "calendar_evidencias": []}
+        return {**state, "calendar_evidencias": existing}
 
     contrato = state.get("contrato_contexto") or {}
     time_min = _to_rfc3339(str(contrato.get("fecha_inicio", "")))
     time_max = _to_rfc3339(str(contrato.get("fecha_fin", "")), end_of_day=True)
     if not time_min or not time_max:
-        return {**state, "calendar_evidencias": []}
+        return {**state, "calendar_evidencias": existing}
 
     obligaciones = state.get("obligaciones_contexto") or []
     q = _build_calendar_query(obligaciones)
 
-    adapter = GoogleCalendarAdapter(db)
+    adapter = GoogleCalendarAdapter(db) if provider == IntegrationProvider.GOOGLE else MicrosoftGraphAdapter(db)
     try:
-        events = await adapter.search_events(
-            user_id, time_min, time_max, max_results=settings.EVIDENCE_MAX_EVENTS, q=q
-        )
+        events = await adapter.search_events(user_id, time_min, time_max, max_results=settings.EVIDENCE_MAX_EVENTS, q=q)
     except Exception as exc:
-        await logger.aerror("calendar_fetch_error", error=str(exc), user_id=str(user_id))
+        await logger.aerror("calendar_fetch_error", error=str(exc), user_id=str(user_id), provider=provider.value)
         return {
             **state,
-            "calendar_evidencias": [],
-            "error": f"Error leyendo Calendar: {exc}. Verifica que tu cuenta de Google esté conectada.",
+            "calendar_evidencias": existing,
+            "error": f"Error leyendo Calendar ({provider.value}): {exc}. Verifica que tu cuenta esté conectada.",
         }
 
     calendar_evidencias = []
     for ev in events:
-        summary = ev.get("summary", "(evento sin título)")
-        description = ev.get("description", "") or ""
+        summary = ev.summary or "(evento sin título)"
+        description = ev.description or ""
         calendar_evidencias.append(
             {
                 "source": "calendar",
                 "title": summary,
                 "content": f"{summary}. {description}".strip(),
-                "link": ev.get("htmlLink", ""),
+                "link": ev.html_link,
                 "date": _event_start(ev),
-                "event_id": ev.get("id", ""),
+                "event_id": ev.id,
                 "metadata": _extract_event_metadata(ev),
+                "provider": provider.value,
             }
         )
 
-    await logger.ainfo("calendar_fetch_complete", user_id=str(user_id), events=len(calendar_evidencias), q=q)
-    return {**state, "calendar_evidencias": calendar_evidencias}
+    await logger.ainfo(
+        "calendar_fetch_complete", user_id=str(user_id), events=len(calendar_evidencias), q=q, provider=provider.value
+    )
+    return {**state, "calendar_evidencias": existing + calendar_evidencias}

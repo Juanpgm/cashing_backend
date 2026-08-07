@@ -9,6 +9,25 @@ from typing import Protocol
 
 
 @dataclass
+class DriveQuery:
+    """Provider-neutral search query for `DrivePort.search_files`.
+
+    Each adapter translates this into its own native query syntax internally
+    (Google Drive query fragments, Graph `$search`/`$filter`, etc.), so callers
+    never construct provider-specific query strings themselves. Kept free of
+    provider-specific operators so a future semantic-search layer can extend
+    it without a breaking change.
+    """
+
+    keywords: list[str] = field(default_factory=list)  # OR-matched across name + full text
+    date_from: datetime | None = None  # inclusive modified/lastModified lower bound
+    date_to: datetime | None = None  # inclusive upper bound
+    exclude_folders: bool = True  # drop folder/system items
+    mime_types: list[str] | None = None  # optional positive type filter (None = any)
+    max_results: int = 20
+
+
+@dataclass
 class DriveFile:
     id: str
     name: str
@@ -59,14 +78,13 @@ class DrivePort(Protocol):
     async def search_files(
         self,
         usuario_id: uuid.UUID,
-        query: str,
-        max_results: int = 20,
+        query: DriveQuery,
     ) -> list[DriveFile]:
         """Search across the user's entire Drive (no folder scope).
 
-        ``query`` is a Google Drive query fragment (e.g. ``name contains 'informe'``
-        or ``fullText contains 'acta' and modifiedTime > '2024-04-01'``). Requires
-        the ``drive.readonly`` scope to see files the app did not create.
+        ``query`` is a provider-neutral `DriveQuery`; the adapter translates it
+        into its own native query language. Requires the ``drive.readonly``
+        scope to see files the app did not create.
         """
         ...
 

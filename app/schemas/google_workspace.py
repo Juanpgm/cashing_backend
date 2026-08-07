@@ -13,7 +13,13 @@ from pydantic import BaseModel, EmailStr, Field, field_validator
 
 
 class GoogleConnectURLResponse(BaseModel):
-    """URL para redirigir al usuario al flujo OAuth de Google."""
+    """URL para redirigir al usuario al flujo OAuth de Google.
+
+    Intentionally reused as-is (name notwithstanding) by
+    `microsoft_graph_service.build_authorization_url()` for the Microsoft
+    `/connect` route's response — the shape (authorization_url + state) is
+    provider-neutral, so no separate `MicrosoftConnectURLResponse` was added.
+    """
 
     authorization_url: str
     state: str

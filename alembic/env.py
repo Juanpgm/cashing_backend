@@ -18,6 +18,7 @@ from app.models import (  # noqa: F401
     documento_fuente,
     evidencia,
     google_token,
+    integracion,
     obligacion,
     pago,
     plantilla,
