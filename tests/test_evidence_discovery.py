@@ -640,9 +640,9 @@ async def test_descubrir_evidencias_default_fechas_desde_contrato(db: AsyncSessi
 async def test_descubrir_evidencias_local_only_true_zero_google_calls(db: AsyncSession) -> None:
     """local_only=True must run the orchestrator→filter→matcher→justify pipeline
     to completion over uploaded local evidence WITHOUT touching Gmail/Drive/
-    Calendar adapters, and WITHOUT ever evaluating the Google-connection gate
-    (evidence-classification-pipeline: Zero Google API calls in local-only mode,
-    Local path never evaluates the Google gate)."""
+    Calendar adapters, and WITHOUT ever evaluating the provider-connection gate
+    (evidence-classification-pipeline: Zero external API calls in local-only mode,
+    Local path never evaluates the provider gate)."""
     from app.models.actividad import Actividad
     from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
     from app.models.evidencia import Evidencia
@@ -684,7 +684,7 @@ async def test_descubrir_evidencias_local_only_true_zero_google_calls(db: AsyncS
     justify_llm.complete = AsyncMock(return_value=MagicMock(content="Entregué el informe mensual."))
 
     with (
-        patch.object(eds.gws, "get_integration_status", gate_spy),
+        patch.object(eds.integration_service, "has_any_connected_provider", gate_spy),
         patch.object(eds, "GmailAdapter", gmail_ctor),
         patch("app.agent.nodes.drive_fetch.DriveAdapter", drive_ctor),
         patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", cal_ctor),
@@ -748,7 +748,10 @@ async def test_descubrir_evidencias_second_call_same_window_hits_cache_no_google
     cal_ctor = MagicMock(return_value=cal_adapter)
 
     with (
-        patch.object(eds.gws, "get_integration_status", AsyncMock(return_value=_connected_status())),
+        patch.object(eds.integration_service, "has_any_connected_provider", AsyncMock(return_value=True)),
+        patch.object(
+            eds.integration_service, "list_integration_statuses", AsyncMock(return_value=[_connected_status()])
+        ),
         patch.object(eds, "GmailAdapter", gmail_ctor),
         patch("app.agent.nodes.drive_fetch.DriveAdapter", drive_ctor),
         patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", cal_ctor),
@@ -790,7 +793,10 @@ async def test_descubrir_evidencias_different_window_forces_fresh_discovery(db: 
     gmail_ctor = MagicMock(return_value=gmail)
 
     with (
-        patch.object(eds.gws, "get_integration_status", AsyncMock(return_value=_connected_status())),
+        patch.object(eds.integration_service, "has_any_connected_provider", AsyncMock(return_value=True)),
+        patch.object(
+            eds.integration_service, "list_integration_statuses", AsyncMock(return_value=[_connected_status()])
+        ),
         patch.object(eds, "GmailAdapter", gmail_ctor),
         patch("app.agent.nodes.drive_fetch.DriveAdapter", return_value=drive_adapter),
         patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", return_value=cal_adapter),
@@ -848,7 +854,10 @@ async def test_descubrir_evidencias_refresh_true_bypasses_and_repopulates_cache(
     gmail_ctor = MagicMock(return_value=gmail)
 
     with (
-        patch.object(eds.gws, "get_integration_status", AsyncMock(return_value=_connected_status())),
+        patch.object(eds.integration_service, "has_any_connected_provider", AsyncMock(return_value=True)),
+        patch.object(
+            eds.integration_service, "list_integration_statuses", AsyncMock(return_value=[_connected_status()])
+        ),
         patch.object(eds, "GmailAdapter", gmail_ctor),
         patch("app.agent.nodes.drive_fetch.DriveAdapter", return_value=drive_adapter),
         patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", return_value=cal_adapter),
@@ -862,11 +871,11 @@ async def test_descubrir_evidencias_refresh_true_bypasses_and_repopulates_cache(
 
 
 @pytest.mark.asyncio
-async def test_descubrir_evidencias_local_only_false_still_requires_google_gate() -> None:
+async def test_descubrir_evidencias_local_only_false_still_requires_provider_gate() -> None:
     """Explicit local_only=False (or omitted — the default) preserves the
-    pre-existing Google-connected requirement unchanged: the gate decoupling
-    applies ONLY to the local branch (evidence-classification-pipeline: Google
-    gate preserved for Google-sourced evidence)."""
+    pre-existing connected-provider requirement unchanged: the gate decoupling
+    applies ONLY to the local branch (evidence-classification-pipeline: provider
+    gate preserved for Google/Microsoft-sourced evidence)."""
     from app.core.exceptions import ExternalServiceError
     from app.services import evidence_discovery_service as eds
 
@@ -875,11 +884,9 @@ async def test_descubrir_evidencias_local_only_false_still_requires_google_gate(
         fecha_inicio="2024-04-01",
         fecha_fin="2024-04-30",
     )
-    disconnected = MagicMock()
-    disconnected.connected = False
 
     with (
-        patch.object(eds.gws, "get_integration_status", AsyncMock(return_value=disconnected)),
+        patch.object(eds.integration_service, "has_any_connected_provider", AsyncMock(return_value=False)),
         pytest.raises(ExternalServiceError),
     ):
         await eds.descubrir_evidencias(MagicMock(), uuid.uuid4(), req, local_only=False)

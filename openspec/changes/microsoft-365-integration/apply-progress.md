@@ -1,5 +1,131 @@
 # Apply Progress — microsoft-365-integration
 
+## Reintegration (2026-08-07) — READ THIS FIRST, supersedes staleness below
+
+**Context**: the sections below this one were written against an old worktree
+(`cashing-backend-ms365`) that later stopped being its own git repo; its
+uncommitted/unpushed source tree was snapshotted into `_ms365_preserved/` in
+*this* repo before deletion. Separately — and not obvious from that snapshot
+alone — the same 5-slice implementation (A1→A2→B→C1→C2) **had also been
+pushed to `origin/feat/microsoft-365-sharepoint-drive`** in *this* repo, plus
+extra work beyond the original 68-task scope (SharePoint `search_site_files`,
+a reverted generic-IMAP-adapter experiment). That branch was real, complete,
+and already had 3 correction commits (mypy fix, debug-secret masking, Azure
+token malformed-response hardening) that never made it into `_ms365_preserved/`.
+
+**What actually happened this session**: verified the pushed branch existed
+and diverged from `master` by 119 commits (not from any deletion — normal
+independent development on both sides). Created `feat/microsoft-365-integration-flagged`
+off current master tip and ran `git merge feat/microsoft-365-sharepoint-drive`
+— a real 3-way merge, not a manual file-by-file reconciliation against the
+stale `_ms365_preserved/` snapshot (which is the superseded, less-complete
+source and was left untouched, per instruction, pending human review/deletion).
+
+**Conflicts resolved by hand** (4 files, all textually genuine — master had
+grown features the branch never saw, and vice versa):
+
+1. `app/services/evidence_discovery_service.py` — master added `local_only`
+   mode (skips the connection gate + local-file evidence classification),
+   `discovery_cache` (TTL result cache), `_contexto_usuario`. Branch added the
+   provider-agnostic gate (`NO_PROVIDER_CONNECTED`, replacing `GOOGLE_NOT_CONNECTED`)
+   and per-provider email/drive/calendar gather with per-provider failure
+   isolation. Merged: `local_only=True` skips the gate+gather entirely
+   (unchanged master semantics, now provider-agnostic wording); `local_only=False`
+   runs the branch's multi-provider gate+gather; cache/contexto/local-evidence
+   untouched.
+2. `app/services/google_workspace_service.py` — master added `_email_from_id_token`
+   (captures the user's email from the OAuth id_token) threaded through
+   `store_credentials`/`get_integration_status`. Branch renamed/refactored
+   `store_credentials` → `google_store_credentials`, a thin wrapper delegating
+   to the new provider-agnostic `integration_service.store_credentials`.
+   Merged: kept the branch's delegation architecture, added `email=email` to
+   the delegated call so the master-side feature survives. Also had to
+   re-add `from jose import JWTError, jwt` (dropped by the branch's rewrite,
+   still needed by `_email_from_id_token`) — a real import bug the naive
+   auto-merge would NOT have caught (no textual conflict, would have been a
+   silent `NameError` at first callback).
+3-4. `tests/test_evidence_discovery.py`, `tests/test_google_workspace_service.py`
+   — matching test-side renames/mock-shape updates for the above two.
+
+**Non-conflicting but load-bearing checks performed before trusting the merge**:
+`app/api/router.py` and `app/api/deps.py` — the files the original briefing
+flagged as "diverged shared wiring" — turned out to be **untouched by the
+branch entirely** (`git diff` empty on both sides of the merge-base); the
+Microsoft routes were added by generalizing the already-registered
+`integraciones_router`'s handlers, not by touching router registration.
+`app/models/__init__.py` and `app/core/config.py` auto-merged cleanly
+(non-overlapping insertion points, verified before merging, not just trusted).
+
+**Alembic chain fork fixed**: `024_integraciones_table.py`'s `down_revision`
+pointed at `023_documento_requisito_vinculos`, but master's tracked chain had
+moved on to `034_cuenta_cobro_consecutivo_ds` without ever consuming revision
+024 (that number was simply skipped on master). Inserting 024 unchanged would
+have forked the chain into two heads (024 and 025 both children of 023).
+Repointed 024's `down_revision` to `034_cuenta_cobro_consecutivo_ds` (append
+at the tail) instead of renumbering 11 intervening migrations. **Not applied
+to any real database in this session** — `alembic upgrade head` was not run
+against Postgres/Neon; the original A1 slice's Neon-substitute verification
+(SQLite + real Alembic Operations API, see below) still stands as the only
+verification this migration's `upgrade()`/`downgrade()` logic itself has had.
+
+**New task, not in the original 68**: `MS365_INTEGRATION_ENABLED: bool = False`
+in `app/core/config.py` — a hard requirement from the reintegration brief,
+"must land coded but not active." The branch's routes were NOT gated by any
+flag (they'd have gone live on merge). Since `/integraciones/{provider}/*`
+is a single already-registered router shared with the live Google routes
+(confirmed above — no separate MS365 router exists to gate registration of),
+gating happens per-request in `app/api/v1/integraciones.py` via
+`_require_ms365_enabled(provider)`, called at the top of
+`integration_connect`/`integration_callback`/`integration_status`/`integration_revoke`
+— raises `NotFoundError` (404) when `provider == IntegrationProvider.MICROSOFT`
+and the flag is off. Google is untouched (checked explicitly: `_require_ms365_enabled`
+is a no-op for `IntegrationProvider.GOOGLE`). Without `/connect`/`/callback`
+reachable, no user can ever create a `provider=microsoft` row in `integraciones`,
+which transitively makes the provider-agnostic discovery gate/gather loop in
+`evidence_discovery_service.py` and the `MicrosoftGraphAdapter` unreachable
+in practice too, even though those layers have no flag check of their own by
+design (they're meant to be exercised directly by tests, per the brief).
+Added `tests/test_integraciones_api.py::TestMs365Disabled` (new) asserting
+the 404s and that Google is unaffected; the rest of that file's classes gained
+an autouse fixture flipping the flag on (that file's whole purpose is testing
+the Microsoft OAuth wiring). `.env.example` — could not read/edit it, blocked
+by this sandbox's permission settings (directory-level deny on `.env.example`);
+the Pydantic Settings default (`False`) is authoritative regardless, but a
+human should manually add a documented, defaulted-empty `MS365_INTEGRATION_ENABLED=false`
+line there for operator visibility. **This is the one explicit gap left by
+this session — flagged, not silently skipped.**
+
+**Verification**: focused MS365-relevant suite (`-k "microsoft or integracion
+or integraciones or evidence_discovery or google_workspace or store_credentials
+or calendar or drive"`) 134/134 passed. Full repo suite: **1934 passed, 0
+failed, 14 deselected** (`live_llm`, opt-in only), 647s. Zero regressions —
+the historical "5 pre-existing environmental failures" baseline mentioned in
+earlier sections below is gone (resolved by the 119 intervening master
+commits, unrelated to this work).
+
+**Explicit human-call gaps** (cannot be closed by an agent):
+- Real Microsoft Graph OAuth end-to-end (actual Azure AD app registration,
+  real user consent, real token exchange against `login.microsoftonline.com`)
+  has never been exercised — only mocked/unit-tested. `AZURE_AD_CLIENT_ID`/
+  `AZURE_AD_CLIENT_SECRET` are empty by default; nothing in this session
+  fabricated or simulated real credentials.
+- `alembic upgrade head` was not run against a real Postgres/Neon instance in
+  this session (see A1's original Neon-substitute note below — still the
+  only verification this migration has had).
+- `.env.example` needs a human edit (documented above) — sandbox-blocked here.
+- `_ms365_preserved/` was intentionally left in place, per instruction,
+  pending a human confirming this reintegration is correct — safe to delete
+  once that's done (it is now the strictly worse/superseded source; nothing
+  in this session drew from it for the final merged code, only for the initial
+  briefing/orientation).
+
+**Not yet done**: commit is local only (`feat/microsoft-365-integration-flagged`,
+merge commit `0125016`, off current `master` tip `cd3e73f`), not pushed, no
+PR opened. `fix/robust-document-extraction-ocr` and
+`feat/secop-contrato-disambiguacion` were not touched, per instruction.
+
+---
+
 ## Slice A1 — Credential store (PR 1, this batch)
 
 **Branch**: `feat/microsoft-365-a1-credential-store` (off `ms365-integration/base`, committed locally, NOT pushed)

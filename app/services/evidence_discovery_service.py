@@ -43,8 +43,7 @@ from app.schemas.google_workspace import (
     EvidenceDiscoveryResponse,
     ObligacionJustificada,
 )
-from app.services import discovery_cache
-from app.services import integration_service
+from app.services import discovery_cache, integration_service
 
 logger = structlog.get_logger("services.evidence_discovery")
 

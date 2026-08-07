@@ -1,5 +1,21 @@
 # Tasks: microsoft-365-integration
 
+## Reintegration note (2026-08-07)
+
+All 68 tasks below (A1–C2) were implemented and verified pre-existing on the
+pushed branch `feat/microsoft-365-sharepoint-drive` (which also carries a
+SharePoint `search_site_files` addition beyond this change's original scope,
+and a reverted IMAP-adapter experiment). That branch had diverged 119 commits
+from `master`. Reintegrated via `git merge` onto a fresh branch off current
+master tip (`feat/microsoft-365-integration-flagged`), hand-resolving 4 real
+conflicts (`evidence_discovery_service.py`, `google_workspace_service.py`,
+`test_evidence_discovery.py`, `test_google_workspace_service.py`) plus an
+alembic chain fork (024's `down_revision` repointed to the current master
+head). Added a **new, not-previously-tracked task** — `MS365_INTEGRATION_ENABLED`
+feature flag, off by default, gating the `/integraciones/microsoft/*` HTTP
+surface only (Google unaffected) — see apply-progress.md for full detail.
+Full suite: 1934 passed / 0 failed / 14 deselected after reintegration.
+
 ## Reconciliation Notes (design open questions → resolved by spec)
 
 1. **`GOOGLE_NOT_CONNECTED` alias** — design D6 left it open. Spec
@@ -126,7 +142,7 @@ Branch: `feat/microsoft-365-a2-port-generalization` (off A1 tip `3e8a538`, workt
 
 - [x] C2.1 [RED] Test gate raises `NO_PROVIDER_CONNECTED` only at zero connected providers; succeeds with Microsoft-only connected (evidence-discovery-gate spec scenarios).
 - [x] C2.2 [GREEN] `app/core/exceptions.py` — add `NO_PROVIDER_CONNECTED` (replaces `GOOGLE_NOT_CONNECTED`, no alias — see Reconciliation #1); `evidence_discovery_service.py` gate calls `integration_service.has_any_connected_provider`.
-- [ ] C2.3 [RED] Regression test: `local_only=True` still bypasses the gate unchanged. **N/A in this codebase lineage** — `local_only` does not exist anywhere in this worktree/branch chain (`ms365-integration/base` → A1 → A2 → B → C1 → C2); it exists only on the separate `cashing-backend` repo's `master`, added there after this SDD change's base was cut (confirmed via `git log --all -- app/services/evidence_discovery_service.py` and grepping both trees). There is nothing to regress-test. See apply-progress.md for full analysis; recommend rebasing this feature chain onto master (or backporting `local_only`) before this scenario becomes applicable.
+- [x] C2.3 [RED] Regression test: `local_only=True` still bypasses the gate unchanged. **Resolved during reintegration** (2026-08-07, `feat/microsoft-365-integration-flagged`, merge of `feat/microsoft-365-sharepoint-drive` onto master): `local_only` now exists in `evidence_discovery_service.descubrir_evidencias` (it was added on master, 119 commits after this branch's base was cut) — the merge hand-reconciled it to skip the provider-agnostic gate entirely on the local path, same as it previously skipped the Google-only gate. Regression covered by `tests/test_evidence_discovery.py::test_descubrir_evidencias_local_only_true_zero_google_calls` (gate spy `assert_not_called()`) and `test_descubrir_evidencias_local_only_false_still_requires_provider_gate` (gate still raises when `local_only=False`).
 - [x] C2.4 [RED] Test discovery merges `evidence_raw` from both providers when both connected; one provider's failure doesn't abort the other's results (spec scenarios "both connected" / "Microsoft fails, Google succeeds").
 - [x] C2.5 [GREEN] `evidence_discovery_service.py` + `calendar_fetch.py`/`drive_fetch.py`/Gmail-gather step — provider-aware adapter instantiation per connected provider; append normalized items with `metadata.provider` set; isolate per-provider failures.
 - [x] C2.6 [RED] Test duplicate evidence across providers deduplicated by existing dedup logic (spec scenario).
