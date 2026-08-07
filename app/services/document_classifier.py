@@ -54,7 +54,20 @@ _SECONDARY_ONLY_BASE = Decimal("0.400")
 # below. That guard exists for genuinely-confusable same-tier pairs (e.g.
 # REGISTRO_PRESUPUESTAL vs CDP, both matching their own specific phrases) —
 # not to punish another category for co-occurring with the word "contrato".
-_GENERIC_PRIMARY_KEYWORDS = frozenset({"contrato"})
+#
+# Correction (RELIABILITY-003): "cto" is CONTRATO's own PRIMARY-listed
+# abbreviation for "contrato" (same CATEGORIA_KEYWORDS entry, line ~82) — an
+# equally generic spelling, not a distinct signal. Filenames using "cto"
+# ("ACTA DE INICIO DEL CTO") were still losing the tie/demotion-exemption
+# above because only the literal string "contrato" was recognized here.
+# Other categories' PRIMARY lists have similar abbreviation/full-name splits
+# (REGISTRO_PRESUPUESTAL: "rpc"/"rp" vs "registro presupuestal"; CDP: "cdp" vs
+# "certificado de disponibilidad") but neither is in this generic set at all
+# — no equivalent co-occurrence problem has been observed for them (unlike
+# "contrato", they don't show up incidentally in other categories' real SECOP
+# filenames). Left as-is; revisit only if a concrete misclassification like
+# RELIABILITY-001/003 surfaces for one of them.
+_GENERIC_PRIMARY_KEYWORDS = frozenset({"contrato", "cto"})
 
 # R4: bounded, clamped adjustments from SECOP metadata (never an override).
 ADJ_MODIFICACION_CONTRATO = Decimal("-0.150")  # a modificatorio is not the base contrato
@@ -238,6 +251,17 @@ def _aplicar_priors(
     still leaves a PRIMARY_BASE hit well above zero). Absent metadata (a
     non-SECOP DocumentoFuente upload has no datos_raw) means every input here
     is None, so this function is effectively an identity no-op.
+
+    Correction (RELIABILITY-002, BLOCKER): a category with zero PRIMARY hits
+    (``p == 0``, secondary-only) is clamped to SECONDARY_ONLY_CAP, not CAP.
+    Clamping post-prior to the higher CAP let a secondary-only match stack
+    priors (e.g. ADJ_TIPO_HINT +0.100 on top of the 0.600 secondary-only
+    score) past AUTO_LINK_THRESHOLD (0.700) and auto-link with zero PRIMARY
+    evidence — contradicting the documented SECONDARY_ONLY_CAP invariant
+    ("secondary-only stays a candidate, never auto-links"). Capping here,
+    after every adjustment, makes that invariant hold unconditionally instead
+    of only for the un-prior-adjusted score — it can't be defeated by any
+    single prior or any future stack of them.
     """
     ext_norm = (extension or "").strip().lstrip(".").lower()
     hint_cat = _tipo_hint_categoria(tipo_hint)
@@ -250,7 +274,8 @@ def _aplicar_priors(
             adj += ADJ_TIPO_HINT
         if cat is CategoriaDocumento.EVIDENCIAS and ext_norm in _EXT_IMAGENES:
             adj += ADJ_EXT_IMG_EVIDENCIA
-        nuevo = max(Decimal("0.000"), min(score + adj, CAP))
+        cap = CAP if p > 0 else SECONDARY_ONLY_CAP
+        nuevo = max(Decimal("0.000"), min(score + adj, cap))
         out.append((cat, nuevo, p, has_specific))
     return out
 
