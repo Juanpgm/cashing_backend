@@ -148,6 +148,78 @@ def test_clasificar_rp_cdp_ambiguedad_genuina_sigue_demorada():
     assert score < Decimal("0.700")
 
 
+# ── secop-contrato-disambiguation-auto-obligaciones (PR-1a, D1): deny-list ──
+# trap guard — a payment-support filename must not win as CONTRATO PRIMARY
+# even though it legitimately cites the contract number.
+
+
+def test_clasificar_pago_no_es_contrato_primario_por_nombre():
+    """Spec scenario: 'Pago # contrato 123.pdf' must not auto-select as CONTRATO.
+
+    Locks the mechanism (RELIABILITY-001): DEMOTE, never exclude — the doc stays
+    CONTRATO (it could still be the base contrato) but drops to the ambiguous
+    score, below the 0.700 auto-link bar, so it becomes a manual candidate.
+    """
+    cat, score = clasificar("Pago # contrato 123.pdf", None)
+    assert cat == CategoriaDocumento.CONTRATO
+    assert score == CONTENIDO_SCORE_AMBIGUO
+    assert score < Decimal("0.700")
+
+
+@pytest.mark.parametrize(
+    "nombre",
+    [
+        "Comprobante de pago contrato 123.pdf",
+        "Orden de pago No 5 contrato 123.pdf",
+    ],
+)
+def test_clasificar_demueve_variantes_de_soporte_de_pago(nombre):
+    cat, score = clasificar(nombre, None)
+    assert cat == CategoriaDocumento.CONTRATO
+    assert score == CONTENIDO_SCORE_AMBIGUO
+
+
+# ── R3-3 fix: "pago #" was the only spelling caught — "Pago No 5" / "Pago Nro 5"
+# (no "#") is the common SECOP payment-receipt filename and previously slipped
+# through the deny-list undemoted at 0.750, clearing both the auto-link and
+# LLM-disambiguation-skip thresholds.
+
+
+@pytest.mark.parametrize(
+    "nombre",
+    [
+        "Pago No 5 Contrato 123.pdf",
+        "Pago Nro 5 Contrato 123.pdf",
+        "Pago No. 5 Contrato 123.docx",
+    ],
+)
+def test_clasificar_demueve_pago_no_sin_numeral(nombre):
+    cat, score = clasificar(nombre, None)
+    assert cat == CategoriaDocumento.CONTRATO
+    assert score == CONTENIDO_SCORE_AMBIGUO
+    assert score < Decimal("0.700")
+
+
+def test_clasificar_contrato_legitimo_no_es_afectado_por_deny_list():
+    """Spec scenario: a legitimate contrato filename still classifies as CONTRATO."""
+    cat, score = clasificar("Contrato de prestación de servicios 123.pdf", None)
+    assert cat == CategoriaDocumento.CONTRATO
+    assert score >= Decimal("0.700")
+
+
+def test_clasificar_contenido_pago_demueve_contrato_a_0600():
+    """The deny-list guard must survive clasificar_contenido's content re-score (D1)."""
+    texto = (
+        "COMPROBANTE DE PAGO No. 5\n"
+        "Pago correspondiente al contrato de prestación de servicios No. 123, "
+        "cuyo clausulado se detalla en el contrato suscrito."
+    )
+    cat, score = clasificar_contenido(texto)
+    # RELIABILITY-001: lock demote-not-exclude — stays CONTRATO, dropped to ambiguous.
+    assert cat == CategoriaDocumento.CONTRATO
+    assert score == CONTENIDO_SCORE_AMBIGUO
+
+
 # ── R3: import-time dominance guard ──────────────────────────────────────────
 
 

@@ -21,6 +21,7 @@ from datetime import date
 from typing import Any
 
 import pytest
+from app.models.categoria_documento import CategoriaDocumento
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
 from app.models.documento_cuenta_cobro import DocumentoCuentaCobro, EstadoRequisito
@@ -163,6 +164,31 @@ async def test_acta_inicio_con_contrato_generico_autolinkea(db: AsyncSession, co
     await db.commit()
 
     fila = await _fila(db, cuenta.id, "ACTA_INICIO")
+    assert fila.estado == EstadoRequisito.DETECTADO
+    assert fila.secop_documento_id == doc.id
+
+
+async def test_cdp_score_bajo_0_75_pero_sobre_0_70_sigue_autolinkeando(db: AsyncSession, contrato: Contrato) -> None:
+    """Regression (secop-contrato-disambiguation-auto-obligaciones, PR-1a, D3):
+    the new CONTRATO-only 0.75 bar must never touch RPC/CDP — a CDP candidate
+    scoring between the shared 0.700 bar and the CONTRATO-only 0.75 bar still
+    auto-links exactly as before this change (AUTO_LINK_THRESHOLD unchanged)."""
+    doc = SecopDocumento(
+        id_documento_secop=f"DOC-{uuid.uuid4().hex[:10]}",
+        numero_contrato=contrato.numero_contrato,
+        nombre_archivo="documento_generico.pdf",
+        datos_raw={},
+        categoria=CategoriaDocumento.CDP,
+        categoria_confianza=0.72,
+    )
+    db.add(doc)
+    await db.commit()
+
+    cuenta = await _make_cuenta(db, contrato)
+    await checklist_service.detectar_desde_secop(db, cuenta)
+    await db.commit()
+
+    fila = await _fila(db, cuenta.id, "CDP")
     assert fila.estado == EstadoRequisito.DETECTADO
     assert fila.secop_documento_id == doc.id
 

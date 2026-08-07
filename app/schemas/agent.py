@@ -149,6 +149,21 @@ class ContratoExtractionResult(BaseModel):
     transcripcion: str = ""
 
 
+class ContratoBaseVeredicto(BaseModel):
+    """LLM read-and-decide verdict over <=3 SECOP CONTRATO candidates
+    (secop-contrato-disambiguation-auto-obligaciones, D2, response_format).
+
+    ``elegido_index`` is the 0-based position (within the candidates shown to
+    the model, NOT the DB candidate list) of the one base contrato/clausulado
+    with obligations, or ``None`` when none of them looks like the base
+    contrato (e.g. all are payment receipts, addenda, or unrelated annexes).
+    """
+
+    elegido_index: int | None = None
+    confianza: float = 0.0
+    razon: str = ""
+
+
 class DocumentUploadResponse(BaseModel):
     id: uuid.UUID
     nombre: str

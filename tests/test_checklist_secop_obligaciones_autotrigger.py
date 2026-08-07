@@ -14,6 +14,7 @@ import asyncio
 import io
 import uuid
 from datetime import date
+from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -266,6 +267,39 @@ async def test_vinculo_manual_no_dispara_extraccion(
     await checklist_service.detectar_desde_secop(db, cuenta)
     await db.commit()
 
+    assert extraccion["llamadas"] == []
+    assert await _obligaciones(db, contrato.id) == []
+
+
+async def test_contrato_bajo_0_75_autolinca_pero_no_autoextrae(
+    db: AsyncSession, contrato: Contrato, descargas: dict[str, Any], extraccion: dict[str, Any]
+) -> None:
+    """secop-contrato-disambiguation-auto-obligaciones (PR-1a, D3): a CONTRATO
+    candidate scoring >= 0.700 (shared auto-link bar) but < 0.75 (CONTRATO-only
+    obligaciones bar) still auto-links estado=DETECTADO, but must NOT silently
+    auto-extract obligaciones. The doc is fully downloadable/extractable (would
+    succeed if the trigger ran) so this proves the 0.75 gate, not a download
+    failure. (The RPC/CDP rows independently sniff this doc's content in the
+    same scan — unrelated pre-existing behavior, not asserted here.)"""
+    url = "https://s/generico.docx"
+    descargas["payloads"][url] = _docx_bytes(TEXTO_CONTRATO)
+    doc = _secop_doc(
+        contrato,
+        "documento_generico.docx",
+        categoria=CategoriaDocumento.CONTRATO,
+        categoria_confianza=0.72,
+        url_descarga=url,
+    )
+    db.add(doc)
+    await db.commit()
+    cuenta = await _make_cuenta(db, contrato)
+
+    await checklist_service.detectar_desde_secop(db, cuenta)
+    await db.commit()
+
+    fila = await _fila_contrato(db, cuenta.id)
+    assert fila.estado == EstadoRequisito.DETECTADO
+    assert fila.confianza_deteccion == Decimal("0.720")
     assert extraccion["llamadas"] == []
     assert await _obligaciones(db, contrato.id) == []
 

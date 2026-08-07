@@ -56,6 +56,33 @@ _SECONDARY_ONLY_BASE = Decimal("0.400")
 # not to punish another category for co-occurring with the word "contrato".
 _GENERIC_PRIMARY_KEYWORDS = frozenset({"contrato"})
 
+# secop-contrato-disambiguation-auto-obligaciones (PR-1a, D1): a payment-support
+# document ("Comprobante de pago", "Orden de pago", etc.) can legitimately
+# co-mention CONTRATO's generic PRIMARY keyword ("contrato" — the filename
+# routinely cites the underlying contract number) without itself being the
+# base contrato. Auto-linking it as CONTRATO would feed the wrong document
+# into obligaciones extraction. Phrase-level, never bare "pago": a real
+# "Contrato de prestación de servicios ... pagos mensuales" clause must not be
+# blocked. When the CONTRATO winner's name/description matches one of these
+# phrases, `clasificar`/`clasificar_contenido` DEMOTE its score to
+# CONTENIDO_SCORE_AMBIGUO (0.600) — a manual-Vincular candidate, never
+# silently dropped — reusing the R3 demotion contract; never exclude, since a
+# doc could still legitimately be "Contrato ... acta de pago" the base
+# contrato itself.
+# STARTER SET ONLY — data-dependent, needs calibration against real SECOP
+# payment-support filenames (design.md open question, not available here).
+_CONTRATO_DENY_PHRASES: frozenset[str] = frozenset(
+    {
+        "pago #",
+        "pago no",
+        "pago nro",
+        "comprobante de pago",
+        "soporte de pago",
+        "orden de pago",
+        "planilla de pago",
+    }
+)
+
 # R4: bounded, clamped adjustments from SECOP metadata (never an override).
 ADJ_MODIFICACION_CONTRATO = Decimal("-0.150")  # a modificatorio is not the base contrato
 ADJ_TIPO_HINT = Decimal("0.100")  # dataset-declared type is a strong prior
@@ -301,6 +328,10 @@ def clasificar(
         if runner_up_p >= 1 and runner_up_specific and not _es_dominante(best_score, runner_up_score):
             best_score = CONTENIDO_SCORE_AMBIGUO
 
+    # PR-1a D1: deny-list trap guard, CONTRATO-only, demote never exclude.
+    if best_cat is CategoriaDocumento.CONTRATO and keyword_hits(haystacks, list(_CONTRATO_DENY_PHRASES)):
+        best_score = min(best_score, CONTENIDO_SCORE_AMBIGUO)
+
     if best_score < CATEGORIA_MIN_THRESHOLD:
         return CategoriaDocumento.OTROS, Decimal("0.000")
 
@@ -343,9 +374,13 @@ def clasificar_contenido(texto: str | None) -> tuple[CategoriaDocumento | None, 
     ranked = sorted(scored, key=lambda kv: kv[1], reverse=True)
     best_cat, best_score = ranked[0]
     runner_up_score = ranked[1][1] if len(ranked) > 1 else Decimal("0.000")
-    if _es_dominante(best_score, runner_up_score):
-        return best_cat, CONTENIDO_SCORE_UNICO
-    return best_cat, CONTENIDO_SCORE_AMBIGUO
+    resultado_score = CONTENIDO_SCORE_UNICO if _es_dominante(best_score, runner_up_score) else CONTENIDO_SCORE_AMBIGUO
+
+    # PR-1a D1: deny-list trap guard must survive the content re-score too.
+    if best_cat is CategoriaDocumento.CONTRATO and keyword_hits([fragmento], list(_CONTRATO_DENY_PHRASES)):
+        resultado_score = CONTENIDO_SCORE_AMBIGUO
+
+    return best_cat, resultado_score
 
 
 def extraer_texto_contenido(data: bytes, filename: str) -> str:

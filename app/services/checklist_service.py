@@ -26,6 +26,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.config import settings
 from app.core.exceptions import NotFoundError, ValidationError
 from app.core.secop_http import SECOP_BROWSER_USER_AGENT
 from app.core.text_match import keyword_score as _keyword_score
@@ -46,9 +47,10 @@ from app.models.obligacion import Obligacion
 from app.models.requisito_cuenta import RequisitoCuenta
 from app.models.requisito_documento import RequisitoDocumento
 from app.models.secop import SecopContrato, SecopDocumento
-from app.schemas.agent import ObligacionExtraida
+from app.schemas.agent import ContratoBaseVeredicto, LLMMessage, ObligacionExtraida
 from app.services.document_classifier import (
     CATEGORIA_A_REQUISITO,
+    CONTENIDO_SCORE_AMBIGUO,
     TIPO_A_REQUISITO,
     clasificar_contenido,
 )
@@ -63,6 +65,15 @@ _REQUISITO_A_CATEGORIA: dict[str, CategoriaDocumento] = {
 # Auto-link threshold for SECOP detection (per session plan decision).
 AUTO_LINK_THRESHOLD = Decimal("0.700")
 TOP_N_CANDIDATES = 3
+
+# secop-contrato-disambiguation-auto-obligaciones (PR-1a, D3): CONTRATO-only
+# confidence bar, ADDITIVE to and independent of AUTO_LINK_THRESHOLD above.
+# Gates ONLY (a) silent obligaciones auto-extraction on a SECOP-auto-assigned
+# CONTRATO and (b) the panel-visibility confidence signal the frontend reads
+# off confianza_deteccion — it must NEVER replace or lower the shared 0.700
+# bar: checklist estado=DETECTADO auto-link for CONTRATO/RPC/CDP/custom stays
+# on AUTO_LINK_THRESHOLD unchanged.
+AUTO_LINK_THRESHOLD_CONTRATO = Decimal("0.75")
 
 # Minimum fuzzy similarity between a contract identifier (numero_contrato) and a
 # SECOP record's identifier to consider them the same contract. Tolerates case,
@@ -792,6 +803,34 @@ _SNIFF_USER_AGENT = SECOP_BROWSER_USER_AGENT
 # under that window alongside the sniff budget above (~20s sniff + this ≲ 60s).
 _AUTO_OBLIGACIONES_TIMEOUT_SEGUNDOS = 25.0
 
+# secop-contrato-disambiguation-auto-obligaciones (PR-1b, D2): deadline for the
+# WHOLE disambiguation step (per-candidate text read, up to TOP_N_CANDIDATES,
+# plus the single LLM verdict call). Mirrors _AUTO_OBLIGACIONES_TIMEOUT_SEGUNDOS'
+# reasoning: kept comfortably under the synchronous scan request's client-side
+# window; timeout degrades silently to the filename-ranked top[0] (D2).
+_DISAMBIGUACION_CONTRATO_TIMEOUT_SEGUNDOS = 60.0
+# Per-candidate text sent to the LLM — the encabezado/objeto that identifies a
+# clausulado/minuta with obligaciones vs. a payment receipt or annex lives at
+# the top of the document, so a shorter excerpt keeps the decision quality while
+# cutting tokens + latency (the model is already the fast gemini flash tier).
+_DISAMBIGUACION_TEXTO_EXCERPT_CHARS = 2500
+
+_DISAMBIGUACION_CONTRATO_SYSTEM = (
+    "Sos un asistente que identifica cuál de varios documentos de un contrato "
+    "estatal colombiano es el CONTRATO BASE (la minuta/clausulado firmado que "
+    "contiene las obligaciones del contratista) — no un comprobante de pago, "
+    "otrosí, acta, anexo técnico o soporte administrativo."
+)
+_DISAMBIGUACION_CONTRATO_USER = (
+    "A continuación hay hasta 3 documentos candidatos, cada uno con su nombre "
+    "de archivo y un fragmento de su texto. Elegí CUÁL es el contrato base "
+    "(minuta/clausulado con las obligaciones del contratista), o ninguno si "
+    "ninguno lo es.\n\n{candidatos}\n\n"
+    "Respondé SOLO el JSON: elegido_index (posición 0-based del elegido entre "
+    "los mostrados, o null si ninguno es el contrato base), confianza "
+    "(0.0 a 1.0) y razon (una frase breve)."
+)
+
 # Manual Vincular action (deliberate single-document user click, not a bulk
 # scan): a generous, unclamped HTTP timeout — the frontend allows up to 300s
 # for this request. Deliberately NOT reused by the scan's `_asegurar_texto_extraido`.
@@ -1140,6 +1179,135 @@ async def _auto_extraer_obligaciones_contrato(
         )
 
 
+async def _texto_candidato_contrato(doc: SecopDocumento, presupuesto: _PresupuestoSniff) -> str | None:
+    """Best-effort text for ONE CONTRATO disambiguation candidate (PR-1b, D2).
+
+    Native first (the scan's budgeted ``_asegurar_texto_extraido`` — same
+    tiers 1+2 ladder, same download budget). Vision is escalated ONLY when
+    native extraction leaves no usable text — a scanned/distorted candidate
+    still gets read, but a healthy digital PDF never pays the vision cost.
+    Never raises: any failure (download, parse, or vision) degrades to
+    ``None`` and the caller simply drops that candidate from the LLM prompt.
+    """
+    await _asegurar_texto_extraido(doc, presupuesto)
+    if doc.texto_estado == "ok" and doc.texto_extraido:
+        return doc.texto_extraido
+    if not doc.url_descarga:
+        await logger.awarning("secop_disambiguacion_sin_url", secop_documento_id=str(doc.id))
+        return None
+    # Vision fallback shares the scan's download budget (RESILIENCE-002): a
+    # borderline tie must never let up to TOP_N_CANDIDATES extra full-document
+    # downloads + vision calls escape _PresupuestoSniff's per-scan caps and
+    # starve later requisitos. Check the budget, count the download, and clamp
+    # the HTTP timeout to the remaining wall-clock — same discipline as
+    # _asegurar_texto_extraido's native pass.
+    restante = presupuesto.restante
+    if presupuesto.agotado or restante <= _SNIFF_EPSILON_SEGUNDOS:
+        await logger.awarning("secop_disambiguacion_presupuesto_agotado", secop_documento_id=str(doc.id))
+        return None
+    presupuesto.descargas += 1
+    try:
+        data = await _descargar_secop_bytes(doc.url_descarga, min(_SNIFF_HTTP_TIMEOUT, restante))
+        from app.agent.tools.multimodal_parser import sniff_multimodal_mime
+        from app.services import document_service
+
+        mime = sniff_multimodal_mime(data, doc.nombre_archivo or "documento")
+        resultado = await document_service._extraer_contrato_multimodal(data, mime)
+        texto = resultado.transcripcion if resultado is not None else None
+        if not texto or not texto.strip():
+            texto = await document_service.transcribir_documento_multimodal(data, mime)
+        if not texto or not texto.strip():
+            await logger.awarning("secop_disambiguacion_vision_sin_texto", secop_documento_id=str(doc.id))
+            return None
+        return texto
+    except Exception as exc:
+        await logger.awarning("secop_disambiguacion_vision_error", secop_documento_id=str(doc.id), error=str(exc))
+        return None
+
+
+async def _desambiguar_contrato_base_llm(
+    top: list[tuple[SecopDocumento, Decimal]],
+    presupuesto: _PresupuestoSniff,
+) -> tuple[list[tuple[SecopDocumento, Decimal]], uuid.UUID | None]:
+    """Read each candidate's text and ask the LLM which one is the base contrato.
+
+    Returns ``(nuevo_top, elegido_doc_id)``. ``elegido_doc_id`` is only set
+    when the LLM confidently reordered ``top`` (used by the caller to mark
+    that candidate's ``score_origen='llm'``); it's ``None`` on a "none"
+    verdict (top[0] capped below the CONTRATO bar, order unchanged) or when
+    fewer than 2 candidates yield usable text (unchanged, degraded).
+    """
+    # Read the <=TOP_N_CANDIDATES candidates CONCURRENTLY (independent I/O):
+    # worst-case read time collapses from the sum of the reads to the slowest
+    # single one. Still bounded by the shared _PresupuestoSniff and the outer
+    # _DISAMBIGUACION_CONTRATO_TIMEOUT_SEGUNDOS deadline. Order is preserved by
+    # gather, so it re-zips cleanly onto `top`.
+    textos = await asyncio.gather(*(_texto_candidato_contrato(doc, presupuesto) for doc, _score in top))
+    candidatos: list[tuple[SecopDocumento, Decimal, str]] = [
+        (doc, score, texto) for (doc, score), texto in zip(top, textos, strict=True) if texto
+    ]
+    if len(candidatos) < 2:
+        return top, None
+
+    from app.adapters.llm import get_llm
+
+    partes = "\n\n".join(
+        f"[{i}] Archivo: {doc.nombre_archivo}\n{texto[:_DISAMBIGUACION_TEXTO_EXCERPT_CHARS]}"
+        for i, (doc, _score, texto) in enumerate(candidatos)
+    )
+    messages = [
+        LLMMessage(role="system", content=_DISAMBIGUACION_CONTRATO_SYSTEM),
+        LLMMessage(role="user", content=_DISAMBIGUACION_CONTRATO_USER.format(candidatos=partes)),
+    ]
+    resp = await get_llm(model=settings.LLM_EXTRACTION_MODEL or None).complete(
+        messages, temperature=0.0, max_tokens=512, response_format=ContratoBaseVeredicto
+    )
+    veredicto = ContratoBaseVeredicto.model_validate_json(resp.content)
+    elegido_index = veredicto.elegido_index
+
+    if elegido_index is None or not (0 <= elegido_index < len(candidatos)):
+        primero = (top[0][0], min(top[0][1], CONTENIDO_SCORE_AMBIGUO))
+        return [primero, *top[1:]], None
+
+    elegido_doc, filename_score, _texto = candidatos[elegido_index]
+    # RELIABILITY-001: clamp the LLM-reported confidence into [0.0, 1.0] before it
+    # ever reaches confianza_deteccion / the Numeric(4,3) score columns. An
+    # unconstrained float (a hallucinated 15.0, inf, or nan) would otherwise
+    # overflow the column at commit — OUTSIDE this function's degrade guard — or
+    # spuriously clear the 0.75 auto-extract bar. inf clamps to 1.0, nan to 0.0.
+    conf_llm = min(Decimal("1.000"), max(Decimal("0.000"), Decimal(f"{veredicto.confianza:.3f}")))
+    confianza = max(filename_score, conf_llm)
+    resto = [d for d in top if d[0].id != elegido_doc.id]
+    return [(elegido_doc, confianza), *resto], elegido_doc.id
+
+
+async def _desambiguar_contrato_base(
+    top: list[tuple[SecopDocumento, Decimal]],
+    presupuesto: _PresupuestoSniff,
+) -> tuple[list[tuple[SecopDocumento, Decimal]], uuid.UUID | None]:
+    """LLM read-and-decide disambiguation over a CONTRATO borderline tie (D2).
+
+    Triggers ONLY when there are >= 2 candidates AND the leading (filename-
+    ranked) score sits in the borderline band
+    ``[CONTENIDO_SCORE_AMBIGUO, AUTO_LINK_THRESHOLD_CONTRATO)`` — a dominant
+    filename match (>= 0.75) or a lone candidate skips the LLM call entirely
+    (no wasted round-trip). Bounded to at most _DISAMBIGUACION_CONTRATO_TIMEOUT_SEGUNDOS
+    for the whole step (reads + LLM call); ANY failure — timeout, LLM error,
+    unparsable response — degrades silently to the unchanged filename-ranked
+    ``top`` (never blocks the scan).
+    """
+    if len(top) < 2 or not (CONTENIDO_SCORE_AMBIGUO <= top[0][1] < AUTO_LINK_THRESHOLD_CONTRATO):
+        return top, None
+    try:
+        return await asyncio.wait_for(
+            _desambiguar_contrato_base_llm(top, presupuesto),
+            timeout=_DISAMBIGUACION_CONTRATO_TIMEOUT_SEGUNDOS,
+        )
+    except Exception as exc:
+        await logger.awarning("secop_disambiguacion_contrato_error", error=str(exc))
+        return top, None
+
+
 _DETECCION_ERRORES_INFO_KEY = "checklist_deteccion_errores"
 
 
@@ -1311,6 +1479,20 @@ async def detectar_desde_secop(
                 scored = await _sniff_requisito(req.codigo, secop_docs, scored, presupuesto, origen_contenido)
 
             top = scored[:TOP_N_CANDIDATES]
+
+            # LLM read-and-decide disambiguation over a CONTRATO borderline tie
+            # (PR-1b, D2). Only worth running while the requisito is still
+            # eligible for auto-link — an already-linked/manual fila gets no
+            # benefit from reordering candidates, so skip the LLM call entirely.
+            origen_llm_doc_id: uuid.UUID | None = None
+            if (
+                req.codigo == "CONTRATO"
+                and fila.estado == EstadoRequisito.PENDIENTE
+                and fila.documento_fuente_id is None
+                and fila.secop_documento_id is None
+            ):
+                top, origen_llm_doc_id = await _desambiguar_contrato_base(top, presupuesto)
+
             resultado[req.codigo] = top
 
             for doc, score in top:
@@ -1320,7 +1502,11 @@ async def detectar_desde_secop(
                         requisito_codigo=req.codigo,
                         secop_documento_id=doc.id,
                         score=score,
-                        score_origen="contenido" if doc.id in origen_contenido else "nombre",
+                        score_origen=(
+                            "llm"
+                            if doc.id == origen_llm_doc_id
+                            else ("contenido" if doc.id in origen_contenido else "nombre")
+                        ),
                     )
                 )
 
@@ -1335,10 +1521,13 @@ async def detectar_desde_secop(
                 fila.confianza_deteccion = top[0][1]
                 fila.estado = EstadoRequisito.DETECTADO
                 db.add(DocumentoRequisitoVinculo(documento_cuenta_cobro_id=fila.id, secop_documento_id=top[0][0].id))
-                if req.codigo == "CONTRATO":
+                if req.codigo == "CONTRATO" and top[0][1] >= AUTO_LINK_THRESHOLD_CONTRATO:
                     # Task 3.9: an auto-assigned SECOP Contrato kicks off the same
                     # obligaciones extraction an uploaded contrato gets (degraded,
-                    # idempotent, never blocks the scan).
+                    # idempotent, never blocks the scan). PR-1a D3: only silently
+                    # when confidence clears the CONTRATO-only 0.75 bar — a link
+                    # between 0.700 and 0.75 stands (estado=DETECTADO) but leaves
+                    # obligaciones extraction to manual Vincular confirmation.
                     await _auto_extraer_obligaciones_contrato(db, contrato, top[0][0], presupuesto)
         except Exception as exc:
             await logger.aerror(
