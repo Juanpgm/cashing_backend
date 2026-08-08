@@ -172,6 +172,30 @@ async def regenerar_paquete(
     )
 
 
+@router.get("/{cuenta_id}/paquete/descargar", response_class=Response)
+async def descargar_paquete(
+    cuenta_id: uuid.UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Pure read (P5): streams the persisted, gate-validated package bytes
+    from the deterministic storage key — never re-runs `preparar_radicacion`
+    or the LLM-backed informe step, so repeated downloads with no explicit
+    regenerate in between are byte-identical.
+
+    `NotFoundError` (404) when nothing has been generated yet for this cuota;
+    the client should call `POST /paquete/regenerar` first (mirrors the
+    `evidencias.zip` route's `Response` shape, but reads instead of
+    regenerating).
+    """
+    content, filename = await paquete_service.descargar_paquete(db, user.id, cuenta_id)
+    return Response(
+        content=content,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.delete("/{cuenta_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
 async def eliminar_cuenta_cobro(
     cuenta_id: uuid.UUID,

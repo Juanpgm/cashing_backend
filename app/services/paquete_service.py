@@ -79,6 +79,42 @@ async def listar_paquete(db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: uui
     )
 
 
+async def descargar_paquete(db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: uuid.UUID) -> tuple[bytes, str]:
+    """Pure read (P5): serves the bytes of the last persisted package object
+    at the deterministic key. NEVER regenerates, NEVER calls `informe_
+    service.generar_zip_evidencias` or any LLM-backed step — a repeated call
+    with no regenerate in between returns byte-identical content because it
+    reads the same storage object every time.
+
+    Raises `NotFoundError` when nothing has been generated yet — the caller
+    must hit `POST /paquete/regenerar` first; this function never triggers it
+    itself.
+
+    Concurrency: relies on the storage backend's atomic PutObject
+    last-writer-wins overwrite (see module docstring) — a download racing a
+    regenerate reads either the complete old object or the complete new one,
+    never a torn/partial mix.
+    """
+    cuenta = await cuenta_cobro_service._get_cuenta_con_ownership(db, usuario_id, cuenta_id)
+    contrato = cuenta.contrato
+    # B7 Fix 4 parity: same soft-deleted-contrato rejection as `listar_paquete`
+    # and `regenerar_paquete`.
+    if contrato.deleted_at is not None:
+        raise NotFoundError("Contrato", str(contrato.id))
+
+    prefix, filename, storage_key = _clave_paquete(
+        usuario_id, cuenta_id, contrato.numero_contrato, cuenta.anio, cuenta.mes
+    )
+
+    storage = _get_storage(settings.S3_BUCKET_EVIDENCIAS)
+    objetos = await storage.list_objects(prefix)
+    if not any(o.key == storage_key for o in objetos):
+        raise NotFoundError("Paquete", storage_key)
+
+    contenido = await storage.download(storage_key)
+    return contenido, filename
+
+
 async def regenerar_paquete(db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: uuid.UUID) -> RadicacionPrepResultado:
     """Thin delegate — no gate re-implementation, no bypass. All fail-closed
     codes (`CHECKLIST_INCOMPLETE`, `COHERENCE_CHECK_FAILED`, `PACKAGE_
