@@ -958,6 +958,38 @@ async def test_zip_leeme_obligacion_lista_enlaces_de_evidencias_link(
     assert "- gmail: https://mail.google.com/mail/u/0/#inbox/abc123" in body
 
 
+async def test_zip_leeme_enlace_sin_url_muestra_referencia_no_disponible(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A link-type evidencia with NO usable url must not be silently dropped —
+    it appears in the "Enlaces:" section with a placeholder instead (P2 delta)."""
+    user = test_user["user"]
+    res = await db.execute(
+        select(Actividad).where(Actividad.cuenta_cobro_id == cuenta.id).order_by(Actividad.fecha_realizacion.asc())
+    )
+    act = res.scalars().first()
+    assert act is not None
+    ev = Evidencia(
+        actividad_id=act.id,
+        storage_key=None,
+        nombre_archivo="evento sin enlace utilizable",
+        fuente="calendar",
+        url=None,
+    )
+    db.add(ev)
+    await db.commit()
+    await db.refresh(act)
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: _fake_storage())
+
+    content, _filename = await informe_service.generar_zip_evidencias(db, user.id, cuenta.id)
+
+    with zipfile.ZipFile(io.BytesIO(content)) as zf:
+        leemes = [n for n in zf.namelist() if n.endswith("LEEME.txt") and "/" in n]
+        body = zf.read(next(n for n in leemes if n.startswith("01_"))).decode("utf-8")
+    assert "Enlaces:" in body
+    assert "- calendar: (referencia no disponible)" in body
+
+
 async def _vincular_cedula(db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro) -> None:
     """Checklist + an uploaded CEDULA doc linked to its (nivel-contrato,
     solo_primera_cuenta) checklist row."""
@@ -1356,3 +1388,41 @@ async def test_obligacion_una_vez_visible_en_cuota_primera_y_ausente_en_recurren
     assert obligacion_unica.descripcion not in body2
     # The regular (not una_vez) obligación is still reported every cuota.
     assert obligaciones[1].descripcion in body2
+
+
+# ── P4: consecutivo_ds non-fatal aviso (obtener_formato_valores) ────────────
+
+
+async def test_formato_valores_organismo_sin_plantilla_ds_no_emite_aviso(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro
+) -> None:
+    """No DS plantilla ingested for the organismo → no consecutivo_ds aviso,
+    generation proceeds unchanged (P4 scenario: non-DS organismo unaffected)."""
+    user = test_user["user"]
+    _valores, avisos = await informe_service.obtener_formato_valores(db, user.id, cuenta.id)
+    assert not any("consecutivo DS" in a for a in avisos)
+
+
+async def test_formato_valores_ds_requerido_consecutivo_nulo_emite_aviso_no_fatal(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro, contrato: Contrato
+) -> None:
+    """DS plantilla exists for the organismo and `consecutivo_ds` is null →
+    a clear non-fatal aviso is added, `valores` is still returned (fail-open,
+    P4 scenario: missing consecutivo does not silently produce bad output)."""
+    user = test_user["user"]
+    plantilla = PlantillaOrganismo(
+        usuario_id=user.id,
+        entidad=contrato.entidad,
+        entidad_normalizada=normalize(contrato.entidad),
+        tipo_documento="documento_soporte",
+        formato="xlsx",
+        estructura_json={"clonable": True},
+    )
+    db.add(plantilla)
+    await db.commit()
+    assert cuenta.consecutivo_ds is None
+
+    valores, avisos = await informe_service.obtener_formato_valores(db, user.id, cuenta.id)
+
+    assert valores is not None
+    assert "El Documento Soporte requiere el consecutivo DS; queda en blanco hasta que lo cargues." in avisos

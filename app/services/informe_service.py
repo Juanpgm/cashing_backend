@@ -1085,6 +1085,10 @@ async def obtener_formato_valores(
     valores = await _valores_plantilla(db, cuenta, contrato)
     avisos: list[str] = []
 
+    plantilla_ds = await _resolver_layout_organismo(db, contrato, "documento_soporte")
+    if plantilla_ds is not None and cuenta.consecutivo_ds is None:
+        avisos.append("El Documento Soporte requiere el consecutivo DS; queda en blanco hasta que lo cargues.")
+
     plantilla = await _resolver_layout_organismo(db, contrato, "cuenta_cobro")
     if plantilla is not None:
         estructura = plantilla.estructura_json or {}
@@ -1587,10 +1591,12 @@ async def generar_zip_evidencias(
             lines.append("(sin actividades reportadas)")
             lines.append("")
         # Link-only evidencias carry no bytes to package — document them here.
-        enlaces = [ev for act in acts for ev in act.evidencias if ev.storage_key is None and ev.url]
+        # A link-type evidencia with no usable url is noted too (not silently
+        # dropped), with a placeholder instead of a broken link (P2 delta).
+        enlaces = [ev for act in acts for ev in act.evidencias if ev.storage_key is None]
         if enlaces:
             lines.append("Enlaces:")
-            lines += [f"- {ev.fuente or 'enlace'}: {ev.url}" for ev in enlaces]
+            lines += [f"- {ev.fuente or 'enlace'}: {ev.url or '(referencia no disponible)'}" for ev in enlaces]
             lines.append("")
         lines += [
             "Coloque aquí los archivos de soporte (correos, capturas, PDFs,",
