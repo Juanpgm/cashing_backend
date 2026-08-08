@@ -45,7 +45,11 @@ from app.schemas.evidencia_clasificacion import (
     ReclasificacionRequest,
     ReclasificacionResponse,
 )
-from app.schemas.google_workspace import EvidencePersistRequest, EvidencePersistSummary
+from app.schemas.google_workspace import (
+    EvidencePersistRequest,
+    EvidencePersistSummary,
+    PaqueteEvidenciasAutoResponse,
+)
 from app.schemas.paquete import PaqueteInfoResponse
 from app.schemas.plantilla_organismo import FormatoValoresResponse
 from app.schemas.radicacion_prep import PreparaRadicacionResponse
@@ -55,6 +59,7 @@ from app.services import (
     constancia_service,
     cruzar_service,
     cuenta_cobro_service,
+    evidence_auto_service,
     evidence_classification_service,
     evidence_persist_service,
     evidencia_service,
@@ -346,6 +351,23 @@ async def persistir_evidencias(
     the same result does not duplicate rows.
     """
     return await evidence_persist_service.persistir_evidencias(db, current_user.id, cuenta_id, data.obligaciones)
+
+
+@router.post("/{cuenta_id}/evidencias/auto", response_model=PaqueteEvidenciasAutoResponse)
+async def auto_evidencias(
+    cuenta_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> PaqueteEvidenciasAutoResponse:
+    """P1 one-action fused evidencias flow: discovery → persistencia → justificación.
+
+    Collapses the 2-3 manual clicks (Descubrir evidencias → Guardar todo → Generar
+    justificaciones) into a single call. Idempotent: repeat calls never duplicate
+    evidence rows and never destructively overwrite an already-justified actividad
+    (see `evidence_auto_service.auto_evidencias`). The manual buttons remain
+    available, unchanged, as a fallback.
+    """
+    return await evidence_auto_service.auto_evidencias(db, current_user.id, cuenta_id)
 
 
 @router.post(
