@@ -13,6 +13,8 @@ sequential `preparar_radicacion` runs.
 
 from __future__ import annotations
 
+import io
+import zipfile
 from datetime import UTC, date, datetime
 from typing import Any
 from unittest.mock import AsyncMock
@@ -30,6 +32,7 @@ from app.models.obligacion import Obligacion, TipoObligacion
 from app.models.usuario import Usuario
 from app.services import informe_service, radicacion_prep_service
 from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 pytestmark = pytest.mark.asyncio
@@ -422,7 +425,14 @@ async def test_get_descargar_after_explicit_regenerate_serves_the_new_bytes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Explicit regenerate still regenerates: a download after regenerate
-    reflects the freshly persisted object, not stale bytes."""
+    reflects the freshly persisted object, not stale bytes.
+
+    RELIABILITY-004: assert on actual CONTENT, not just object count — mutate
+    the cuenta's Actividad.justificacion (which the per-obligación LEEME
+    inside the zip renders verbatim, `informe_service.py` "Justificación:
+    {act.justificacion}") between the two `preparar_radicacion` calls, and
+    prove the marker shows up only after regenerate re-persisted the package.
+    """
     storage = _FakeStorage()
     monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: storage)
     monkeypatch.setattr("app.services.radicacion_prep_service._get_storage", lambda *_a, **_k: storage)
@@ -432,6 +442,13 @@ async def test_get_descargar_after_explicit_regenerate_serves_the_new_bytes(
     r1 = await client.get(f"/api/v1/cuentas-cobro/{cuenta_lista.id}/paquete/descargar", headers=test_user["headers"])
     assert r1.status_code == 200, r1.text
 
+    marcador = "Justificación actualizada tras regenerar — marcador de contenido."
+    act_rows = await db.execute(select(Actividad).where(Actividad.cuenta_cobro_id == cuenta_lista.id))
+    actividad = act_rows.scalars().one()
+    actividad.justificacion = marcador
+    db.add(actividad)
+    await db.commit()
+
     r_regen = await client.post(
         f"/api/v1/cuentas-cobro/{cuenta_lista.id}/paquete/regenerar", headers=test_user["headers"]
     )
@@ -439,10 +456,12 @@ async def test_get_descargar_after_explicit_regenerate_serves_the_new_bytes(
 
     r2 = await client.get(f"/api/v1/cuentas-cobro/{cuenta_lista.id}/paquete/descargar", headers=test_user["headers"])
     assert r2.status_code == 200, r2.text
-    # Same deterministic key/filename, content still a valid (re-persisted)
-    # package — the point here is regenerate ran and re-persisted, not that
-    # bytes differ (a real LLM would vary content; this proves the read path
-    # reflects whatever is currently persisted after an explicit regenerate).
+    assert r2.content != r1.content
+    zip_bytes = io.BytesIO(r2.content)
+    with zipfile.ZipFile(zip_bytes) as zf:
+        combined = b"".join(zf.read(name) for name in zf.namelist())
+    assert marcador.encode("utf-8") in combined
+
     prefix = f"paquetes/{test_user['user'].id}/{cuenta_lista.id}/"
     objetos = await storage.list_objects(prefix)
     assert len(objetos) == 1
