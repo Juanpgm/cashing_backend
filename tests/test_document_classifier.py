@@ -141,6 +141,31 @@ def test_clasificar_no_se_demuestra_por_co_ocurrencia_generica_de_contrato(nombr
     assert score >= Decimal("0.700")
 
 
+def test_clasificar_secondary_only_con_tipo_hint_no_alcanza_auto_link():
+    """BLOCKER regression: SECONDARY_ONLY_CAP (0.600) stacked with ADJ_TIPO_HINT
+    (+0.100) must never reach AUTO_LINK_THRESHOLD (0.700) — a secondary-only
+    (zero PRIMARY hits) match must never auto-link, per the documented
+    SECONDARY_ONLY_CAP invariant. Pre-fix this landed exactly on 0.700."""
+    nombre = (
+        "contract condiciones generales condiciones especiales "
+        "acuerdo de prestacion prestacion de servicios.pdf"
+    )
+    cat, score = clasificar(nombre, None, tipo_hint="contrato")
+    assert cat == CategoriaDocumento.CONTRATO
+    assert score == Decimal("0.600")
+    assert score < Decimal("0.700")
+
+
+def test_clasificar_cto_abreviatura_no_se_confunde_con_acta_inicio():
+    """CRITICAL regression: 'cto' is CONTRATO's own PRIMARY abbreviation for
+    'contrato' and must be treated as equally generic — otherwise it wins the
+    (score, has_specific) tie against ACTA_INICIO's specific 'acta de inicio'
+    phrase and gets demoted to 0.600 CONTRATO instead of 0.750 ACTA_INICIO."""
+    cat, score = clasificar("ACTA DE INICIO DEL CTO No 123.pdf", None)
+    assert cat == CategoriaDocumento.ACTA_INICIO
+    assert score == Decimal("0.750")
+
+
 def test_clasificar_rp_cdp_ambiguedad_genuina_sigue_demorada():
     """The genuine RP<->CDP confusion the R3 guard exists for must still demote."""
     cat, score = clasificar("REGISTRO PRESUPUESTAL Y CERTIFICADO DE DISPONIBILIDAD.pdf", None)
