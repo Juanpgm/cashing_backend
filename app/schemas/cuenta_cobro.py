@@ -43,6 +43,17 @@ class CuentaCobroCreate(BaseModel):
     contrato_id: uuid.UUID
     mes: int = Field(ge=1, le=12)
     anio: int = Field(ge=2020, le=2099)
+    numero_cuota: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Optional explicit override for the 1-based cuota number. Use to migrate a "
+            "contrato that already had cuotas tracked outside the app — the first cuota "
+            "registered in-app can start above 1. Omit to keep the default: count of "
+            "existing active cuotas + 1. Colliding with another active cuota of the same "
+            "contrato raises CUOTA_NUMERO_CONFLICT."
+        ),
+    )
     valor: Decimal | None = Field(
         default=None,
         gt=0,

@@ -7,12 +7,12 @@ field instead of the old `_is_first_cuenta` read-time heuristic (task 3.11).
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 
 import pytest
-from app.core.exceptions import CUOTA_POSITION_CONFLICT, ValidationError, domain_to_http
+from app.core.exceptions import CUOTA_NUMERO_CONFLICT, CUOTA_POSITION_CONFLICT, ValidationError, domain_to_http
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro, PosicionCuota
 from app.models.usuario import Usuario
@@ -311,3 +311,112 @@ async def test_one_time_obligation_blank_for_final(db: AsyncSession) -> None:
 
     codigos = {f.requisito_codigo for f in filas}
     assert "DEPENDIENTES" not in codigos
+
+
+# ── numero_cuota explicit override (cuota-numero-explicito) ──────────────────
+
+
+async def test_crear_cuenta_cobro_honors_explicit_numero_cuota(db: AsyncSession) -> None:
+    """Migrating a contrato with N cuotas already tracked outside the app: the
+    first cuota registered in-app can start above 1 via an explicit override."""
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+    await db.commit()
+
+    data = CuentaCobroCreate(contrato_id=contrato.id, mes=1, anio=2024, valor=Decimal("1000000.00"), numero_cuota=7)
+    resp = await cuenta_cobro_service.crear_cuenta_cobro(db, user.id, data)
+
+    assert resp.numero_cuota == 7
+    assert resp.posicion == PosicionCuota.RECURRENTE  # only numero_cuota==1 gets PRIMERA
+
+
+async def test_crear_cuenta_cobro_without_numero_cuota_keeps_auto_derivation(db: AsyncSession) -> None:
+    """Omitting numero_cuota is unchanged: still derived as count of active cuotas + 1."""
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+    await db.commit()
+
+    data1 = CuentaCobroCreate(contrato_id=contrato.id, mes=1, anio=2024, valor=Decimal("1000000.00"))
+    resp1 = await cuenta_cobro_service.crear_cuenta_cobro(db, user.id, data1)
+    await db.commit()
+    assert resp1.numero_cuota == 1
+    assert resp1.posicion == PosicionCuota.PRIMERA
+
+    data2 = CuentaCobroCreate(contrato_id=contrato.id, mes=2, anio=2024, valor=Decimal("1000000.00"))
+    resp2 = await cuenta_cobro_service.crear_cuenta_cobro(db, user.id, data2)
+    assert resp2.numero_cuota == 2
+    assert resp2.posicion == PosicionCuota.RECURRENTE
+
+
+async def test_crear_cuenta_cobro_explicit_numero_cuota_collision_raises_conflict(db: AsyncSession) -> None:
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+    await db.commit()
+
+    data1 = CuentaCobroCreate(contrato_id=contrato.id, mes=1, anio=2024, valor=Decimal("1000000.00"), numero_cuota=5)
+    await cuenta_cobro_service.crear_cuenta_cobro(db, user.id, data1)
+    await db.commit()
+
+    data2 = CuentaCobroCreate(contrato_id=contrato.id, mes=2, anio=2024, valor=Decimal("1000000.00"), numero_cuota=5)
+    with pytest.raises(ValidationError) as exc_info:
+        await cuenta_cobro_service.crear_cuenta_cobro(db, user.id, data2)
+    assert exc_info.value.code == CUOTA_NUMERO_CONFLICT
+
+
+async def test_crear_cuenta_cobro_explicit_numero_cuota_one_still_hits_position_conflict(db: AsyncSession) -> None:
+    """The override must NOT bypass the existing PRIMERA-uniqueness guard.
+
+    DEVIATION (mirrors `test_verificar_conflicto_posicion_primera_duplicate_raises`
+    a few tests above): under normal `crear_cuenta_cobro` usage a PRIMERA cuota
+    always has numero_cuota==1, so overriding to numero_cuota=1 while such a cuota
+    exists would ALSO collide on numero_cuota — CUOTA_NUMERO_CONFLICT fires first
+    and the position guard is never reached, but the write is still correctly
+    rejected either way. To isolate the position guard itself (proving it still
+    runs, unbypassed, when reached), the existing PRIMERA cuota here is seeded
+    directly with a non-1 numero_cuota — an edge case only reachable via direct
+    data manipulation, not through the public service.
+    """
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+    await db.commit()
+
+    cuenta_primera = CuentaCobro(
+        contrato_id=contrato.id,
+        mes=1,
+        anio=2024,
+        valor=1_000_000,
+        numero_cuota=99,
+        posicion=PosicionCuota.PRIMERA,
+    )
+    db.add(cuenta_primera)
+    await db.commit()
+
+    data = CuentaCobroCreate(contrato_id=contrato.id, mes=2, anio=2024, valor=Decimal("1000000.00"), numero_cuota=1)
+    with pytest.raises(ValidationError) as exc_info:
+        await cuenta_cobro_service.crear_cuenta_cobro(db, user.id, data)
+    assert exc_info.value.code == CUOTA_POSITION_CONFLICT
+
+
+async def test_crear_cuenta_cobro_explicit_numero_cuota_reuses_soft_deleted_number(db: AsyncSession) -> None:
+    """A soft-deleted cuota's numero_cuota is not "active" — the collision check
+    only scans deleted_at IS NULL rows, mirroring how mes/anio uniqueness already
+    treats soft-deletes."""
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+    await db.commit()
+
+    tombstone = CuentaCobro(
+        contrato_id=contrato.id,
+        mes=1,
+        anio=2023,
+        valor=1_000_000,
+        numero_cuota=5,
+        posicion=PosicionCuota.RECURRENTE,
+        deleted_at=datetime.now(UTC),
+    )
+    db.add(tombstone)
+    await db.commit()
+
+    data = CuentaCobroCreate(contrato_id=contrato.id, mes=1, anio=2024, valor=Decimal("1000000.00"), numero_cuota=5)
+    resp = await cuenta_cobro_service.crear_cuenta_cobro(db, user.id, data)
+    assert resp.numero_cuota == 5

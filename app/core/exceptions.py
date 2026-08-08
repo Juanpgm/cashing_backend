@@ -23,6 +23,9 @@ PACKAGE_PENDIENTE = "PACKAGE_PENDIENTE"
 # an inconsistent position for a contract (two cuotas both `informe_final=true`, or a
 # second `posicion=primera` for the same contrato).
 CUOTA_POSITION_CONFLICT = "CUOTA_POSITION_CONFLICT"
+# Explicit `numero_cuota` override (cuota-numero-explicito): the requested number
+# collides with another active (non-deleted) cuota of the same contrato.
+CUOTA_NUMERO_CONFLICT = "CUOTA_NUMERO_CONFLICT"
 
 
 class DomainError(Exception):
