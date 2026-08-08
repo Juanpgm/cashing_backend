@@ -22,6 +22,7 @@ from app.core.config import settings
 from app.core.exceptions import (
     CHECKLIST_INCOMPLETE,
     COHERENCE_CHECK_FAILED,
+    CUOTA_NUMERO_CONFLICT,
     CUOTA_POSITION_CONFLICT,
     AlreadyExistsError,
     ForbiddenError,
@@ -268,6 +269,33 @@ async def _verificar_conflicto_posicion(
         )
 
 
+async def _verificar_numero_cuota_libre(
+    db: AsyncSession,
+    contrato_id: uuid.UUID,
+    numero_cuota: int,
+    *,
+    excluir_cuenta_id: uuid.UUID | None = None,
+) -> None:
+    """Reject an explicit `numero_cuota` override that collides with another
+    active (non-deleted) cuota of the SAME contrato (cuota-numero-explicito).
+    Raises `ValidationError(code=CUOTA_NUMERO_CONFLICT)` on collision.
+    """
+    stmt = select(CuentaCobro.id).where(
+        CuentaCobro.contrato_id == contrato_id,
+        CuentaCobro.deleted_at.is_(None),
+        CuentaCobro.numero_cuota == numero_cuota,
+    )
+    if excluir_cuenta_id is not None:
+        stmt = stmt.where(CuentaCobro.id != excluir_cuenta_id)
+
+    existente = await db.execute(stmt)
+    if existente.scalar_one_or_none() is not None:
+        raise ValidationError(
+            f"Ya existe otra cuota de este contrato con numero_cuota={numero_cuota}.",
+            code=CUOTA_NUMERO_CONFLICT,
+        )
+
+
 async def crear_cuenta_cobro(
     db: AsyncSession,
     usuario_id: uuid.UUID,
@@ -329,7 +357,11 @@ async def crear_cuenta_cobro(
     # from the count of existing active cuotas, promote to posicion=primera when it's
     # the contrato's first. informe_final is NEVER inferred — only ever set explicitly
     # via `data.informe_final`. Both invariants are checked BEFORE the insert.
-    numero_cuota = await _numero_cuota_siguiente(db, data.contrato_id)
+    if data.numero_cuota is not None:
+        await _verificar_numero_cuota_libre(db, data.contrato_id, data.numero_cuota)
+        numero_cuota = data.numero_cuota
+    else:
+        numero_cuota = await _numero_cuota_siguiente(db, data.contrato_id)
     posicion = PosicionCuota.PRIMERA if numero_cuota == 1 else PosicionCuota.RECURRENTE
     if posicion == PosicionCuota.PRIMERA:
         await _verificar_conflicto_posicion(db, data.contrato_id, posicion_primera=True)
@@ -1157,9 +1189,7 @@ def _paquete_prefix(usuario_id: uuid.UUID, cuenta_id: uuid.UUID) -> str:
     return f"paquetes/{usuario_id}/{cuenta_id}/"
 
 
-async def _listar_y_borrar_prefix_best_effort(
-    storage: StoragePort, prefix: str, **log_context: str
-) -> tuple[int, int]:
+async def _listar_y_borrar_prefix_best_effort(storage: StoragePort, prefix: str, **log_context: str) -> tuple[int, int]:
     """List every object under `prefix` and best-effort delete each. Shared by
     `eliminar_cuenta_cobro` and `purgar_huerfanos_cuentas`'s tombstone loop. A
     failing `list_objects` counts as one failure and yields zero further keys —
@@ -1276,9 +1306,7 @@ async def eliminar_cuenta_cobro(
     # by a storage-side error.
     keys_to_delete = [*evidencia_storage_keys, *([pdf_storage_key] if pdf_storage_key else [])]
     await _borrar_storage_keys_best_effort(storage, keys_to_delete, cuenta_id=str(cuenta_id))
-    await _listar_y_borrar_prefix_best_effort(
-        storage, _paquete_prefix(usuario_id, cuenta_id), cuenta_id=str(cuenta_id)
-    )
+    await _listar_y_borrar_prefix_best_effort(storage, _paquete_prefix(usuario_id, cuenta_id), cuenta_id=str(cuenta_id))
 
 
 def _huerfanos_subqueries() -> tuple[Any, Any, Any, Any]:
@@ -1328,7 +1356,9 @@ async def _contar_huerfanos(
             )
         ),
         "clasificacion_job": await _count(
-            select(ClasificacionEvidenciasJob.id).where(ClasificacionEvidenciasJob.cuenta_cobro_id.not_in(valid_cuentas))
+            select(ClasificacionEvidenciasJob.id).where(
+                ClasificacionEvidenciasJob.cuenta_cobro_id.not_in(valid_cuentas)
+            )
         ),
         "borrador": await _count(
             select(BorradorCuentaCobro.id).where(BorradorCuentaCobro.cuenta_cobro_id.not_in(valid_cuentas))
@@ -1438,9 +1468,7 @@ async def purgar_huerfanos_cuentas(db: AsyncSession, storage: StoragePort, *, dr
     )
 
     candidato_result = await db.execute(
-        sa_delete(DocumentoChecklistCandidato).where(
-            DocumentoChecklistCandidato.cuenta_cobro_id.not_in(valid_cuentas)
-        )
+        sa_delete(DocumentoChecklistCandidato).where(DocumentoChecklistCandidato.cuenta_cobro_id.not_in(valid_cuentas))
     )
 
     requisito_result = await db.execute(
