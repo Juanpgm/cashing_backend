@@ -64,7 +64,7 @@ class CrearCuentaCobroInput(BaseModel):
         le=12,
         description="Mes de la cuenta de cobro: entero 1-12, o nombre del mes en español (ej. 'febrero').",
     )
-    anio: int = Field(ge=2020, le=2099)
+    anio: int = Field(ge=2000, le=2099)
     valor: Decimal | None = Field(
         default=None,
         gt=0,
@@ -112,7 +112,7 @@ class CrearCuentaCobroInput(BaseModel):
         "FIRST to obtain it; never invent a UUID or pass a placeholder/description string. "
         "REQUIRES BOTH mes AND anio — never omit anio even if only the month was emphasized in "
         "the request. Args: contrato_id (UUID, from listar_contratos), mes (integer 1-12, OR a "
-        "Spanish month name such as 'febrero'), anio (integer 2020-2099, e.g. 2026), valor "
+        "Spanish month name such as 'febrero'), anio (integer 2000-2099, e.g. 2026), valor "
         "(optional; defaults to the contrato's valor_mensual when omitted). Example call: "
         "{\"contrato_id\": \"<uuid from listar_contratos>\", \"mes\": 7, \"anio\": 2026}."
     ),

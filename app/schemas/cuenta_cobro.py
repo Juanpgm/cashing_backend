@@ -42,7 +42,7 @@ class ActividadResponse(BaseModel):
 class CuentaCobroCreate(BaseModel):
     contrato_id: uuid.UUID
     mes: int = Field(ge=1, le=12)
-    anio: int = Field(ge=2020, le=2099)
+    anio: int = Field(ge=2000, le=2099)
     numero_cuota: int | None = Field(
         default=None,
         ge=1,
@@ -95,7 +95,7 @@ class CuentaCobroUpdate(BaseModel):
     """Partial update for a CuentaCobro. Only allowed when in BORRADOR state."""
 
     mes: int | None = Field(default=None, ge=1, le=12)
-    anio: int | None = Field(default=None, ge=2020, le=2099)
+    anio: int | None = Field(default=None, ge=2000, le=2099)
     valor: Decimal | None = Field(default=None, gt=0, decimal_places=2)
     informe_final: bool | None = Field(
         default=None,
