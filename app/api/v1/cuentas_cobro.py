@@ -48,7 +48,7 @@ from app.schemas.evidencia_clasificacion import (
 from app.schemas.google_workspace import (
     EvidencePersistRequest,
     EvidencePersistSummary,
-    PaqueteEvidenciasAutoResponse,
+    EvidenciasAutoResponse,
 )
 from app.schemas.paquete import PaqueteInfoResponse
 from app.schemas.plantilla_organismo import FormatoValoresResponse
@@ -377,12 +377,12 @@ async def persistir_evidencias(
     return await evidence_persist_service.persistir_evidencias(db, current_user.id, cuenta_id, data.obligaciones)
 
 
-@router.post("/{cuenta_id}/evidencias/auto", response_model=PaqueteEvidenciasAutoResponse)
+@router.post("/{cuenta_id}/evidencias/auto", response_model=EvidenciasAutoResponse)
 async def auto_evidencias(
     cuenta_id: uuid.UUID,
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_db),
-) -> PaqueteEvidenciasAutoResponse:
+) -> EvidenciasAutoResponse:
     """P1 one-action fused evidencias flow: discovery → persistencia → justificación.
 
     Collapses the 2-3 manual clicks (Descubrir evidencias → Guardar todo → Generar

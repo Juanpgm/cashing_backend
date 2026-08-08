@@ -31,7 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import ExternalServiceError
 from app.models.actividad import Actividad
-from app.schemas.google_workspace import EvidenceDiscoveryRequest, PaqueteEvidenciasAutoResponse
+from app.schemas.google_workspace import EvidenceDiscoveryRequest, EvidenciasAutoResponse
 from app.services import evidence_discovery_service, evidence_persist_service
 from app.services.informe_constants import SENTINEL_SIN_EVIDENCIAS
 
@@ -59,9 +59,7 @@ async def _obligaciones_con_justificacion(db: AsyncSession, cuenta_id: uuid.UUID
     return {str(obligacion_id) for (obligacion_id,) in result.all()}
 
 
-async def auto_evidencias(
-    db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: uuid.UUID
-) -> PaqueteEvidenciasAutoResponse:
+async def auto_evidencias(db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: uuid.UUID) -> EvidenciasAutoResponse:
     """One call: discovery → persistencia → justificación for a CuentaCobro.
 
     Ownership of `cuenta_id` is verified by the reused services (discovery via
@@ -76,10 +74,10 @@ async def auto_evidencias(
         # the auto-fire runs without explicit user action and must not surface a
         # hard failure; the manual buttons stay available to connect + retry.
         await logger.ainfo("auto_evidencias_sin_proveedor", cuenta_id=str(cuenta_id))
-        return PaqueteEvidenciasAutoResponse(descubiertas=0, persistidas=0, justificadas=0, omitido=True)
+        return EvidenciasAutoResponse(descubiertas=0, persistidas=0, justificadas=0, omitido=True)
 
     if discovery.total_evidencias == 0:
-        return PaqueteEvidenciasAutoResponse(descubiertas=0, persistidas=0, justificadas=0, omitido=True)
+        return EvidenciasAutoResponse(descubiertas=0, persistidas=0, justificadas=0, omitido=True)
 
     ya_justificadas = await _obligaciones_con_justificacion(db, cuenta_id)
     if ya_justificadas:
@@ -107,7 +105,7 @@ async def auto_evidencias(
         justificadas=justificadas,
     )
 
-    return PaqueteEvidenciasAutoResponse(
+    return EvidenciasAutoResponse(
         descubiertas=discovery.total_evidencias,
         persistidas=persisted.evidencias_creadas,
         justificadas=justificadas,

@@ -285,7 +285,7 @@ class EvidencePersistSummary(BaseModel):
     evidencias_omitidas: int
 
 
-class PaqueteEvidenciasAutoResponse(BaseModel):
+class EvidenciasAutoResponse(BaseModel):
     """Result of the P1 one-action fused evidencias flow (discover → persist → justificación).
 
     `descubiertas` mirrors `EvidenceDiscoveryResponse.total_evidencias`; `persistidas`
