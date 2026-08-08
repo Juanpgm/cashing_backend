@@ -285,6 +285,24 @@ class EvidencePersistSummary(BaseModel):
     evidencias_omitidas: int
 
 
+class PaqueteEvidenciasAutoResponse(BaseModel):
+    """Result of the P1 one-action fused evidencias flow (discover → persist → justificación).
+
+    `descubiertas` mirrors `EvidenceDiscoveryResponse.total_evidencias`; `persistidas`
+    mirrors `EvidencePersistSummary.evidencias_creadas`; `justificadas` counts how many
+    actividades got real text written this call (created + updated).
+
+    `omitido=True` marks either intentional no-op branch — empty discovery (nothing
+    found) or no Google/Microsoft provider connected — never an error. The manual
+    Descubrir/Guardar todo/Generar justificaciones buttons stay available regardless.
+    """
+
+    descubiertas: int
+    persistidas: int
+    justificadas: int
+    omitido: bool = False
+
+
 # ── Integration test responses ───────────────────────────────────────────────
 
 
