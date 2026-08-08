@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.adapters.storage import get_storage as _get_storage
 from app.core.config import settings
 from app.core.exceptions import NotFoundError
+from app.models.cuenta_cobro import CuentaCobro
 from app.schemas.paquete import ObligacionEstadoOut, PaqueteInfoResponse
 from app.services import cuenta_cobro_service, informe_service, radicacion_prep_service
 from app.services.radicacion_prep_service import RadicacionPrepResultado
@@ -42,18 +43,24 @@ def _clave_paquete(
     return prefix, filename, f"{prefix}{filename}"
 
 
+async def _get_cuenta_con_contrato_vivo(db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: uuid.UUID) -> CuentaCobro:
+    """Shared by all 3 module entry points (B7 Fix 4): `_get_cuenta_con_
+    ownership` only filters `CuentaCobro.deleted_at`, not the joined
+    `Contrato.deleted_at` — reject soft-deleted contracts here (this module's
+    own call sites) rather than in that shared helper."""
+    cuenta = await cuenta_cobro_service._get_cuenta_con_ownership(db, usuario_id, cuenta_id)
+    if cuenta.contrato.deleted_at is not None:
+        raise NotFoundError("Contrato", str(cuenta.contrato_id))
+    return cuenta
+
+
 async def listar_paquete(db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: uuid.UUID) -> PaqueteInfoResponse:
     """Read-only package listing. Never uploads, never packages, never charges
     credits — only a storage-prefix read (`StoragePort.list_objects`) plus the
     same read-only LISTO/PENDIENTE split `generar_zip_evidencias` uses
     internally."""
-    cuenta = await cuenta_cobro_service._get_cuenta_con_ownership(db, usuario_id, cuenta_id)
+    cuenta = await _get_cuenta_con_contrato_vivo(db, usuario_id, cuenta_id)
     contrato = cuenta.contrato
-    # B7 Fix 4: `_get_cuenta_con_ownership` only filters `CuentaCobro.deleted_at`,
-    # not the joined `Contrato.deleted_at` — reject soft-deleted contracts here
-    # (new call site) rather than in the shared helper.
-    if contrato.deleted_at is not None:
-        raise NotFoundError("Contrato", str(contrato.id))
     estado = await informe_service.obtener_estado_listo_pendiente(db, usuario_id, cuenta_id)
 
     prefix, filename, storage_key = _clave_paquete(
@@ -95,12 +102,8 @@ async def descargar_paquete(db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: 
     regenerate reads either the complete old object or the complete new one,
     never a torn/partial mix.
     """
-    cuenta = await cuenta_cobro_service._get_cuenta_con_ownership(db, usuario_id, cuenta_id)
+    cuenta = await _get_cuenta_con_contrato_vivo(db, usuario_id, cuenta_id)
     contrato = cuenta.contrato
-    # B7 Fix 4 parity: same soft-deleted-contrato rejection as `listar_paquete`
-    # and `regenerar_paquete`.
-    if contrato.deleted_at is not None:
-        raise NotFoundError("Contrato", str(contrato.id))
 
     prefix, filename, storage_key = _clave_paquete(
         usuario_id, cuenta_id, contrato.numero_contrato, cuenta.anio, cuenta.mes
@@ -121,10 +124,8 @@ async def regenerar_paquete(db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: 
     PENDIENTE`, `SECRET_DETECTED_IN_PACKAGE`) propagate unchanged from
     `preparar_radicacion`.
 
-    B7 Fix 4: pre-checks contrato aliveness (see `listar_paquete`'s comment —
-    same rationale) before delegating, so a soft-deleted contract's cuota
-    cannot be regenerated/packaged."""
-    cuenta = await cuenta_cobro_service._get_cuenta_con_ownership(db, usuario_id, cuenta_id)
-    if cuenta.contrato.deleted_at is not None:
-        raise NotFoundError("Contrato", str(cuenta.contrato_id))
+    B7 Fix 4: pre-checks contrato aliveness (see `_get_cuenta_con_contrato_
+    vivo`) before delegating, so a soft-deleted contract's cuota cannot be
+    regenerated/packaged."""
+    await _get_cuenta_con_contrato_vivo(db, usuario_id, cuenta_id)
     return await radicacion_prep_service.preparar_radicacion(db, usuario_id, cuenta_id)
