@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from app.adapters.drive.port import DriveQuery
 
 
 def _fake_drive_service(files: list[dict]):
@@ -36,7 +38,7 @@ async def test_search_files_global_query_returns_parsed_files():
     adapter._auth.get_credentials = AsyncMock(return_value=MagicMock())
 
     with patch.object(adapter, "_build_service", return_value=_fake_drive_service(raw_files)):
-        results = await adapter.search_files(uuid.uuid4(), "name contains 'informe'", max_results=10)
+        results = await adapter.search_files(uuid.uuid4(), DriveQuery(keywords=["informe"], max_results=10))
 
     assert len(results) == 1
     assert results[0].id == "f1"
@@ -54,7 +56,7 @@ async def test_search_files_excludes_trashed_and_folders_in_query():
     adapter._auth.get_credentials = AsyncMock(return_value=MagicMock())
 
     with patch.object(adapter, "_build_service", return_value=service):
-        await adapter.search_files(uuid.uuid4(), "fullText contains 'acta'", max_results=5)
+        await adapter.search_files(uuid.uuid4(), DriveQuery(keywords=["acta"], max_results=5))
 
     # Inspect the q kwarg passed to files().list(...)
     _, kwargs = service.files.return_value.list.call_args
@@ -73,6 +75,68 @@ async def test_search_files_empty_result():
     adapter._auth.get_credentials = AsyncMock(return_value=MagicMock())
 
     with patch.object(adapter, "_build_service", return_value=_fake_drive_service([])):
-        results = await adapter.search_files(uuid.uuid4(), "name contains 'nada'")
+        results = await adapter.search_files(uuid.uuid4(), DriveQuery(keywords=["nada"]))
 
     assert results == []
+
+
+@pytest.mark.asyncio
+async def test_search_files_translates_date_range_and_excludes_folders():
+    """date_from/date_to and exclude_folders translate to the equivalent Google clauses."""
+    from app.adapters.drive.drive_adapter import DriveAdapter
+
+    service = _fake_drive_service([])
+    adapter = DriveAdapter(db=MagicMock())
+    adapter._auth.get_credentials = AsyncMock(return_value=MagicMock())
+
+    query = DriveQuery(
+        keywords=["informe"],
+        date_from=datetime(2024, 4, 1),
+        date_to=datetime(2024, 4, 30, 23, 59, 59),
+        exclude_folders=True,
+    )
+    with patch.object(adapter, "_build_service", return_value=service):
+        await adapter.search_files(uuid.uuid4(), query)
+
+    _, kwargs = service.files.return_value.list.call_args
+    q = kwargs["q"]
+    assert "modifiedTime >= '2024-04-01T00:00:00'" in q
+    assert "modifiedTime <= '2024-04-30T23:59:59'" in q
+    assert "mimeType != 'application/vnd.google-apps.folder'" in q
+
+
+@pytest.mark.asyncio
+async def test_search_files_escapes_quote_and_backslash_in_keyword():
+    """A keyword with a trailing backslash plus a quote must not corrupt the query's quoting."""
+    from app.adapters.drive.drive_adapter import DriveAdapter
+
+    service = _fake_drive_service([])
+    adapter = DriveAdapter(db=MagicMock())
+    adapter._auth.get_credentials = AsyncMock(return_value=MagicMock())
+
+    with patch.object(adapter, "_build_service", return_value=service):
+        await adapter.search_files(uuid.uuid4(), DriveQuery(keywords=["informe's\\"], max_results=5))
+
+    _, kwargs = service.files.return_value.list.call_args
+    q = kwargs["q"]
+    # Balanced quotes: every opening ' must have a matching closing ' immediately
+    # after the sanitized term, with no stray backslash escaping it away.
+    assert q.count("'") % 2 == 0
+    assert "name contains 'informes'" in q
+    assert "\\" not in q
+
+
+@pytest.mark.asyncio
+async def test_search_files_no_keywords_omits_name_clause():
+    """An empty keyword list (e.g. the 'most recent files' probe) adds no name/fullText clause."""
+    from app.adapters.drive.drive_adapter import DriveAdapter
+
+    service = _fake_drive_service([])
+    adapter = DriveAdapter(db=MagicMock())
+    adapter._auth.get_credentials = AsyncMock(return_value=MagicMock())
+
+    with patch.object(adapter, "_build_service", return_value=service):
+        await adapter.search_files(uuid.uuid4(), DriveQuery(keywords=[]))
+
+    _, kwargs = service.files.return_value.list.call_args
+    assert "contains" not in kwargs["q"]

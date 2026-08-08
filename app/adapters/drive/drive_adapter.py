@@ -14,7 +14,7 @@ from googleapiclient.errors import HttpError as GoogleHttpError
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.adapters.drive.port import DriveFile
+from app.adapters.drive.port import DriveFile, DriveQuery
 from app.adapters.email.gmail_adapter import GmailAdapter
 from app.core.exceptions import ExternalServiceError
 
@@ -26,7 +26,7 @@ FOLDER_MIME = "application/vnd.google-apps.folder"
 class DriveAdapter:
     """Google Drive implementation of DrivePort.
 
-    Reuses GmailAdapter for credential management — both use the same GoogleToken.
+    Reuses GmailAdapter for credential management — both read the same `Integracion` row.
     All Google API calls run via run_in_executor to stay non-blocking.
     """
 
@@ -166,28 +166,29 @@ class DriveAdapter:
     async def search_files(
         self,
         usuario_id: uuid.UUID,
-        query: str,
-        max_results: int = 20,
+        query: DriveQuery,
     ) -> list[DriveFile]:
         """Search across the user's entire Drive (no parent folder constraint).
 
-        ``query`` is a Google Drive query fragment (e.g. ``name contains 'informe'``).
-        Requires the ``drive.readonly`` scope to reach files the app did not create.
+        ``query`` is a provider-neutral `DriveQuery`, translated here into Google
+        Drive's native query syntax. Requires the ``drive.readonly`` scope to
+        reach files the app did not create.
         """
         creds = await self._auth.get_credentials(usuario_id)
         service = self._build_service(creds)
         loop = asyncio.get_running_loop()
 
         q = "trashed=false"
-        if query:
-            q += f" and ({query})"
+        translated = self._translate_query(query)
+        if translated:
+            q += f" and ({translated})"
 
         def _search() -> dict:  # type: ignore[type-arg]
             return (
                 service.files()
                 .list(
                     q=q,
-                    pageSize=max_results,
+                    pageSize=query.max_results,
                     orderBy="modifiedTime desc",
                     fields="files(id,name,mimeType,size,createdTime,modifiedTime,webViewLink,webContentLink,parents)",
                 )
@@ -199,8 +200,28 @@ class DriveAdapter:
         except GoogleHttpError as exc:
             raise ExternalServiceError("Drive", f"Error buscando archivos: {exc}") from exc
         files = [self._parse_file(f) for f in result.get("files", [])]
-        logger.info("drive_search", user_id=str(usuario_id), query=query, count=len(files))
+        logger.info("drive_search", user_id=str(usuario_id), query=query.keywords, count=len(files))
         return files
+
+    def _translate_query(self, query: DriveQuery) -> str:
+        """Translate a provider-neutral `DriveQuery` into Google Drive query syntax."""
+        parts: list[str] = []
+        if query.keywords:
+            # Drive query grammar uses backslash as the escape char inside single-quoted
+            # literals; strip both quotes and backslashes so a keyword can't corrupt quoting.
+            safe_terms = [kw.replace("'", "").replace("\\", "") for kw in query.keywords]
+            or_clause = " or ".join(f"name contains '{kw}' or fullText contains '{kw}'" for kw in safe_terms)
+            parts.append(f"({or_clause})")
+        if query.date_from:
+            parts.append(f"modifiedTime >= '{query.date_from.isoformat()}'")
+        if query.date_to:
+            parts.append(f"modifiedTime <= '{query.date_to.isoformat()}'")
+        if query.exclude_folders:
+            parts.append(f"mimeType != '{FOLDER_MIME}'")
+        if query.mime_types:
+            mime_clause = " or ".join(f"mimeType = '{m}'" for m in query.mime_types)
+            parts.append(f"({mime_clause})")
+        return " and ".join(parts)
 
     async def get_file(self, usuario_id: uuid.UUID, file_id: str) -> DriveFile:
         creds = await self._auth.get_credentials(usuario_id)

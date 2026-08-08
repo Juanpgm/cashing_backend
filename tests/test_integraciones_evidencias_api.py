@@ -109,8 +109,11 @@ async def test_descubrir_endpoint_refresh_true_bypasses_warm_cache(
     cal_adapter.search_events = AsyncMock(return_value=[])
     justify_llm = AsyncMock()
     justify_llm.complete = AsyncMock(return_value=MagicMock(content="No hay evidencia."))
-    connected = MagicMock()
-    connected.connected = True
+    from app.models.integracion import IntegrationProvider
+
+    connected_status = MagicMock()
+    connected_status.connected = True
+    connected_status.provider = IntegrationProvider.GOOGLE
     gmail_ctor = MagicMock(return_value=gmail)
 
     payload = {
@@ -121,7 +124,8 @@ async def test_descubrir_endpoint_refresh_true_bypasses_warm_cache(
     }
 
     with (
-        patch.object(eds.gws, "get_integration_status", AsyncMock(return_value=connected)),
+        patch.object(eds.integration_service, "has_any_connected_provider", AsyncMock(return_value=True)),
+        patch.object(eds.integration_service, "list_integration_statuses", AsyncMock(return_value=[connected_status])),
         patch.object(eds, "GmailAdapter", gmail_ctor),
         patch("app.agent.nodes.drive_fetch.DriveAdapter", return_value=drive_adapter),
         patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", return_value=cal_adapter),

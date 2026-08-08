@@ -3,7 +3,9 @@
 Guards three frontend recovery paths that previously relied on sniffing free
 text / status codes:
 - ACTIVIDADES_MISSING: checklist autogen fails because the cuenta has no Actividad rows.
-- GOOGLE_NOT_CONNECTED: evidence discovery fails because Google isn't connected.
+- NO_PROVIDER_CONNECTED: evidence discovery fails because no provider (Google or
+  Microsoft) is connected — replaces the old Google-only GOOGLE_NOT_CONNECTED code
+  (microsoft-365-integration Slice C2).
 - CHECKLIST_INCOMPLETE: radicar_cuenta fails because mandatory requisitos are pending.
 
 Also guards the regression case: an error without an assigned code keeps the
@@ -118,15 +120,12 @@ async def test_radicar_checklist_incompleto_returns_checklist_incomplete_code(
     assert body["code"] == "CHECKLIST_INCOMPLETE"
 
 
-async def test_evidencias_descubrir_google_not_connected_returns_code(
+async def test_evidencias_descubrir_no_provider_connected_returns_code(
     client: AsyncClient, test_user: dict[str, Any]
 ) -> None:
-    disconnected = AsyncMock()
-    disconnected.connected = False
-
     with patch(
-        "app.services.evidence_discovery_service.gws.get_integration_status",
-        AsyncMock(return_value=disconnected),
+        "app.services.evidence_discovery_service.integration_service.has_any_connected_provider",
+        AsyncMock(return_value=False),
     ):
         resp = await client.post(
             "/api/v1/integraciones/evidencias/descubrir",
@@ -139,7 +138,7 @@ async def test_evidencias_descubrir_google_not_connected_returns_code(
         )
     assert resp.status_code == 502, resp.text
     body = resp.json()
-    assert body["code"] == "GOOGLE_NOT_CONNECTED"
+    assert body["code"] == "NO_PROVIDER_CONNECTED"
 
 
 _CODIGOS_OBLIGATORIOS_RADICAR = [

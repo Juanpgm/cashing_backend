@@ -19,34 +19,37 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.email.gmail_adapter import GmailAdapter
+from app.adapters.microsoft.graph_adapter import MicrosoftGraphAdapter
 from app.agent.nodes.calendar_fetch import calendar_fetch_node
 from app.agent.nodes.drive_fetch import drive_fetch_node
+from app.agent.nodes.evidence_dedup import evidence_dedup_node
 from app.agent.nodes.evidence_filter import evidence_filter_node
 from app.agent.nodes.evidence_justify import evidence_justify_node
 from app.agent.nodes.evidence_matcher import evidence_matcher_node
 from app.agent.nodes.evidence_orchestrator import evidence_orchestrator_node
-from app.agent.prompts.email_evidence import build_obligation_queries
-from app.agent.prompts.evidence_filter import score_non_personal_email
+from app.agent.prompts.email_evidence import _extract_keywords, build_obligation_queries
+from app.agent.prompts.evidence_filter import score_non_personal_email, score_non_personal_ms_email
 from app.agent.state import AgentState
 from app.core.config import settings
-from app.core.exceptions import GOOGLE_NOT_CONNECTED, ExternalServiceError, NotFoundError, ValidationError
+from app.core.exceptions import NO_PROVIDER_CONNECTED, ExternalServiceError, NotFoundError, ValidationError
 from app.models.actividad import Actividad
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro
 from app.models.evidencia import Evidencia
+from app.models.integracion import IntegrationProvider
 from app.models.obligacion import Obligacion
 from app.schemas.google_workspace import (
     EvidenceDiscoveryRequest,
     EvidenceDiscoveryResponse,
     ObligacionJustificada,
 )
-from app.services import discovery_cache
-from app.services import google_workspace_service as gws
+from app.services import discovery_cache, integration_service
 
 logger = structlog.get_logger("services.evidence_discovery")
 
 MAX_EMAILS_PER_QUERY = 10
 GMAIL_PERMALINK = "https://mail.google.com/mail/u/0/#all/{message_id}"
+OUTLOOK_PERMALINK = "https://outlook.office.com/mail/deeplink/read/{message_id}"
 MAX_ACTIVIDADES_PREVIAS = 20
 
 
@@ -197,7 +200,41 @@ async def _evidencias_subidas(db: AsyncSession, cuenta_id: uuid.UUID | None) -> 
     ]
 
 
-async def _gather_gmail_evidence(
+def _email_permalink(provider: IntegrationProvider, message_id: str, web_link: str) -> str:
+    """Builds a stable permalink for the message — required by EvidenceLink.link
+    (validated http(s) URL downstream in evidence_justify → ObligacionJustificada)."""
+    if provider == IntegrationProvider.MICROSOFT:
+        return web_link or OUTLOOK_PERMALINK.format(message_id=message_id)
+    return GMAIL_PERMALINK.format(message_id=message_id)
+
+
+def _build_email_queries(
+    provider: IntegrationProvider,
+    descripcion: str,
+    fecha_inicio: str,
+    fecha_fin: str,
+    supervisor_email: str | None,
+    entidad: str | None,
+) -> list[str]:
+    """Provider-aware query builder.
+
+    Google reuses `build_obligation_queries` (Gmail search-operator syntax:
+    `subject:`, `after:`, `before:`, category exclusions). Microsoft Graph's
+    `$search` is free-text only (see MicrosoftGraphAdapter.search_messages) —
+    sending it Gmail-operator strings verbatim would search for that literal
+    text and reliably match nothing, so Microsoft gets a plain keyword query
+    instead (mirrors calendar_fetch._build_calendar_query's same pattern).
+    Deviation, not spec-locked (microsoft-graph-adapter spec explicitly defers
+    exact query translation) — documented in apply-progress.md.
+    """
+    if provider == IntegrationProvider.MICROSOFT:
+        keywords = _extract_keywords(descripcion)[:4]
+        return [" ".join(keywords)] if keywords else []
+    fi, ff = _to_gmail_date(fecha_inicio), _to_gmail_date(fecha_fin)
+    return build_obligation_queries(descripcion, fi, ff, supervisor_email or None, entidad or None)
+
+
+async def _gather_email_evidence(
     db: AsyncSession,
     usuario_id: uuid.UUID,
     obligaciones: list[dict[str, str]],
@@ -205,14 +242,17 @@ async def _gather_gmail_evidence(
     fecha_fin: str,
     supervisor_email: str | None,
     entidad: str | None,
+    provider: IntegrationProvider = IntegrationProvider.GOOGLE,
 ) -> tuple[list[dict], int]:
     """Busca correos crudos como evidencia y los normaliza al formato común.
+
+    `provider` selects the adapter (Gmail vs. Microsoft Graph) and the noise
+    heuristic (score_non_personal_email vs. score_non_personal_ms_email).
 
     Returns (emails, filtered_count) — filtered_count is how many non-personal
     emails were dropped before they could contaminate the evidence pipeline.
     """
-    adapter = GmailAdapter(db)
-    fi, ff = _to_gmail_date(fecha_inicio), _to_gmail_date(fecha_fin)
+    adapter = GmailAdapter(db) if provider == IntegrationProvider.GOOGLE else MicrosoftGraphAdapter(db)
 
     max_obligaciones = settings.EVIDENCE_MAX_OBLIGACIONES_QUERIES
     obligaciones_para_query = obligaciones if max_obligaciones <= 0 else obligaciones[:max_obligaciones]
@@ -220,12 +260,16 @@ async def _gather_gmail_evidence(
     queries: list[str] = []
     for ob in obligaciones_para_query:
         queries.extend(
-            build_obligation_queries(ob["descripcion"], fi, ff, supervisor_email or None, entidad or None)[
+            _build_email_queries(provider, ob["descripcion"], fecha_inicio, fecha_fin, supervisor_email, entidad)[
                 : settings.EVIDENCE_QUERIES_PER_OBLIGACION
             ]
         )
     seen_q: set[str] = set()
-    unique_queries = [q for q in queries if not (q in seen_q or seen_q.add(q))]
+    unique_queries: list[str] = []
+    for q in queries:
+        if q and q not in seen_q:
+            seen_q.add(q)
+            unique_queries.append(q)
 
     emails_by_id: dict[str, dict] = {}
     filtered_count = 0
@@ -233,24 +277,33 @@ async def _gather_gmail_evidence(
         try:
             messages = await adapter.search_messages(usuario_id, query, MAX_EMAILS_PER_QUERY)
         except Exception as exc:
-            await logger.awarning("gmail_query_failed", query=query, error=str(exc))
+            await logger.awarning("email_query_failed", query=query, error=str(exc), provider=provider.value)
             continue
         for m in messages:
             if m.id not in emails_by_id:
-                score, reason = score_non_personal_email(
-                    sender=m.sender,
-                    subject=m.subject,
-                    labels=list(m.labels or []),
-                    headers=dict(m.headers or {}),
-                )
+                if provider == IntegrationProvider.MICROSOFT:
+                    score, reason = score_non_personal_ms_email(
+                        sender=m.sender,
+                        subject=m.subject,
+                        categories=list(m.labels or []),
+                        inference_classification=dict(m.headers or {}).get("inferenceClassification", ""),
+                    )
+                else:
+                    score, reason = score_non_personal_email(
+                        sender=m.sender,
+                        subject=m.subject,
+                        labels=list(m.labels or []),
+                        headers=dict(m.headers or {}),
+                    )
                 if score >= 3:
                     filtered_count += 1
                     await logger.adebug(
-                        "gmail_evidence_filtered_non_personal",
+                        "email_evidence_filtered_non_personal",
                         subject=m.subject[:80],
                         sender=m.sender[:80],
                         score=score,
                         reason=reason,
+                        provider=provider.value,
                     )
                     continue
                 emails_by_id[m.id] = {
@@ -258,12 +311,13 @@ async def _gather_gmail_evidence(
                     "content": (m.body_plain or m.snippet or "")[:800],
                     "title": m.subject,
                     "subject": m.subject,
-                    "link": GMAIL_PERMALINK.format(message_id=m.id),
+                    "link": _email_permalink(provider, m.id, getattr(m, "web_link", "")),
                     "date": m.date.isoformat() if m.date else "",
                     "message_id": m.id,
                     "sender": m.sender,
                     "labels": list(m.labels or []),
                     "headers": dict(m.headers or {}),
+                    "provider": provider.value,
                 }
     return list(emails_by_id.values())[: settings.EVIDENCE_MAX_EMAILS_TOTAL], filtered_count
 
@@ -279,12 +333,13 @@ async def descubrir_evidencias(
     """Punto de entrada: descubre evidencias y genera justificaciones por obligación.
 
     `local_only=True` runs the SAME orchestrator→filter→matcher→justify pipeline
-    over only the uploaded local evidence (`_evidencias_subidas`), skipping Gmail/
-    Drive/Calendar entirely — including the Google-connection gate below, which is
-    never evaluated on this path (evidence-classification-pipeline: Local-only
-    pipeline execution, Zero Google API calls in local-only mode, Local path never
-    evaluates the Google gate). Non-local (default) behavior is unchanged: the
-    Google gate still runs and still raises `GOOGLE_NOT_CONNECTED` when applicable.
+    over only the uploaded local evidence (`_evidencias_subidas`), skipping
+    Gmail/Outlook/Drive/Calendar entirely — including the provider-connection gate
+    below, which is never evaluated on this path (evidence-classification-pipeline:
+    Local-only pipeline execution, Zero external API calls in local-only mode,
+    Local path never evaluates the provider gate). Non-local (default) behavior is
+    unchanged: the gate still runs and still raises `NO_PROVIDER_CONNECTED` when
+    no provider (Google or Microsoft) is connected.
 
     Discovery-result cache (radicar-ui-ux-improvements C.1, design §5): when
     `req.cuenta_id` is set and this isn't a `local_only` call, a prior result for
@@ -318,26 +373,39 @@ async def descubrir_evidencias(
         if cached is not None:
             return cached
 
-    if local_only:
-        # Local-only classification never touches Google — the connection gate
-        # below must NOT run at all on this path (evidence-classification-pipeline:
-        # Local path never evaluates the Google gate).
-        email_evidencias: list[dict] = []
-        email_filtered = 0
-    else:
-        # Verificar conexión de Google antes de gastar llamadas.
-        status = await gws.get_integration_status(db, usuario_id)
-        if not status.connected:
+    email_evidencias: list[dict] = []
+    email_filtered = 0
+    connected_providers: list[IntegrationProvider] = []
+    if not local_only:
+        # Gate provider-agnóstico: procede con al menos un proveedor conectado
+        # (Google o Microsoft) — evidence-discovery-gate spec, no exclusivo de Google.
+        # Local-only classification never touches Google/Microsoft — this gate must
+        # NOT run at all on that path (evidence-classification-pipeline: Local path
+        # never evaluates the provider gate).
+        if not await integration_service.has_any_connected_provider(db, usuario_id):
             raise ExternalServiceError(
-                "Google",
-                "La cuenta de Google no está conectada. Usa /integraciones/google/connect.",
-                code=GOOGLE_NOT_CONNECTED,
+                "Integraciones",
+                "Ninguna cuenta está conectada. Conecta Google o Microsoft en "
+                "/integraciones/{provider}/connect (provider: google | microsoft).",
+                code=NO_PROVIDER_CONNECTED,
             )
 
-        # 1. Reunir evidencia cruda de Gmail (filtra no-personal en origen).
-        email_evidencias, email_filtered = await _gather_gmail_evidence(
-            db, usuario_id, obligaciones, fecha_inicio, fecha_fin, req.supervisor_email, req.entidad
-        )
+        statuses = await integration_service.list_integration_statuses(db, usuario_id)
+        connected_providers = [s.provider for s in statuses if s.connected]
+
+        # 1. Reunir evidencia cruda de correo (Gmail/Outlook) por cada proveedor conectado.
+        # El fallo de un proveedor no debe abortar los demás (spec: "Microsoft fails,
+        # Google succeeds" — Google-sourced evidence is still returned).
+        for provider in connected_providers:
+            try:
+                provider_emails, provider_filtered = await _gather_email_evidence(
+                    db, usuario_id, obligaciones, fecha_inicio, fecha_fin, req.supervisor_email, req.entidad, provider
+                )
+            except Exception as exc:
+                await logger.awarning("email_gather_provider_failed", provider=provider.value, error=str(exc))
+                continue
+            email_evidencias.extend(provider_emails)
+            email_filtered += provider_filtered
 
     # Actividades de meses anteriores del mismo contrato (grounding para no repetir texto).
     actividades_previas = await _actividades_previas(db, contrato_id, req.cuenta_id)
@@ -360,13 +428,24 @@ async def descubrir_evidencias(
         "local_evidence": local_evidence,
     }
 
-    # 2-3. Explorar Drive y Calendar (skipped entirely in local_only mode).
+    # 2-3. Explorar Drive y Calendar por cada proveedor conectado (skipped entirely
+    # in local_only mode) — misma tolerancia a fallos por proveedor que el correo.
     if not local_only:
-        state = await drive_fetch_node(state)
-        state = await calendar_fetch_node(state)
+        for provider in connected_providers:
+            try:
+                state = await drive_fetch_node(state, provider=provider)
+            except Exception as exc:
+                await logger.awarning("drive_fetch_provider_failed", provider=provider.value, error=str(exc))
+            try:
+                state = await calendar_fetch_node(state, provider=provider)
+            except Exception as exc:
+                await logger.awarning("calendar_fetch_provider_failed", provider=provider.value, error=str(exc))
 
-    # 4. Consolidar → filtrar ruido → emparejar → justificar.
+    # 4. Consolidar → deduplicar (por si el mismo item aparece en ambos proveedores)
+    #    → filtrar ruido → emparejar → justificar.
     state = await evidence_orchestrator_node(state)
+    state = await evidence_dedup_node(state)
+    state["evidence_raw"] = state.get("deduplicated_evidence") or []
     state = await evidence_filter_node(state)
     state = await evidence_matcher_node(state)
     state = await evidence_justify_node(state)

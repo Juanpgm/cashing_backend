@@ -21,7 +21,10 @@ from app.agent.prompts.evidence_filter import (
     build_work_noise_prompt,
     is_noise_calendar,
     is_noise_drive,
+    is_noise_ms_calendar,
+    is_noise_ms_drive,
     score_non_personal_email,
+    score_non_personal_ms_email,
 )
 from app.agent.state import AgentState
 from app.schemas.agent import LLMMessage
@@ -68,25 +71,42 @@ async def _llm_classify_batch(items: list[dict], llm) -> list[bool]:  # True = T
 
 
 def _heuristic_is_noise(item: dict) -> bool:
-    """Capa 1: heurísticas deterministas por source. True = descartar."""
+    """Capa 1: heurísticas deterministas por (source, provider). True = descartar.
+
+    Dispatches to the Microsoft counterpart when `metadata.provider ==
+    "microsoft"`; defaults to "google" (the Google heuristics) for legacy
+    items that predate the provider marker (microsoft-noise-heuristics spec:
+    "each item scored by its own provider's heuristic").
+    """
     source = item.get("source", "")
     meta = item.get("metadata") or {}
+    provider = meta.get("provider") or "google"
+    is_microsoft = provider == "microsoft"
 
     if source == "email":
         sender = meta.get("sender") or ""
         labels = meta.get("labels") or []
         title = item.get("title") or ""
         headers = meta.get("headers") or {}
-        score, _ = score_non_personal_email(sender, title, labels, headers)
+        if is_microsoft:
+            score, _ = score_non_personal_ms_email(
+                sender, title, categories=labels, inference_classification=headers.get("inferenceClassification", "")
+            )
+        else:
+            score, _ = score_non_personal_email(sender, title, labels, headers)
         return score >= 3
 
     if source == "calendar":
         cal_meta = meta.get("metadata") or {}
         title = item.get("title") or ""
+        if is_microsoft:
+            return is_noise_ms_calendar(title, cal_meta)
         return is_noise_calendar(title, cal_meta)
 
     if source == "drive":
         mime = meta.get("mime_type") or ""
+        if is_microsoft:
+            return is_noise_ms_drive(mime)
         return is_noise_drive(mime)
 
     return False

@@ -30,6 +30,10 @@ class EmailMessage:
     attachments: list[EmailAttachment] = field(default_factory=list)
     labels: list[str] = field(default_factory=list)
     headers: dict[str, str] = field(default_factory=dict)
+    # Provider-hosted permalink to the message (e.g. Graph's `webLink`). Gmail has
+    # no adapter-level equivalent — the service builds its permalink from `id`
+    # instead — so this defaults to "" and is only populated by non-Google adapters.
+    web_link: str = ""
 
 
 class EmailPort(Protocol):

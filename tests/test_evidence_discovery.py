@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from app.adapters.email.port import EmailMessage
 from app.models.contrato import Contrato
+from app.models.integracion import IntegrationProvider
 from app.models.usuario import Usuario
 from app.schemas.google_workspace import EvidenceDiscoveryRequest
 from app.tools.invoke import invoke_tool as real_invoke_tool
@@ -30,10 +31,21 @@ def _email(mid: str, subject: str, body: str) -> EmailMessage:
     )
 
 
-def _connected_status():
+def _connected_status(provider: IntegrationProvider = IntegrationProvider.GOOGLE):
     s = MagicMock()
     s.connected = True
+    s.provider = provider
     return s
+
+
+def _patch_only_google_connected(eds):
+    """Patches the provider-agnostic gate so only Google is connected (Slice C2)."""
+    return (
+        patch.object(eds.integration_service, "has_any_connected_provider", AsyncMock(return_value=True)),
+        patch.object(
+            eds.integration_service, "list_integration_statuses", AsyncMock(return_value=[_connected_status()])
+        ),
+    )
 
 
 @pytest.mark.asyncio
@@ -69,8 +81,10 @@ async def test_descubrir_evidencias_full_flow():
         return_value=MagicMock(content="Elaboré y entregué el informe mensual de actividades del contrato.")
     )
 
+    only_google, only_google_statuses = _patch_only_google_connected(eds)
     with (
-        patch.object(eds.gws, "get_integration_status", AsyncMock(return_value=_connected_status())),
+        only_google,
+        only_google_statuses,
         patch.object(eds, "GmailAdapter", return_value=gmail),
         patch("app.agent.nodes.drive_fetch.DriveAdapter", return_value=drive_adapter),
         patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", return_value=cal_adapter),
@@ -127,8 +141,10 @@ async def test_descubrir_evidencias_filters_promo_emails():
     justify_llm = AsyncMock()
     justify_llm.complete = AsyncMock(return_value=MagicMock(content="No se encontraron evidencias."))
 
+    only_google, only_google_statuses = _patch_only_google_connected(eds)
     with (
-        patch.object(eds.gws, "get_integration_status", AsyncMock(return_value=_connected_status())),
+        only_google,
+        only_google_statuses,
         patch.object(eds, "GmailAdapter", return_value=gmail),
         patch("app.agent.nodes.drive_fetch.DriveAdapter", return_value=drive_adapter),
         patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", return_value=cal_adapter),
@@ -146,7 +162,8 @@ async def test_descubrir_evidencias_filters_promo_emails():
 
 
 @pytest.mark.asyncio
-async def test_descubrir_evidencias_requires_google_connected():
+async def test_descubrir_evidencias_requires_a_connected_provider():
+    """Zero connected providers (Google or Microsoft) raises NO_PROVIDER_CONNECTED."""
     from app.core.exceptions import ExternalServiceError
     from app.services import evidence_discovery_service as eds
 
@@ -155,12 +172,190 @@ async def test_descubrir_evidencias_requires_google_connected():
         fecha_inicio="2024-04-01",
         fecha_fin="2024-04-30",
     )
-    disconnected = MagicMock()
-    disconnected.connected = False
 
-    with patch.object(eds.gws, "get_integration_status", AsyncMock(return_value=disconnected)):
-        with pytest.raises(ExternalServiceError):
-            await eds.descubrir_evidencias(MagicMock(), uuid.uuid4(), req)
+    with (
+        patch.object(eds.integration_service, "has_any_connected_provider", AsyncMock(return_value=False)),
+        pytest.raises(ExternalServiceError) as exc_info,
+    ):
+        await eds.descubrir_evidencias(MagicMock(), uuid.uuid4(), req)
+    assert exc_info.value.code == "NO_PROVIDER_CONNECTED"
+
+
+@pytest.mark.asyncio
+async def test_descubrir_evidencias_succeeds_microsoft_only_connected():
+    """A Microsoft-only connected user proceeds past the gate without error
+    (evidence-discovery-gate spec: "User connected only to Microsoft")."""
+    from app.services import evidence_discovery_service as eds
+
+    req = EvidenceDiscoveryRequest(
+        obligaciones=[{"id": "ob1", "descripcion": "Entregar informe mensual de actividades"}],
+        fecha_inicio="2024-04-01",
+        fecha_fin="2024-04-30",
+    )
+
+    ms_adapter = MagicMock()
+    ms_adapter.search_messages = AsyncMock(return_value=[])
+    drive_adapter = MagicMock()
+    drive_adapter.search_files = AsyncMock(return_value=[])
+    cal_adapter = MagicMock()
+    cal_adapter.search_events = AsyncMock(return_value=[])
+    justify_llm = AsyncMock()
+    justify_llm.complete = AsyncMock(return_value=MagicMock(content="No hay evidencia."))
+
+    with (
+        patch.object(eds.integration_service, "has_any_connected_provider", AsyncMock(return_value=True)),
+        patch.object(
+            eds.integration_service,
+            "list_integration_statuses",
+            AsyncMock(return_value=[_connected_status(IntegrationProvider.MICROSOFT)]),
+        ),
+        patch.object(eds, "MicrosoftGraphAdapter", return_value=ms_adapter),
+        patch("app.agent.nodes.drive_fetch.MicrosoftGraphAdapter", return_value=drive_adapter),
+        patch("app.agent.nodes.calendar_fetch.MicrosoftGraphAdapter", return_value=cal_adapter),
+        patch("app.agent.nodes.evidence_justify.get_llm", return_value=justify_llm),
+    ):
+        resp = await eds.descubrir_evidencias(MagicMock(), uuid.uuid4(), req)
+
+    assert resp is not None  # reached the end of the pipeline — gate did not raise
+
+
+@pytest.mark.asyncio
+async def test_descubrir_evidencias_merges_both_providers_and_isolates_failure():
+    """Both providers connected: evidence_raw has items from both. Microsoft failing
+    after exhausting retries must not prevent Google's evidence from being returned
+    (evidence-discovery-gate spec scenarios "both connected" / "Microsoft fails,
+    Google succeeds")."""
+    from app.core.exceptions import ExternalServiceError
+    from app.services import evidence_discovery_service as eds
+
+    req = EvidenceDiscoveryRequest(
+        obligaciones=[{"id": "ob1", "descripcion": "Entregar informe mensual de actividades del contrato"}],
+        fecha_inicio="2024-04-01",
+        fecha_fin="2024-04-30",
+    )
+
+    gmail = MagicMock()
+    gmail.search_messages = AsyncMock(
+        return_value=[_email("g1", "Informe mensual actividades", "Adjunto informe mensual de abril")]
+    )
+    ms_adapter = MagicMock()
+    ms_adapter.search_messages = AsyncMock(side_effect=ExternalServiceError("Microsoft Graph", "reintentos agotados"))
+    drive_adapter = MagicMock()
+    drive_adapter.search_files = AsyncMock(return_value=[])
+    cal_adapter = MagicMock()
+    cal_adapter.search_events = AsyncMock(return_value=[])
+    justify_llm = AsyncMock()
+    justify_llm.complete = AsyncMock(
+        return_value=MagicMock(content="Elaboré y entregué el informe mensual de actividades del contrato.")
+    )
+
+    with (
+        patch.object(eds.integration_service, "has_any_connected_provider", AsyncMock(return_value=True)),
+        patch.object(
+            eds.integration_service,
+            "list_integration_statuses",
+            AsyncMock(
+                return_value=[
+                    _connected_status(IntegrationProvider.GOOGLE),
+                    _connected_status(IntegrationProvider.MICROSOFT),
+                ]
+            ),
+        ),
+        patch.object(eds, "GmailAdapter", return_value=gmail),
+        patch.object(eds, "MicrosoftGraphAdapter", return_value=ms_adapter),
+        patch("app.agent.nodes.drive_fetch.DriveAdapter", return_value=drive_adapter),
+        patch("app.agent.nodes.drive_fetch.MicrosoftGraphAdapter", return_value=drive_adapter),
+        patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", return_value=cal_adapter),
+        patch("app.agent.nodes.calendar_fetch.MicrosoftGraphAdapter", return_value=cal_adapter),
+        patch("app.agent.nodes.evidence_filter.get_llm", return_value=AsyncMock()),
+        patch("app.agent.nodes.evidence_matcher.get_llm", return_value=AsyncMock()),
+        patch("app.agent.nodes.evidence_justify.get_llm", return_value=justify_llm),
+    ):
+        resp = await eds.descubrir_evidencias(MagicMock(), uuid.uuid4(), req)
+
+    # Microsoft's email gather raised — Google's evidence must still be present.
+    assert resp.total_evidencias >= 1
+    assert resp.fuentes["email"] == 1
+
+
+@pytest.mark.asyncio
+async def test_descubrir_evidencias_dedupes_duplicate_evidence_across_providers():
+    """The same underlying document surfaced by both providers is deduplicated by
+    the existing (SHA-256 content hash) dedup logic (spec: "Duplicate evidence
+    across providers is deduplicated")."""
+    from app.adapters.drive.port import DriveFile
+    from app.services import evidence_discovery_service as eds
+
+    req = EvidenceDiscoveryRequest(
+        obligaciones=[{"id": "ob1", "descripcion": "Entregar informe mensual de actividades"}],
+        fecha_inicio="2024-04-01",
+        fecha_fin="2024-04-30",
+    )
+
+    def _drive_file(fid: str) -> DriveFile:
+        return DriveFile(
+            id=fid,
+            name="Informe mensual abril.pdf",
+            mime_type="application/pdf",
+            size_bytes=100,
+            created_at=datetime(2024, 4, 12, tzinfo=UTC),
+            modified_at=datetime(2024, 4, 12, tzinfo=UTC),
+            web_view_link=f"https://example.com/{fid}",
+        )
+
+    google_drive = MagicMock()
+    google_drive.search_files = AsyncMock(return_value=[_drive_file("g-file")])
+    ms_drive = MagicMock()
+    ms_drive.search_files = AsyncMock(return_value=[_drive_file("ms-file")])
+    gmail = MagicMock()
+    gmail.search_messages = AsyncMock(return_value=[])
+    ms_mail = MagicMock()
+    ms_mail.search_messages = AsyncMock(return_value=[])
+    cal_adapter = MagicMock()
+    cal_adapter.search_events = AsyncMock(return_value=[])
+    justify_llm = AsyncMock()
+    justify_llm.complete = AsyncMock(return_value=MagicMock(content="Elaboré el informe mensual."))
+    filter_llm = AsyncMock()
+    filter_llm.complete = AsyncMock(return_value=MagicMock(content="[]"))
+
+    # Spy in place of the real matcher: `fuentes` counts are computed from the
+    # RAW per-source lists (drive_evidencias etc., unaffected by dedup — that's
+    # pre-existing behavior, not part of this fix), so the only direct way to
+    # observe that evidence_dedup_node collapsed the cross-provider duplicate
+    # is to inspect what actually reaches the matcher (`state["evidence_raw"]`).
+    captured: dict[str, int] = {}
+
+    async def _spy_matcher(state):
+        captured["evidence_raw_len"] = len(state.get("evidence_raw") or [])
+        return {**state, "matched_evidence": {}, "current_phase": "evidence_matcher"}
+
+    with (
+        patch.object(eds.integration_service, "has_any_connected_provider", AsyncMock(return_value=True)),
+        patch.object(
+            eds.integration_service,
+            "list_integration_statuses",
+            AsyncMock(
+                return_value=[
+                    _connected_status(IntegrationProvider.GOOGLE),
+                    _connected_status(IntegrationProvider.MICROSOFT),
+                ]
+            ),
+        ),
+        patch.object(eds, "GmailAdapter", return_value=gmail),
+        patch.object(eds, "MicrosoftGraphAdapter", return_value=ms_mail),
+        patch("app.agent.nodes.drive_fetch.DriveAdapter", return_value=google_drive),
+        patch("app.agent.nodes.drive_fetch.MicrosoftGraphAdapter", return_value=ms_drive),
+        patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", return_value=cal_adapter),
+        patch("app.agent.nodes.calendar_fetch.MicrosoftGraphAdapter", return_value=cal_adapter),
+        patch("app.agent.nodes.evidence_filter.get_llm", return_value=filter_llm),
+        patch.object(eds, "evidence_matcher_node", _spy_matcher),
+        patch("app.agent.nodes.evidence_justify.get_llm", return_value=justify_llm),
+    ):
+        await eds.descubrir_evidencias(MagicMock(), uuid.uuid4(), req)
+
+    # Same file name/content from both providers → the SHA-256 content-hash dedup
+    # collapses them to a single evidence item before the matcher ever sees it.
+    assert captured["evidence_raw_len"] == 1
 
 
 @pytest.mark.asyncio
@@ -182,19 +377,16 @@ async def test_descubrir_evidencias_endpoint_routes_through_tool_registry(
     `invoke_tool("descubrir_evidencias", ...)` — the shared tool registry (same
     handler the /mcp server exposes) — rather than calling the service directly.
 
-    Reuses the GOOGLE_NOT_CONNECTED scenario (cheap to trigger, no LLM/Google
+    Reuses the NO_PROVIDER_CONNECTED scenario (cheap to trigger, no LLM/Google
     mocking needed) so this also re-confirms the swap preserved error mapping.
     """
-    disconnected = MagicMock()
-    disconnected.connected = False
-
     spy = AsyncMock(side_effect=real_invoke_tool)
 
     with (
         patch("app.api.v1.integraciones.invoke_tool", spy),
         patch(
-            "app.services.evidence_discovery_service.gws.get_integration_status",
-            AsyncMock(return_value=disconnected),
+            "app.services.evidence_discovery_service.integration_service.has_any_connected_provider",
+            AsyncMock(return_value=False),
         ),
     ):
         resp = await client.post(
@@ -208,7 +400,7 @@ async def test_descubrir_evidencias_endpoint_routes_through_tool_registry(
         )
 
     assert resp.status_code == 502, resp.text
-    assert resp.json()["code"] == "GOOGLE_NOT_CONNECTED"
+    assert resp.json()["code"] == "NO_PROVIDER_CONNECTED"
     spy.assert_awaited_once()
     assert spy.await_args is not None
     assert spy.await_args.args[0] == "descubrir_evidencias"
@@ -253,7 +445,7 @@ async def test_gather_gmail_evidence_queries_all_obligaciones_not_just_first_thr
     adapter.search_messages = AsyncMock(side_effect=_fake_search)
 
     with patch.object(eds, "GmailAdapter", return_value=adapter):
-        await eds._gather_gmail_evidence(
+        await eds._gather_email_evidence(
             MagicMock(), uuid.uuid4(), obligaciones, "2024-04-01", "2024-04-30", None, None
         )
 
@@ -366,7 +558,11 @@ async def test_descubrir_evidencias_contrato_id_ajeno_lanza_not_found(db: AsyncS
 @pytest.mark.asyncio
 async def test_descubrir_evidencias_propio_cuenta_id_no_lanza_not_found(db: AsyncSession) -> None:
     """A user's own cuenta_id must resolve past the ownership check (reaches the
-    Google-connected check, proving no NotFoundError was raised for legit ids)."""
+    provider-connected gate, proving no NotFoundError was raised for legit ids).
+
+    No `Integracion` row exists for this user in the real test DB, so the gate
+    naturally raises NO_PROVIDER_CONNECTED — no mocking of the gate needed.
+    """
     from app.core.exceptions import ExternalServiceError
     from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
     from app.services import evidence_discovery_service as eds
@@ -390,13 +586,9 @@ async def test_descubrir_evidencias_propio_cuenta_id_no_lanza_not_found(db: Asyn
         fecha_fin="2024-04-30",
     )
 
-    disconnected = MagicMock()
-    disconnected.connected = False
-    with (
-        patch.object(eds.gws, "get_integration_status", AsyncMock(return_value=disconnected)),
-        pytest.raises(ExternalServiceError),
-    ):
+    with pytest.raises(ExternalServiceError) as exc_info:
         await eds.descubrir_evidencias(db, user.id, req)
+    assert exc_info.value.code == "NO_PROVIDER_CONNECTED"
 
 
 @pytest.mark.asyncio
@@ -424,8 +616,10 @@ async def test_descubrir_evidencias_default_fechas_desde_contrato(db: AsyncSessi
     justify_llm = AsyncMock()
     justify_llm.complete = AsyncMock(return_value=MagicMock(content="No hay evidencia."))
 
+    only_google, only_google_statuses = _patch_only_google_connected(eds)
     with (
-        patch.object(eds.gws, "get_integration_status", AsyncMock(return_value=_connected_status())),
+        only_google,
+        only_google_statuses,
         patch.object(eds, "GmailAdapter", return_value=gmail),
         patch("app.agent.nodes.drive_fetch.DriveAdapter", return_value=drive_adapter),
         patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", return_value=cal_adapter),
@@ -446,9 +640,9 @@ async def test_descubrir_evidencias_default_fechas_desde_contrato(db: AsyncSessi
 async def test_descubrir_evidencias_local_only_true_zero_google_calls(db: AsyncSession) -> None:
     """local_only=True must run the orchestrator→filter→matcher→justify pipeline
     to completion over uploaded local evidence WITHOUT touching Gmail/Drive/
-    Calendar adapters, and WITHOUT ever evaluating the Google-connection gate
-    (evidence-classification-pipeline: Zero Google API calls in local-only mode,
-    Local path never evaluates the Google gate)."""
+    Calendar adapters, and WITHOUT ever evaluating the provider-connection gate
+    (evidence-classification-pipeline: Zero external API calls in local-only mode,
+    Local path never evaluates the provider gate)."""
     from app.models.actividad import Actividad
     from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
     from app.models.evidencia import Evidencia
@@ -490,7 +684,7 @@ async def test_descubrir_evidencias_local_only_true_zero_google_calls(db: AsyncS
     justify_llm.complete = AsyncMock(return_value=MagicMock(content="Entregué el informe mensual."))
 
     with (
-        patch.object(eds.gws, "get_integration_status", gate_spy),
+        patch.object(eds.integration_service, "has_any_connected_provider", gate_spy),
         patch.object(eds, "GmailAdapter", gmail_ctor),
         patch("app.agent.nodes.drive_fetch.DriveAdapter", drive_ctor),
         patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", cal_ctor),
@@ -554,7 +748,10 @@ async def test_descubrir_evidencias_second_call_same_window_hits_cache_no_google
     cal_ctor = MagicMock(return_value=cal_adapter)
 
     with (
-        patch.object(eds.gws, "get_integration_status", AsyncMock(return_value=_connected_status())),
+        patch.object(eds.integration_service, "has_any_connected_provider", AsyncMock(return_value=True)),
+        patch.object(
+            eds.integration_service, "list_integration_statuses", AsyncMock(return_value=[_connected_status()])
+        ),
         patch.object(eds, "GmailAdapter", gmail_ctor),
         patch("app.agent.nodes.drive_fetch.DriveAdapter", drive_ctor),
         patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", cal_ctor),
@@ -596,7 +793,10 @@ async def test_descubrir_evidencias_different_window_forces_fresh_discovery(db: 
     gmail_ctor = MagicMock(return_value=gmail)
 
     with (
-        patch.object(eds.gws, "get_integration_status", AsyncMock(return_value=_connected_status())),
+        patch.object(eds.integration_service, "has_any_connected_provider", AsyncMock(return_value=True)),
+        patch.object(
+            eds.integration_service, "list_integration_statuses", AsyncMock(return_value=[_connected_status()])
+        ),
         patch.object(eds, "GmailAdapter", gmail_ctor),
         patch("app.agent.nodes.drive_fetch.DriveAdapter", return_value=drive_adapter),
         patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", return_value=cal_adapter),
@@ -654,7 +854,10 @@ async def test_descubrir_evidencias_refresh_true_bypasses_and_repopulates_cache(
     gmail_ctor = MagicMock(return_value=gmail)
 
     with (
-        patch.object(eds.gws, "get_integration_status", AsyncMock(return_value=_connected_status())),
+        patch.object(eds.integration_service, "has_any_connected_provider", AsyncMock(return_value=True)),
+        patch.object(
+            eds.integration_service, "list_integration_statuses", AsyncMock(return_value=[_connected_status()])
+        ),
         patch.object(eds, "GmailAdapter", gmail_ctor),
         patch("app.agent.nodes.drive_fetch.DriveAdapter", return_value=drive_adapter),
         patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", return_value=cal_adapter),
@@ -668,11 +871,11 @@ async def test_descubrir_evidencias_refresh_true_bypasses_and_repopulates_cache(
 
 
 @pytest.mark.asyncio
-async def test_descubrir_evidencias_local_only_false_still_requires_google_gate() -> None:
+async def test_descubrir_evidencias_local_only_false_still_requires_provider_gate() -> None:
     """Explicit local_only=False (or omitted — the default) preserves the
-    pre-existing Google-connected requirement unchanged: the gate decoupling
-    applies ONLY to the local branch (evidence-classification-pipeline: Google
-    gate preserved for Google-sourced evidence)."""
+    pre-existing connected-provider requirement unchanged: the gate decoupling
+    applies ONLY to the local branch (evidence-classification-pipeline: provider
+    gate preserved for Google/Microsoft-sourced evidence)."""
     from app.core.exceptions import ExternalServiceError
     from app.services import evidence_discovery_service as eds
 
@@ -681,11 +884,9 @@ async def test_descubrir_evidencias_local_only_false_still_requires_google_gate(
         fecha_inicio="2024-04-01",
         fecha_fin="2024-04-30",
     )
-    disconnected = MagicMock()
-    disconnected.connected = False
 
     with (
-        patch.object(eds.gws, "get_integration_status", AsyncMock(return_value=disconnected)),
+        patch.object(eds.integration_service, "has_any_connected_provider", AsyncMock(return_value=False)),
         pytest.raises(ExternalServiceError),
     ):
         await eds.descubrir_evidencias(MagicMock(), uuid.uuid4(), req, local_only=False)
