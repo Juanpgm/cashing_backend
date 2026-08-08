@@ -131,6 +131,35 @@ def _discovery_response(
     )
 
 
+def _discovery_response_multi(
+    obligaciones: list[Obligacion],
+    *,
+    justificacion: str = "Justificación generada por el agente.",
+) -> EvidenceDiscoveryResponse:
+    return EvidenceDiscoveryResponse(
+        obligaciones=[
+            ObligacionJustificada(
+                obligacion_id=str(ob.id),
+                descripcion=ob.descripcion,
+                actividad="Actividad redactada por el agente.",
+                justificacion=justificacion,
+                evidencias=[
+                    EvidenceLink(
+                        source="email",
+                        titulo="Informe mensual",
+                        link=f"https://mail.google.com/mail/u/0/#all/{ob.id}",
+                        fecha="2024-03-10",
+                    )
+                ],
+            )
+            for ob in obligaciones
+        ],
+        resumen=f"Exploré Gmail para {len(obligaciones)} obligaciones.",
+        total_evidencias=len(obligaciones),
+        fuentes={"email": len(obligaciones)},
+    )
+
+
 def _empty_discovery_response() -> EvidenceDiscoveryResponse:
     return EvidenceDiscoveryResponse(obligaciones=[], resumen="Nada encontrado.", total_evidencias=0, fuentes={})
 
@@ -191,6 +220,47 @@ async def test_auto_evidencias_repeat_trigger_no_duplica_ni_sobrescribe(
 
     ev_rows = await db.execute(select(Evidencia).where(Evidencia.actividad_id == actividad.id))
     assert len(ev_rows.scalars().all()) == 1  # no duplicate row
+
+
+async def test_auto_evidencias_cuenta_mixta_solo_bloquea_la_obligacion_ya_justificada(
+    db: AsyncSession, scenario: dict[str, Any]
+) -> None:
+    """RELIABILITY-002: the "already justified, don't overwrite" guard must be
+    scoped PER-OBLIGACIÓN, not per-cuenta. A cuenta with a mix of an already-
+    justified obligación and a never-justified one must still get real
+    justificación text written for the untouched one on this auto-fire, while
+    the already-justified one's existing text is preserved unchanged."""
+    user, contrato, cuenta = scenario["user"], scenario["contrato"], scenario["cuenta"]
+    obligacion_justificada = scenario["obligacion"]
+    obligacion_pendiente = await _make_obligacion(db, contrato.id, orden=2)
+    await db.commit()
+
+    ya = Actividad(
+        cuenta_cobro_id=cuenta.id,
+        obligacion_id=obligacion_justificada.id,
+        descripcion="Actividad ya justificada de una corrida previa.",
+        justificacion="Justificación previa que no debe cambiar.",
+    )
+    db.add(ya)
+    await db.commit()
+
+    response = _discovery_response_multi(
+        [obligacion_justificada, obligacion_pendiente],
+        justificacion="Nueva justificación de esta corrida.",
+    )
+    with _mock_discover(response):
+        result = await evidence_auto_service.auto_evidencias(db, user.id, cuenta.id)
+
+    assert result.omitido is False
+    assert result.justificadas == 1  # only the pending obligación gets new text
+
+    rows = await db.execute(select(Actividad).where(Actividad.obligacion_id == obligacion_justificada.id))
+    act_ya = rows.scalar_one()
+    assert act_ya.justificacion == "Justificación previa que no debe cambiar."  # untouched
+
+    rows = await db.execute(select(Actividad).where(Actividad.obligacion_id == obligacion_pendiente.id))
+    act_pendiente = rows.scalar_one()
+    assert act_pendiente.justificacion == "Nueva justificación de esta corrida."  # written
 
 
 async def test_auto_evidencias_discovery_vacia_es_no_op_limpio(db: AsyncSession, scenario: dict[str, Any]) -> None:
