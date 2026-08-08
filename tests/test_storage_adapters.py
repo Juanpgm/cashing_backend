@@ -7,6 +7,8 @@ without downloading or packaging. Covers both adapters — `LocalStorageAdapter`
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import boto3
 import pytest
 from app.adapters.storage.local_adapter import LocalStorageAdapter
@@ -29,6 +31,46 @@ async def test_local_list_objects_returns_empty_when_prefix_has_no_files(
     result = await adapter.list_objects("paquetes/usuario-x/cuenta-y/")
 
     assert result == []
+
+
+async def test_local_upload_interrupted_write_leaves_original_file_untouched(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RESILIENCE-001: `upload()` writes to a sibling temp file then
+    atomically renames onto the final path (`os.replace`), so a write that
+    crashes mid-way never corrupts (or partially overwrites) bytes a
+    concurrent `download()` could already be reading."""
+    monkeypatch.setattr(settings, "LOCAL_STORAGE_PATH", str(tmp_path))
+    adapter = LocalStorageAdapter(bucket="test-bucket")
+    key = "paquetes/u1/c1/paquete.zip"
+    await adapter.upload(key, b"original-bytes", "application/zip")
+
+    def _boom(self: Path, data: bytes) -> int:
+        # Simulate a real interrupted write: some bytes actually land on
+        # whichever path is targeted, then it crashes — mirroring a disk-full
+        # or killed-process mid-write, not a clean no-op failure.
+        with self.open("wb") as f:
+            f.write(data[: len(data) // 2])
+        raise OSError("simulated crash mid-write")
+
+    monkeypatch.setattr(Path, "write_bytes", _boom)
+
+    with pytest.raises(OSError):
+        await adapter.upload(key, b"new-bytes-that-must-never-land", "application/zip")
+
+    assert await adapter.download(key) == b"original-bytes"
+
+
+async def test_local_upload_leaves_no_leftover_temp_file_after_success(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "LOCAL_STORAGE_PATH", str(tmp_path))
+    adapter = LocalStorageAdapter(bucket="test-bucket")
+
+    await adapter.upload("paquetes/u1/c1/paquete.zip", b"1234", "application/zip")
+
+    leftovers = list(Path(str(tmp_path)).rglob("*.tmp-*"))
+    assert leftovers == []
 
 
 async def test_local_list_objects_returns_key_and_size_for_matching_prefix(

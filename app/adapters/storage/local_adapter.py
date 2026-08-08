@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import uuid
 from pathlib import Path
 
 from app.adapters.storage.port import StorageObjectInfo
@@ -52,8 +53,21 @@ class LocalStorageAdapter:
     ) -> str:
         path = self._path(key)
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, path.write_bytes, data)
+        await loop.run_in_executor(None, self._write_atomic, path, data)
         return key
+
+    @staticmethod
+    def _write_atomic(path: Path, data: bytes) -> None:
+        """Write to a sibling temp file, then atomically rename onto the final
+        path. `os.replace` is atomic on both POSIX and Windows for same-
+        filesystem renames, so a concurrent `download()` never observes a
+        torn/partial file while a write is in progress or fails midway."""
+        tmp_path = path.with_name(f"{path.name}.tmp-{uuid.uuid4().hex}")
+        try:
+            tmp_path.write_bytes(data)
+            os.replace(tmp_path, path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
 
     async def download(self, key: str) -> bytes:
         path = self._path(key)

@@ -13,6 +13,8 @@ sequential `preparar_radicacion` runs.
 
 from __future__ import annotations
 
+import io
+import zipfile
 from datetime import UTC, date, datetime
 from typing import Any
 from unittest.mock import AsyncMock
@@ -30,6 +32,7 @@ from app.models.obligacion import Obligacion, TipoObligacion
 from app.models.usuario import Usuario
 from app.services import informe_service, radicacion_prep_service
 from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 pytestmark = pytest.mark.asyncio
@@ -365,6 +368,130 @@ async def test_post_regenerar_raises_secret_detected_through_the_gate(
 
     assert r.status_code == 422, r.text
     assert r.json()["code"] == "SECRET_DETECTED_IN_PACKAGE"
+
+
+# ── P5 — GET /paquete/descargar (pure read, byte-identical) ──────────────
+
+
+async def test_get_descargar_returns_404_when_no_package_generated_yet(
+    client: AsyncClient,
+    test_user: dict[str, Any],
+    cuenta_lista: CuentaCobro,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _FakeStorage()
+    monkeypatch.setattr("app.services.paquete_service._get_storage", lambda *_a, **_k: storage)
+
+    r = await client.get(f"/api/v1/cuentas-cobro/{cuenta_lista.id}/paquete/descargar", headers=test_user["headers"])
+
+    assert r.status_code == 404, r.text
+
+
+async def test_get_descargar_twice_is_byte_identical_with_no_regenerate_call(
+    db: AsyncSession,
+    client: AsyncClient,
+    test_user: dict[str, Any],
+    cuenta_lista: CuentaCobro,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P5's core scenario: two downloads without triggering regenerate return
+    byte-identical content and never invoke the packager/LLM-backed informe
+    step on the read path."""
+    storage = _FakeStorage()
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: storage)
+    monkeypatch.setattr("app.services.radicacion_prep_service._get_storage", lambda *_a, **_k: storage)
+    monkeypatch.setattr("app.services.paquete_service._get_storage", lambda *_a, **_k: storage)
+
+    await radicacion_prep_service.preparar_radicacion(db, test_user["user"].id, cuenta_lista.id)
+
+    packager_spy = AsyncMock(side_effect=AssertionError("GET /paquete/descargar must never call the packager"))
+    monkeypatch.setattr(informe_service, "generar_zip_evidencias", packager_spy)
+
+    r1 = await client.get(f"/api/v1/cuentas-cobro/{cuenta_lista.id}/paquete/descargar", headers=test_user["headers"])
+    r2 = await client.get(f"/api/v1/cuentas-cobro/{cuenta_lista.id}/paquete/descargar", headers=test_user["headers"])
+
+    assert r1.status_code == 200, r1.text
+    assert r2.status_code == 200, r2.text
+    assert r1.content == r2.content
+    packager_spy.assert_not_awaited()
+    assert r1.headers["content-disposition"].endswith('.zip"')
+
+
+async def test_get_descargar_after_explicit_regenerate_serves_the_new_bytes(
+    db: AsyncSession,
+    client: AsyncClient,
+    test_user: dict[str, Any],
+    cuenta_lista: CuentaCobro,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit regenerate still regenerates: a download after regenerate
+    reflects the freshly persisted object, not stale bytes.
+
+    RELIABILITY-004: assert on actual CONTENT, not just object count — mutate
+    the cuenta's Actividad.justificacion (which the per-obligación LEEME
+    inside the zip renders verbatim, `informe_service.py` "Justificación:
+    {act.justificacion}") between the two `preparar_radicacion` calls, and
+    prove the marker shows up only after regenerate re-persisted the package.
+    """
+    storage = _FakeStorage()
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: storage)
+    monkeypatch.setattr("app.services.radicacion_prep_service._get_storage", lambda *_a, **_k: storage)
+    monkeypatch.setattr("app.services.paquete_service._get_storage", lambda *_a, **_k: storage)
+
+    await radicacion_prep_service.preparar_radicacion(db, test_user["user"].id, cuenta_lista.id)
+    r1 = await client.get(f"/api/v1/cuentas-cobro/{cuenta_lista.id}/paquete/descargar", headers=test_user["headers"])
+    assert r1.status_code == 200, r1.text
+
+    marcador = "Justificación actualizada tras regenerar — marcador de contenido."
+    act_rows = await db.execute(select(Actividad).where(Actividad.cuenta_cobro_id == cuenta_lista.id))
+    actividad = act_rows.scalars().one()
+    actividad.justificacion = marcador
+    db.add(actividad)
+    await db.commit()
+
+    r_regen = await client.post(
+        f"/api/v1/cuentas-cobro/{cuenta_lista.id}/paquete/regenerar", headers=test_user["headers"]
+    )
+    assert r_regen.status_code == 200, r_regen.text
+
+    r2 = await client.get(f"/api/v1/cuentas-cobro/{cuenta_lista.id}/paquete/descargar", headers=test_user["headers"])
+    assert r2.status_code == 200, r2.text
+    assert r2.content != r1.content
+    zip_bytes = io.BytesIO(r2.content)
+    with zipfile.ZipFile(zip_bytes) as zf:
+        combined = b"".join(zf.read(name) for name in zf.namelist())
+    assert marcador.encode("utf-8") in combined
+
+    prefix = f"paquetes/{test_user['user'].id}/{cuenta_lista.id}/"
+    objetos = await storage.list_objects(prefix)
+    assert len(objetos) == 1
+
+
+async def test_get_descargar_cross_tenant_returns_403(
+    client: AsyncClient, db: AsyncSession, contrato: Contrato
+) -> None:
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    token = await _crear_otro_usuario_token(db, email="otro-get-descargar@example.com")
+
+    r = await client.get(
+        f"/api/v1/cuentas-cobro/{cuenta.id}/paquete/descargar",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert r.status_code == 403
+
+
+async def test_get_descargar_soft_deleted_contrato_returns_404(
+    client: AsyncClient, db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
+) -> None:
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    contrato.deleted_at = datetime.now(UTC)
+    db.add(contrato)
+    await db.commit()
+
+    r = await client.get(f"/api/v1/cuentas-cobro/{cuenta.id}/paquete/descargar", headers=test_user["headers"])
+
+    assert r.status_code == 404
 
 
 # ── B7 Fix 3 — cross-tenant negative tests ───────────────────────────────
