@@ -217,6 +217,11 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
     allow_headers=["Authorization", "Content-Type"],
+    # Without this, browsers strip Content-Disposition from cross-origin
+    # responses before JS ever sees it (frontend :3000 / backend :8000 are
+    # different origins) — every file-download helper that reads this header
+    # to name the saved file silently falls back to a broken filename.
+    expose_headers=["Content-Disposition"],
 )
 
 # Rate limiting
