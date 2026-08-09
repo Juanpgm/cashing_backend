@@ -8,6 +8,7 @@ from app.api.v1.agent_sessions import router as agent_sessions_router
 from app.api.v1.auth import router as auth_router
 from app.api.v1.chat import router as chat_router
 from app.api.v1.checklist import router as checklist_router
+from app.api.v1.configuracion import router as configuracion_router
 from app.api.v1.contratos import router as contratos_router
 from app.api.v1.cuentas_cobro import router as cuentas_cobro_router
 from app.api.v1.dashboard import router as dashboard_router
@@ -48,6 +49,7 @@ api_v1_router.include_router(creditos_router)
 api_v1_router.include_router(webhooks_router)
 api_v1_router.include_router(dashboard_router)
 api_v1_router.include_router(usuarios_router)
+api_v1_router.include_router(configuracion_router)
 
 # Debug panel — only mounted in non-production environments
 from app.core.config import settings  # noqa: E402
