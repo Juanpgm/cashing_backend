@@ -42,32 +42,12 @@ from app.adapters.storage import get_storage
 from app.core.config import settings
 from app.core.db_ssl import prepare_pg_url
 from app.services import cuenta_cobro_service as ccs
-from sqlalchemy import delete as sa_delete
+from app.services.purga_service import _DELETE_ALL, _NULLIFY, wipe_cuentas_globalmente
 from sqlalchemy import func, select
-from sqlalchemy import update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 
 _SQLITE_MARKER = ":///"
-
-# Child -> parent order, same as eliminar_cuenta_cobro. Every one of these is
-# fully cuenta-scoped, so an unconditional delete-all is the correct full wipe.
-_DELETE_ALL = [
-    ("evidencia_obligacion", ccs.EvidenciaObligacion),
-    ("evidencia", ccs.Evidencia),
-    ("clasificacion_job", ccs.ClasificacionEvidenciasJob),
-    ("actividad", ccs.Actividad),
-    ("borrador", ccs.BorradorCuentaCobro),
-    ("documento_requisito_vinculo", ccs.DocumentoRequisitoVinculo),
-    ("documento_cuenta_cobro", ccs.DocumentoCuentaCobro),
-    ("documento_checklist_candidato", ccs.DocumentoChecklistCandidato),
-    ("requisito_cuenta", ccs.RequisitoCuenta),
-]
-# Kept rows — only the nullable pointer is cleared.
-_NULLIFY = [
-    ("documento_fuente_actualizados", ccs.DocumentoFuente),
-    ("conversacion_actualizadas", ccs.Conversacion),
-]
 
 
 def _mask_database_url(url: str) -> str:
@@ -143,47 +123,8 @@ async def wipe_cuentas(*, dry_run: bool, yes: bool) -> dict[str, int]:
 
     print("Borrando...")
     async with async_session() as db:
-        # Collect storage keys BEFORE deleting the rows (session expires ORM
-        # attrs on commit; keys must be captured as plain values first).
-        evidencia_storage_keys = [k for (k,) in (await db.execute(select(ccs.Evidencia.storage_key))).all() if k]
-        cuentas = (
-            await db.execute(
-                select(ccs.CuentaCobro.id, ccs.CuentaCobro.pdf_storage_key, ccs.Contrato.usuario_id).outerjoin(
-                    ccs.Contrato, ccs.Contrato.id == ccs.CuentaCobro.contrato_id
-                )
-            )
-        ).all()
-        pdf_storage_keys = [row[1] for row in cuentas if row[1]]
-
-        counts: dict[str, int] = {}
-        for name, model in _DELETE_ALL:
-            counts[name] = (await db.execute(sa_delete(model))).rowcount or 0
-        for name, model in _NULLIFY:
-            counts[name] = (
-                await db.execute(
-                    sa_update(model).where(model.cuenta_cobro_id.is_not(None)).values(cuenta_cobro_id=None)
-                )
-            ).rowcount or 0
-        counts["cuenta_cobro"] = (await db.execute(sa_delete(ccs.CuentaCobro))).rowcount or 0
+        counts = await wipe_cuentas_globalmente(db, storage, origen="wipe_cuentas")
         await db.commit()
-
-    # Best-effort storage cleanup AFTER the commit — DB deletion is the source
-    # of truth and must never be failed by a storage-side error.
-    ok, failed = await ccs._borrar_storage_keys_best_effort(storage, evidencia_storage_keys, origen="wipe_cuentas")
-    ok2, failed2 = await ccs._borrar_storage_keys_best_effort(storage, pdf_storage_keys, origen="wipe_cuentas")
-    ok += ok2
-    failed += failed2
-    for cuenta_id, _pdf_key, usuario_id in cuentas:
-        if usuario_id is None:
-            continue  # contrato gone too — no reliable prefix to list
-        obj_ok, obj_failed = await ccs._listar_y_borrar_prefix_best_effort(
-            storage, ccs._paquete_prefix(usuario_id, cuenta_id), origen="wipe_cuentas"
-        )
-        ok += obj_ok
-        failed += obj_failed
-
-    counts["storage_keys_ok"] = ok
-    counts["storage_keys_failed"] = failed
 
     await engine.dispose()
     return counts

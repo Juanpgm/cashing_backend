@@ -15,7 +15,7 @@ from app.core.auth import authenticate_bearer
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.exceptions import ForbiddenError, InsufficientCreditsError, UnauthorizedError
-from app.models.usuario import Usuario
+from app.models.usuario import RolUsuario, Usuario
 
 _bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -38,6 +38,19 @@ async def get_current_user(
 
 
 CurrentUser = Annotated[Usuario, Depends(get_current_user)]
+
+
+async def get_admin_user(user: CurrentUser) -> Usuario:
+    """Require the authenticated user to have the admin role. First use of
+    `RolUsuario.ADMIN` as an actual enforcement gate — everything reachable
+    only via `AdminUser` is destructive/global-scope and must never be
+    reachable by a regular `contratista` user."""
+    if user.rol != RolUsuario.ADMIN:
+        raise ForbiddenError("Esta acción requiere rol de administrador.")
+    return user
+
+
+AdminUser = Annotated[Usuario, Depends(get_admin_user)]
 
 
 def require_role(allowed_roles: list[str]):  # type: ignore[no-untyped-def]

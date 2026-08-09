@@ -8,9 +8,11 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from app.core.exceptions import ValidationError
+from app.core.security import hash_password
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
 from app.models.obligacion import Obligacion, TipoObligacion
+from app.models.usuario import Usuario
 from app.schemas.contrato import ContratoCreate, ObligacionCreate
 from app.services import contrato_service, purga_service
 from sqlalchemy import select
@@ -134,3 +136,82 @@ async def test_purgar_datos_prueba_cuenta_contratos_omitidos_sin_abortar(
     # Both contratos still exist regardless of which branch they took.
     assert (await db.get(Contrato, contrato_ok.id)) is not None
     assert (await db.get(Contrato, contrato_bloqueado.id)) is not None
+
+
+@pytest.mark.asyncio
+async def test_purgar_todo_admin_borra_todo_menos_usuarios(db: AsyncSession, test_user: dict[str, Any]) -> None:
+    """GLOBAL wipe across 2+ users: every cuenta/obligación is gone, every
+    contrato survives with `obligaciones_extraidas` reset, and the `usuarios`
+    rows themselves are never touched (no auto-lockout)."""
+    usuario_1 = test_user["user"]
+    usuario_2 = Usuario(
+        email="otro-admin-wipe@example.com",
+        nombre="Otro Usuario Wipe",
+        cedula="999888777",
+        telefono="+573009998888",
+        password_hash=hash_password("OtroPass123!"),
+        rol="contratista",
+        activo=True,
+        creditos_disponibles=100,
+    )
+    db.add(usuario_2)
+    await db.commit()
+    await db.refresh(usuario_2)
+
+    contrato_1 = await contrato_service.crear_contrato(
+        db,
+        usuario_1.id,
+        _make_contrato_create(
+            "CTR-ADMIN-001",
+            obligaciones=[ObligacionCreate(descripcion="Obligación admin uno", tipo=TipoObligacion.GENERAL)],
+        ),
+    )
+    contrato_2 = await contrato_service.crear_contrato(
+        db,
+        usuario_2.id,
+        _make_contrato_create(
+            "CTR-ADMIN-002",
+            obligaciones=[ObligacionCreate(descripcion="Obligación admin dos", tipo=TipoObligacion.GENERAL)],
+        ),
+    )
+
+    row1 = await db.get(Contrato, contrato_1.id)
+    row2 = await db.get(Contrato, contrato_2.id)
+    assert row1 is not None
+    assert row2 is not None
+    row1.obligaciones_extraidas = True
+    row2.obligaciones_extraidas = True
+
+    cuenta_1 = CuentaCobro(
+        contrato_id=contrato_1.id, mes=1, anio=2024, valor=3_000_000, estado=EstadoCuentaCobro.BORRADOR
+    )
+    cuenta_2 = CuentaCobro(
+        contrato_id=contrato_2.id, mes=2, anio=2024, valor=3_000_000, estado=EstadoCuentaCobro.BORRADOR
+    )
+    db.add_all([cuenta_1, cuenta_2])
+    await db.commit()
+
+    result = await purga_service.purgar_todo_admin(db, _mock_storage())
+    await db.commit()
+
+    assert result["cuentas_borradas"] == 2
+    assert result["obligaciones_borradas"] == 2
+    assert result["contratos_afectados"] == 2
+    assert result["usuarios_afectados"] == 2
+
+    cuentas_restantes = (await db.execute(select(CuentaCobro))).scalars().all()
+    assert cuentas_restantes == []
+
+    obligaciones_restantes = (await db.execute(select(Obligacion))).scalars().all()
+    assert obligaciones_restantes == []
+
+    await db.refresh(row1)
+    await db.refresh(row2)
+    assert row1.obligaciones_extraidas is None
+    assert row2.obligaciones_extraidas is None
+
+    # Contratos survive; usuarios survive (no auto-lockout).
+    assert (await db.get(Contrato, contrato_1.id)) is not None
+    assert (await db.get(Contrato, contrato_2.id)) is not None
+    assert (await db.get(Usuario, usuario_1.id)) is not None
+    assert (await db.get(Usuario, usuario_2.id)) is not None
