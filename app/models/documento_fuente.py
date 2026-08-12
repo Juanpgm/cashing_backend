@@ -51,6 +51,9 @@ class DocumentoFuente(UUIDMixin, TimestampMixin, Base):
     )
     texto_extraido: Mapped[str | None] = mapped_column(Text, nullable=True)
     metadata_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # type: ignore[type-arg]
+    # Content hash for dedup-by-content in upload_document (same file, different
+    # filename). Nullable — pre-existing rows have no hash and don't participate.
+    sha256: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
 
     # Document classification (global axis — independent from checklist per-cuenta state)
     categoria: Mapped[CategoriaDocumento] = mapped_column(

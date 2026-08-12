@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import uuid
 from datetime import date
 from decimal import Decimal, InvalidOperation
@@ -811,15 +812,22 @@ async def upload_document(
                 contrato_id=str(contrato_id),
             )
 
+    # Content hash — computed early so dedup can match on content, not just
+    # filename (same file re-uploaded under a different name must not create
+    # a duplicate row/storage object).
+    sha256_hash = hashlib.sha256(content).hexdigest()
+
     # Deduplicate: if same filename+tipo+contrato already exists, reuse it.
-    # In auto-create mode (contrato_id=None), only short-circuit when the
-    # previous upload already linked a contrato successfully.  If it didn't
-    # (contrato_id IS NULL on the existing row), fall through and retry extraction
-    # so the user can re-upload after fixing their document or model config.
+    # Also matches by content hash — a re-upload of identical BYTES under a
+    # different filename hits the same fast-path. In auto-create mode
+    # (contrato_id=None), only short-circuit when the previous upload already
+    # linked a contrato successfully.  If it didn't (contrato_id IS NULL on the
+    # existing row), fall through and retry extraction so the user can
+    # re-upload after fixing their document or model config.
     dup_conditions = [
         DocumentoFuente.usuario_id == user_id,
-        DocumentoFuente.nombre == filename,
         DocumentoFuente.tipo == tipo,
+        or_(DocumentoFuente.nombre == filename, DocumentoFuente.sha256 == sha256_hash),
     ]
     # Dedup within the document's effective scope: cuenta-level docs dedup per cuenta,
     # contract-level docs dedup per contract (same filename can exist independently
@@ -864,10 +872,17 @@ async def upload_document(
             contrato_id=str(effective_contrato_id),
             has_text=bool(existing_doc.texto_extraido),
         )
-        avisos.append(
-            f"El archivo '{filename}' ya estaba cargado. Se retorna el documento existente. "
-            "Si querés reemplazarlo, eliminá el documento anterior y subí el nuevo."
-        )
+        if existing_doc.nombre != filename:
+            avisos.append(
+                f"El contenido de '{filename}' ya estaba cargado como '{existing_doc.nombre}'. "
+                "Se retorna el documento existente. Si querés reemplazarlo, eliminá el documento "
+                "anterior y subí el nuevo."
+            )
+        else:
+            avisos.append(
+                f"El archivo '{filename}' ya estaba cargado. Se retorna el documento existente. "
+                "Si querés reemplazarlo, eliminá el documento anterior y subí el nuevo."
+            )
         return DocumentUploadResponse(
             id=existing_doc.id,
             nombre=existing_doc.nombre,
@@ -1099,6 +1114,7 @@ async def upload_document(
         tipo=tipo,
         texto_extraido=texto_extraido,
         metadata_json=metadata if metadata else None,
+        sha256=sha256_hash,
     )
     from app.services.document_classifier import aplicar_clasificacion
 

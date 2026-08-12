@@ -452,9 +452,12 @@ async def test_upload_batch_3_files_to_rpc_creates_3_vinculos(
             "requisito_codigo": "RPC",
         },
         files=[
-            ("files", ("rpc-1.pdf", _PDF_MAGIC, "application/pdf")),
-            ("files", ("rpc-2.pdf", _PDF_MAGIC, "application/pdf")),
-            ("files", ("rpc-3.pdf", _PDF_MAGIC, "application/pdf")),
+            # Distinct content per file (not just distinct filenames): B4's
+            # content-hash dedup in upload_document would otherwise collapse
+            # byte-identical files into a single document regardless of name.
+            ("files", ("rpc-1.pdf", _PDF_MAGIC + b" 1", "application/pdf")),
+            ("files", ("rpc-2.pdf", _PDF_MAGIC + b" 2", "application/pdf")),
+            ("files", ("rpc-3.pdf", _PDF_MAGIC + b" 3", "application/pdf")),
         ],
     )
     assert r.status_code == 201, r.text
