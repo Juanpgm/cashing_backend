@@ -18,10 +18,18 @@ class VentanaMes:
 
     fecha_inicio: date
     fecha_fin: date
-    advertencia: bool  # True only when fecha_transaccion < fecha_inicio (misconfiguration fallback)
+    # True when fecha_transaccion < fecha_inicio (misconfiguration fallback) OR when the
+    # billed calendar month falls entirely outside the contract vigencia (H5, warn-only).
+    advertencia: bool
 
 
-def calcular_ventana_mes(mes: int, anio: int, fecha_transaccion: date | None = None) -> VentanaMes:
+def calcular_ventana_mes(
+    mes: int,
+    anio: int,
+    fecha_transaccion: date | None = None,
+    vigencia_inicio: date | None = None,
+    vigencia_fin: date | None = None,
+) -> VentanaMes:
     """Calendar-month window for ``(mes, anio)``, upper-capped by ``fecha_transaccion`` when present.
 
     Rule:
@@ -31,13 +39,25 @@ def calcular_ventana_mes(mes: int, anio: int, fecha_transaccion: date | None = N
     - ``fecha_transaccion < fecha_inicio`` (misconfiguration) falls back to the full
       calendar month and sets ``advertencia=True`` instead of producing an empty/invalid
       window. Omitting ``fecha_transaccion`` entirely never triggers the warning.
+    - ``vigencia_inicio``/``vigencia_fin`` (contract vigencia, optional): when the billed
+      calendar month falls ENTIRELY outside ``[vigencia_inicio, vigencia_fin]``,
+      ``advertencia=True`` too (H5: warn, never reject — the caller decides what to do).
+      Omitting them keeps the previous behavior unchanged.
     """
     fecha_inicio = date(anio, mes, 1)
     ultimo_dia = calendar.monthrange(anio, mes)[1]
     fin_de_mes = date(anio, mes, ultimo_dia)
 
-    if fecha_transaccion is not None and fecha_transaccion >= fecha_inicio:
-        return VentanaMes(fecha_inicio=fecha_inicio, fecha_fin=min(fin_de_mes, fecha_transaccion), advertencia=False)
+    fuera_de_vigencia = (vigencia_inicio is not None and fin_de_mes < vigencia_inicio) or (
+        vigencia_fin is not None and fecha_inicio > vigencia_fin
+    )
 
-    advertencia = fecha_transaccion is not None and fecha_transaccion < fecha_inicio
+    if fecha_transaccion is not None and fecha_transaccion >= fecha_inicio:
+        return VentanaMes(
+            fecha_inicio=fecha_inicio,
+            fecha_fin=min(fin_de_mes, fecha_transaccion),
+            advertencia=fuera_de_vigencia,
+        )
+
+    advertencia = (fecha_transaccion is not None and fecha_transaccion < fecha_inicio) or fuera_de_vigencia
     return VentanaMes(fecha_inicio=fecha_inicio, fecha_fin=fin_de_mes, advertencia=advertencia)

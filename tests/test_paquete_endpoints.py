@@ -140,6 +140,10 @@ class _FakeStorage:
     async def list_objects(self, prefix: str) -> list[StorageObjectInfo]:
         return [StorageObjectInfo(key=k, size_bytes=len(v)) for k, v in self._objects.items() if k.startswith(prefix)]
 
+    async def stat(self, key: str) -> StorageObjectInfo | None:
+        data = self._objects.get(key)
+        return StorageObjectInfo(key=key, size_bytes=len(data)) if data is not None else None
+
 
 @pytest.fixture
 async def cuenta_lista(
@@ -523,6 +527,139 @@ async def test_get_paquete_cross_tenant_returns_403(client: AsyncClient, db: Asy
     )
 
     assert r.status_code == 403
+
+
+async def test_regenerate_insert_based_two_obligaciones_reflects_new_evidencia(
+    db: AsyncSession,
+    client: AsyncClient,
+    test_user: dict[str, Any],
+    contrato: Contrato,
+    obligacion: Obligacion,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Diagnostic regression (paquete-regenerar-evidencia-nueva, Slice 1) — mirrors the
+    live Ejercicio 10 sequence: TWO obligaciones, a `NO_PROVIDER_CONNECTED`
+    justificaciones fail-fast call BEFORE first generation, `preparar_radicacion` #1
+    (shared `db` fixture, sibling convention), then a brand-new Actividad+Evidencia
+    inserted on the SECOND obligación, then a regenerate #2 through the real HTTP
+    endpoint (fresh session, matching a real second frontend request). The second
+    package MUST include the new evidencia's marker; the first must not.
+
+    Caveat: this does NOT reproduce the originally reported symptom — that was a
+    frontend test-timing issue, fixed in `cashing-frontend/e2e/diez-ejercicios-radicacion.spec.ts`
+    via `page.waitForResponse()`. This test guards the insert-then-regenerate backend
+    data contract on its own merits, independently of that fix."""
+    storage = _FakeStorage()
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: storage)
+    monkeypatch.setattr("app.services.radicacion_prep_service._get_storage", lambda *_a, **_k: storage)
+    monkeypatch.setattr("app.services.paquete_service._get_storage", lambda *_a, **_k: storage)
+
+    obligacion2 = Obligacion(
+        contrato_id=contrato.id,
+        descripcion="Elaborar informes mensuales de supervisión técnica y financiera del proyecto",
+        tipo=TipoObligacion.GENERAL,
+        orden=1,
+    )
+    db.add(obligacion2)
+    await db.commit()
+    await db.refresh(obligacion2)
+    # Same trap the `obligacion` fixture's own comment documents: `contrato.obligaciones`
+    # was already eagerly cached (with just `obligacion`) by an earlier query on this
+    # session before `obligacion2` existed — force a real reload so it reflects both.
+    await db.refresh(contrato)
+
+    cuenta = await _make_cuenta(db, contrato, mes=3)
+    await _completar_checklist(client, test_user["headers"], cuenta.id)
+
+    for ob in (obligacion, obligacion2):
+        act = Actividad(
+            cuenta_cobro_id=cuenta.id,
+            obligacion_id=ob.id,
+            descripcion=f"Actividad inicial obligación {ob.orden}",
+            justificacion="Justificación inicial",
+            fecha_realizacion=date(2024, 3, 10),
+        )
+        db.add(act)
+        await db.commit()
+        await db.refresh(act)
+        ev = Evidencia(
+            actividad_id=act.id,
+            storage_key=f"evidencias/{act.id}/inicial.jpg",
+            nombre_archivo="inicial.jpg",
+            tipo_archivo="image/jpeg",
+            tamano_bytes=12,
+        )
+        db.add(ev)
+        await db.commit()
+    # Same trap as above, for `cuenta.actividades` (see `cuenta_lista` fixture's own
+    # trailing `db.refresh(cuenta)`) — `_make_cuenta`'s own refresh cached it empty
+    # before either actividad existed.
+    await db.refresh(cuenta)
+
+    # Mirrors Ejercicio 10 ordering: a NO_PROVIDER_CONNECTED justificaciones fail-fast
+    # call happens BEFORE the first package generation.
+    monkeypatch.setattr(
+        "app.services.evidence_discovery_service.integration_service.has_any_connected_provider",
+        AsyncMock(return_value=False),
+    )
+    r_just = await client.post(
+        "/api/v1/integraciones/evidencias/descubrir",
+        headers=test_user["headers"],
+        json={
+            "cuenta_id": str(cuenta.id),
+            "obligaciones": [{"descripcion": obligacion.descripcion}, {"descripcion": obligacion2.descripcion}],
+            "fecha_inicio": "2024-03-01",
+            "fecha_fin": "2024-03-31",
+        },
+    )
+    assert r_just.status_code == 502, r_just.text
+    assert r_just.json()["code"] == "NO_PROVIDER_CONNECTED"
+
+    resultado1 = await radicacion_prep_service.preparar_radicacion(db, test_user["user"].id, cuenta.id)
+    r1 = await client.get(f"/api/v1/cuentas-cobro/{cuenta.id}/paquete/descargar", headers=test_user["headers"])
+    assert r1.status_code == 200, r1.text
+
+    marcador = "NUEVA-EVIDENCIA-TRAS-REGENERAR"
+    act2 = Actividad(
+        cuenta_cobro_id=cuenta.id,
+        obligacion_id=obligacion2.id,
+        descripcion=marcador,
+        justificacion=marcador,
+        fecha_realizacion=date(2024, 3, 20),
+    )
+    db.add(act2)
+    await db.commit()
+    await db.refresh(act2)
+    ev2 = Evidencia(
+        actividad_id=act2.id,
+        storage_key=f"evidencias/{act2.id}/{marcador}.jpg",
+        nombre_archivo=f"{marcador}.jpg",
+        tipo_archivo="image/jpeg",
+        tamano_bytes=len(marcador.encode("utf-8")),
+    )
+    db.add(ev2)
+    await storage.upload(ev2.storage_key, marcador.encode("utf-8"))
+    await db.commit()
+
+    # Regen #2 through the real HTTP endpoint — a FRESH session, exactly like the
+    # real second frontend request (never the same session as regen #1 or the setup).
+    r_regen = await client.post(f"/api/v1/cuentas-cobro/{cuenta.id}/paquete/regenerar", headers=test_user["headers"])
+    assert r_regen.status_code == 200, r_regen.text
+    assert r_regen.json()["storage_key"] == resultado1.storage_key
+
+    r2 = await client.get(f"/api/v1/cuentas-cobro/{cuenta.id}/paquete/descargar", headers=test_user["headers"])
+    assert r2.status_code == 200, r2.text
+
+    def _combined(zip_bytes: bytes) -> bytes:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            return b"".join(zf.read(name) for name in zf.namelist())
+
+    assert marcador.encode("utf-8") not in _combined(r1.content)
+    assert marcador.encode("utf-8") in _combined(r2.content)
+
+    prefix = f"paquetes/{test_user['user'].id}/{cuenta.id}/"
+    objetos = await storage.list_objects(prefix)
+    assert len(objetos) == 1
 
 
 async def test_post_regenerar_cross_tenant_returns_403(

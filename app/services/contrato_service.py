@@ -590,6 +590,12 @@ async def vincular_secop_documento(
         raise ValidationError("El documento SECOP no pertenece a este contrato.")
 
     try:
-        return await checklist_service.extraer_obligaciones_desde_secop_doc(db, contrato, doc, manual=True)
+        resultado = await checklist_service.extraer_obligaciones_desde_secop_doc(db, contrato, doc, manual=True)
     except TimeoutError as exc:
         raise ValidationError("La extracción de obligaciones tardó demasiado, inténtalo de nuevo.") from exc
+
+    # Persistence-only follow-up (best-effort, never raises): the download above
+    # extracted obligaciones but discarded the bytes — Checklist reads DocumentoFuente
+    # directly and would otherwise show this contract's document as permanently missing.
+    await checklist_service._persistir_contrato_documento_si_falta(db, usuario_id, contrato_id, doc)
+    return resultado

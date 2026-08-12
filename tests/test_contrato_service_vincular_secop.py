@@ -11,13 +11,18 @@ import asyncio
 import uuid
 from datetime import date
 from typing import Any
+from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 from app.core.exceptions import NotFoundError, ValidationError
+from app.models.categoria_documento import CategoriaDocumento
 from app.models.contrato import Contrato
+from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
 from app.models.secop import SecopContrato, SecopDocumento
 from app.schemas.agent import ObligacionExtraida
 from app.services import checklist_service, contrato_service
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 pytestmark = pytest.mark.asyncio
@@ -216,3 +221,147 @@ async def test_timeout_de_extraccion_lanza_validation_error(
 
     with pytest.raises(ValidationError):
         await contrato_service.vincular_secop_documento(db, test_user["user"].id, contrato.id, doc.id)
+
+
+async def _fila_documento_fuente_contrato(db: AsyncSession, contrato_id: uuid.UUID) -> list[DocumentoFuente]:
+    result = await db.execute(
+        select(DocumentoFuente).where(
+            DocumentoFuente.contrato_id == contrato_id,
+            DocumentoFuente.tipo == TipoDocumentoFuente.CONTRATO,
+        )
+    )
+    return list(result.scalars().all())
+
+
+async def test_vincular_persiste_documento_fuente_contrato_si_falta(
+    db: AsyncSession, contrato: Contrato, test_user: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live-reproduced bug: Vincular downloads a SECOP doc's bytes to extract
+    obligaciones but never persisted a `DocumentoFuente` from it, so Checklist
+    (which reads `DocumentoFuente` directly) permanently showed
+    'Contrato / minuta / clausulado — Pendiente' even after obligaciones existed."""
+
+    async def _core_spy(*args: Any, **kwargs: Any) -> tuple[list[ObligacionExtraida], list[str]]:
+        return ([ObligacionExtraida(descripcion="Obligación X", tipo="general", orden=1)], [])
+
+    monkeypatch.setattr(checklist_service, "extraer_obligaciones_desde_secop_doc", _core_spy)
+
+    descargas: dict[str, int] = {"n": 0}
+
+    async def _fake_download(url: str, timeout: float = 0) -> bytes:
+        descargas["n"] += 1
+        return b"fake bytes"
+
+    monkeypatch.setattr(checklist_service, "_descargar_secop_bytes", _fake_download)
+
+    mock_storage = AsyncMock()
+    mock_storage.upload = AsyncMock()
+    monkeypatch.setattr(checklist_service, "_get_storage", lambda bucket: mock_storage)
+
+    doc = _secop_doc(
+        contrato.numero_contrato,
+        "contrato.docx",
+        url_descarga="https://secop/fake.docx",
+        texto_estado="ok",
+        texto_extraido=TEXTO_CONTRATO,
+        categoria=CategoriaDocumento.CONTRATO,
+    )
+    db.add(doc)
+    await db.commit()
+    await db.refresh(doc)
+
+    await contrato_service.vincular_secop_documento(db, test_user["user"].id, contrato.id, doc.id)
+
+    docs = await _fila_documento_fuente_contrato(db, contrato.id)
+    assert len(docs) == 1
+    assert docs[0].cuenta_cobro_id is None
+    assert docs[0].texto_extraido == TEXTO_CONTRATO
+    assert docs[0].categoria == CategoriaDocumento.CONTRATO
+    assert descargas["n"] == 1
+    mock_storage.upload.assert_awaited_once()
+
+
+async def test_vincular_idempotente_no_duplica_documento_fuente(
+    db: AsyncSession, contrato: Contrato, test_user: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A CONTRATO DocumentoFuente already exists for this contrato → no-op:
+    no re-download, no re-upload, no duplicate row."""
+    existente = DocumentoFuente(
+        usuario_id=test_user["user"].id,
+        contrato_id=contrato.id,
+        cuenta_cobro_id=None,
+        storage_key="usuarios/x/documentos/y/existente.docx",
+        nombre="existente.docx",
+        tipo=TipoDocumentoFuente.CONTRATO,
+        texto_extraido="ya existente",
+    )
+    db.add(existente)
+    await db.commit()
+
+    async def _core_spy(*args: Any, **kwargs: Any) -> tuple[list[ObligacionExtraida], list[str]]:
+        return ([], [])
+
+    monkeypatch.setattr(checklist_service, "extraer_obligaciones_desde_secop_doc", _core_spy)
+
+    download_spy = AsyncMock(side_effect=AssertionError("no debe descargar"))
+    monkeypatch.setattr(checklist_service, "_descargar_secop_bytes", download_spy)
+    storage_factory_spy = AsyncMock(side_effect=AssertionError("no debe subir a storage"))
+    monkeypatch.setattr(checklist_service, "_get_storage", storage_factory_spy)
+
+    doc = _secop_doc(
+        contrato.numero_contrato,
+        "contrato.docx",
+        url_descarga="https://secop/fake.docx",
+        texto_estado="ok",
+        texto_extraido=TEXTO_CONTRATO,
+        categoria=CategoriaDocumento.CONTRATO,
+    )
+    db.add(doc)
+    await db.commit()
+    await db.refresh(doc)
+
+    await contrato_service.vincular_secop_documento(db, test_user["user"].id, contrato.id, doc.id)
+
+    docs = await _fila_documento_fuente_contrato(db, contrato.id)
+    assert len(docs) == 1
+    download_spy.assert_not_awaited()
+    storage_factory_spy.assert_not_awaited()
+
+
+async def test_vincular_degrada_si_falla_persistencia_documento(
+    db: AsyncSession, contrato: Contrato, test_user: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Persistence best-effort: a download failure must not raise nor block the
+    obligaciones-extraction result the user is actually waiting on, and must not
+    leave a partial DocumentoFuente row behind."""
+    resultado = ([ObligacionExtraida(descripcion="Obligación X", tipo="general", orden=1)], [])
+
+    async def _core_spy(*args: Any, **kwargs: Any) -> tuple[list[ObligacionExtraida], list[str]]:
+        return resultado
+
+    monkeypatch.setattr(checklist_service, "extraer_obligaciones_desde_secop_doc", _core_spy)
+
+    async def _fallo_descarga(url: str, timeout: float = 0) -> bytes:
+        raise httpx.TimeoutException("boom")
+
+    monkeypatch.setattr(checklist_service, "_descargar_secop_bytes", _fallo_descarga)
+
+    doc = _secop_doc(
+        contrato.numero_contrato,
+        "contrato.docx",
+        url_descarga="https://secop/fake.docx",
+        texto_estado="ok",
+        texto_extraido=TEXTO_CONTRATO,
+        categoria=CategoriaDocumento.CONTRATO,
+    )
+    db.add(doc)
+    await db.commit()
+    await db.refresh(doc)
+
+    obligaciones, avisos = await contrato_service.vincular_secop_documento(
+        db, test_user["user"].id, contrato.id, doc.id
+    )
+
+    assert (obligaciones, avisos) == resultado
+    docs = await _fila_documento_fuente_contrato(db, contrato.id)
+    assert docs == []

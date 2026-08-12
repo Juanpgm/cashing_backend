@@ -37,11 +37,16 @@ class LocalStorageAdapter:
         self._root = (Path(settings.LOCAL_STORAGE_PATH) / bucket).resolve()
         self._root.mkdir(parents=True, exist_ok=True)
 
-    def _path(self, key: str) -> Path:
+    def _resolve(self, key: str) -> Path:
+        """Resolve `key` to an absolute path under `self._root` without creating
+        any directories — used by read-only operations like `stat()`."""
         resolved = (self._root / key).resolve()
         if not str(resolved).startswith(str(self._root)):
             raise ValueError(f"Path traversal attempt blocked: {key}")
-        resolved = _winsafe(resolved)
+        return _winsafe(resolved)
+
+    def _path(self, key: str) -> Path:
+        resolved = self._resolve(key)
         resolved.parent.mkdir(parents=True, exist_ok=True)
         return resolved
 
@@ -122,3 +127,17 @@ class LocalStorageAdapter:
             ]
 
         return await loop.run_in_executor(None, _scan)
+
+    async def stat(self, key: str) -> StorageObjectInfo | None:
+        """Metadata for a single known key — cheaper than `list_objects` +
+        filter when the caller already knows the exact key (e.g. `GET
+        /paquete`'s deterministic package key)."""
+        path = self._resolve(key)
+        loop = asyncio.get_running_loop()
+
+        def _stat() -> StorageObjectInfo | None:
+            if not path.exists():
+                return None
+            return StorageObjectInfo(key=key, size_bytes=path.stat().st_size)
+
+        return await loop.run_in_executor(None, _stat)

@@ -7,6 +7,7 @@ from functools import partial
 
 import boto3
 from botocore.config import Config
+from botocore.exceptions import ClientError
 
 from app.adapters.storage.port import StorageObjectInfo
 from app.core.config import settings
@@ -97,6 +98,23 @@ class S3StorageAdapter:
             ),
         )
         return [StorageObjectInfo(key=item["Key"], size_bytes=item["Size"]) for item in response.get("Contents", [])]
+
+    async def stat(self, key: str) -> StorageObjectInfo | None:
+        loop = asyncio.get_running_loop()
+        try:
+            response = await loop.run_in_executor(
+                None,
+                partial(
+                    self._client.head_object,
+                    Bucket=self._bucket,
+                    Key=key,
+                ),
+            )
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") in ("404", "NoSuchKey"):
+                return None
+            raise
+        return StorageObjectInfo(key=key, size_bytes=response["ContentLength"])
 
 
 def get_storage() -> S3StorageAdapter:

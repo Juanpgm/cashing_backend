@@ -56,20 +56,20 @@ async def _get_cuenta_con_contrato_vivo(db: AsyncSession, usuario_id: uuid.UUID,
 
 async def listar_paquete(db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: uuid.UUID) -> PaqueteInfoResponse:
     """Read-only package listing. Never uploads, never packages, never charges
-    credits — only a storage-prefix read (`StoragePort.list_objects`) plus the
-    same read-only LISTO/PENDIENTE split `generar_zip_evidencias` uses
-    internally."""
+    credits — only a single-key storage stat (`StoragePort.stat` — cheaper and
+    more direct than a prefix `list_objects` scan for a key we already know
+    exactly) plus the same read-only LISTO/PENDIENTE split
+    `generar_zip_evidencias` uses internally."""
     cuenta = await _get_cuenta_con_contrato_vivo(db, usuario_id, cuenta_id)
     contrato = cuenta.contrato
     estado = await informe_service.obtener_estado_listo_pendiente(db, usuario_id, cuenta_id)
 
-    prefix, filename, storage_key = _clave_paquete(
+    _prefix, filename, storage_key = _clave_paquete(
         usuario_id, cuenta_id, contrato.numero_contrato, cuenta.anio, cuenta.mes
     )
 
     storage = _get_storage(settings.S3_BUCKET_EVIDENCIAS)
-    objetos = await storage.list_objects(prefix)
-    objeto = next((o for o in objetos if o.key == storage_key), None)
+    objeto = await storage.stat(storage_key)
 
     return PaqueteInfoResponse(
         cuenta_cobro_id=cuenta_id,
@@ -105,13 +105,12 @@ async def descargar_paquete(db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: 
     cuenta = await _get_cuenta_con_contrato_vivo(db, usuario_id, cuenta_id)
     contrato = cuenta.contrato
 
-    prefix, filename, storage_key = _clave_paquete(
+    _prefix, filename, storage_key = _clave_paquete(
         usuario_id, cuenta_id, contrato.numero_contrato, cuenta.anio, cuenta.mes
     )
 
     storage = _get_storage(settings.S3_BUCKET_EVIDENCIAS)
-    objetos = await storage.list_objects(prefix)
-    if not any(o.key == storage_key for o in objetos):
+    if await storage.stat(storage_key) is None:
         raise NotFoundError("Paquete", storage_key)
 
     contenido = await storage.download(storage_key)

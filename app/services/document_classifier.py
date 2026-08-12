@@ -96,6 +96,37 @@ _CONTRATO_DENY_PHRASES: frozenset[str] = frozenset(
     }
 )
 
+# A3 (H7, 2026-08-11): real SECOP listings routinely name NON-contrato documents
+# with the word "contrato"/"cto" in them — "CIERRE CTO 320…", "Acta de cierre de
+# contrato…", "Complemento al contrato - ART. 111…", "ESTUDIOS PREVIOS CTO…",
+# "Modificación: Cierre contrato" — and the generic PRIMARY hit tagged them all
+# categoria=contrato, so the frontend proposed a cierre/acta as the base contrato.
+# When the name/description hits one of these phrases AND carries none of the
+# strong contrato signals below, CONTRATO is EXCLUDED from the ranking (falls to
+# the next category or OTROS) — stronger than the payment deny-list's demotion,
+# because a cierre/estudios-previos is never the base contrato. Word-boundary,
+# accent-insensitive matching ("modificacion" matches "Modificación").
+_CONTRATO_EXCLUDE_PHRASES: frozenset[str] = frozenset(
+    {
+        "cierre",
+        "complemento",
+        "estudios previos",
+        "modificacion",
+        "designacion",
+        "idoneidad",
+    }
+)
+# A name carrying any of these keeps categoria=contrato even if an exclude
+# phrase co-occurs — the clausulado/minuta/firmado wording marks the base doc.
+_CONTRATO_STRONG_PHRASES: frozenset[str] = frozenset(
+    {
+        "clausulado",
+        "minuta",
+        "contrato firmado",
+        "contrato secop",
+    }
+)
+
 # R4: bounded, clamped adjustments from SECOP metadata (never an override).
 ADJ_MODIFICACION_CONTRATO = Decimal("-0.150")  # a modificatorio is not the base contrato
 ADJ_TIPO_HINT = Decimal("0.100")  # dataset-declared type is a strong prior
@@ -212,6 +243,21 @@ TIPO_A_REQUISITO: dict[str, str] = {
 _REQUISITO_A_CATEGORIA: dict[str, CategoriaDocumento] = {
     v: k for k, v in CATEGORIA_A_REQUISITO.items() if v is not None
 }
+
+# Reverse of TIPO_A_REQUISITO (1:1) — requisito_codigo back to the tipo value.
+_REQUISITO_A_TIPO: dict[str, str] = {v: k for k, v in TIPO_A_REQUISITO.items()}
+
+
+def categoria_a_tipo(categoria: CategoriaDocumento | None) -> str | None:
+    """Resolve a CategoriaDocumento to its TipoDocumentoFuente value, or None.
+
+    Chains the two existing maps (categoria → requisito → tipo). Categorias with
+    no tipo equivalent (EVIDENCIAS, OTROS) return None. Used by the A1 upload
+    tipo re-derivation (document_service.upload_document)."""
+    if categoria is None:
+        return None
+    req = CATEGORIA_A_REQUISITO.get(categoria)
+    return _REQUISITO_A_TIPO.get(req) if req else None
 
 
 def _tipo_hint_categoria(tipo_hint: str | None) -> CategoriaDocumento | None:
@@ -342,6 +388,18 @@ def clasificar(
         return CategoriaDocumento.OTROS, Decimal("0.000")
 
     scored = _aplicar_priors(scored, extension, tipo_origen, tipo_hint)
+
+    # A3 exclusion: a cierre/complemento/estudios-previos/modificación/designación/
+    # idoneidad name is never the base contrato — drop CONTRATO from the ranking
+    # entirely unless a strong contrato phrase (clausulado/minuta/…) also matches.
+    if (
+        any(cat is CategoriaDocumento.CONTRATO for cat, *_rest in scored)
+        and keyword_hits(haystacks, list(_CONTRATO_EXCLUDE_PHRASES))
+        and not keyword_hits(haystacks, list(_CONTRATO_STRONG_PHRASES))
+    ):
+        scored = [t for t in scored if t[0] is not CategoriaDocumento.CONTRATO]
+        if not scored:
+            return CategoriaDocumento.OTROS, Decimal("0.000")
 
     # Score first; a specific (non-generic) PRIMARY match only breaks EXACT
     # ties over a generic-only one — see _GENERIC_PRIMARY_KEYWORDS.

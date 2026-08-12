@@ -47,6 +47,8 @@ from app.models.actividad import Actividad
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, PosicionCuota
 from app.models.documento_fuente import DocumentoFuente
+from app.models.evidencia import Evidencia
+from app.models.evidencia_obligacion import EstadoEnlace, EvidenciaObligacion
 from app.models.obligacion import Obligacion
 from app.models.plantilla_organismo import PlantillaOrganismo
 from app.models.usuario import Usuario
@@ -1177,16 +1179,86 @@ class EstadoListoPendiente:
 def _calcular_estado_obligaciones(
     obligaciones: list[Obligacion],
     actividades_por_ob: dict[uuid.UUID | None, list[Actividad]],
+    cuenta_id: uuid.UUID | None = None,
+    obligaciones_con_link: frozenset[uuid.UUID] = frozenset(),
 ) -> list[ObligacionEstado]:
     """An obligación is LISTO when at least one of its actividades in this cuenta
-    carries at least one evidencia (uploaded file or external link); PENDIENTE
-    otherwise. Mirrors the human LEEME workflow this packager has always shown."""
+    carries at least one evidencia (uploaded file or external link), OR when it has
+    a CONFIRMED `evidencia_obligacion` link (`obligaciones_con_link`), OR when at
+    least one of its actividades carries a REAL (non-sentinel) justificación;
+    PENDIENTE otherwise. Mirrors the human LEEME workflow this packager has always
+    shown.
+
+    The link-table branch is the root-cause fix for the classify-after-upload path
+    (live-reproduced 2026-08-11): an evidencia uploaded before classification lands
+    on the shared "sin clasificar" stub Actividad (obligacion_id=None); confirming
+    the link later only writes `evidencia_obligacion` and never re-attaches the
+    Evidencia row, so counting only `act.evidencias` left the obligación PENDIENTE
+    forever — steps 4/7 and the modo="final" gate disagreed with cobertura and the
+    checklist EVIDENCIAS row, which already count confirmed links
+    (`cobertura_service.calcular_cobertura`, «link table as source of truth»).
+
+    The justificación branch (H12, 2026-08-11) aligns this split with the
+    modo="final" package gate, which already accepts justificación-only coverage
+    (ground truth: real approved cuotas radicate with partial evidencia). The
+    deterministic sentinels ("No he desarrollado esta obligación…") do NOT count —
+    they mean explicit absence of work, not justificación-only coverage."""
+
     estados: list[ObligacionEstado] = []
     for ob in obligaciones:
         acts = actividades_por_ob.get(ob.id, [])
-        listo = any(act.evidencias for act in acts)
+        listo = (
+            any(act.evidencias for act in acts)
+            or ob.id in obligaciones_con_link
+            or any(_tiene_justificacion_real(act.justificacion) for act in acts)
+        )
         estados.append(ObligacionEstado(obligacion_id=ob.id, descripcion=ob.descripcion, listo=listo))
     return estados
+
+
+def _tiene_justificacion_real(justificacion: str | None) -> bool:
+    """A justificación counts as real coverage only when it carries user/agent
+    text — the deterministic sentinels mean explicit absence of work. Shared by
+    `_calcular_estado_obligaciones` and the checklist EVIDENCIAS derivation
+    (`checklist_service.construir_checklist_completo`) so the two gates never
+    diverge again."""
+    texto = (justificacion or "").strip()
+    return bool(texto) and texto not in (SENTINEL_SIN_EVIDENCIAS, SENTINEL_SIN_EVIDENCIAS_TERCERA_PERSONA)
+
+
+async def _obligaciones_con_link_confirmado(db: AsyncSession, cuenta_id: uuid.UUID) -> frozenset[uuid.UUID]:
+    """Obligación ids covered by a CONFIRMED evidencia link within this cuenta —
+    same rule `cobertura_service.calcular_cobertura` applies (scoped through the
+    cuenta's actividades so cross-cuenta evidencias never leak in)."""
+    return frozenset(await _evidencias_por_link_confirmado(db, cuenta_id))
+
+
+async def _evidencias_por_link_confirmado(db: AsyncSession, cuenta_id: uuid.UUID) -> dict[uuid.UUID, list[Evidencia]]:
+    """CONFIRMED-linked Evidencia rows per obligación for this cuenta.
+
+    Live-reproduced 2026-08-12 (second E2E run): an evidencia confirmed to an
+    obligación after upload stays attached to the shared "sin clasificar" stub
+    Actividad, so the packager — which places bytes per `act.evidencias` — shipped
+    the obligation folder with only its LEEME and no evidence files, while the
+    gates (H13) already counted the obligación as covered. This map lets the zip
+    place link-confirmed files under their obligation folders. An evidencia linked
+    to several obligaciones is deliberately packaged into each folder (mirrors the
+    human bundle)."""
+    result = await db.execute(
+        select(EvidenciaObligacion.obligacion_id, Evidencia)
+        .join(Evidencia, Evidencia.id == EvidenciaObligacion.evidencia_id)
+        .join(Actividad, Actividad.id == Evidencia.actividad_id)
+        .where(
+            Actividad.cuenta_cobro_id == cuenta_id,
+            EvidenciaObligacion.status == EstadoEnlace.CONFIRMED.value,
+            EvidenciaObligacion.obligacion_id.is_not(None),
+        )
+    )
+    por_ob: dict[uuid.UUID, list[Evidencia]] = {}
+    for ob_id, ev in result.all():
+        if ob_id is not None:
+            por_ob.setdefault(ob_id, []).append(ev)
+    return por_ob
 
 
 async def obtener_estado_listo_pendiente(
@@ -1199,7 +1271,8 @@ async def obtener_estado_listo_pendiente(
     for act in actividades:
         actividades_por_ob.setdefault(act.obligacion_id, []).append(act)
 
-    estados = _calcular_estado_obligaciones(obligaciones, actividades_por_ob)
+    con_link = await _obligaciones_con_link_confirmado(db, cuenta_id)
+    estados = _calcular_estado_obligaciones(obligaciones, actividades_por_ob, cuenta_id, con_link)
     pendientes = sum(1 for e in estados if not e.listo)
     return EstadoListoPendiente(
         cuenta_cobro_id=cuenta_id,
@@ -1450,7 +1523,9 @@ async def generar_zip_evidencias(
     # (slice #6) for the DOCX informes themselves, not by this folder builder.
     usa_folders_anexo = bool(estructura_organismo and estructura_organismo.estructura_json.get("anexo_refs"))
 
-    estados = _calcular_estado_obligaciones(obligaciones, actividades_por_ob)
+    evidencias_link_por_ob = await _evidencias_por_link_confirmado(db, cuenta_id)
+    con_link = frozenset(evidencias_link_por_ob)
+    estados = _calcular_estado_obligaciones(obligaciones, actividades_por_ob, cuenta_id, con_link)
     pendientes_desc = [e.descripcion for e in estados if not e.listo]
 
     # Ground truth (real approved SYJ cuotas): partial evidencia coverage is the
@@ -1590,10 +1665,23 @@ async def generar_zip_evidencias(
         else:
             lines.append("(sin actividades reportadas)")
             lines.append("")
+        # Evidencias confirmed to this obligación via the link table but attached
+        # to another actividad (typically the "sin clasificar" upload stub) —
+        # without this branch their bytes never shipped, leaving the obligation
+        # folder LEEME-only while the gates reported the obligación covered
+        # (live-reproduced 2026-08-12, H13 packaging counterpart).
+        ids_act = {ev.id for act in acts for ev in act.evidencias}
+        evs_link = [ev for ev in evidencias_link_por_ob.get(ob.id, []) if ev.id not in ids_act]
+        if evs_link:
+            lines.append("Evidencias clasificadas (confirmadas para esta obligación):")
+            lines += [f"  - {ev.nombre_archivo}" for ev in evs_link]
+            lines.append("")
+
         # Link-only evidencias carry no bytes to package — document them here.
         # A link-type evidencia with no usable url is noted too (not silently
         # dropped), with a placeholder instead of a broken link (P2 delta).
         enlaces = [ev for act in acts for ev in act.evidencias if ev.storage_key is None]
+        enlaces += [ev for ev in evs_link if ev.storage_key is None]
         if enlaces:
             lines.append("Enlaces:")
             lines += [f"- {ev.fuente or 'enlace'}: {ev.url or '(referencia no disponible)'}" for ev in enlaces]
@@ -1604,25 +1692,46 @@ async def generar_zip_evidencias(
         ]
         _agregar_texto(f"{folder}/LEEME.txt", "\n".join(lines))
 
-        for act in acts:
-            for ev in act.evidencias:
-                if ev.storage_key is None:
-                    continue  # external-link evidence — no real bytes to fetch (no new StoragePort methods this change)
-                try:
-                    contenido = await storage.download(ev.storage_key)
-                except Exception as exc:  # one missing file must not sink the whole package
-                    await logger.awarning(
-                        "zip_evidencias_download_failed",
-                        evidencia_id=str(ev.id),
-                        storage_key=ev.storage_key,
-                        error=str(exc),
-                    )
-                    continue
-                arcname = f"{folder}/evidencias/{_safe_dirname(ev.nombre_archivo, max_len=150)}"
-                miembros_zip.append((arcname, contenido))
-                texto_scan = await _texto_para_scan(contenido, ev.nombre_archivo)
-                if texto_scan:
-                    miembros_scan.append((arcname, texto_scan.encode("utf-8")))
+        # Actividad-attached evidencias plus the link-confirmed ones (dedup'd
+        # above) — both classes ship real bytes into this obligation's folder.
+        for ev in [ev for act in acts for ev in act.evidencias] + evs_link:
+            if ev.storage_key is None:
+                continue  # external-link evidence — no real bytes to fetch (no new StoragePort methods this change)
+            try:
+                contenido = await storage.download(ev.storage_key)
+            except Exception as exc:  # one missing file must not sink the whole package
+                await logger.awarning(
+                    "zip_evidencias_download_failed",
+                    evidencia_id=str(ev.id),
+                    storage_key=ev.storage_key,
+                    error=str(exc),
+                )
+                # Diagnostic instrumentation (paquete-regenerar-evidencia-nueva,
+                # Slice 1) — discriminates "read-but-dropped" (this fail-open
+                # branch, storage-durability race) from "never loaded" (pt1
+                # shows no such evidencia at all).
+                await logger.awarning(
+                    "zip_evidencia_download",
+                    cuenta_id=str(cuenta_id),
+                    evidencia_id=str(ev.id),
+                    storage_key=ev.storage_key,
+                    download_ok=False,
+                    bytes_len=0,
+                )
+                continue
+            await logger.ainfo(
+                "zip_evidencia_download",
+                cuenta_id=str(cuenta_id),
+                evidencia_id=str(ev.id),
+                storage_key=ev.storage_key,
+                download_ok=True,
+                bytes_len=len(contenido),
+            )
+            arcname = f"{folder}/evidencias/{_safe_dirname(ev.nombre_archivo, max_len=150)}"
+            miembros_zip.append((arcname, contenido))
+            texto_scan = await _texto_para_scan(contenido, ev.nombre_archivo)
+            if texto_scan:
+                miembros_scan.append((arcname, texto_scan.encode("utf-8")))
 
     # Activities not linked to any obligation
     sueltas = actividades_por_ob.get(None, [])

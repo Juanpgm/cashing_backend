@@ -23,9 +23,11 @@ from app.models.actividad import Actividad
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro, PosicionCuota
 from app.models.evidencia import Evidencia
+from app.models.evidencia_obligacion import EstadoEnlace, EvidenciaObligacion, FuenteEnlace
 from app.models.obligacion import Obligacion, TipoObligacion
 from app.models.plantilla_organismo import PlantillaOrganismo
 from app.services import informe_service
+from app.services.informe_constants import SENTINEL_SIN_EVIDENCIAS
 from docx import Document
 from httpx import AsyncClient
 from sqlalchemy import select
@@ -282,6 +284,54 @@ async def test_zip_evidencias_usa_bytes_reales_de_storage(
     storage.download.assert_any_call(ev.storage_key)
 
 
+async def test_zip_empaca_evidencia_link_confirmado_en_carpeta_de_obligacion(
+    db: AsyncSession,
+    test_user: dict[str, Any],
+    cuenta: CuentaCobro,
+    obligaciones: list[Obligacion],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Packaging counterpart of the H13 gate fix (live-reproduced 2026-08-12):
+    an evidencia attached to the "sin clasificar" stub (obligacion_id=None) but
+    CONFIRMED-linked to an obligación must ship its bytes under that obligation's
+    folder — before the fix the folder carried only its LEEME."""
+    user = test_user["user"]
+    stub = Actividad(cuenta_cobro_id=cuenta.id, obligacion_id=None, descripcion="stub sin clasificar")
+    db.add(stub)
+    await db.flush()
+    ev = Evidencia(
+        actividad_id=stub.id,
+        storage_key=f"evidencias/{stub.id}/soporte.pdf",
+        nombre_archivo="soporte.pdf",
+        tipo_archivo="application/pdf",
+        tamano_bytes=10,
+    )
+    db.add(ev)
+    await db.flush()
+    db.add(
+        EvidenciaObligacion(
+            evidencia_id=ev.id,
+            obligacion_id=obligaciones[0].id,
+            status=EstadoEnlace.CONFIRMED.value,
+            source=FuenteEnlace.USER.value,
+        )
+    )
+    await db.commit()
+
+    contenido_real = b"bytes-de-la-evidencia-linkeada"
+    storage = _fake_storage({ev.storage_key: contenido_real})
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: storage)
+
+    content, _filename = await informe_service.generar_zip_evidencias(db, user.id, cuenta.id)
+
+    with zipfile.ZipFile(io.BytesIO(content)) as zf:
+        matches = [n for n in zf.namelist() if n.startswith("01_") and n.endswith("soporte.pdf")]
+        assert matches, "link-confirmed evidencia must land under its obligation folder"
+        assert zf.read(matches[0]) == contenido_real
+        leeme_name = next(n for n in zf.namelist() if n.startswith("01_") and n.endswith("LEEME.txt"))
+        assert "soporte.pdf" in zf.read(leeme_name).decode("utf-8")
+
+
 async def test_zip_evidencias_incluye_bytes_subidos_por_el_seam_real(
     db: AsyncSession,
     test_user: dict[str, Any],
@@ -491,12 +541,20 @@ async def test_zip_evidencias_modo_final_justificacion_sin_evidencia_emite_zip(
     actividad_con_evidencia: Actividad,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Obligación 1 has evidencia; obligaciones 2/3 only carry justificación text
-    (no evidencia, from the base `cuenta` fixture) — modo="final" must still
-    emit the package: real approved cuentas radicate with partial evidencia
-    coverage as long as every obligación has evidencia OR a justificación."""
+    """Obligación 1 has evidencia; obligaciones 2/3 carry only the SENTINEL
+    justificación — modo="final" must still emit the package: real approved
+    cuentas radicate with partial evidencia coverage as long as every obligación
+    has evidencia OR a justificación (the gate deliberately accepts the sentinel).
+    H12 note: the base fixture's REAL justificaciones now make an obligación
+    LISTO outright, so the sentinel is what keeps 2/3 in the "justificadas sin
+    evidencia" LEEME split this test asserts."""
     user = test_user["user"]
     monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: _fake_storage())
+    res = await db.execute(select(Actividad).where(Actividad.cuenta_cobro_id == cuenta.id))
+    for act in res.scalars().all():
+        if act.id != actividad_con_evidencia.id:
+            act.justificacion = SENTINEL_SIN_EVIDENCIAS
+    await db.commit()
 
     content, filename = await informe_service.generar_zip_evidencias(db, user.id, cuenta.id, modo="final")
 
@@ -722,7 +780,17 @@ async def test_obtener_estado_listo_pendiente_sin_zip(
     cuenta: CuentaCobro,
     actividad_con_evidencia: Actividad,
 ) -> None:
+    # H12: a REAL justificación now counts as listo, and the base `cuenta`
+    # fixture writes one on every actividad — downgrade the two non-evidencia
+    # actividades to the sentinel (explicit absence of work) so this test keeps
+    # exercising the evidencia-based split AND the sentinel-does-not-count rule.
     user = test_user["user"]
+    res = await db.execute(select(Actividad).where(Actividad.cuenta_cobro_id == cuenta.id))
+    for act in res.scalars().all():
+        if act.id != actividad_con_evidencia.id:
+            act.justificacion = SENTINEL_SIN_EVIDENCIAS
+    await db.commit()
+
     estado = await informe_service.obtener_estado_listo_pendiente(db, user.id, cuenta.id)
 
     assert estado.cuenta_cobro_id == cuenta.id
@@ -731,6 +799,93 @@ async def test_obtener_estado_listo_pendiente_sin_zip(
     assert len(listos) == 1
     assert estado.pendientes == 2
     assert estado.listo_para_radicar is False
+
+
+async def test_estado_justificacion_real_sola_cuenta_como_listo(
+    db: AsyncSession,
+    test_user: dict[str, Any],
+    cuenta: CuentaCobro,
+) -> None:
+    """H12 parity: an obligación whose actividad carries a REAL justificación —
+    no evidencia file, no confirmed link — is LISTO, matching the modo="final"
+    package gate that has always accepted justificación-only coverage."""
+    user = test_user["user"]
+    estado = await informe_service.obtener_estado_listo_pendiente(db, user.id, cuenta.id)
+
+    # Base fixture: 3 actividades, all with real justificación, zero evidencias.
+    assert estado.pendientes == 0
+    assert estado.listo_para_radicar is True
+
+
+async def test_estado_justificacion_sentinel_no_cuenta_como_listo(
+    db: AsyncSession,
+    test_user: dict[str, Any],
+    cuenta: CuentaCobro,
+) -> None:
+    """H12: the deterministic sentinel means "no work done" — it must NOT flip
+    an obligación to LISTO."""
+    user = test_user["user"]
+    res = await db.execute(select(Actividad).where(Actividad.cuenta_cobro_id == cuenta.id))
+    for act in res.scalars().all():
+        act.justificacion = SENTINEL_SIN_EVIDENCIAS
+    await db.commit()
+
+    estado = await informe_service.obtener_estado_listo_pendiente(db, user.id, cuenta.id)
+
+    assert estado.pendientes == 3
+    assert estado.listo_para_radicar is False
+
+
+async def test_estado_listo_cuenta_link_confirmado_en_stub_sin_clasificar(
+    db: AsyncSession,
+    test_user: dict[str, Any],
+    cuenta: CuentaCobro,
+    obligaciones: list[Obligacion],
+) -> None:
+    """Classify-after-upload path (live-reproduced 2026-08-11): an evidencia
+    uploaded before classification hangs off the shared "sin clasificar" stub
+    Actividad (obligacion_id=None); confirming its link later only writes
+    `evidencia_obligacion`. The obligación must still count as LISTO — link
+    table as source of truth, parity with cobertura/checklist."""
+    user = test_user["user"]
+    # H12: neutralize the base fixture's real justificaciones (they now count as
+    # listo on their own) so this test isolates the link-table branch.
+    res = await db.execute(select(Actividad).where(Actividad.cuenta_cobro_id == cuenta.id))
+    for act in res.scalars().all():
+        act.justificacion = SENTINEL_SIN_EVIDENCIAS
+    await db.flush()
+    stub = Actividad(
+        cuenta_cobro_id=cuenta.id,
+        obligacion_id=None,
+        descripcion="Pendiente de redactar — evidencia adjunta (stub)",
+    )
+    db.add(stub)
+    await db.flush()
+    ev = Evidencia(
+        actividad_id=stub.id,
+        storage_key=f"evidencias/{stub.id}/consolidado.pdf",
+        nombre_archivo="consolidado.pdf",
+        tipo_archivo="application/pdf",
+        tamano_bytes=10,
+    )
+    db.add(ev)
+    await db.flush()
+    db.add(
+        EvidenciaObligacion(
+            evidencia_id=ev.id,
+            obligacion_id=obligaciones[0].id,
+            status=EstadoEnlace.CONFIRMED.value,
+            source=FuenteEnlace.USER.value,
+        )
+    )
+    await db.commit()
+
+    estado = await informe_service.obtener_estado_listo_pendiente(db, user.id, cuenta.id)
+
+    por_id = {o.obligacion_id: o.listo for o in estado.obligaciones}
+    assert por_id[obligaciones[0].id] is True
+    # A confirmed link on one obligación must not leak listo to the others.
+    assert estado.pendientes == 2
 
 
 # ── Paquete radicado completo (G1 docs generados, G3 enlaces, G5 diferencial) ──

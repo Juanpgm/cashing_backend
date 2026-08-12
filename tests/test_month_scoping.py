@@ -99,3 +99,53 @@ class TestCalcularVentanaMes:
 
         assert ventana.fecha_fin == esperado_fin
         assert ventana.advertencia is esperado_advertencia
+
+
+class TestVentanaVigenciaContrato:
+    """H5: optional contract vigencia — advertencia=True when the billed calendar
+    month falls ENTIRELY outside [vigencia_inicio, vigencia_fin]. Warn-only."""
+
+    VIG_INI = date(2024, 1, 15)
+    VIG_FIN = date(2024, 12, 15)
+
+    def test_mes_despues_de_vigencia_advierte(self) -> None:
+        ventana = calcular_ventana_mes(mes=4, anio=2025, vigencia_inicio=self.VIG_INI, vigencia_fin=self.VIG_FIN)
+        assert ventana.advertencia is True
+        # Window itself is unchanged — vigencia only drives the flag.
+        assert ventana.fecha_inicio == date(2025, 4, 1)
+        assert ventana.fecha_fin == date(2025, 4, 30)
+
+    def test_mes_antes_de_vigencia_advierte(self) -> None:
+        ventana = calcular_ventana_mes(mes=12, anio=2023, vigencia_inicio=self.VIG_INI, vigencia_fin=self.VIG_FIN)
+        assert ventana.advertencia is True
+
+    def test_mes_dentro_de_vigencia_no_advierte(self) -> None:
+        ventana = calcular_ventana_mes(mes=6, anio=2024, vigencia_inicio=self.VIG_INI, vigencia_fin=self.VIG_FIN)
+        assert ventana.advertencia is False
+
+    def test_mes_parcialmente_dentro_no_advierte(self) -> None:
+        """Vigencia starts/ends mid-month: any overlap with the month is enough."""
+        assert (
+            calcular_ventana_mes(mes=1, anio=2024, vigencia_inicio=self.VIG_INI, vigencia_fin=self.VIG_FIN).advertencia
+            is False
+        )
+        assert (
+            calcular_ventana_mes(mes=12, anio=2024, vigencia_inicio=self.VIG_INI, vigencia_fin=self.VIG_FIN).advertencia
+            is False
+        )
+
+    def test_sin_vigencia_comportamiento_intacto(self) -> None:
+        ventana = calcular_ventana_mes(mes=4, anio=2025, fecha_transaccion=date(2025, 4, 15))
+        assert ventana.advertencia is False
+
+    def test_fuera_de_vigencia_con_fecha_transaccion_dentro_del_mes(self) -> None:
+        """The fecha_transaccion cap branch must also surface the vigencia warning."""
+        ventana = calcular_ventana_mes(
+            mes=4,
+            anio=2025,
+            fecha_transaccion=date(2025, 4, 15),
+            vigencia_inicio=self.VIG_INI,
+            vigencia_fin=self.VIG_FIN,
+        )
+        assert ventana.advertencia is True
+        assert ventana.fecha_fin == date(2025, 4, 15)

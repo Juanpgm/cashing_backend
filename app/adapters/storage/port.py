@@ -38,9 +38,15 @@ class StoragePort(Protocol):
         ...
 
     async def list_objects(self, prefix: str) -> list[StorageObjectInfo]:
-        """List objects under a key prefix — key + size only, no data read.
+        """List objects under a key prefix — key + size only, no data read."""
+        ...
 
-        Used for existence/metadata checks (e.g. `GET /paquete`) without
-        downloading or packaging anything.
+    async def stat(self, key: str) -> StorageObjectInfo | None:
+        """Metadata for a SINGLE known key, or `None` if it doesn't exist.
+
+        Prefer this over `list_objects(prefix)` + filter for an
+        existence/size check on a key you already know exactly (e.g. `GET
+        /paquete`'s deterministic package key) — cheaper than scanning an
+        entire prefix for one entry.
         """
         ...

@@ -115,3 +115,60 @@ async def test_s3_list_objects_returns_empty_when_prefix_has_no_objects() -> Non
         result = await adapter.list_objects("paquetes/nobody/nothing/")
 
     assert result == []
+
+
+# ── stat() — paquete-regenerar-evidencia-nueva Slice 2 (single-key, not a
+# prefix scan: `GET /paquete` must not rely on a directory-listing read that
+# proved exposed to storage read-after-write staleness right after a
+# regenerate overwrite) ─────────────────────────────────────────────────────
+
+
+async def test_local_stat_returns_none_when_key_missing(tmp_path: object, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "LOCAL_STORAGE_PATH", str(tmp_path))
+    adapter = LocalStorageAdapter(bucket="test-bucket")
+
+    assert await adapter.stat("paquetes/u1/c1/evidencias-CTR-1-2024-01.zip") is None
+    # stat() is a read-only metadata lookup — it must not create the key's
+    # parent directory tree as a side effect (unlike upload()/_path()).
+    assert not (Path(tmp_path) / "test-bucket" / "paquetes" / "u1" / "c1").exists()
+
+
+async def test_local_stat_returns_key_and_size_after_overwrite(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "LOCAL_STORAGE_PATH", str(tmp_path))
+    adapter = LocalStorageAdapter(bucket="test-bucket")
+    key = "paquetes/u1/c1/evidencias-CTR-1-2024-01.zip"
+
+    await adapter.upload(key, b"1234", "application/zip")
+    await adapter.upload(key, b"1234567890", "application/zip")  # regenerate overwrite
+
+    result = await adapter.stat(key)
+
+    assert result is not None
+    assert result.key == key
+    assert result.size_bytes == 10
+
+
+async def test_s3_stat_returns_none_when_key_missing() -> None:
+    with mock_aws():
+        boto3.client("s3", region_name="us-east-1").create_bucket(Bucket="test-bucket-s3-stat")
+        adapter = S3StorageAdapter(bucket="test-bucket-s3-stat")
+
+        assert await adapter.stat("paquetes/nobody/nothing.zip") is None
+
+
+async def test_s3_stat_returns_key_and_size_after_overwrite() -> None:
+    with mock_aws():
+        boto3.client("s3", region_name="us-east-1").create_bucket(Bucket="test-bucket-s3-stat-2")
+        adapter = S3StorageAdapter(bucket="test-bucket-s3-stat-2")
+        key = "paquetes/u1/c1/evidencias-CTR-1-2024-01.zip"
+
+        await adapter.upload(key, b"1234", "application/zip")
+        await adapter.upload(key, b"1234567890", "application/zip")  # regenerate overwrite
+
+        result = await adapter.stat(key)
+
+    assert result is not None
+    assert result.key == key
+    assert result.size_bytes == 10

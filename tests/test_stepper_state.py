@@ -143,12 +143,13 @@ async def _add_actividad_con_evidencia(
     obligacion: Obligacion,
     *,
     con_evidencia: bool = True,
+    justificacion: str = "Justificación",
 ) -> Actividad:
     act = Actividad(
         cuenta_cobro_id=cuenta.id,
         obligacion_id=obligacion.id,
         descripcion="Actividad realizada",
-        justificacion="Justificación",
+        justificacion=justificacion,
         fecha_realizacion=date(2024, 1, 10),
     )
     db.add(act)
@@ -176,18 +177,11 @@ async def _add_actividad_con_evidencia(
 
 
 async def _contrato_completo(db: AsyncSession, contrato: Contrato, usuario_id: Any) -> None:
-    """Satisfy step 1's nivel-contrato mandatory docs via contract-level uploads:
-    CONTRATO + RPC (recurring, every cuenta) plus CEDULA/RUT/ACTA_INICIO
-    (obligatorio + solo_primera_cuenta — required because `_make_cuenta`
-    defaults `posicion=PRIMERA`)."""
-    for tipo in (
-        TipoDocumentoFuente.CONTRATO,
-        TipoDocumentoFuente.RPC,
-        TipoDocumentoFuente.CEDULA,
-        TipoDocumentoFuente.RUT,
-        TipoDocumentoFuente.ACTA_INICIO,
-    ):
-        await _add_documento_contrato(db, usuario_id=usuario_id, contrato_id=contrato.id, tipo=tipo)
+    """Satisfy step 1's completeness predicate: a contract-level CONTRATO
+    upload (narrowed rule — see `_step1_contrato`'s docstring; RPC/CEDULA/
+    RUT/ACTA_INICIO are no longer required here, only at the step-3
+    checklist gate)."""
+    await _add_documento_contrato(db, usuario_id=usuario_id, contrato_id=contrato.id, tipo=TipoDocumentoFuente.CONTRATO)
 
 
 async def _cuenta_completo(db: AsyncSession, cuenta: CuentaCobro, usuario_id: Any) -> None:
@@ -204,9 +198,13 @@ async def _cuenta_completo(db: AsyncSession, cuenta: CuentaCobro, usuario_id: An
 # ── B4a — one unit test per step-1..4 predicate (direct calls) ─────────────
 
 
-async def test_step1_predicate_incomplete_without_mandatory_docs(
-    db: AsyncSession, test_user: dict[str, Any], contrato: Contrato, obligacion: Obligacion
+async def test_step1_predicate_incomplete_without_contrato_doc_or_obligaciones(
+    db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
 ) -> None:
+    """No CONTRATO doc, no obligaciones, flag unset — genuinely nothing to
+    show step 1 was ever processed. Deliberately does NOT use the
+    `obligacion` fixture (see the OR-satisfier tests below) — that fixture's
+    presence alone now satisfies step 1, per the live-reproduced fix."""
     user = test_user["user"]
     cuenta = await _make_cuenta(db, contrato)
 
@@ -219,9 +217,11 @@ async def test_step1_predicate_incomplete_without_mandatory_docs(
     _ = user
 
 
-async def test_step1_predicate_complete_with_obligaciones_and_mandatory_docs(
+async def test_step1_predicate_complete_with_only_contrato_doc(
     db: AsyncSession, test_user: dict[str, Any], contrato: Contrato, obligacion: Obligacion
 ) -> None:
+    """Only the CONTRATO doc is attached (no RPC/CEDULA/RUT/ACTA_INICIO) —
+    step 1 must still report complete, per the narrowed product rule."""
     user = test_user["user"]
     await _contrato_completo(db, contrato, user.id)
     cuenta = await _make_cuenta(db, contrato)
@@ -232,32 +232,77 @@ async def test_step1_predicate_complete_with_obligaciones_and_mandatory_docs(
     assert result.blocking is False
 
 
-async def test_step2_predicate_incomplete_without_ss_planilla(db: AsyncSession, contrato: Contrato) -> None:
-    cuenta = await _make_cuenta(db, contrato, numero_cuota=1)
+async def test_step1_predicate_complete_with_obligaciones_extraidas_no_contrato_doc(
+    db: AsyncSession, test_user: dict[str, Any], contrato: Contrato, obligacion: Obligacion
+) -> None:
+    """Live-reproduced bug: a contrato imported via the SECOP 'Vincular' flow
+    extracts obligaciones (sets `obligaciones_extraidas = True`) without ever
+    persisting a CONTRATO-typed `DocumentoFuente` — step 1 must still report
+    complete, not stay permanently stuck."""
+    cuenta = await _make_cuenta(db, contrato)
+    contrato.obligaciones_extraidas = True
+    await db.commit()
+    await db.refresh(contrato)
 
-    result = await stepper_state_service._step2_cuota(db, cuenta)
+    result = await stepper_state_service._step1_contrato(db, cuenta, contrato)
+
+    assert result.complete is True
+    assert result.blocking is False
+
+
+async def test_step1_predicate_complete_with_obligaciones_but_null_flag(
+    db: AsyncSession, test_user: dict[str, Any], contrato: Contrato, obligacion: Obligacion
+) -> None:
+    """Live-reproduced bug (Postgres, real data): 'Reiniciar obligaciones'
+    resets `obligaciones_extraidas` to None (`contrato_service.py`), and the
+    manual Vincular recovery path that follows repopulates `Obligacion` rows
+    WITHOUT ever setting the flag back to True. Step 1 must key off
+    obligaciones presence, not just the flag, or this contrato — despite
+    having real obligaciones and no CONTRATO doc, exactly like the live
+    reproduction — stays permanently stuck."""
+    cuenta = await _make_cuenta(db, contrato)
+    contrato.obligaciones_extraidas = None
+    await db.commit()
+    await db.refresh(contrato, attribute_names=["obligaciones_extraidas"])
+    await db.refresh(contrato)
+
+    result = await stepper_state_service._step1_contrato(db, cuenta, contrato)
+
+    assert contrato.obligaciones_extraidas is None
+    assert result.complete is True
+    assert result.blocking is False
+
+
+async def test_step2_predicate_incomplete_without_numero_cuota(db: AsyncSession, contrato: Contrato) -> None:
+    cuenta = await _make_cuenta(db, contrato, numero_cuota=None)
+
+    result = stepper_state_service._step2_cuota(cuenta)
 
     assert result.step == 2
     assert result.key == "cuota"
     assert result.complete is False
 
 
-async def test_step2_predicate_complete_with_numero_cuota_and_ss_planilla(
-    db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
-) -> None:
-    user = test_user["user"]
+async def test_step2_predicate_complete_with_numero_cuota_alone(db: AsyncSession, contrato: Contrato) -> None:
+    """Live-reproduced deadlock (restores an already-archived design decision
+    — `radicar-stepper-simplificacion` design.md, 'move SS complete from
+    _step2_cuota to _step3_checklist' — that never actually landed in this
+    function): SS-planilla is NOT required for step 2 anymore. The only place
+    it's attachable is the checklist's generic per-requisito upload (step 3)
+    — requiring it here made step 3 permanently unreachable whenever it was
+    still missing (`furthest_completed_step` could never pass 1), since
+    checklist needs step 2 complete to even be navigated to."""
     cuenta = await _make_cuenta(db, contrato, numero_cuota=1)
-    await _cuenta_completo(db, cuenta, user.id)
 
-    result = await stepper_state_service._step2_cuota(db, cuenta)
+    result = stepper_state_service._step2_cuota(cuenta)
 
     assert result.complete is True
 
 
-def test_step3_predicate_incomplete_when_mode_not_chosen() -> None:
-    cuenta = CuentaCobro(requisitos_modo=None)
+async def test_step3_predicate_incomplete_when_mode_not_chosen(db: AsyncSession, contrato: Contrato) -> None:
+    cuenta = await _make_cuenta(db, contrato, requisitos_modo=None)
 
-    result = stepper_state_service._step3_checklist(cuenta)
+    result = await stepper_state_service._step3_checklist(db, cuenta)
 
     assert result.step == 3
     assert result.key == "checklist"
@@ -265,10 +310,50 @@ def test_step3_predicate_incomplete_when_mode_not_chosen() -> None:
     assert result.code == "CHECKLIST_INCOMPLETE"
 
 
-def test_step3_predicate_complete_when_mode_chosen() -> None:
-    cuenta = CuentaCobro(requisitos_modo="estandar")
+async def test_step3_predicate_incomplete_when_mode_chosen_but_no_ss_planilla(
+    db: AsyncSession, contrato: Contrato
+) -> None:
+    """The mode gate alone is no longer sufficient — SS-planilla completeness
+    moved here from step 2 (same design decision as above)."""
+    cuenta = await _make_cuenta(db, contrato, requisitos_modo="estandar")
 
-    result = stepper_state_service._step3_checklist(cuenta)
+    result = await stepper_state_service._step3_checklist(db, cuenta)
+
+    assert result.complete is False
+    assert result.code == "CHECKLIST_INCOMPLETE"
+
+
+async def test_step3_predicate_complete_when_mode_chosen_and_ss_planilla_attached(
+    db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
+) -> None:
+    user = test_user["user"]
+    cuenta = await _make_cuenta(db, contrato, requisitos_modo="estandar")
+    await _cuenta_completo(db, cuenta, user.id)  # attaches the cuenta-scoped SEGURIDAD_SOCIAL doc
+
+    result = await stepper_state_service._step3_checklist(db, cuenta)
+
+    assert result.complete is True
+    assert result.code is None
+
+
+async def test_step3_predicate_complete_when_ss_requisito_cumplido_manual(db: AsyncSession, contrato: Contrato) -> None:
+    """Parity with `computar_resumen` (live-reproduced 2026-08-11): the checklist
+    UI offers "Marcar cumplido"/"No aplica" on the SS row and radicación honors
+    them — step 3 must too, or the row shows green while the wizard stays
+    blocked with a generic hint."""
+    from app.models.documento_cuenta_cobro import DocumentoCuentaCobro, EstadoRequisito
+
+    cuenta = await _make_cuenta(db, contrato, requisitos_modo="estandar")
+    db.add(
+        DocumentoCuentaCobro(
+            cuenta_cobro_id=cuenta.id,
+            requisito_codigo="SEGURIDAD_SOCIAL",
+            estado=EstadoRequisito.CUMPLIDO_MANUAL,
+        )
+    )
+    await db.commit()
+
+    result = await stepper_state_service._step3_checklist(db, cuenta)
 
     assert result.complete is True
     assert result.code is None
@@ -443,7 +528,9 @@ async def test_step4_evidencias_incomplete_when_pendientes_greater_than_zero(
 ) -> None:
     user = test_user["user"]
     cuenta = await _make_cuenta(db, contrato)
-    await _add_actividad_con_evidencia(db, cuenta, obligacion, con_evidencia=False)
+    # H12: a real justificación now counts as coverage — this test intends "no
+    # support at all", so the actividad must carry neither evidencia nor texto.
+    await _add_actividad_con_evidencia(db, cuenta, obligacion, con_evidencia=False, justificacion="")
 
     result = await stepper_state_service.obtener_stepper_state(db, user.id, cuenta.id)
 
@@ -468,7 +555,8 @@ async def test_step7_paquete_incomplete_when_not_listo_para_radicar(
 ) -> None:
     user = test_user["user"]
     cuenta = await _make_cuenta(db, contrato)
-    await _add_actividad_con_evidencia(db, cuenta, obligacion, con_evidencia=False)
+    # H12: same as step-4 test above — "not listo" now requires no justificación.
+    await _add_actividad_con_evidencia(db, cuenta, obligacion, con_evidencia=False, justificacion="")
 
     result = await stepper_state_service.obtener_stepper_state(db, user.id, cuenta.id)
 
@@ -626,11 +714,15 @@ async def test_stepper_state_includes_ventana_fields_from_month_scoping(
     instead of duplicating the rule client-side (the SECOP-drift precedent
     this design was built to avoid)."""
     user = test_user["user"]
-    cuenta = await _make_cuenta(db, contrato, mes=4, anio=2025, fecha_transaccion=date(2025, 4, 15))
+    # mes/anio inside the contrato fixture's vigencia (2024) — H5 makes a month
+    # outside vigencia set advertencia=True, covered by its own test below.
+    cuenta = await _make_cuenta(db, contrato, mes=4, anio=2024, fecha_transaccion=date(2024, 4, 15))
 
     result = await stepper_state_service.obtener_stepper_state(db, user.id, cuenta.id)
 
-    esperado = calcular_ventana_mes(4, 2025, date(2025, 4, 15))
+    esperado = calcular_ventana_mes(
+        4, 2024, date(2024, 4, 15), vigencia_inicio=contrato.fecha_inicio, vigencia_fin=contrato.fecha_fin
+    )
     assert result.ventana_inicio == esperado.fecha_inicio
     assert result.ventana_fin == esperado.fecha_fin
     assert result.ventana_advertencia == esperado.advertencia
@@ -641,13 +733,28 @@ async def test_stepper_state_ventana_advertencia_true_when_fecha_transaccion_bef
     db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
 ) -> None:
     user = test_user["user"]
-    cuenta = await _make_cuenta(db, contrato, mes=4, anio=2025, fecha_transaccion=date(2025, 3, 1))
+    cuenta = await _make_cuenta(db, contrato, mes=4, anio=2024, fecha_transaccion=date(2024, 3, 1))
+
+    result = await stepper_state_service.obtener_stepper_state(db, user.id, cuenta.id)
+
+    assert result.ventana_advertencia is True
+    assert result.ventana_inicio == date(2024, 4, 1)
+    assert result.ventana_fin == date(2024, 4, 30)
+
+
+async def test_stepper_state_ventana_advertencia_true_when_mes_fuera_de_vigencia(
+    db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
+) -> None:
+    """H5: cuota month entirely outside the contract vigencia (fixture: 2024)
+    → server-driven advertencia, never a rejection."""
+    user = test_user["user"]
+    cuenta = await _make_cuenta(db, contrato, mes=4, anio=2025, fecha_transaccion=date(2025, 4, 15))
 
     result = await stepper_state_service.obtener_stepper_state(db, user.id, cuenta.id)
 
     assert result.ventana_advertencia is True
     assert result.ventana_inicio == date(2025, 4, 1)
-    assert result.ventana_fin == date(2025, 4, 30)
+    assert result.ventana_fin == date(2025, 4, 15)
 
 
 # ── B7 Fix 3 — cross-tenant negative test ────────────────────────────────────

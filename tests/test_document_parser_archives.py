@@ -41,6 +41,19 @@ class TestPlainText:
         with pytest.raises(ValueError):
             parse_text(b"\x00\x01\x02\x03\xff\xfe\x00\x00binarypayload\x00")
 
+    def test_decodes_cp1252_before_latin1(self) -> None:
+        """E1 (H1): 0x97 is an em-dash in cp1252 but the C1 control U+0097 in
+        latin-1 — real SECOP text decoded as latin-1 produced mojibake in
+        contratos.objeto. cp1252 must win for the Windows punctuation range."""
+        raw = "objeto del contrato — prestación de servicios".encode("cp1252")
+        assert parse_text(raw) == "objeto del contrato — prestación de servicios"
+        assert "\x97" not in parse_text(raw)
+
+    def test_latin1_sigue_como_fallback_final(self) -> None:
+        """Bytes undefined in cp1252 (e.g. 0x81) still decode via latin-1."""
+        raw = b"texto con byte raro \x81 pero decodificable"
+        assert "\x81" in parse_text(raw)
+
 
 class TestZip:
     def test_expands_zip_members_with_headers(self) -> None:

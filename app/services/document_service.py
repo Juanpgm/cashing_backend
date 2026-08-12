@@ -58,6 +58,7 @@ from app.schemas.agent import (
     LLMMessage,
     ObligacionesLLMList,
     ObligacionExtraida,
+    TipoCorregido,
 )
 from app.schemas.documento_fuente import ContratoConfiguracionResponse, DocumentoFuenteResponse
 
@@ -922,6 +923,65 @@ async def upload_document(
             texto_suficiente = True
             await logger.ainfo("ocr_recovered_text", filename=filename, chars=len(texto_ocr))
 
+    # ── A1 (H3): re-derive tipo by CONTENT when the caller asked for CONTRATO ──
+    # Step-1 upload flows hardcode tipo=contrato, so any PDF (e.g. an RPC) used
+    # to be persisted as CONTRATO and wrongly completed wizard step 1. Only a
+    # DOMINANT content classification (CONTENIDO_SCORE_UNICO) on sufficient text
+    # corrects the tipo; anything weaker fails open and keeps the caller's tipo
+    # (scanned legit contracts must not break). Corrected BEFORE the auto-create/
+    # obligaciones branches below so a mis-typed RPC neither creates a Contrato
+    # nor pollutes obligaciones. Other explicit tipos are never touched.
+    tipo_corregido: TipoCorregido | None = None
+    if tipo == TipoDocumentoFuente.CONTRATO and texto_suficiente and texto_extraido:
+        from app.services.document_classifier import (
+            CONTENIDO_SCORE_UNICO,
+            categoria_a_tipo,
+            clasificar,
+            clasificar_contenido,
+        )
+
+        # Two independent correctors, most reliable first (live case 2026-08-11:
+        # a real "1. RPC.pdf" uploaded as contrato scored registro_presupuestal
+        # 0.750 via the mature name+text `clasificar` — the same R1-R6 scoring
+        # that sets `doc.categoria` — while its TEXT alone never reached
+        # CONTENIDO_SCORE_UNICO, so content-only correction failed open):
+        #   1. `clasificar` (name+text, deny-lists/dominance/priors) at the same
+        #      0.75 bar the SECOP CTA's genuineness gate uses.
+        #   2. `clasificar_contenido` (text-only dominance) for mis-NAMED files.
+        # Guard: a filename that itself carries a contrato signal (e.g.
+        # "contrato_sin_cedula.pdf") must never be name-corrected — fractional
+        # scoring can rank a shorter sibling list (cedula) above CONTRATO even
+        # when "contrato" is present. Those files fall through to the stricter
+        # content-only corrector.
+        _nombre_norm = _normalize_texto(filename or "")
+        _nombre_es_contratoish = any(s in _nombre_norm for s in ("contrato", "clausulado", "minuta"))
+        cat_detectada, cat_confianza = (
+            clasificar(filename, None) if not _nombre_es_contratoish else (CategoriaDocumento.CONTRATO, Decimal("0"))
+        )
+        if cat_detectada in (CategoriaDocumento.CONTRATO, CategoriaDocumento.OTROS) or cat_confianza < Decimal("0.750"):
+            cat_detectada, cat_confianza = clasificar_contenido(texto_extraido)
+            if cat_confianza < CONTENIDO_SCORE_UNICO:
+                cat_detectada = None
+        tipo_detectado = categoria_a_tipo(cat_detectada)
+        if cat_detectada is not None and cat_detectada != CategoriaDocumento.CONTRATO and tipo_detectado is not None:
+            tipo_corregido = TipoCorregido(
+                solicitado=TipoDocumentoFuente.CONTRATO.value,
+                detectado=tipo_detectado,
+                confianza=float(cat_confianza),
+            )
+            tipo = TipoDocumentoFuente(tipo_detectado)
+            avisos.append(
+                f"El contenido del documento corresponde a '{tipo_detectado}', no a un contrato — "
+                "se guardó con el tipo detectado. El paso Contrato sigue pendiente."
+            )
+            await logger.ainfo(
+                "upload_tipo_corregido",
+                filename=filename,
+                solicitado=TipoDocumentoFuente.CONTRATO.value,
+                detectado=tipo_detectado,
+                confianza=float(cat_confianza),
+            )
+
     es_contrato_autocrear = tipo == TipoDocumentoFuente.CONTRATO and contrato_id is None
 
     # ── Hybrid fallback: scanned PDF / image (poor/no text) → vision extraction ──
@@ -1055,7 +1115,11 @@ async def upload_document(
     # Safe: ownership of cuenta_cobro_id was already verified against user_id above
     # (unconditionally, whenever cuenta_cobro_id is not None) — checklist_service
     # itself does not re-check ownership, so callers must guarantee it before invoking it.
-    if cuenta_cobro_id is not None and requisito_codigo is not None:
+    # A1: if the tipo was content-corrected, the caller's requisito_codigo="CONTRATO"
+    # assumption is invalid — do not mark the CONTRATO checklist row CARGADO with a
+    # non-contrato document; auto-link will route it to the right requisito instead.
+    omitir_vinculo_contrato = tipo_corregido is not None and requisito_codigo == "CONTRATO"
+    if cuenta_cobro_id is not None and requisito_codigo is not None and not omitir_vinculo_contrato:
         from app.services import checklist_service
 
         try:
@@ -1084,6 +1148,7 @@ async def upload_document(
         contrato_creado=contrato_creado,
         obligaciones_extraidas=obligaciones_extraidas,
         avisos=avisos,
+        tipo_corregido=tipo_corregido,
     )
 
 

@@ -383,6 +383,15 @@ async def descubrir_evidencias(
         # NOT run at all on that path (evidence-classification-pipeline: Local path
         # never evaluates the provider gate).
         if not await integration_service.has_any_connected_provider(db, usuario_id):
+            # Diagnostic instrumentation (paquete-regenerar-evidencia-nueva, Slice 1)
+            # — was this fail-fast raise on a session left dirty/mid-transaction?
+            # Correlate via `cuenta_id` against a later `regenerate_load_context`.
+            await logger.awarning(
+                "justificaciones_no_provider_connected",
+                cuenta_id=str(req.cuenta_id) if req.cuenta_id else None,
+                session_dirty=bool(db.dirty),
+                session_in_transaction=db.in_transaction(),
+            )
             raise ExternalServiceError(
                 "Integraciones",
                 "Ninguna cuenta está conectada. Conecta Google o Microsoft en "

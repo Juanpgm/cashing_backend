@@ -696,3 +696,190 @@ class TestDocumentUploadAPIAutoCreate:
         data = response.model_dump(mode="json")
         assert data["contrato_id"] is None
         assert data["contrato_creado"] is None
+
+
+# ── A1 (H3): tipo re-derived by content on upload ───────────────────
+
+
+_TEXTO_RPC = (
+    "REGISTRO PRESUPUESTAL DE COMPROMISO No. 4525 RPC\n"
+    "REGISTRO DE COMPROMISO expedido por la Secretaría de Hacienda.\n"
+    "Compromiso presupuestal con cargo al rubro de funcionamiento, "
+    "vigencia fiscal 2025. Valor del compromiso: dieciocho millones de pesos. "
+    "Beneficiario: el contratista identificado como se indica en este registro "
+    "presupuestal. Fecha de expedición: 2 de enero de 2025. RP 4525."
+)
+
+
+class TestUploadTipoCorregido:
+    async def _crear_contrato(self, db: AsyncSession, test_user: dict[str, Any]):
+        from app.models.contrato import Contrato
+
+        c = Contrato(
+            usuario_id=test_user["user"].id,
+            numero_contrato="CTR-A1-001",
+            objeto="Servicios para pruebas A1",
+            valor_total=12_000_000,
+            valor_mensual=1_000_000,
+            fecha_inicio=date(2025, 1, 1),
+            fecha_fin=date(2025, 12, 31),
+            entidad="MinTIC",
+        )
+        db.add(c)
+        await db.commit()
+        await db.refresh(c)
+        return c
+
+    @pytest.mark.asyncio
+    async def test_rpc_subido_como_contrato_persiste_rpc_y_avisa(
+        self, db: AsyncSession, test_user: dict[str, Any]
+    ) -> None:
+        """An RPC uploaded through the step-1 flow (hardcoded tipo=contrato) must
+        be persisted with the DETECTED tipo and surface `tipo_corregido`."""
+        from app.models.documento_fuente import DocumentoFuente
+        from app.services.document_service import upload_document
+        from sqlalchemy import select
+
+        contrato = await self._crear_contrato(db, test_user)
+
+        with (
+            patch(_PATCH_PARSE_PDF, return_value=_TEXTO_RPC),
+            patch(_PATCH_S3) as mock_storage_cls,
+        ):
+            mock_storage = AsyncMock()
+            mock_storage.upload = AsyncMock()
+            mock_storage_cls.return_value = mock_storage
+
+            result = await upload_document(
+                db=db,
+                user_id=test_user["user"].id,
+                filename="1_RPC.pdf",
+                content=b"fake pdf content",
+                content_type="application/pdf",
+                tipo="contrato",
+                contrato_id=contrato.id,
+            )
+
+        assert result.tipo == "rpc"
+        assert result.tipo_corregido is not None
+        assert result.tipo_corregido.solicitado == "contrato"
+        assert result.tipo_corregido.detectado == "rpc"
+        # Name-based corrector (clasificar, R1-R6) fires first at the 0.75 bar;
+        # the content-only corrector (>= 0.85) is the fallback for mis-named files.
+        assert result.tipo_corregido.confianza >= 0.75
+        # No garbage obligaciones extracted from an RPC.
+        assert result.obligaciones_extraidas == []
+
+        doc = (await db.execute(select(DocumentoFuente).where(DocumentoFuente.id == result.id))).scalar_one()
+        assert doc.tipo.value == "rpc"
+
+    @pytest.mark.asyncio
+    async def test_rpc_por_nombre_con_texto_debil_tambien_corrige(
+        self, db: AsyncSession, test_user: dict[str, Any]
+    ) -> None:
+        """Live case 2026-08-11: the real '1. RPC.pdf' has text that never reaches
+        the content-dominance bar — the NAME alone (clasificar, 0.750) must still
+        correct the tipo. Weak/neutral text, RPC-named file → corrected."""
+        from app.models.documento_fuente import DocumentoFuente
+        from app.services.document_service import upload_document
+        from sqlalchemy import select
+
+        contrato = await self._crear_contrato(db, test_user)
+        texto_neutro = (
+            "Alcaldía de Santiago de Cali. Documento oficial del proceso. "
+            "Fecha de expedición: 27 de enero. Valor total en pesos colombianos. "
+            "Este documento hace parte del expediente del proceso administrativo. " * 3
+        )
+
+        with (
+            patch(_PATCH_PARSE_PDF, return_value=texto_neutro),
+            patch(_PATCH_S3) as mock_storage_cls,
+        ):
+            mock_storage = AsyncMock()
+            mock_storage.upload = AsyncMock()
+            mock_storage_cls.return_value = mock_storage
+
+            result = await upload_document(
+                db=db,
+                user_id=test_user["user"].id,
+                filename="1_RPC.pdf",
+                content=b"fake pdf content",
+                content_type="application/pdf",
+                tipo="contrato",
+                contrato_id=contrato.id,
+            )
+
+        assert result.tipo == "rpc"
+        assert result.tipo_corregido is not None
+        doc = (await db.execute(select(DocumentoFuente).where(DocumentoFuente.id == result.id))).scalar_one()
+        assert doc.tipo.value == "rpc"
+
+    @pytest.mark.asyncio
+    async def test_texto_insuficiente_respeta_tipo_del_caller(
+        self, db: AsyncSession, test_user: dict[str, Any]
+    ) -> None:
+        """FAIL-OPEN: a scanned/empty document keeps the caller's tipo=contrato —
+        legit scanned contracts must not break. `.txt` avoids the multimodal
+        fallback (not a vision-supported mime)."""
+        from app.services.document_service import upload_document
+
+        contrato = await self._crear_contrato(db, test_user)
+
+        with patch(_PATCH_S3) as mock_storage_cls:
+            mock_storage = AsyncMock()
+            mock_storage.upload = AsyncMock()
+            mock_storage_cls.return_value = mock_storage
+
+            result = await upload_document(
+                db=db,
+                user_id=test_user["user"].id,
+                filename="contrato_escaneado.txt",
+                content=b"x",
+                content_type="text/plain",
+                tipo="contrato",
+                contrato_id=contrato.id,
+            )
+
+        assert result.tipo == "contrato"
+        assert result.tipo_corregido is None
+
+    @pytest.mark.asyncio
+    async def test_contrato_real_mantiene_tipo_contrato(self, db: AsyncSession, test_user: dict[str, Any]) -> None:
+        """A genuine contrato text keeps tipo=contrato, no correction field."""
+        from app.services.document_service import upload_document
+
+        contrato = await self._crear_contrato(db, test_user)
+
+        texto_contrato = (
+            "CONTRATO DE PRESTACIÓN DE SERVICIOS PROFESIONALES No. CTR-A1-001. "
+            "Minuta y clausulado del contrato celebrado entre el Ministerio de TIC y el "
+            "contratista. OBJETO: prestación de servicios profesionales. VALOR TOTAL: "
+            "doce millones de pesos. PLAZO: del 1 de enero al 31 de diciembre de 2025. "
+            "OBLIGACIONES ESPECÍFICAS del contratista según el presente clausulado."
+        )
+        llm_response = LLMResponse(content="OBLIGACION|especifica|Prestar el servicio\n", model="t", total_tokens=10)
+
+        with (
+            patch(_PATCH_PARSE_PDF, return_value=texto_contrato),
+            patch(_PATCH_GET_LLM) as mock_get_llm,
+            patch(_PATCH_S3) as mock_storage_cls,
+        ):
+            mock_llm = AsyncMock()
+            mock_llm.complete = AsyncMock(return_value=llm_response)
+            mock_get_llm.return_value = mock_llm
+            mock_storage = AsyncMock()
+            mock_storage.upload = AsyncMock()
+            mock_storage_cls.return_value = mock_storage
+
+            result = await upload_document(
+                db=db,
+                user_id=test_user["user"].id,
+                filename="contrato_real.pdf",
+                content=b"fake pdf content",
+                content_type="application/pdf",
+                tipo="contrato",
+                contrato_id=contrato.id,
+            )
+
+        assert result.tipo == "contrato"
+        assert result.tipo_corregido is None

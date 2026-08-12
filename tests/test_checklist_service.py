@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 from app.models.actividad import Actividad
+from app.models.categoria_documento import CategoriaDocumento
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
 from app.models.documento_cuenta_cobro import (
@@ -20,6 +21,7 @@ from app.models.evidencia import Evidencia
 from app.models.obligacion import Obligacion, TipoObligacion
 from app.models.secop import SecopDocumento
 from app.services import checklist_service
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 pytestmark = pytest.mark.asyncio
@@ -238,6 +240,72 @@ async def test_new_cuenta_does_not_inherit_old_cuenta_links(
     assert (await _fila(cuenta2.id, "CONTRATO")).estado == EstadoRequisito.CARGADO
     # Cuenta-level SEGURIDAD_SOCIAL (scoped to cuenta1) never leaks into cuenta2.
     assert (await _fila(cuenta2.id, "SEGURIDAD_SOCIAL")).estado == EstadoRequisito.PENDIENTE
+
+
+# ── C1 (H8): explicit tipo is a first-class auto-link signal ────────────────
+
+
+def test_score_fuente_tipo_explicito_alcanza_0950() -> None:
+    """A user-declared tipo (content-verified for CONTRATO per A1) scores 0.950 —
+    at least as strong as any non-override categoria confianza (classifier CAP),
+    still below the manual-override 1.000."""
+    doc = DocumentoFuente(
+        tipo=TipoDocumentoFuente.INFORME_ACTIVIDADES,
+        categoria=CategoriaDocumento.OTROS,
+        nombre="informe.pdf",
+        storage_key="k/i",
+    )
+    assert checklist_service._score_fuente_para_requisito(doc, "INFORME_ACTIVIDADES") == Decimal("0.950")
+
+
+def test_score_fuente_tipo_contrato_default_mantiene_0750() -> None:
+    """tipo=contrato is the upload endpoint's DEFAULT — not a deliberate
+    declaration — so it keeps the old 0.750 and never outranks a genuine
+    high-confidence categoria for the CONTRATO row."""
+    doc = DocumentoFuente(
+        tipo=TipoDocumentoFuente.CONTRATO,
+        categoria=CategoriaDocumento.OTROS,
+        nombre="x.pdf",
+        storage_key="k/x",
+    )
+    assert checklist_service._score_fuente_para_requisito(doc, "CONTRATO") == Decimal("0.750")
+
+
+async def test_auto_vincular_tipo_explicito_con_categoria_otros(
+    db: AsyncSession, contrato: Contrato, test_user: dict[str, Any]
+) -> None:
+    """Live case 027.2025: docs uploaded with an exact tipo (INFORME_ACTIVIDADES)
+    but categoria='otros' stayed Pendiente — the explicit tipo alone must
+    auto-link them to their requisito."""
+    user = test_user["user"]
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    await checklist_service.asegurar_checklist(db, cuenta)
+    await db.commit()
+
+    doc = DocumentoFuente(
+        usuario_id=user.id,
+        contrato_id=contrato.id,
+        cuenta_cobro_id=cuenta.id,
+        storage_key="k/informe",
+        nombre="documento sin señales en el nombre.pdf",
+        tipo=TipoDocumentoFuente.INFORME_ACTIVIDADES,
+        categoria=CategoriaDocumento.OTROS,
+    )
+    db.add(doc)
+    await db.commit()
+
+    await checklist_service.auto_vincular_documentos_fuente(db, cuenta)
+    await db.commit()
+
+    r = await db.execute(
+        select(DocumentoCuentaCobro).where(
+            DocumentoCuentaCobro.cuenta_cobro_id == cuenta.id,
+            DocumentoCuentaCobro.requisito_codigo == "INFORME_ACTIVIDADES",
+        )
+    )
+    fila = r.scalar_one()
+    assert fila.estado == EstadoRequisito.CARGADO
+    assert fila.documento_fuente_id == doc.id
 
 
 # ── detectar_desde_secop ───────────────────────────────────────────────────

@@ -131,7 +131,11 @@ def parse_text(content: bytes) -> str:
     Raises ValueError if the bytes don't look like text (too many undecodable bytes),
     so archives/binaries don't masquerade as empty documents.
     """
-    for encoding in ("utf-8", "utf-8-sig", "latin-1"):
+    # cp1252 before latin-1: for bytes 0x80-0x9F cp1252 maps to real punctuation
+    # (em-dash, curly quotes) while latin-1 maps to C1 control chars — real SECOP
+    # text decoded as latin-1 produced U+0097 mojibake in contratos.objeto (H1).
+    # latin-1 stays last as the never-fails fallback (cp1252 rejects 0x81/0x8D/…).
+    for encoding in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
         try:
             decoded = content.decode(encoding)
         except (UnicodeDecodeError, LookupError):

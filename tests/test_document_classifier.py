@@ -12,6 +12,7 @@ from app.services.document_classifier import (
     CONTENIDO_SCORE_AMBIGUO,
     TIPO_A_REQUISITO,
     aplicar_clasificacion,
+    categoria_a_tipo,
     clasificar,
     clasificar_contenido,
     extraer_texto_contenido,
@@ -146,10 +147,7 @@ def test_clasificar_secondary_only_con_tipo_hint_no_alcanza_auto_link():
     (+0.100) must never reach AUTO_LINK_THRESHOLD (0.700) — a secondary-only
     (zero PRIMARY hits) match must never auto-link, per the documented
     SECONDARY_ONLY_CAP invariant. Pre-fix this landed exactly on 0.700."""
-    nombre = (
-        "contract condiciones generales condiciones especiales "
-        "acuerdo de prestacion prestacion de servicios.pdf"
-    )
+    nombre = "contract condiciones generales condiciones especiales acuerdo de prestacion prestacion de servicios.pdf"
     cat, score = clasificar(nombre, None, tipo_hint="contrato")
     assert cat == CategoriaDocumento.CONTRATO
     assert score == Decimal("0.600")
@@ -230,6 +228,53 @@ def test_clasificar_contrato_legitimo_no_es_afectado_por_deny_list():
     cat, score = clasificar("Contrato de prestación de servicios 123.pdf", None)
     assert cat == CategoriaDocumento.CONTRATO
     assert score >= Decimal("0.700")
+
+
+# ── A3 (H7): cierre/complemento/estudios-previos names are NOT the contrato ──
+
+
+@pytest.mark.parametrize(
+    "nombre",
+    [
+        # Real SECOP names from the 2026-08-11 audit sweep — all were tagged
+        # categoria=contrato because their name contains "contrato"/"cto".
+        "CIERRE CTO 320 DE 2023.pdf",
+        "Acta de cierre de contrato 320.pdf",
+        "Complemento al contrato - ART. 111.pdf",
+        "ESTUDIOS PREVIOS CTO 320.pdf",
+        "Modificación: Cierre contrato.pdf",
+        "Designación de supervisión del contrato.pdf",
+        "Certificado de idoneidad del contratista cto 320.pdf",
+    ],
+)
+def test_clasificar_excluye_contrato_para_nombres_de_cierre_y_afines(nombre):
+    cat, _score = clasificar(nombre, None)
+    assert cat != CategoriaDocumento.CONTRATO
+
+
+@pytest.mark.parametrize(
+    "nombre",
+    [
+        "CLAUSULADO CTO 320 DE 2023.pdf",
+        "Minuta del contrato 320.pdf",
+        "Contrato firmado 320.pdf",
+        # Strong signal wins even when an exclude phrase co-occurs.
+        "Modificación al clausulado del contrato.pdf",
+    ],
+)
+def test_clasificar_mantiene_contrato_para_nombres_genuinos(nombre):
+    cat, _score = clasificar(nombre, None)
+    assert cat == CategoriaDocumento.CONTRATO
+
+
+def test_categoria_a_tipo_mapea_via_requisito():
+    """A1 helper: categoria → TipoDocumentoFuente value; EVIDENCIAS/OTROS → None."""
+    assert categoria_a_tipo(CategoriaDocumento.REGISTRO_PRESUPUESTAL) == "rpc"
+    assert categoria_a_tipo(CategoriaDocumento.CDP) == "cdp"
+    assert categoria_a_tipo(CategoriaDocumento.SEGURIDAD_SOCIAL) == "seguridad_social"
+    assert categoria_a_tipo(CategoriaDocumento.EVIDENCIAS) is None
+    assert categoria_a_tipo(CategoriaDocumento.OTROS) is None
+    assert categoria_a_tipo(None) is None
 
 
 def test_clasificar_contenido_pago_demueve_contrato_a_0600():

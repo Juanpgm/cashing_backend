@@ -26,8 +26,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.adapters.storage import get_storage as _get_storage
 from app.core.config import settings
 from app.core.exceptions import NotFoundError, ValidationError
+from app.core.file_validation import get_safe_filename
 from app.core.secop_http import SECOP_BROWSER_USER_AGENT
 from app.core.text_match import keyword_score as _keyword_score
 from app.core.text_match import similar as _similar
@@ -42,7 +44,7 @@ from app.models.documento_cuenta_cobro import (
     DocumentoRequisitoVinculo,
     EstadoRequisito,
 )
-from app.models.documento_fuente import DocumentoFuente
+from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
 from app.models.obligacion import Obligacion
 from app.models.requisito_cuenta import RequisitoCuenta
 from app.models.requisito_documento import RequisitoDocumento
@@ -504,9 +506,12 @@ async def _detectar_alias_cdp(
     created when not already present.
 
     Two cases:
-      1. RPC-folded: a document already linked to the RPC row whose name/text
-         also mentions CDP keywords gets an ADDITIONAL link to the CDP row.
-         The RPC link is untouched.
+      1. RPC-folded: a document already linked to the RPC row whose NAME also
+         mentions CDP keywords gets an ADDITIONAL link to the CDP row. The RPC
+         link is untouched. NAME only (C2/H11, 2026-08-11): an RPC routinely
+         cites its CDP in the TEXT, so a text match over-linked every plain RPC
+         to the CDP row too — the legit combined-document case ships both
+         acronyms in the filename.
       2. Custom-requisito alias: a custom ``RequisitoCuenta`` whose label or
          own keywords mention CDP gets its linked documents ALSO linked to the
          standard CDP row. The custom row and its links are left in place.
@@ -571,9 +576,8 @@ async def _detectar_alias_cdp(
                 if v.documento_fuente_id in linked_fuente_ids:
                     continue
                 doc = await db.get(DocumentoFuente, v.documento_fuente_id)
-                if doc is not None and _matches_alias_keywords(
-                    cdp_req.keywords_deteccion, doc.nombre, doc.texto_extraido
-                ):
+                # NAME only — see case 1 in the docstring (never texto_extraido).
+                if doc is not None and _matches_alias_keywords(cdp_req.keywords_deteccion, doc.nombre):
                     _enlazar(documento_fuente_id=doc.id)
             elif v.secop_documento_id is not None:
                 if v.secop_documento_id in linked_secop_ids:
@@ -1019,6 +1023,97 @@ async def _asegurar_texto_extraido_manual(doc: SecopDocumento) -> None:
         )
     doc.texto_extraido = texto[:TEXTO_EXTRAIDO_MAX_CHARS]
     doc.texto_estado = "ok"
+
+
+async def _persistir_contrato_documento_si_falta(
+    db: AsyncSession, user_id: uuid.UUID, contrato_id: uuid.UUID, doc: SecopDocumento
+) -> None:
+    """Persists the SECOP doc Vincular just used to extract obligaciones as the
+    contract's CONTRATO-typed DocumentoFuente, if one doesn't already exist.
+
+    Live-reproduced bug: `extraer_obligaciones_desde_secop_doc` downloads the
+    doc's bytes to extract text/obligaciones but discards them — Checklist
+    (which correctly reads `DocumentoFuente` directly, since that's what the
+    physical radicación package needs) never learns the document was
+    provided. Persistence-only: does NOT re-run text/OCR/vision extraction
+    (`doc.texto_extraido` is already populated by the caller) or re-extract
+    obligaciones (already done, would duplicate `Obligacion` rows) — this
+    only stores the bytes + creates the DB record, mirroring
+    `secop_scraper_service.py`'s persistence call (~line 309) minus its
+    extraction side effects. Best-effort: logs and swallows any failure
+    (network, storage) rather than raising — a persistence hiccup here must
+    never break the obligaciones-extraction the user is actually waiting on.
+    """
+    existing = await db.execute(
+        select(DocumentoFuente).where(
+            DocumentoFuente.contrato_id == contrato_id,
+            DocumentoFuente.cuenta_cobro_id.is_(None),
+            DocumentoFuente.tipo == TipoDocumentoFuente.CONTRATO,
+        )
+    )
+    if existing.scalar_one_or_none() is not None:
+        return
+
+    if not doc.url_descarga:
+        await logger.awarning(
+            "contrato_documento_persistencia_fallida",
+            contrato_id=str(contrato_id),
+            secop_documento_id=str(doc.id),
+            error="documento sin url_descarga",
+        )
+        return
+
+    try:
+        data = await _descargar_secop_bytes(doc.url_descarga, _VINCULAR_HTTP_TIMEOUT)
+    except Exception as exc:
+        await logger.awarning(
+            "contrato_documento_persistencia_fallida",
+            contrato_id=str(contrato_id),
+            secop_documento_id=str(doc.id),
+            error=str(exc),
+        )
+        return
+
+    # Function-level import: multimodal_parser is only needed for mime sniffing here
+    # (mirrors the function-level import convention already used in this module).
+    from app.agent.tools.multimodal_parser import guess_mime_type
+
+    filename = doc.nombre_archivo or "documento"
+    safe_filename = get_safe_filename(filename)
+    storage_key = f"usuarios/{user_id}/documentos/{uuid.uuid4()}/{safe_filename}"
+    try:
+        storage = _get_storage(settings.S3_BUCKET_DOCUMENTOS)
+        await storage.upload(key=storage_key, data=data, content_type=guess_mime_type(filename))
+    except Exception as exc:
+        await logger.awarning(
+            "contrato_documento_persistencia_fallida",
+            contrato_id=str(contrato_id),
+            secop_documento_id=str(doc.id),
+            error=str(exc),
+        )
+        return
+
+    try:
+        nuevo_doc = DocumentoFuente(
+            usuario_id=user_id,
+            contrato_id=contrato_id,
+            cuenta_cobro_id=None,
+            storage_key=storage_key,
+            nombre=safe_filename,
+            tipo=TipoDocumentoFuente.CONTRATO,
+            texto_extraido=doc.texto_extraido,
+            categoria=doc.categoria,
+        )
+        db.add(nuevo_doc)
+        await db.commit()
+    except Exception as exc:
+        await db.rollback()
+        await logger.awarning(
+            "contrato_documento_persistencia_fallida",
+            contrato_id=str(contrato_id),
+            secop_documento_id=str(doc.id),
+            error=str(exc),
+        )
 
 
 def _score_contenido_para_requisito(doc: SecopDocumento, req_codigo: str) -> Decimal | None:
@@ -1949,6 +2044,17 @@ async def set_observaciones(
 # and we want to cover requisitos without CategoriaDocumento.
 _AUTO_LINK_FUENTE_THRESHOLD = Decimal("0.700")
 
+# C1 (H8, 2026-08-11): an explicit tipo (user-declared at upload, content-verified
+# for CONTRATO per A1) is at least as strong as any non-override categoria score
+# (classifier CAP is 0.950) — a doc with tipo=INFORME_ACTIVIDADES must auto-link
+# to its requisito even when categoria says "otros" or a misclassification carries
+# a high confianza. Below the manual-override 1.000 ceiling.
+_TIPO_EXPLICITO_SCORE = Decimal("0.950")
+# tipo=contrato keeps the old weight: it is the upload endpoint's DEFAULT query
+# value, not a deliberate user declaration, so it must not outrank a genuine
+# categoria signal competing for the CONTRATO row.
+_TIPO_CONTRATO_SCORE = Decimal("0.750")
+
 
 def _score_fuente_para_requisito(doc: DocumentoFuente, req_codigo: str) -> Decimal:
     """Multi-signal score (0.000-1.000) for assigning a DocumentoFuente to a checklist row.
@@ -1956,10 +2062,10 @@ def _score_fuente_para_requisito(doc: DocumentoFuente, req_codigo: str) -> Decim
     Signal priority (highest score wins):
       1. categoria_override=True + categoria maps to req_codigo → 1.000
       2. categoria != OTROS + maps to req_codigo → categoria_confianza (or 0.500 floor)
-      3. tipo declared by user maps to req_codigo → 0.750
+      3. tipo declared by user maps to req_codigo → 0.950 (0.750 for the defaulted
+         tipo=contrato — see _TIPO_EXPLICITO_SCORE/_TIPO_CONTRATO_SCORE)
 
-    When signals 2 and 3 both fire (categoria + tipo both match), the higher score wins,
-    which means a high-confidence categoria classification beats the fixed tipo score.
+    When signals 2 and 3 both fire (categoria + tipo both match), the higher score wins.
     """
     best = Decimal("0.000")
 
@@ -1975,7 +2081,7 @@ def _score_fuente_para_requisito(doc: DocumentoFuente, req_codigo: str) -> Decim
     # Signal 3: user-declared tipo (reliable declarative intent)
     tipo_val = doc.tipo.value if hasattr(doc.tipo, "value") else str(doc.tipo)
     if TIPO_A_REQUISITO.get(tipo_val) == req_codigo:
-        best = max(best, Decimal("0.750"))
+        best = max(best, _TIPO_CONTRATO_SCORE if tipo_val == "contrato" else _TIPO_EXPLICITO_SCORE)
 
     return best
 
@@ -2193,6 +2299,7 @@ async def listar_arbol_evidencias(db: AsyncSession, cuenta: CuentaCobro) -> list
                     {
                         "id": str(a.id),
                         "descripcion": a.descripcion,
+                        "justificacion": a.justificacion,
                         "evidencias": [
                             {
                                 "id": str(e.id),
@@ -2373,13 +2480,33 @@ async def construir_checklist_completo(
     # EVIDENCIAS is derived state: no evidencia-attachment path updates its
     # persisted row, so derive its effective estado from actual coverage —
     # same LISTO semantics as informe_service._calcular_estado_obligaciones:
-    # every obligación has >= 1 evidencia (uploaded file or external link)
-    # across its actividades. In-memory only (nothing persisted): a manual
-    # NO_APLICA/CUMPLIDO_MANUAL override wins, and losing coverage later
-    # simply stops the override (the row is still PENDIENTE on disk).
+    # every obligación has >= 1 evidencia across its actividades, OR a
+    # CONFIRMED evidencia_obligacion link, OR a real (non-sentinel)
+    # justificación (H13/D1 parity, 2026-08-12: this derivation was the third
+    # copy of the pre-link-table rule — an evidencia confirmed to an obligación
+    # after upload lives on the shared "sin clasificar" stub, so counting only
+    # actividad-attached evidencias left EVIDENCIAS PENDIENTE and blocked
+    # preparar_radicacion while steps 4/7 reported complete). In-memory only
+    # (nothing persisted): a manual NO_APLICA/CUMPLIDO_MANUAL override wins,
+    # and losing coverage later simply stops the override (the row is still
+    # PENDIENTE on disk).
+    from app.services.informe_service import (
+        _obligaciones_con_link_confirmado,
+        _tiene_justificacion_real,
+    )
+
     arbol = await listar_arbol_evidencias(db, cuenta)
+    con_link = await _obligaciones_con_link_confirmado(db, cuenta.id)
     estado_overrides: dict[str, EstadoRequisito] = {}
-    cobertura_completa = bool(arbol) and all(any(act["evidencias"] for act in ob["actividades"]) for ob in arbol)
+
+    def _ob_cubierta(ob: dict) -> bool:
+        if any(act["evidencias"] for act in ob["actividades"]):
+            return True
+        if uuid.UUID(ob["obligacion_id"]) in con_link:
+            return True
+        return any(_tiene_justificacion_real(act.get("justificacion")) for act in ob["actividades"])
+
+    cobertura_completa = bool(arbol) and all(_ob_cubierta(ob) for ob in arbol)
     if cobertura_completa and any(
         f.requisito_codigo == "EVIDENCIAS" and f.estado == EstadoRequisito.PENDIENTE for f in filas
     ):

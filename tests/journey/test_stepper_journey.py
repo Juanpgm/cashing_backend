@@ -66,6 +66,10 @@ class _FakeStorage:
     async def list_objects(self, prefix: str) -> list[StorageObjectInfo]:
         return [StorageObjectInfo(key=k, size_bytes=len(v)) for k, v in self._objects.items() if k.startswith(prefix)]
 
+    async def stat(self, key: str) -> StorageObjectInfo | None:
+        data = self._objects.get(key)
+        return StorageObjectInfo(key=key, size_bytes=len(data)) if data is not None else None
+
 
 @pytest.fixture
 async def contrato(db: AsyncSession, test_user: dict[str, Any]) -> Contrato:
@@ -130,18 +134,13 @@ async def _add_documento_contrato(
 
 
 async def _contrato_completo(db: AsyncSession, contrato: Contrato, usuario_id: Any) -> None:
-    """Satisfy step 1's nivel-contrato mandatory docs (contract-level uploads):
-    CONTRATO + RPC (every cuenta) plus CEDULA/RUT/ACTA_INICIO (obligatorio +
-    solo_primera_cuenta — required because the API-created cuota below is the
-    contrato's first, hence posicion=PRIMERA)."""
-    for tipo in (
-        TipoDocumentoFuente.CONTRATO,
-        TipoDocumentoFuente.RPC,
-        TipoDocumentoFuente.CEDULA,
-        TipoDocumentoFuente.RUT,
-        TipoDocumentoFuente.ACTA_INICIO,
-    ):
-        await _add_documento_contrato(db, usuario_id=usuario_id, contrato_id=contrato.id, tipo=tipo)
+    """Satisfy step 1's completeness predicate: a contract-level CONTRATO
+    upload (narrowed rule — see `stepper_state_service._step1_contrato`'s
+    docstring; RPC/CEDULA/RUT/ACTA_INICIO are no longer required here, only
+    at the step-3 checklist gate)."""
+    await _add_documento_contrato(
+        db, usuario_id=usuario_id, contrato_id=contrato.id, tipo=TipoDocumentoFuente.CONTRATO
+    )
 
 
 # ── B6.1a — read-only guarantee: stepper-state + GET /paquete in sequence ──

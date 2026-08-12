@@ -73,6 +73,7 @@ async def _make_documento_fuente(
     cuenta: CuentaCobro,
     nombre: str,
     tipo: TipoDocumentoFuente = TipoDocumentoFuente.RPC,
+    texto_extraido: str | None = None,
 ) -> DocumentoFuente:
     df = DocumentoFuente(
         usuario_id=test_user["user"].id,
@@ -81,6 +82,7 @@ async def _make_documento_fuente(
         storage_key=f"k/{nombre}",
         nombre=nombre,
         tipo=tipo,
+        texto_extraido=texto_extraido,
     )
     db.add(df)
     await db.commit()
@@ -216,6 +218,35 @@ async def test_alias_detection_no_folds_rpc_document_sin_keywords_cdp(
     cdp_fila = await _fila(db, cuenta.id, codigo="CDP")
     cdp_vinculos = await _vinculos_de(db, cdp_fila.id)
     assert cdp_vinculos == []
+
+
+async def test_alias_detection_no_folds_rpc_que_solo_cita_cdp_en_texto(
+    db: AsyncSession, contrato: Contrato, test_user: dict[str, Any]
+) -> None:
+    """C2 (H11): an RPC ROUTINELY cites its CDP in the extracted TEXT — that
+    citation alone must not duplicate the link to the CDP row. Only a NAME
+    match folds (the legit combined document ships both acronyms in its name,
+    covered by `test_alias_detection_links_rpc_folded_cdp_document_…`)."""
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    await checklist_service.asegurar_checklist(db, cuenta)
+    await db.commit()
+
+    df = await _make_documento_fuente(
+        db,
+        test_user,
+        contrato,
+        cuenta,
+        "rpc-compromiso-presupuestal.pdf",
+        texto_extraido="Registro presupuestal con cargo al CDP No. 045 de disponibilidad presupuestal vigente.",
+    )
+    await checklist_service.vincular_documento_fuente(db, cuenta.id, "RPC", df.id)
+    await db.commit()
+
+    await checklist_service.asegurar_checklist(db, cuenta)
+    await db.commit()
+
+    cdp_fila = await _fila(db, cuenta.id, codigo="CDP")
+    assert await _vinculos_de(db, cdp_fila.id) == []
 
 
 async def test_alias_detection_es_idempotente_sin_duplicar_vinculos(

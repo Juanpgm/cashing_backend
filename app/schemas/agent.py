@@ -164,6 +164,15 @@ class ContratoBaseVeredicto(BaseModel):
     razon: str = ""
 
 
+class TipoCorregido(BaseModel):
+    """A1 (H3): upload requested tipo=contrato but the content classifier detected a
+    different document type with dominant confidence — the persisted tipo was corrected."""
+
+    solicitado: str
+    detectado: str
+    confianza: float
+
+
 class DocumentUploadResponse(BaseModel):
     id: uuid.UUID
     nombre: str
@@ -184,6 +193,13 @@ class DocumentUploadResponse(BaseModel):
     avisos: list[str] = Field(
         default_factory=list,
         description="Advertencias o errores durante la extracción automática (LLM, parsing, etc.)",
+    )
+    tipo_corregido: TipoCorregido | None = Field(
+        default=None,
+        description=(
+            "Presente solo cuando se pidió tipo=contrato pero el contenido del documento "
+            "corresponde a otro tipo con confianza dominante — `tipo` refleja el valor corregido."
+        ),
     )
 
     model_config = {"from_attributes": True}
