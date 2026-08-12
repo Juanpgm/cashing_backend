@@ -10,6 +10,7 @@ from __future__ import annotations
 import uuid
 from datetime import date
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from app.core.exceptions import NotFoundError, ValidationError
@@ -209,9 +210,7 @@ async def test_persistir_reemplaza_justificacion_existente(db: AsyncSession, sce
     assert existente.justificacion == "Justificación generada por el agente."
 
 
-async def test_persistir_generacion_vacia_no_borra_texto_existente(
-    db: AsyncSession, scenario: dict[str, Any]
-) -> None:
+async def test_persistir_generacion_vacia_no_borra_texto_existente(db: AsyncSession, scenario: dict[str, Any]) -> None:
     obligacion, cuenta = scenario["obligacion"], scenario["cuenta"]
     user = scenario["user"]
 
@@ -232,6 +231,62 @@ async def test_persistir_generacion_vacia_no_borra_texto_existente(
     await db.refresh(existente)
     assert existente.descripcion == "Descripción previa."
     assert existente.justificacion == "Justificación previa."
+
+
+async def test_persistir_seed_no_pisa_justificacion_real(db: AsyncSession, scenario: dict[str, Any]) -> None:
+    """Workstream B (B3): a `seed`-origin incoming justificación must NEVER overwrite
+    an existing `llm`/`manual` one — the seed fallback would silently discard real
+    Gemini-authored text on a later, degraded regeneration."""
+    obligacion, cuenta = scenario["obligacion"], scenario["cuenta"]
+    user = scenario["user"]
+
+    existente = Actividad(
+        cuenta_cobro_id=cuenta.id,
+        obligacion_id=obligacion.id,
+        descripcion=obligacion.descripcion,
+        justificacion="Justificación real de Gemini.",
+        justificacion_origen="llm",
+    )
+    db.add(existente)
+    await db.commit()
+    await db.refresh(existente)
+
+    entrada = [_obligacion_justificada(obligacion, justificacion="Texto seed degradado.")]
+    entrada[0].origen = "seed"
+    summary = await evidence_persist_service.persistir_evidencias(db, user.id, cuenta.id, entrada)
+
+    assert summary.actividades_actualizadas == 0
+    await db.refresh(existente)
+    assert existente.justificacion == "Justificación real de Gemini."
+    assert existente.justificacion_origen == "llm"
+
+
+async def test_persistir_llm_pisa_justificacion_seed_existente(db: AsyncSession, scenario: dict[str, Any]) -> None:
+    """Workstream B (B3): `llm`/`manual`-origin incoming text SHOULD replace an
+    existing `seed` one — preserves the pre-existing "regenerate discards the
+    draft" behavior for genuinely real text."""
+    obligacion, cuenta = scenario["obligacion"], scenario["cuenta"]
+    user = scenario["user"]
+
+    existente = Actividad(
+        cuenta_cobro_id=cuenta.id,
+        obligacion_id=obligacion.id,
+        descripcion=obligacion.descripcion,
+        justificacion="Texto seed anterior.",
+        justificacion_origen="seed",
+    )
+    db.add(existente)
+    await db.commit()
+    await db.refresh(existente)
+
+    entrada = [_obligacion_justificada(obligacion, justificacion="Justificación real de Gemini.")]
+    entrada[0].origen = "llm"
+    summary = await evidence_persist_service.persistir_evidencias(db, user.id, cuenta.id, entrada)
+
+    assert summary.actividades_actualizadas == 1
+    await db.refresh(existente)
+    assert existente.justificacion == "Justificación real de Gemini."
+    assert existente.justificacion_origen == "llm"
 
 
 async def test_persistir_usa_actividad_no_descripcion_ni_justificacion(
@@ -492,3 +547,150 @@ async def test_persistir_endpoint_acepta_link_https(client, db: AsyncSession, te
     )
 
     assert resp.status_code == 200
+
+
+# ── A1: snapshot real bytes for discovered evidence (Problema A) ──────────────
+
+
+def _fake_storage_upload_ok() -> AsyncMock:
+    storage = AsyncMock()
+    storage.upload = AsyncMock(return_value="fake/key")
+    return storage
+
+
+async def test_persistir_email_con_attachment_id_descarga_bytes_reales(
+    db: AsyncSession, scenario: dict[str, Any]
+) -> None:
+    """A `source="email"` link carrying `message_id`+`attachment_id` must download
+    the real bytes via `EmailPort.get_attachment` and set `storage_key`/`tipo_archivo`
+    /`tamano_bytes` on the persisted Evidencia — not just store the link."""
+    user, obligacion, cuenta = scenario["user"], scenario["obligacion"], scenario["cuenta"]
+    contenido = b"contenido real del adjunto de gmail"
+
+    entrada = [
+        _obligacion_justificada(obligacion),
+    ]
+    entrada[0].evidencias = [
+        EvidenceLink(
+            source="email",
+            titulo="Informe mensual",
+            link="https://mail.google.com/mail/u/0/#all/m1",
+            fecha="2024-03-10",
+            provider="google",
+            message_id="m1",
+            attachment_id="a1",
+            mime_type="application/pdf",
+        )
+    ]
+
+    storage = _fake_storage_upload_ok()
+    gmail = AsyncMock()
+    gmail.get_attachment = AsyncMock(return_value=contenido)
+
+    with (
+        patch("app.adapters.email.gmail_adapter.GmailAdapter", return_value=gmail),
+        patch("app.services.informe_service.get_evidencia_storage", return_value=storage),
+    ):
+        summary = await evidence_persist_service.persistir_evidencias(db, user.id, cuenta.id, entrada)
+
+    assert summary.evidencias_creadas == 1
+    gmail.get_attachment.assert_awaited_once_with(user.id, "m1", "a1")
+    storage.upload.assert_awaited_once()
+    _, kwargs = storage.upload.call_args
+    assert kwargs["data"] == contenido
+    assert kwargs["content_type"] == "application/pdf"
+
+    result = await db.execute(select(Evidencia).join(Actividad).where(Actividad.obligacion_id == obligacion.id))
+    evidencia = result.scalars().one()
+    assert evidencia.storage_key is not None and evidencia.storage_key.startswith("evidencias/")
+    assert evidencia.tipo_archivo == "application/pdf"
+    assert evidencia.tamano_bytes == len(contenido)
+    assert evidencia.url == "https://mail.google.com/mail/u/0/#all/m1"  # url kept as reference
+
+
+async def test_persistir_drive_con_file_id_descarga_bytes_reales(db: AsyncSession, scenario: dict[str, Any]) -> None:
+    """A `source="drive"` link carrying `file_id` must download via
+    `DrivePort.download_file`."""
+    user, obligacion, cuenta = scenario["user"], scenario["obligacion"], scenario["cuenta"]
+    contenido = b"contenido real del archivo de drive"
+
+    entrada = [_obligacion_justificada(obligacion)]
+    entrada[0].evidencias = [
+        EvidenceLink(
+            source="drive",
+            titulo="Informe mensual.pdf",
+            link="https://drive.google.com/file/d/f1/view",
+            fecha="2024-03-10",
+            provider="google",
+            file_id="f1",
+            mime_type="application/pdf",
+        )
+    ]
+
+    storage = _fake_storage_upload_ok()
+    drive = AsyncMock()
+    drive.download_file = AsyncMock(return_value=contenido)
+
+    with (
+        patch("app.adapters.drive.drive_adapter.DriveAdapter", return_value=drive),
+        patch("app.services.informe_service.get_evidencia_storage", return_value=storage),
+    ):
+        summary = await evidence_persist_service.persistir_evidencias(db, user.id, cuenta.id, entrada)
+
+    assert summary.evidencias_creadas == 1
+    drive.download_file.assert_awaited_once_with(user.id, "f1")
+
+    result = await db.execute(select(Evidencia).join(Actividad).where(Actividad.obligacion_id == obligacion.id))
+    evidencia = result.scalars().one()
+    assert evidencia.storage_key is not None and evidencia.storage_key.startswith("evidencias/")
+    assert evidencia.tamano_bytes == len(contenido)
+
+
+async def test_persistir_descarga_fallida_no_bloquea_y_queda_como_enlace(
+    db: AsyncSession, scenario: dict[str, Any]
+) -> None:
+    """Fail-open: a download error must not sink the whole persist call — the
+    Evidencia is still created, just link-only (storage_key=None), same as before
+    A1 existed."""
+    user, obligacion, cuenta = scenario["user"], scenario["obligacion"], scenario["cuenta"]
+
+    entrada = [_obligacion_justificada(obligacion)]
+    entrada[0].evidencias = [
+        EvidenceLink(
+            source="email",
+            titulo="Informe mensual",
+            link="https://mail.google.com/mail/u/0/#all/m1",
+            fecha="2024-03-10",
+            provider="google",
+            message_id="m1",
+            attachment_id="a1",
+        )
+    ]
+
+    gmail = AsyncMock()
+    gmail.get_attachment = AsyncMock(side_effect=RuntimeError("gmail down"))
+
+    with patch("app.adapters.email.gmail_adapter.GmailAdapter", return_value=gmail):
+        summary = await evidence_persist_service.persistir_evidencias(db, user.id, cuenta.id, entrada)
+
+    assert summary.evidencias_creadas == 1
+    result = await db.execute(select(Evidencia).join(Actividad).where(Actividad.obligacion_id == obligacion.id))
+    evidencia = result.scalars().one()
+    assert evidencia.storage_key is None
+    assert evidencia.url == "https://mail.google.com/mail/u/0/#all/m1"
+
+
+async def test_persistir_link_generico_no_intenta_descargar(db: AsyncSession, scenario: dict[str, Any]) -> None:
+    """A link with no provider file id (the pre-A1 shape, or a calendar event) never
+    triggers a download attempt — stays link-only, exactly as before this change."""
+    user, obligacion, cuenta = scenario["user"], scenario["obligacion"], scenario["cuenta"]
+    entrada = [_obligacion_justificada(obligacion)]  # default EvidenceLink: no provider ids
+
+    with patch("app.adapters.email.gmail_adapter.GmailAdapter") as gmail_cls:
+        summary = await evidence_persist_service.persistir_evidencias(db, user.id, cuenta.id, entrada)
+
+    gmail_cls.assert_not_called()
+    assert summary.evidencias_creadas == 1
+    result = await db.execute(select(Evidencia).join(Actividad).where(Actividad.obligacion_id == obligacion.id))
+    evidencia = result.scalars().one()
+    assert evidencia.storage_key is None

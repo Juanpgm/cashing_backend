@@ -62,6 +62,7 @@ async def test_evidence_justify_generates_text_and_links():
     assert "actividades" in just[0]["justificacion"]
     assert just[0]["evidencias"][0]["link"] == "https://drive/x"
     assert just[0]["evidencias"][0]["titulo"] == "informe.pdf"
+    assert just[0]["origen"] == "llm"
 
 
 @pytest.mark.asyncio
@@ -83,7 +84,8 @@ async def test_evidence_justify_no_evidence_uses_sentinel_without_llm_call():
         result = await mod.evidence_justify_node(state)
 
     assert result["justificaciones"][0]["evidencias"] == []
-    assert result["justificaciones"][0]["justificacion"] == mod.SENTINEL_SIN_EVIDENCIAS
+    assert result["justificaciones"][0]["justificacion"] == mod.TEXTO_SIN_LABORES
+    assert result["justificaciones"][0]["origen"] == "sin_labores"
     mock_llm.complete.assert_not_called()
     # Fallback actividad must never echo the obligación's own text.
     assert result["justificaciones"][0]["actividad"] != "Asistir a reuniones"
@@ -122,6 +124,7 @@ async def test_evidence_justify_parses_strict_actividad_justificacion_format():
     # Neither field echoes the obligación's own text.
     assert just["actividad"] != "Entregar informe mensual"
     assert just["justificacion"] != "Entregar informe mensual"
+    assert just["origen"] == "llm"
 
 
 @pytest.mark.asyncio
@@ -151,3 +154,4 @@ async def test_evidence_justify_near_identical_llm_output_falls_back_determinist
     assert just["actividad"] == texto_repetido
     assert just["justificacion"] != texto_repetido
     assert just["actividad"] != just["justificacion"]
+    assert just["origen"] == "seed"

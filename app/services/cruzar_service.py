@@ -33,7 +33,7 @@ from app.agent.prompts.cruzar import (
     CRUZAR_RELEVANCE_BATCH_SYSTEM,
 )
 from app.core.exceptions import ForbiddenError, NotFoundError
-from app.models.actividad import Actividad
+from app.models.actividad import Actividad, JustificacionOrigen
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro
 from app.models.documento_fuente import DocumentoFuente
@@ -155,8 +155,12 @@ def _contexto_contrato_bloque(contexto_docs: list[dict[str, Any]]) -> str:
 
 async def _llm_justification(
     obligation_text: str, candidate: dict, llm, contexto_usuario: str = "", contexto_contrato: str = ""
-) -> str:
-    """Generate a grounded one-sentence justification from the matched evidence."""
+) -> tuple[str, str]:
+    """Generate a grounded one-sentence justification from the matched evidence.
+
+    Returns (justificacion, origen) — origen is "llm" on success, "seed" on the
+    deterministic fallback.
+    """
     user_content = (
         CRUZAR_JUSTIFICATION_USER.format(
             obligacion=obligation_text[:600],
@@ -177,10 +181,10 @@ async def _llm_justification(
             # 256 trunca la salida a mitad de frase.
             max_tokens=2048,
         )
-        return resp.content.strip()
+        return resp.content.strip(), "llm"
     except Exception as exc:
         await logger.awarning("cruzar.justification_llm_error", error=str(exc))
-        return f"Evidencia documental referenciada en {candidate['source']}."
+        return f"Evidencia documental referenciada en {candidate['source']}.", "seed"
 
 
 async def _llm_actividad(
@@ -378,7 +382,7 @@ async def cruzar_documentos(
             actividad_texto = await _llm_actividad(
                 ob_text, candidate, llm_justification, contexto_usuario, contexto_contrato
             )
-            justificacion = await _llm_justification(
+            justificacion, justificacion_origen = await _llm_justification(
                 ob_text, candidate, llm_justification, contexto_usuario, contexto_contrato
             )
 
@@ -395,6 +399,7 @@ async def cruzar_documentos(
             if stub is not None:
                 stub.descripcion = actividad_texto[:1000]
                 stub.justificacion = justificacion[:1000]
+                stub.justificacion_origen = JustificacionOrigen(justificacion_origen)
                 stub.fecha_realizacion = fecha_realizacion
             else:
                 db.add(
@@ -403,6 +408,7 @@ async def cruzar_documentos(
                         obligacion_id=ob.id,
                         descripcion=actividad_texto[:1000],
                         justificacion=justificacion[:1000],
+                        justificacion_origen=justificacion_origen,
                         fecha_realizacion=fecha_realizacion,
                     )
                 )

@@ -41,6 +41,12 @@ async def evidence_orchestrator_node(state: AgentState) -> AgentState:
                 "link": ev.get("link", ""),
                 "date": ev.get("date", ""),
                 "message_id": ev.get("message_id", ""),
+                # Provider-file ids (Problema A) — carried through so
+                # evidence_justify/evidence_persist_service can snapshot real
+                # bytes instead of a link-only Evidencia.
+                "attachment_id": ev.get("attachment_id", ""),
+                "mime_type": ev.get("mime_type", ""),
+                "provider": ev.get("provider", ""),
                 "metadata": ev,
             }
         )
@@ -54,6 +60,8 @@ async def evidence_orchestrator_node(state: AgentState) -> AgentState:
                 "link": ev.get("link", ""),
                 "date": ev.get("date", ""),
                 "file_id": ev.get("file_id", ""),
+                "mime_type": ev.get("mime_type", ""),
+                "provider": ev.get("provider", ""),
                 "metadata": ev,
             }
         )

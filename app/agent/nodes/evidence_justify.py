@@ -22,7 +22,7 @@ from app.agent.prompts.actividad_generation import (
 from app.agent.prompts.evidence_justification import format_evidencias_for_prompt
 from app.agent.state import AgentState
 from app.schemas.agent import LLMMessage
-from app.services.informe_constants import SENTINEL_SIN_EVIDENCIAS
+from app.services.informe_constants import TEXTO_SIN_LABORES
 
 logger = structlog.get_logger("agent.nodes.evidence_justify")
 
@@ -51,6 +51,13 @@ def _evidence_links(evidencias: list[dict]) -> list[dict]:
                 "titulo": ev.get("title") or ev.get("subject") or ev.get("filename") or "(sin título)",
                 "link": link,
                 "fecha": ev.get("date", ""),
+                # Provider-file ids (Problema A) — propagated so evidence_persist_service
+                # can download the real bytes instead of storing a link-only Evidencia.
+                "provider": ev.get("provider", ""),
+                "message_id": ev.get("message_id", ""),
+                "attachment_id": ev.get("attachment_id", ""),
+                "file_id": ev.get("file_id", ""),
+                "mime_type": ev.get("mime_type", ""),
             }
         )
     return out
@@ -58,8 +65,7 @@ def _evidence_links(evidencias: list[dict]) -> list[dict]:
 
 def _evidence_titles(evidencias: list[dict], limit: int = 3) -> list[str]:
     return [
-        str(ev.get("title") or ev.get("subject") or ev.get("filename") or "(sin título)")
-        for ev in evidencias[:limit]
+        str(ev.get("title") or ev.get("subject") or ev.get("filename") or "(sin título)") for ev in evidencias[:limit]
     ]
 
 
@@ -90,10 +96,12 @@ async def _generate_actividad_justificacion(
     contrato_contexto: str = "",
     actividades_previas: list[str] | None = None,
     contexto_usuario: str = "",
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     """Pide al LLM la ACTIVIDAD + JUSTIFICACION. Degrada con texto determinístico si falla.
 
-    Returns (actividad, justificacion) — nunca iguales, nunca el texto de la obligación.
+    Returns (actividad, justificacion, origen) — actividad/justificacion nunca iguales,
+    nunca el texto de la obligación. `origen` es "llm" cuando la justificación es texto
+    real del modelo, "seed" cuando degradó a texto determinístico.
     """
     from app.core.config import settings
 
@@ -122,7 +130,7 @@ async def _generate_actividad_justificacion(
         )
     except Exception as exc:
         await logger.awarning("justify_llm_failed", error=str(exc))
-        return _deterministic_actividad(evidencias), _deterministic_justificacion(evidencias)
+        return _deterministic_actividad(evidencias), _deterministic_justificacion(evidencias), "seed"
 
     parsed = parse_actividad_justificacion(resp.content)
     if parsed is None:
@@ -133,14 +141,16 @@ async def _generate_actividad_justificacion(
         libre = re.sub(r"^\s*ACTIVIDAD\s*:\s*", "", resp.content.strip(), flags=re.IGNORECASE)
         justificacion = libre or _deterministic_justificacion(evidencias)
         actividad = _deterministic_actividad(evidencias)
-        return actividad, justificacion
+        origen = "llm" if libre else "seed"
+        return actividad, justificacion, origen
 
     actividad, justificacion = parsed
     if is_near_identical(actividad, justificacion):
         # El modelo violó la regla de "textos distintos" — no persistir dos copias
         # del mismo texto; recae en la justificación determinística.
         justificacion = _deterministic_justificacion(evidencias)
-    return actividad, justificacion
+        return actividad, justificacion, "seed"
+    return actividad, justificacion, "llm"
 
 
 async def evidence_justify_node(state: AgentState) -> AgentState:
@@ -166,11 +176,11 @@ async def evidence_justify_node(state: AgentState) -> AgentState:
         evidencias = matched.get(ob_id, [])
 
         if not evidencias:
-            # Sin evidencia para esta obligación en el período: sentinel determinístico,
+            # Sin evidencia para esta obligación en el período: texto con tacto,
             # sin gastar una llamada LLM (que solo produciría meta-texto sobre la ausencia).
-            actividad, justificacion = _deterministic_actividad(evidencias), SENTINEL_SIN_EVIDENCIAS
+            actividad, justificacion, origen = _deterministic_actividad(evidencias), TEXTO_SIN_LABORES, "sin_labores"
         else:
-            actividad, justificacion = await _generate_actividad_justificacion(
+            actividad, justificacion, origen = await _generate_actividad_justificacion(
                 ob_texto, evidencias, contrato_contexto, actividades_previas, contexto_usuario
             )
         justificaciones.append(
@@ -179,6 +189,7 @@ async def evidence_justify_node(state: AgentState) -> AgentState:
                 "descripcion": ob_texto,
                 "actividad": actividad,
                 "justificacion": justificacion,
+                "origen": origen,
                 "evidencias": _evidence_links(evidencias),
             }
         )

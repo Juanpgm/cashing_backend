@@ -432,26 +432,27 @@ async def test_get_descargar_after_explicit_regenerate_serves_the_new_bytes(
     reflects the freshly persisted object, not stale bytes.
 
     RELIABILITY-004: assert on actual CONTENT, not just object count — mutate
-    the cuenta's Actividad.justificacion (which the per-obligación LEEME
-    inside the zip renders verbatim, `informe_service.py` "Justificación:
-    {act.justificacion}") between the two `preparar_radicacion` calls, and
-    prove the marker shows up only after regenerate re-persisted the package.
+    the evidencia's real bytes in storage (obligación folders now carry ONLY
+    real files, no per-folder LEEME to render `act.justificacion` into — A3)
+    between the two `preparar_radicacion` calls, and prove the new bytes show
+    up only after regenerate re-packaged from storage.
     """
     storage = _FakeStorage()
     monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: storage)
     monkeypatch.setattr("app.services.radicacion_prep_service._get_storage", lambda *_a, **_k: storage)
     monkeypatch.setattr("app.services.paquete_service._get_storage", lambda *_a, **_k: storage)
 
+    ev_rows = await db.execute(select(Evidencia).join(Actividad).where(Actividad.cuenta_cobro_id == cuenta_lista.id))
+    evidencia = ev_rows.scalars().one()
+    assert evidencia.storage_key is not None
+    await storage.upload(key=evidencia.storage_key, data=b"contenido original", content_type="image/jpeg")
+
     await radicacion_prep_service.preparar_radicacion(db, test_user["user"].id, cuenta_lista.id)
     r1 = await client.get(f"/api/v1/cuentas-cobro/{cuenta_lista.id}/paquete/descargar", headers=test_user["headers"])
     assert r1.status_code == 200, r1.text
 
-    marcador = "Justificación actualizada tras regenerar — marcador de contenido."
-    act_rows = await db.execute(select(Actividad).where(Actividad.cuenta_cobro_id == cuenta_lista.id))
-    actividad = act_rows.scalars().one()
-    actividad.justificacion = marcador
-    db.add(actividad)
-    await db.commit()
+    marcador = b"contenido actualizado tras regenerar - marcador de bytes"
+    await storage.upload(key=evidencia.storage_key, data=marcador, content_type="image/jpeg")
 
     r_regen = await client.post(
         f"/api/v1/cuentas-cobro/{cuenta_lista.id}/paquete/regenerar", headers=test_user["headers"]
@@ -464,7 +465,7 @@ async def test_get_descargar_after_explicit_regenerate_serves_the_new_bytes(
     zip_bytes = io.BytesIO(r2.content)
     with zipfile.ZipFile(zip_bytes) as zf:
         combined = b"".join(zf.read(name) for name in zf.namelist())
-    assert marcador.encode("utf-8") in combined
+    assert marcador in combined
 
     prefix = f"paquetes/{test_user['user'].id}/{cuenta_lista.id}/"
     objetos = await storage.list_objects(prefix)

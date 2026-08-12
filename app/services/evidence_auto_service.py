@@ -30,30 +30,31 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import ExternalServiceError
-from app.models.actividad import Actividad
+from app.models.actividad import Actividad, JustificacionOrigen
 from app.schemas.google_workspace import EvidenceDiscoveryRequest, EvidenciasAutoResponse
 from app.services import evidence_discovery_service, evidence_persist_service
-from app.services.informe_constants import SENTINEL_SIN_EVIDENCIAS
 
 logger = structlog.get_logger("services.evidence_auto")
 
 
 async def _obligaciones_con_justificacion(db: AsyncSession, cuenta_id: uuid.UUID) -> set[str]:
     """IDs (as str) of obligaciones in this cuenta that already have a real
-    (non-sentinel) justificación, scoped PER-OBLIGACIÓN — not per-cuenta. A
-    mixed cuenta (one obligación already justified, another never justified)
-    must only skip the already-justified one; the rest still get real text.
+    justificación, scoped PER-OBLIGACIÓN — not per-cuenta. A mixed cuenta (one
+    obligación already justified, another never justified) must only skip the
+    already-justified one; the rest still get real text.
 
-    `SENTINEL_SIN_EVIDENCIAS` (the deterministic "no evidence found" text) never
-    counts — an obligación that only has sentinel text should still get a real
-    justificación written the next time evidence turns up.
+    "Real" = `justificacion_origen in (llm, manual)` — the SAME definition
+    `informe_service._tiene_justificacion_real` uses, so the two gates never
+    diverge (workstream B, B5). `seed`/`sin_labores` never count: an obligación
+    with only degraded/tactful text should still get a real justificación
+    written the next time evidence turns up. A string-equality check against
+    the old sentinel text would stop matching once B4's tactful `sin_labores`
+    text replaced it — origin-based filtering is regression-proof to redaction changes.
     """
     result = await db.execute(
         select(Actividad.obligacion_id).where(
             Actividad.cuenta_cobro_id == cuenta_id,
-            Actividad.justificacion.is_not(None),
-            Actividad.justificacion != "",
-            Actividad.justificacion != SENTINEL_SIN_EVIDENCIAS,
+            Actividad.justificacion_origen.in_([JustificacionOrigen.LLM, JustificacionOrigen.MANUAL]),
         )
     )
     return {str(obligacion_id) for (obligacion_id,) in result.all()}

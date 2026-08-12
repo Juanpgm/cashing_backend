@@ -306,6 +306,11 @@ async def _gather_email_evidence(
                         provider=provider.value,
                     )
                     continue
+                # ponytail: only the FIRST attachment (if any) is snapshotted as
+                # downloadable bytes — a message with several attachments still
+                # ships just one EvidenceLink for the whole email. Fan out one
+                # EvidenceLink per attachment if that ceiling ever bites.
+                attachment = m.attachments[0] if m.attachments else None
                 emails_by_id[m.id] = {
                     "source": "email",
                     "content": (m.body_plain or m.snippet or "")[:800],
@@ -314,6 +319,8 @@ async def _gather_email_evidence(
                     "link": _email_permalink(provider, m.id, getattr(m, "web_link", "")),
                     "date": m.date.isoformat() if m.date else "",
                     "message_id": m.id,
+                    "attachment_id": attachment.attachment_id if attachment else "",
+                    "mime_type": attachment.mime_type if attachment else "",
                     "sender": m.sender,
                     "labels": list(m.labels or []),
                     "headers": dict(m.headers or {}),

@@ -2300,6 +2300,7 @@ async def listar_arbol_evidencias(db: AsyncSession, cuenta: CuentaCobro) -> list
                         "id": str(a.id),
                         "descripcion": a.descripcion,
                         "justificacion": a.justificacion,
+                        "justificacion_origen": a.justificacion_origen,
                         "evidencias": [
                             {
                                 "id": str(e.id),
@@ -2504,7 +2505,7 @@ async def construir_checklist_completo(
             return True
         if uuid.UUID(ob["obligacion_id"]) in con_link:
             return True
-        return any(_tiene_justificacion_real(act.get("justificacion")) for act in ob["actividades"])
+        return any(_tiene_justificacion_real(act.get("justificacion_origen")) for act in ob["actividades"])
 
     cobertura_completa = bool(arbol) and all(_ob_cubierta(ob) for ob in arbol)
     if cobertura_completa and any(

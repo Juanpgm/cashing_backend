@@ -54,7 +54,7 @@ from app.models.plantilla_organismo import PlantillaOrganismo
 from app.models.usuario import Usuario
 from app.schemas.agent import LLMMessage
 from app.services import document_service, secret_scan_service
-from app.services.informe_constants import SENTINEL_SIN_EVIDENCIAS, SENTINEL_SIN_EVIDENCIAS_TERCERA_PERSONA
+from app.services.informe_constants import SENTINEL_SIN_EVIDENCIAS, TEXTO_SIN_LABORES
 
 logger = structlog.get_logger("service.informe")
 
@@ -167,6 +167,20 @@ def _add_kv_table(doc: DocxDocument, rows: list[tuple[str, str]]) -> None:
                 run.bold = True
 
 
+def _prefijo_borrador(origen: str | None) -> str:
+    """Visible `[BORRADOR] ` prefix for `seed`-origin justificación text — Gemini
+    text was pending/failed but there was evidence, so the seed fallback text
+    must never be mistaken for a final, LLM-authored justificación (B6)."""
+    return "[BORRADOR] " if origen == "seed" else ""
+
+
+def _es_sin_labores(act: Actividad) -> bool:
+    """True when this actividad's justificación is the tactful "sin labores" text
+    (new `origen="sin_labores"`, or the historical sentinel persisted before this
+    migration — backward-compat, B4)."""
+    return act.justificacion_origen == "sin_labores" or (act.justificacion or "").strip() == SENTINEL_SIN_EVIDENCIAS
+
+
 def _add_actividades_table(
     doc: DocxDocument,
     actividades: list[Actividad],
@@ -198,6 +212,8 @@ def _add_actividades_table(
         override = overrides.get(act.id) if overrides else None
         actividad_text = override[0] if override else act.descripcion
         justificacion_text = override[1] if override else (act.justificacion or "—")
+        if not override and justificacion_text != "—" and not _es_sin_labores(act):
+            justificacion_text = _prefijo_borrador(act.justificacion_origen) + justificacion_text
         row.cells[0].text = str(idx)
         row.cells[1].text = ob_text
         row.cells[2].text = actividad_text
@@ -255,6 +271,8 @@ def _add_actividades_table_adaptativa(
         override = overrides.get(act.id) if overrides else None
         actividad_text = override[0] if override else act.descripcion
         justificacion_text = override[1] if override else (act.justificacion or "—")
+        if not override and justificacion_text != "—" and not _es_sin_labores(act):
+            justificacion_text = _prefijo_borrador(act.justificacion_origen) + justificacion_text
         for col_idx, slot in enumerate(slots):
             if slot == "numero":
                 texto = str(idx)
@@ -628,8 +646,12 @@ def _justificaciones_tercera_por_orden(
     An actividad with no justificación AND whose obligación has no evidencia
     is exempted from the LLM tercera-persona conversion — the sentinel is a
     fixed deterministic string, not user prose, and the LLM could mangle its
-    exact wording. It renders as `SENTINEL_SIN_EVIDENCIAS_TERCERA_PERSONA`
-    directly instead.
+    exact wording. It renders as `TEXTO_SIN_LABORES` directly instead (B4: a
+    single tactful text serves both 1st and 3rd person).
+
+    The `[BORRADOR] ` prefix (B6) is applied HERE, once, for `seed`-origin text
+    — not in the generic `_add_actividades_table` consumer, so it doesn't
+    interfere with the override's editorial third-person rewrite.
     """
     actividades_por_ob: dict[uuid.UUID | None, list[Actividad]] = {}
     for act in actividades_visibles:
@@ -642,12 +664,14 @@ def _justificaciones_tercera_por_orden(
         partes: list[str] = []
         for act in acts_ob:
             justificacion = (act.justificacion or "").strip()
-            if justificacion == SENTINEL_SIN_EVIDENCIAS or (not justificacion and not tiene_evidencia):
-                texto = SENTINEL_SIN_EVIDENCIAS_TERCERA_PERSONA
+            if _es_sin_labores(act) or (not justificacion and not tiene_evidencia):
+                texto = TEXTO_SIN_LABORES
             else:
                 ov = overrides.get(act.id)
                 texto = (ov[1] if ov[1] and ov[1] != "—" else ov[0]) if ov else (act.justificacion or act.descripcion)
                 texto = (texto or "").strip()
+                if texto:
+                    texto = _prefijo_borrador(act.justificacion_origen) + texto
             if texto:
                 partes.append(texto)
         if partes:
@@ -717,17 +741,19 @@ async def _generar_docx_clonado(
                 # An obligación with no evidencia anywhere and no written
                 # justificación would otherwise echo `act.descripcion` here —
                 # meaningless in a real informe (it just repeats the
-                # obligación's own seeded activity text). Render the sentinel
-                # instead; keep the descripcion fallback ONLY when the
-                # obligación has real evidencia (unchanged prior behavior).
+                # obligación's own seeded activity text). Render the tactful
+                # "sin labores" text instead; keep the descripcion fallback
+                # ONLY when the obligación has real evidencia (unchanged prior
+                # behavior). `seed`-origin text gets a visible [BORRADOR] prefix
+                # (B6) — Gemini text was pending/failed, never pass it off as final.
                 tiene_evidencia = any(act.evidencias for act in acts_ob)
                 partes: list[str] = []
                 for act in acts_ob:
                     justificacion = (act.justificacion or "").strip()
-                    if justificacion:
-                        partes.append(justificacion)
-                    elif not tiene_evidencia:
-                        partes.append(SENTINEL_SIN_EVIDENCIAS)
+                    if _es_sin_labores(act) or (not justificacion and not tiene_evidencia):
+                        partes.append(TEXTO_SIN_LABORES)
+                    elif justificacion:
+                        partes.append(_prefijo_borrador(act.justificacion_origen) + justificacion)
                     else:
                         descripcion = (act.descripcion or "").strip()
                         if descripcion:
@@ -1210,20 +1236,20 @@ def _calcular_estado_obligaciones(
         listo = (
             any(act.evidencias for act in acts)
             or ob.id in obligaciones_con_link
-            or any(_tiene_justificacion_real(act.justificacion) for act in acts)
+            or any(_tiene_justificacion_real(act.justificacion_origen) for act in acts)
         )
         estados.append(ObligacionEstado(obligacion_id=ob.id, descripcion=ob.descripcion, listo=listo))
     return estados
 
 
-def _tiene_justificacion_real(justificacion: str | None) -> bool:
-    """A justificación counts as real coverage only when it carries user/agent
-    text — the deterministic sentinels mean explicit absence of work. Shared by
-    `_calcular_estado_obligaciones` and the checklist EVIDENCIAS derivation
-    (`checklist_service.construir_checklist_completo`) so the two gates never
-    diverge again."""
-    texto = (justificacion or "").strip()
-    return bool(texto) and texto not in (SENTINEL_SIN_EVIDENCIAS, SENTINEL_SIN_EVIDENCIAS_TERCERA_PERSONA)
+def _tiene_justificacion_real(justificacion_origen: str | None) -> bool:
+    """A justificación counts as real coverage only when it comes from the LLM or a
+    manual edit — seed/sin_labores/unset never count. Shared by
+    `_calcular_estado_obligaciones` and `checklist_service.construir_checklist_completo`
+    so the two gates never diverge. Works for both the ORM `Actividad`
+    (`act.justificacion_origen`) and the dict shape from `checklist_service`
+    (`act.get("justificacion_origen")`)."""
+    return justificacion_origen in ("llm", "manual")
 
 
 async def _obligaciones_con_link_confirmado(db: AsyncSession, cuenta_id: uuid.UUID) -> frozenset[uuid.UUID]:
@@ -1259,6 +1285,23 @@ async def _evidencias_por_link_confirmado(db: AsyncSession, cuenta_id: uuid.UUID
         if ob_id is not None:
             por_ob.setdefault(ob_id, []).append(ev)
     return por_ob
+
+
+async def _evidencias_con_archivo(db: AsyncSession, cuenta_id: uuid.UUID) -> list[Evidencia]:
+    """Every Evidencia with real bytes (`storage_key` set) attached to this
+    cuenta's actividades — regardless of obligación classification. Feeds the
+    `sin_clasificar/` root folder (A2): the caller filters out whatever the
+    per-obligación loop already packaged, so orphan uploads (the "sin
+    clasificar" stub, `obligacion_id=None`) and evidencias whose only link is
+    still PROPOSED (not CONFIRMED) still ship instead of being silently
+    dropped from the zip."""
+    result = await db.execute(
+        select(Evidencia)
+        .join(Actividad, Actividad.id == Evidencia.actividad_id)
+        .where(Actividad.cuenta_cobro_id == cuenta_id, Evidencia.storage_key.is_not(None))
+        .order_by(Evidencia.created_at.asc())
+    )
+    return list(result.scalars().all())
 
 
 async def obtener_estado_listo_pendiente(
@@ -1565,6 +1608,15 @@ async def generar_zip_evidencias(
     miembros_zip: list[tuple[str, bytes]] = []
     miembros_scan: list[tuple[str, bytes]] = []
 
+    # A4: visibility counters for the fail-open evidence downloads below — surfaced
+    # in the zip_evidencias_generado log and, when non-zero, as an AVISO line in
+    # the root LEEME (assembled further down, once these are known).
+    evidencias_empacadas = 0
+    evidencias_fallidas = 0
+    # Evidencia ids already placed inside an obligación folder — the sin_clasificar
+    # pass (A2) below skips these so nothing ships twice.
+    ids_empacadas: set[uuid.UUID] = set()
+
     def _agregar_texto(nombre: str, texto: str) -> None:
         contenido = texto.encode("utf-8")
         miembros_zip.append((nombre, contenido))
@@ -1581,11 +1633,11 @@ async def generar_zip_evidencias(
         f"Actividades reportadas: {len(actividades)}",
         "",
         "Estructura:",
-        "  - Una subcarpeta por obligación contractual.",
-        "  - Cada subcarpeta contiene un README.txt con las actividades",
-        "    asociadas y el listado de evidencias esperadas.",
-        "  - Coloque dentro de cada subcarpeta los archivos de soporte",
-        "    (PDF, fotos, capturas, correos exportados, etc.).",
+        "  - Una subcarpeta por obligación contractual, con los archivos de",
+        "    evidencia ya clasificados para esa obligación (sin README individual).",
+        "  - Una obligación sin evidencia clasificada no genera subcarpeta.",
+        "  - sin_clasificar/: evidencias con archivo que aún no quedaron",
+        "    confirmadas contra ninguna obligación específica.",
         "",
         "Estado de completitud (LISTO/PENDIENTE)",
         "========================================",
@@ -1621,8 +1673,9 @@ async def generar_zip_evidencias(
             + ", ".join(sorted(codigos_solo_primera))
             + ").",
         ]
-    root_readme_lines.append("")
-    _agregar_texto("LEEME.txt", "\n".join(root_readme_lines))
+    # NOTE: root LEEME.txt is written further down (after the obligación +
+    # sin_clasificar packaging loops), once evidencias_fallidas is known — see the
+    # AVISO line appended there (A4).
 
     for arcname, contenido in docs_generados:
         miembros_zip.append((arcname, contenido))
@@ -1640,31 +1693,6 @@ async def generar_zip_evidencias(
         folder_prefix = f"A{idx}" if usa_folders_anexo else f"{idx:02d}"
         folder = f"{folder_prefix}_{_safe_dirname(ob.descripcion)}"
         acts = actividades_por_ob.get(ob.id, [])
-        lines = [
-            f"Obligación #{idx} ({ob.tipo.value if ob.tipo else 'general'})",
-            "=" * 60,
-            "",
-            ob.descripcion,
-            "",
-            f"Período: {_periodo_str(cuenta)}",
-            "",
-            "Actividades reportadas en este período:",
-            "-" * 40,
-        ]
-        if acts:
-            for j, act in enumerate(acts, start=1):
-                lines.append(f"{j}. {act.descripcion}")
-                if act.justificacion:
-                    lines.append(f"   Justificación: {act.justificacion}")
-                lines.append(f"   Fecha: {_formato_fecha(act.fecha_realizacion)}")
-                if act.evidencias:
-                    lines.append(f"   Evidencias adjuntas: {len(act.evidencias)}")
-                    for ev in act.evidencias:
-                        lines.append(f"     - {ev.nombre_archivo}")
-                lines.append("")
-        else:
-            lines.append("(sin actividades reportadas)")
-            lines.append("")
         # Evidencias confirmed to this obligación via the link table but attached
         # to another actividad (typically the "sin clasificar" upload stub) —
         # without this branch their bytes never shipped, leaving the obligation
@@ -1672,29 +1700,13 @@ async def generar_zip_evidencias(
         # (live-reproduced 2026-08-12, H13 packaging counterpart).
         ids_act = {ev.id for act in acts for ev in act.evidencias}
         evs_link = [ev for ev in evidencias_link_por_ob.get(ob.id, []) if ev.id not in ids_act]
-        if evs_link:
-            lines.append("Evidencias clasificadas (confirmadas para esta obligación):")
-            lines += [f"  - {ev.nombre_archivo}" for ev in evs_link]
-            lines.append("")
-
-        # Link-only evidencias carry no bytes to package — document them here.
-        # A link-type evidencia with no usable url is noted too (not silently
-        # dropped), with a placeholder instead of a broken link (P2 delta).
-        enlaces = [ev for act in acts for ev in act.evidencias if ev.storage_key is None]
-        enlaces += [ev for ev in evs_link if ev.storage_key is None]
-        if enlaces:
-            lines.append("Enlaces:")
-            lines += [f"- {ev.fuente or 'enlace'}: {ev.url or '(referencia no disponible)'}" for ev in enlaces]
-            lines.append("")
-        lines += [
-            "Coloque aquí los archivos de soporte (correos, capturas, PDFs,",
-            "fotografías, etc.) que evidencien el cumplimiento de esta obligación.",
-        ]
-        _agregar_texto(f"{folder}/LEEME.txt", "\n".join(lines))
 
         # Actividad-attached evidencias plus the link-confirmed ones (dedup'd
         # above) — both classes ship real bytes into this obligation's folder.
+        # No LEEME here anymore (A3): a folder is ONLY the real files, and an
+        # obligación with none of them simply produces no folder at all.
         for ev in [ev for act in acts for ev in act.evidencias] + evs_link:
+            ids_empacadas.add(ev.id)
             if ev.storage_key is None:
                 continue  # external-link evidence — no real bytes to fetch (no new StoragePort methods this change)
             try:
@@ -1718,6 +1730,7 @@ async def generar_zip_evidencias(
                     download_ok=False,
                     bytes_len=0,
                 )
+                evidencias_fallidas += 1
                 continue
             await logger.ainfo(
                 "zip_evidencia_download",
@@ -1727,25 +1740,51 @@ async def generar_zip_evidencias(
                 download_ok=True,
                 bytes_len=len(contenido),
             )
+            evidencias_empacadas += 1
             arcname = f"{folder}/evidencias/{_safe_dirname(ev.nombre_archivo, max_len=150)}"
             miembros_zip.append((arcname, contenido))
             texto_scan = await _texto_para_scan(contenido, ev.nombre_archivo)
             if texto_scan:
                 miembros_scan.append((arcname, texto_scan.encode("utf-8")))
 
-    # Activities not linked to any obligation
-    sueltas = actividades_por_ob.get(None, [])
-    if sueltas:
-        lines = [
-            "Actividades sin obligación vinculada",
-            "=" * 60,
+    # A2: every evidencia with real bytes not already placed in an obligación
+    # folder above — orphan uploads ("sin clasificar" stub, obligacion_id=None)
+    # and evidencias whose only link is still PROPOSED (not CONFIRMED) — ships
+    # under a root sin_clasificar/ folder instead of being silently dropped.
+    # Supersedes the old 99_otras_actividades/LEEME.txt block (A3): that block
+    # never shipped bytes anyway, only a filename-less activity listing.
+    for ev in await _evidencias_con_archivo(db, cuenta_id):
+        if ev.id in ids_empacadas:
+            continue
+        try:
+            contenido = await storage.download(ev.storage_key)
+        except Exception as exc:  # one missing file must not sink the whole package
+            await logger.awarning(
+                "zip_evidencia_sin_clasificar_download_failed",
+                evidencia_id=str(ev.id),
+                storage_key=ev.storage_key,
+                error=str(exc),
+            )
+            evidencias_fallidas += 1
+            continue
+        evidencias_empacadas += 1
+        arcname = f"sin_clasificar/{_safe_dirname(ev.nombre_archivo, max_len=150)}"
+        miembros_zip.append((arcname, contenido))
+        texto_scan = await _texto_para_scan(contenido, ev.nombre_archivo)
+        if texto_scan:
+            miembros_scan.append((arcname, texto_scan.encode("utf-8")))
+
+    # A4: root LEEME AVISO when some evidencia couldn't be packaged, then write it —
+    # deferred from earlier in this function so evidencias_fallidas is known.
+    if evidencias_fallidas:
+        root_readme_lines += [
             "",
+            f"AVISO: {evidencias_fallidas} evidencia(s) no se pudieron incluir en este paquete "
+            "(fallo al descargar el archivo desde almacenamiento) — reintente más tarde o "
+            "contacte soporte si persiste.",
         ]
-        for j, act in enumerate(sueltas, start=1):
-            lines.append(f"{j}. {act.descripcion}")
-            lines.append(f"   Fecha: {_formato_fecha(act.fecha_realizacion)}")
-            lines.append("")
-        _agregar_texto("99_otras_actividades/LEEME.txt", "\n".join(lines))
+    root_readme_lines.append("")
+    _agregar_texto("LEEME.txt", "\n".join(root_readme_lines))
 
     # Contract-level docs ship classified in the paquete (D5) — before the scan
     # gate so every new member is covered by it.
@@ -1787,5 +1826,7 @@ async def generar_zip_evidencias(
         size=len(buf.getvalue()),
         modo=modo,
         pendientes=len(pendientes_desc),
+        evidencias_empacadas=evidencias_empacadas,
+        evidencias_fallidas=evidencias_fallidas,
     )
     return buf.getvalue(), filename

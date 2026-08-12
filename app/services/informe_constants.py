@@ -22,3 +22,15 @@ SENTINEL_SIN_EVIDENCIAS = "No he desarrollado esta obligación a corte del prese
 # a fixed deterministic string, never run through the LLM rewrite (which could
 # mangle the sentinel's exact wording).
 SENTINEL_SIN_EVIDENCIAS_TERCERA_PERSONA = "No desarrolló esta obligación a corte del presente informe."
+
+# Obligación sin evidencia en el período, redactada con tacto (origen `sin_labores`) —
+# reemplaza los sentinels secos de arriba en escritura nueva. Texto ya impersonal/neutro:
+# sirve tanto para primera como tercera persona sin necesidad de una variante separada.
+# Deliberadamente NO generado por LLM (ver evidence_justify.py: la rama sin evidencia ya
+# evita gastar una llamada LLM porque no hay nada que resumir; añadirla aquí regresaría
+# esa invariante para ganar variación de redacción que nadie pidió).
+TEXTO_SIN_LABORES = (
+    "Durante el periodo reportado no se adelantaron actividades directamente asociadas a "
+    "esta obligación; se dará continuidad en periodos subsiguientes conforme a la ejecución "
+    "del contrato."
+)

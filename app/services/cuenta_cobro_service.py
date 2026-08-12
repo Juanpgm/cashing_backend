@@ -30,7 +30,7 @@ from app.core.exceptions import (
     NotFoundError,
     ValidationError,
 )
-from app.models.actividad import Actividad
+from app.models.actividad import Actividad, JustificacionOrigen
 from app.models.borrador_cuenta_cobro import BorradorCuentaCobro
 from app.models.clasificacion_job import ClasificacionEvidenciasJob
 from app.models.contrato import Contrato
@@ -874,6 +874,7 @@ async def generar_actividades_agente(
         if stub is not None:
             stub.descripcion = data.descripcion
             stub.justificacion = data.justificacion
+            stub.justificacion_origen = JustificacionOrigen.LLM
             stub.fecha_realizacion = data.fecha_realizacion
             await db.flush()
             await db.refresh(stub)
@@ -884,6 +885,7 @@ async def generar_actividades_agente(
             obligacion_id=data.obligacion_id,
             descripcion=data.descripcion,
             justificacion=data.justificacion,
+            justificacion_origen=JustificacionOrigen.LLM,
             fecha_realizacion=data.fecha_realizacion,
         )
         db.add(act)

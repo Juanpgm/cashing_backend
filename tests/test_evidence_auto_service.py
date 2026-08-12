@@ -114,6 +114,7 @@ def _discovery_response(
     *,
     justificacion: str = "Justificación generada por el agente.",
     link: str = "https://mail.google.com/mail/u/0/#all/abc123",
+    origen: str = "llm",
 ) -> EvidenceDiscoveryResponse:
     return EvidenceDiscoveryResponse(
         obligaciones=[
@@ -122,6 +123,7 @@ def _discovery_response(
                 descripcion=obligacion.descripcion,
                 actividad="Actividad redactada por el agente.",
                 justificacion=justificacion,
+                origen=origen,
                 evidencias=[EvidenceLink(source="email", titulo="Informe mensual", link=link, fecha="2024-03-10")],
             )
         ],
@@ -135,6 +137,7 @@ def _discovery_response_multi(
     obligaciones: list[Obligacion],
     *,
     justificacion: str = "Justificación generada por el agente.",
+    origen: str = "llm",
 ) -> EvidenceDiscoveryResponse:
     return EvidenceDiscoveryResponse(
         obligaciones=[
@@ -143,6 +146,7 @@ def _discovery_response_multi(
                 descripcion=ob.descripcion,
                 actividad="Actividad redactada por el agente.",
                 justificacion=justificacion,
+                origen=origen,
                 evidencias=[
                     EvidenceLink(
                         source="email",
@@ -240,6 +244,7 @@ async def test_auto_evidencias_cuenta_mixta_solo_bloquea_la_obligacion_ya_justif
         obligacion_id=obligacion_justificada.id,
         descripcion="Actividad ya justificada de una corrida previa.",
         justificacion="Justificación previa que no debe cambiar.",
+        justificacion_origen="llm",
     )
     db.add(ya)
     await db.commit()

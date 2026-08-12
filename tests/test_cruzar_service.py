@@ -259,6 +259,7 @@ async def test_cruzar_creates_actividades_for_relevant_docs(db: AsyncSession) ->
     assert actividades[0].descripcion == mock_actividad_resp.content
     assert not actividades[0].descripcion.startswith("Evidencia documental:")
     assert actividades[0].descripcion != actividades[0].justificacion
+    assert actividades[0].justificacion_origen == "llm"
 
     # CoberturaResponse must reflect the new actividades (DEBIL because no Evidencia files attached)
     assert result.resumen.total == 1
@@ -304,6 +305,7 @@ async def test_cruzar_actividad_falls_back_deterministically_on_llm_error(db: As
     assert actividades[0].descripcion == "Elaboración y entrega de informe_marzo.pdf."
     assert actividades[0].descripcion != ob.descripcion
     assert not actividades[0].descripcion.startswith("Evidencia documental:")
+    assert actividades[0].justificacion_origen == "seed"
 
 
 @pytest.mark.asyncio

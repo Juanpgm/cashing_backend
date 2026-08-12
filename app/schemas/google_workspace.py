@@ -224,6 +224,16 @@ class EvidenceLink(BaseModel):
     titulo: str
     link: str
     fecha: str = ""
+    # Provider-file identifiers, populated by discovery when the underlying item
+    # is a real downloadable file — NOT just a permalink. `evidence_persist_service`
+    # uses these to snapshot the real bytes into storage (Problema A). Empty for
+    # generic web links (calendar events, message permalinks with no attachment) —
+    # those stay link-only, same as before this field existed.
+    provider: str = ""  # "google" | "microsoft" — selects the download adapter
+    message_id: str = ""  # email: Gmail/Graph message id (paired with attachment_id)
+    attachment_id: str = ""  # email: id of the specific attachment to download
+    file_id: str = ""  # drive: Drive/OneDrive file id
+    mime_type: str = ""  # best-effort content-type for the downloaded bytes
 
     @field_validator("link")
     @classmethod
@@ -253,6 +263,7 @@ class ObligacionJustificada(BaseModel):
         description="Qué se hizo concretamente en el período (distinto de 'justificacion').",
     )
     justificacion: str
+    origen: str = "seed"
     evidencias: list[EvidenceLink] = Field(default_factory=list)
 
 

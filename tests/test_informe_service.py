@@ -213,22 +213,44 @@ async def test_informe_supervision_genera_docx_valido(
 # ── ZIP evidencias ─────────────────────────────────────────────────────────
 
 
-async def test_zip_evidencias_estructura(db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro) -> None:
+async def test_zip_evidencias_estructura(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A3: an obligación folder carries ONLY real evidence files — no per-folder
+    LEEME.txt anymore (the root LEEME.txt manifest is the only text file)."""
     user = test_user["user"]
+    res = await db.execute(
+        select(Actividad).where(Actividad.cuenta_cobro_id == cuenta.id).order_by(Actividad.fecha_realizacion.asc())
+    )
+    act = res.scalars().first()
+    assert act is not None
+    ev = Evidencia(
+        actividad_id=act.id,
+        storage_key=f"evidencias/{act.id}/soporte.pdf",
+        nombre_archivo="soporte.pdf",
+        tipo_archivo="application/pdf",
+        tamano_bytes=10,
+    )
+    db.add(ev)
+    await db.commit()
+    # `Actividad.evidencias` is `lazy="selectin"` — the query above already loaded
+    # (and cached, empty) that collection on this same session's identity-mapped
+    # `act`. Expire just that attribute so generar_zip_evidencias's own query
+    # re-fetches it instead of reusing the stale pre-evidencia snapshot.
+    db.expire(act, ["evidencias"])
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: _fake_storage())
+
     content, filename = await informe_service.generar_zip_evidencias(db, user.id, cuenta.id)
     assert filename.endswith(".zip")
     with zipfile.ZipFile(io.BytesIO(content)) as zf:
         names = zf.namelist()
         # Root readme
         assert "LEEME.txt" in names
-        # One folder per obligacion (3) each with a LEEME.txt
+        # No per-folder LEEME anymore (A3) — folders carry only the real files.
         leemes = [n for n in names if n.endswith("LEEME.txt") and "/" in n]
-        assert len(leemes) >= 3
-        # Verify content of one folder
-        sample = next(n for n in leemes if n.startswith("01_"))
-        body = zf.read(sample).decode("utf-8")
-        assert "Obligación #1" in body
-        assert "Actividad realizada 1" in body
+        assert leemes == []
+        archivo = next(n for n in names if n.startswith("01_") and n.endswith("soporte.pdf"))
+        assert zf.read(archivo)
 
 
 async def test_ownership_otro_usuario_falla(db: AsyncSession, cuenta: CuentaCobro) -> None:
@@ -328,8 +350,9 @@ async def test_zip_empaca_evidencia_link_confirmado_en_carpeta_de_obligacion(
         matches = [n for n in zf.namelist() if n.startswith("01_") and n.endswith("soporte.pdf")]
         assert matches, "link-confirmed evidencia must land under its obligation folder"
         assert zf.read(matches[0]) == contenido_real
-        leeme_name = next(n for n in zf.namelist() if n.startswith("01_") and n.endswith("LEEME.txt"))
-        assert "soporte.pdf" in zf.read(leeme_name).decode("utf-8")
+        # A3: no per-folder LEEME anymore — the folder is just the real file.
+        leemes = [n for n in zf.namelist() if n.startswith("01_") and n.endswith("LEEME.txt")]
+        assert leemes == []
 
 
 async def test_zip_evidencias_incluye_bytes_subidos_por_el_seam_real(
@@ -441,6 +464,22 @@ async def test_resolver_estructura_organismo_returns_real_lookup_when_ingested(
 async def test_zip_evidencias_uses_default_numbered_folders_when_no_organismo_template(
     db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # A folder only renders once it has a real evidencia file to carry (A3).
+    res = await db.execute(select(Actividad).where(Actividad.cuenta_cobro_id == cuenta.id).limit(1))
+    act = res.scalars().first()
+    assert act is not None
+    db.add(
+        Evidencia(
+            actividad_id=act.id,
+            storage_key=f"evidencias/{act.id}/soporte.pdf",
+            nombre_archivo="soporte.pdf",
+            tipo_archivo="application/pdf",
+            tamano_bytes=10,
+        )
+    )
+    await db.commit()
+    # See test_zip_evidencias_estructura for why this expire is required.
+    db.expire(act, ["evidencias"])
     user = test_user["user"]
     monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: _fake_storage())
 
@@ -481,7 +520,22 @@ async def test_zip_evidencias_uses_anexo_style_folders_when_organismo_template_e
         },
     )
     db.add(plantilla)
+    # A folder only renders once it has a real evidencia file to carry (A3).
+    res = await db.execute(select(Actividad).where(Actividad.cuenta_cobro_id == cuenta.id).limit(1))
+    act = res.scalars().first()
+    assert act is not None
+    db.add(
+        Evidencia(
+            actividad_id=act.id,
+            storage_key=f"evidencias/{act.id}/soporte.pdf",
+            nombre_archivo="soporte.pdf",
+            tipo_archivo="application/pdf",
+            tamano_bytes=10,
+        )
+    )
     await db.commit()
+    # See test_zip_evidencias_estructura for why this expire is required.
+    db.expire(act, ["evidencias"])
 
     monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: _fake_storage())
 
@@ -810,6 +864,14 @@ async def test_estado_justificacion_real_sola_cuenta_como_listo(
     no evidencia file, no confirmed link — is LISTO, matching the modo="final"
     package gate that has always accepted justificación-only coverage."""
     user = test_user["user"]
+    # Workstream B (B5): coverage now keys off `justificacion_origen`, not text —
+    # the base `cuenta` fixture's text defaults to `seed` (model default), so mark
+    # it `llm` explicitly to exercise the "real justificación" branch under test.
+    res = await db.execute(select(Actividad).where(Actividad.cuenta_cobro_id == cuenta.id))
+    for act in res.scalars().all():
+        act.justificacion_origen = "llm"
+    await db.commit()
+
     estado = await informe_service.obtener_estado_listo_pendiente(db, user.id, cuenta.id)
 
     # Base fixture: 3 actividades, all with real justificación, zero evidencias.
@@ -834,6 +896,16 @@ async def test_estado_justificacion_sentinel_no_cuenta_como_listo(
 
     assert estado.pendientes == 3
     assert estado.listo_para_radicar is False
+
+
+def test_tiene_justificacion_real_por_origen() -> None:
+    """Workstream B (B5): coverage is decided by `justificacion_origen` alone —
+    llm/manual count, seed/sin_labores/None never do."""
+    assert informe_service._tiene_justificacion_real("llm") is True
+    assert informe_service._tiene_justificacion_real("manual") is True
+    assert informe_service._tiene_justificacion_real("seed") is False
+    assert informe_service._tiene_justificacion_real("sin_labores") is False
+    assert informe_service._tiene_justificacion_real(None) is False
 
 
 async def test_estado_listo_cuenta_link_confirmado_en_stub_sin_clasificar(
@@ -1081,25 +1153,38 @@ async def test_zip_documentos_generados_entran_al_secret_scan(
     assert exc_info.value.code == "SECRET_DETECTED_IN_PACKAGE"
 
 
-async def test_zip_leeme_obligacion_lista_enlaces_de_evidencias_link(
+async def test_zip_evidencia_link_only_no_genera_carpeta_ni_se_cuela_en_sin_clasificar(
     db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Link-only evidencias (fuente/url, no storage_key) contribute no bytes —
-    the obligación LEEME documents them under an "Enlaces:" section."""
+    since A3 removed the per-folder LEEME (which used to document them under an
+    "Enlaces:" section), they now simply produce no folder at all, and are NOT
+    swept into sin_clasificar/ either (A2 only ships evidencias WITH storage_key).
+    Covers both a usable url and a missing one — neither crashes packaging."""
     user = test_user["user"]
     res = await db.execute(
         select(Actividad).where(Actividad.cuenta_cobro_id == cuenta.id).order_by(Actividad.fecha_realizacion.asc())
     )
     act = res.scalars().first()
     assert act is not None
-    ev = Evidencia(
-        actividad_id=act.id,
-        storage_key=None,
-        nombre_archivo="correo de aprobación",
-        fuente="gmail",
-        url="https://mail.google.com/mail/u/0/#inbox/abc123",
+    db.add_all(
+        [
+            Evidencia(
+                actividad_id=act.id,
+                storage_key=None,
+                nombre_archivo="correo de aprobación",
+                fuente="gmail",
+                url="https://mail.google.com/mail/u/0/#inbox/abc123",
+            ),
+            Evidencia(
+                actividad_id=act.id,
+                storage_key=None,
+                nombre_archivo="evento sin enlace utilizable",
+                fuente="calendar",
+                url=None,
+            ),
+        ]
     )
-    db.add(ev)
     await db.commit()
     await db.refresh(act)
     monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: _fake_storage())
@@ -1107,42 +1192,9 @@ async def test_zip_leeme_obligacion_lista_enlaces_de_evidencias_link(
     content, _filename = await informe_service.generar_zip_evidencias(db, user.id, cuenta.id)
 
     with zipfile.ZipFile(io.BytesIO(content)) as zf:
-        leemes = [n for n in zf.namelist() if n.endswith("LEEME.txt") and "/" in n]
-        body = zf.read(next(n for n in leemes if n.startswith("01_"))).decode("utf-8")
-    assert "Enlaces:" in body
-    assert "- gmail: https://mail.google.com/mail/u/0/#inbox/abc123" in body
-
-
-async def test_zip_leeme_enlace_sin_url_muestra_referencia_no_disponible(
-    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A link-type evidencia with NO usable url must not be silently dropped —
-    it appears in the "Enlaces:" section with a placeholder instead (P2 delta)."""
-    user = test_user["user"]
-    res = await db.execute(
-        select(Actividad).where(Actividad.cuenta_cobro_id == cuenta.id).order_by(Actividad.fecha_realizacion.asc())
-    )
-    act = res.scalars().first()
-    assert act is not None
-    ev = Evidencia(
-        actividad_id=act.id,
-        storage_key=None,
-        nombre_archivo="evento sin enlace utilizable",
-        fuente="calendar",
-        url=None,
-    )
-    db.add(ev)
-    await db.commit()
-    await db.refresh(act)
-    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: _fake_storage())
-
-    content, _filename = await informe_service.generar_zip_evidencias(db, user.id, cuenta.id)
-
-    with zipfile.ZipFile(io.BytesIO(content)) as zf:
-        leemes = [n for n in zf.namelist() if n.endswith("LEEME.txt") and "/" in n]
-        body = zf.read(next(n for n in leemes if n.startswith("01_"))).decode("utf-8")
-    assert "Enlaces:" in body
-    assert "- calendar: (referencia no disponible)" in body
+        names = zf.namelist()
+    assert not any(n.startswith("01_") for n in names)
+    assert not any(n.startswith("sin_clasificar/") for n in names)
 
 
 async def _vincular_cedula(db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro) -> None:

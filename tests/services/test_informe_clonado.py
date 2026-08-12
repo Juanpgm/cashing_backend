@@ -20,7 +20,7 @@ from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
 from app.models.obligacion import Obligacion, TipoObligacion
 from app.models.plantilla_organismo import PlantillaOrganismo
 from app.services import informe_service
-from app.services.informe_constants import SENTINEL_SIN_EVIDENCIAS
+from app.services.informe_constants import TEXTO_SIN_LABORES
 from docx import Document
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -475,8 +475,8 @@ async def test_justificaciones_sobrantes_quedan_en_blanco(
 
     assert resultado is not None
     out = Document(BytesIO(resultado))
-    assert out.tables[0].cell(0, 0).text == SENTINEL_SIN_EVIDENCIAS
-    assert out.tables[0].cell(1, 0).text == SENTINEL_SIN_EVIDENCIAS
+    assert out.tables[0].cell(0, 0).text == TEXTO_SIN_LABORES
+    assert out.tables[0].cell(1, 0).text == TEXTO_SIN_LABORES
     assert out.tables[0].cell(2, 0).text == ""  # example narrative blanked
     eventos = [e for e in captured if e.get("event") == "informe_clonado_justificaciones_blanqueadas"]
     assert eventos and eventos[0]["n"] == 1
@@ -526,7 +526,11 @@ async def test_generar_docx_clonado_justificacion_evidencia_sentinel_prioridad(
     obligaciones_by_id = {ob.id: ob for ob in obs}
 
     act_justificada = Actividad(
-        id=uuid.uuid4(), obligacion_id=obs[0].id, descripcion="Trabajo 1", justificacion="Justificación real 1"
+        id=uuid.uuid4(),
+        obligacion_id=obs[0].id,
+        descripcion="Trabajo 1",
+        justificacion="Justificación real 1",
+        justificacion_origen="llm",
     )
     act_con_evidencia = Actividad(id=uuid.uuid4(), obligacion_id=obs[1].id, descripcion="Trabajo 2", justificacion=None)
     act_con_evidencia.evidencias = [
@@ -542,7 +546,7 @@ async def test_generar_docx_clonado_justificacion_evidencia_sentinel_prioridad(
     out = Document(BytesIO(resultado))
     assert out.tables[0].cell(0, 0).text == "Justificación real 1"
     assert out.tables[0].cell(1, 0).text == "Trabajo 2"
-    assert out.tables[0].cell(2, 0).text == SENTINEL_SIN_EVIDENCIAS
+    assert out.tables[0].cell(2, 0).text == TEXTO_SIN_LABORES
 
 
 async def test_campos_sin_dato_quedan_en_blanco(

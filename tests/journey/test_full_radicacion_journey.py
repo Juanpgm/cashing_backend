@@ -43,13 +43,16 @@ FRICTION FOUND (partially mitigated, bug #6):
 
 from __future__ import annotations
 
+import io
+import uuid
+import zipfile
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from app.adapters.email.port import EmailMessage
+from app.adapters.email.port import EmailAttachment, EmailMessage
 from app.models.secop import SecopDocumento
 from app.schemas.agent import LLMResponse
 from app.services import evidence_discovery_service as eds
@@ -131,10 +134,16 @@ def _patch_actividades_llm(monkeypatch: pytest.MonkeyPatch, content: str) -> Non
 def _fake_storage() -> AsyncMock:
     storage = AsyncMock()
     storage.upload = AsyncMock(return_value="fake/key")
+    # A1 (evidence_persist_service) may snapshot real attachment bytes into storage
+    # during paso 7, and `generar_zip_evidencias` downloads them back in pasos 9b/11 —
+    # a plain AsyncMock's un-configured `.download()` return would not be real bytes
+    # and would break `zipfile.writestr`. Not stateful (doesn't echo what `.upload`
+    # received) — good enough since no assertion here depends on exact content.
+    storage.download = AsyncMock(return_value=b"contenido de evidencia de prueba")
     return storage
 
 
-def _email(mid: str, subject: str, body: str) -> EmailMessage:
+def _email(mid: str, subject: str, body: str, attachments: list[EmailAttachment] | None = None) -> EmailMessage:
     return EmailMessage(
         id=mid,
         thread_id="t1",
@@ -144,6 +153,7 @@ def _email(mid: str, subject: str, body: str) -> EmailMessage:
         date=datetime(2024, 3, 15, tzinfo=UTC),
         body_plain=body,
         snippet=body[:80],
+        attachments=attachments or [],
     )
 
 
@@ -355,6 +365,10 @@ async def test_full_radicacion_journey(
     # A single email whose body plausibly evidences BOTH obligaciones (shared
     # vocabulary keeps the matcher's keyword pre-filter above threshold for
     # both), so both obligaciones come back justified with a linked evidence.
+    # The email carries a real attachment — A1 (evidence_persist_service) must
+    # download it via EmailPort.get_attachment and snapshot it into storage, so
+    # paso 11 below finds real bytes inside the obligación folders, not just links.
+    attachment_bytes = b"contenido real del adjunto de gmail (informe mensual)"
     gmail = MagicMock()
     gmail.search_messages = AsyncMock(
         return_value=[
@@ -364,9 +378,18 @@ async def test_full_radicacion_journey(
                 "Adjunto el informe mensual de avance de actividades del contrato correspondiente "
                 "al período de marzo, incluyendo el apoyo brindado en la atención al ciudadano y "
                 "la gestión de solicitudes radicadas ante la entidad.",
+                attachments=[
+                    EmailAttachment(
+                        attachment_id="a1",
+                        filename="informe-mensual.pdf",
+                        mime_type="application/pdf",
+                        size_bytes=len(attachment_bytes),
+                    )
+                ],
             )
         ]
     )
+    gmail.get_attachment = AsyncMock(return_value=attachment_bytes)
     drive_adapter = MagicMock()
     drive_adapter.search_files = AsyncMock(return_value=[])
     cal_adapter = MagicMock()
@@ -389,11 +412,19 @@ async def test_full_radicacion_journey(
             eds.integration_service, "list_integration_statuses", AsyncMock(return_value=[_connected_status()])
         ),
         patch.object(eds, "GmailAdapter", return_value=gmail),
+        # A1: evidence_persist_service does its OWN `from
+        # app.adapters.email.gmail_adapter import GmailAdapter` at download time —
+        # a separate binding from `eds.GmailAdapter` above, so it needs its own patch.
+        patch("app.adapters.email.gmail_adapter.GmailAdapter", return_value=gmail),
         patch("app.agent.nodes.drive_fetch.DriveAdapter", return_value=drive_adapter),
         patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", return_value=cal_adapter),
         patch("app.agent.nodes.evidence_filter.get_llm", return_value=filter_llm),
         patch("app.agent.nodes.evidence_matcher.get_llm", return_value=matcher_llm),
         patch("app.agent.nodes.evidence_justify.get_llm", return_value=justify_llm),
+        # A1's upload of the downloaded attachment goes through
+        # informe_service.get_evidencia_storage() (S3_BUCKET_PDFS) — different seam
+        # than `_PATCH_S3` (document_service, used elsewhere in this journey).
+        patch("app.services.informe_service._get_storage", return_value=_fake_storage()),
     ):
         r = await client.post(
             "/api/v1/integraciones/evidencias/descubrir",
@@ -406,20 +437,27 @@ async def test_full_radicacion_journey(
                 "entidad": "Alcaldía de Bogotá",
             },
         )
-    assert r.status_code == 200, r.text
-    discovery = r.json()
-    assert len(discovery["obligaciones"]) == 2
-    ledger.auto("agente explorador descubrió evidencia en Gmail/Drive/Calendar y redactó justificación")
+        assert r.status_code == 200, r.text
+        discovery = r.json()
+        assert len(discovery["obligaciones"]) == 2
+        ledger.auto("agente explorador descubrió evidencia en Gmail/Drive/Calendar y redactó justificación")
 
-    r = await client.post(
-        f"/api/v1/cuentas-cobro/{cuenta_id}/evidencias/persistir",
-        headers=headers,
-        json={"obligaciones": discovery["obligaciones"]},
-    )
+        # Confirms A1 propagated the provider file id all the way to the API response
+        # — without it, evidence_persist_service has nothing to download.
+        enlaces = [ev for ob in discovery["obligaciones"] for ev in ob["evidencias"]]
+        assert enlaces and all(ev["attachment_id"] == "a1" for ev in enlaces), enlaces
+
+        r = await client.post(
+            f"/api/v1/cuentas-cobro/{cuenta_id}/evidencias/persistir",
+            headers=headers,
+            json={"obligaciones": discovery["obligaciones"]},
+        )
     assert r.status_code == 200, r.text
     persist_summary = r.json()
     assert persist_summary["evidencias_creadas"] == 2
-    ledger.auto("persistencia automática de Evidencia por cada obligación justificada")
+    ledger.auto(
+        "persistencia automática de Evidencia por cada obligación justificada (A1: con bytes reales del adjunto)"
+    )
 
     # ── 8. Cobertura: no obligación should remain SIN_EVIDENCIA ─────────────
     r = await client.get(f"/api/v1/cuentas-cobro/{cuenta_id}/cobertura", headers=headers)
@@ -482,6 +520,46 @@ async def test_full_radicacion_journey(
     final_body = final.json()
     assert final_body["estado"] == "enviada"
     assert final_body["fecha_envio"] is not None
+
+    # ── 11. Generación completa del paquete: ZIP real + validación ──────────
+    # Capstone de "generación completa". Ejercita el pipeline REAL de empaquetado
+    # (informes DOCX regenerados en la raíz, una subcarpeta por obligación con
+    # los ARCHIVOS reales de evidencia descubierta en Gmail — A1/A2/A3 —, gate
+    # secret-scan, gate modo="final") y valida integridad + estructura del zip
+    # resultante — el paso que faltaba entre este journey y la validación
+    # manual del paquete descargado.
+    with patch.object(_informe_service, "_get_storage", return_value=_fake_storage()):
+        contenido_zip, zip_filename = await _informe_service.generar_zip_evidencias(
+            db, test_user["user"].id, uuid.UUID(str(cuenta_id)), modo="final"
+        )
+    assert zip_filename.endswith(".zip"), zip_filename
+    zf = zipfile.ZipFile(io.BytesIO(contenido_zip))
+    assert zf.testzip() is None, "zip corrupto (integridad CRC falló)"
+    nombres = zf.namelist()
+    assert "LEEME.txt" in nombres, nombres
+    # Una subcarpeta numerada por obligación (2 en este journey) — A3: SOLO
+    # archivos reales, ningún LEEME por carpeta.
+    ob_folders = sorted({n.split("/")[0] for n in nombres if "/" in n and n[:2].isdigit()})
+    assert len(ob_folders) == len(obligacion_ids), (ob_folders, nombres)
+    assert not any(n.endswith("LEEME.txt") and "/" in n for n in nombres), nombres
+    # A1/A2: el adjunto de Gmail descubierto en paso 7 llegó con bytes reales
+    # (storage_key), así que cada carpeta de obligación debe contener un
+    # archivo real bajo su subcarpeta evidencias/ — no solo el LEEME que existía.
+    for folder in ob_folders:
+        archivos = [n for n in nombres if n.startswith(f"{folder}/evidencias/")]
+        assert archivos, (folder, nombres)
+        assert zf.read(archivos[0]), "archivo de evidencia vacío"
+    # Los informes DOCX generados viajan en la raíz del paquete.
+    docs_raiz = [n for n in nombres if n.endswith(".docx") and "/" not in n]
+    assert docs_raiz, f"esperaba informes DOCX en la raíz, obtuve: {nombres}"
+    ledger.auto(
+        "paquete de radicación generado y validado (zip íntegro, carpeta por obligación con archivos reales, informes)"
+    )
+    print(  # noqa: T201 — visible con -s, espeja la validación manual del paquete
+        f"\nPAQUETE GENERADO: {zip_filename}\n"
+        f"  entradas: {len(nombres)} | carpetas obligación: {len(ob_folders)} "
+        f"| docs raíz: {len(docs_raiz)} | integridad: OK"
+    )
 
     # ── Ledger assertions (the usability regression guard) ──────────────────
     report = ledger.render()

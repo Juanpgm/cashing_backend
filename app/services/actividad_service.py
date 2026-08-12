@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.exceptions import NotFoundError, ValidationError
-from app.models.actividad import Actividad
+from app.models.actividad import Actividad, JustificacionOrigen
 from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
 from app.models.obligacion import Obligacion
 from app.schemas.actividad import ActividadCreate, ActividadResponse, ActividadUpdate
@@ -20,9 +20,7 @@ logger = structlog.get_logger("service.actividad")
 _ESTADOS_EDITABLES = {EstadoCuentaCobro.BORRADOR}
 
 
-async def _get_cuenta_cobro_owned(
-    db: AsyncSession, cuenta_cobro_id: uuid.UUID, usuario_id: uuid.UUID
-) -> CuentaCobro:
+async def _get_cuenta_cobro_owned(db: AsyncSession, cuenta_cobro_id: uuid.UUID, usuario_id: uuid.UUID) -> CuentaCobro:
     from app.models.contrato import Contrato
 
     result = await db.execute(
@@ -46,7 +44,9 @@ async def _get_actividad(
     cuenta_cobro_id: uuid.UUID,
 ) -> Actividad:
     result = await db.execute(
-        select(Actividad).options(selectinload(Actividad.evidencias)).where(
+        select(Actividad)
+        .options(selectinload(Actividad.evidencias))
+        .where(
             Actividad.id == actividad_id,
             Actividad.cuenta_cobro_id == cuenta_cobro_id,
         )
@@ -80,9 +80,7 @@ async def crear_actividad(
 ) -> ActividadResponse:
     cc = await _get_cuenta_cobro_owned(db, cuenta_cobro_id, usuario_id)
     if cc.estado not in _ESTADOS_EDITABLES:
-        raise ValidationError(
-            f"No se pueden agregar actividades a una cuenta de cobro en estado '{cc.estado}'."
-        )
+        raise ValidationError(f"No se pueden agregar actividades a una cuenta de cobro en estado '{cc.estado}'.")
 
     if data.obligacion_id:
         ob = await db.get(Obligacion, data.obligacion_id)
@@ -112,11 +110,11 @@ async def actualizar_actividad(
 ) -> ActividadResponse:
     cc = await _get_cuenta_cobro_owned(db, cuenta_cobro_id, usuario_id)
     if cc.estado not in _ESTADOS_EDITABLES:
-        raise ValidationError(
-            f"No se puede editar actividades de una cuenta de cobro en estado '{cc.estado}'."
-        )
+        raise ValidationError(f"No se puede editar actividades de una cuenta de cobro en estado '{cc.estado}'.")
 
     a = await _get_actividad(db, actividad_id, cuenta_cobro_id)
+    if data.justificacion is not None:
+        a.justificacion_origen = JustificacionOrigen.MANUAL
     for field, value in data.model_dump(exclude_none=True).items():
         setattr(a, field, value)
     await db.commit()
@@ -132,9 +130,7 @@ async def eliminar_actividad(
 ) -> None:
     cc = await _get_cuenta_cobro_owned(db, cuenta_cobro_id, usuario_id)
     if cc.estado not in _ESTADOS_EDITABLES:
-        raise ValidationError(
-            f"No se puede eliminar actividades de una cuenta de cobro en estado '{cc.estado}'."
-        )
+        raise ValidationError(f"No se puede eliminar actividades de una cuenta de cobro en estado '{cc.estado}'.")
     a = await _get_actividad(db, actividad_id, cuenta_cobro_id)
     await db.delete(a)
     await db.commit()

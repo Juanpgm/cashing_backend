@@ -4,10 +4,19 @@
 and evidence links, it never writes to the database. This module is the write
 path: given the `ObligacionJustificada` list the discovery agent produced, it
 upserts one `Actividad` per obligación (linked by `obligacion_id`) and creates
-one link-type `Evidencia` per `EvidenceLink`, plus a CONFIRMED `EvidenciaObligacion`
+one `Evidencia` per `EvidenceLink`, plus a CONFIRMED `EvidenciaObligacion`
 row for the same (evidencia, obligación) pair — that link table is the
 classification source of truth `cobertura_service` reads from, so the
 obligación stops being SIN_EVIDENCIA.
+
+Each `Evidencia` keeps `url` as a reference to the discovered item, but when the
+link carries provider file ids (email `message_id`+`attachment_id`, or drive
+`file_id` — Problema A / `EvidenceLink.file_id` etc.) the real bytes are
+downloaded via `EmailPort.get_attachment`/`DrivePort.download_file` and stored
+in `get_evidencia_storage()`, so `storage_key` is set and the evidence packages
+real files (`informe_service.generar_zip_evidencias`), not just a link. Generic
+web links (no provider file id) stay link-only, same as before. Download
+failures are fail-open — logged and skipped, never abort the whole persist call.
 
 Idempotent on rows: re-persisting the same discovery result does not duplicate
 Actividad/Evidencia rows. Text is REPLACED on regeneration: a new discovery run
@@ -23,17 +32,50 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import NotFoundError, ValidationError
-from app.models.actividad import Actividad
+from app.core.file_validation import sanitize_filename
+from app.models.actividad import Actividad, JustificacionOrigen
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro
 from app.models.evidencia import Evidencia
 from app.models.evidencia_obligacion import ConfianzaEnlace, EstadoEnlace, EvidenciaObligacion, FuenteEnlace
 from app.models.obligacion import Obligacion
-from app.schemas.google_workspace import EvidencePersistSummary, ObligacionJustificada
+from app.schemas.google_workspace import EvidenceLink, EvidencePersistSummary, ObligacionJustificada
 
 logger = structlog.get_logger("service.evidence_persist")
 
 _NOMBRE_ARCHIVO_MAX_LEN = 255
+
+
+async def _descargar_bytes_link(db: AsyncSession, usuario_id: uuid.UUID, link: EvidenceLink) -> bytes | None:
+    """Download the real file behind a discovered `EvidenceLink`, or `None`.
+
+    `None` means either "this link has no provider file id" (a generic web
+    link — nothing to fetch) or "the download failed" (logged, fail-open: one
+    bad attachment must not sink the whole persist call). `link.provider`
+    selects Google vs. Microsoft — mirrors the adapter selection already used
+    in `evidence_discovery_service`/`drive_fetch_node`.
+    """
+    from app.models.integracion import IntegrationProvider
+
+    es_microsoft = link.provider == IntegrationProvider.MICROSOFT.value
+    try:
+        if link.source == "email" and link.message_id and link.attachment_id:
+            from app.adapters.email.gmail_adapter import GmailAdapter
+            from app.adapters.microsoft.graph_adapter import MicrosoftGraphAdapter
+
+            email_adapter = MicrosoftGraphAdapter(db) if es_microsoft else GmailAdapter(db)
+            return await email_adapter.get_attachment(usuario_id, link.message_id, link.attachment_id)
+        if link.source == "drive" and link.file_id:
+            from app.adapters.drive.drive_adapter import DriveAdapter
+            from app.adapters.microsoft.graph_adapter import MicrosoftGraphAdapter
+
+            drive_adapter = MicrosoftGraphAdapter(db) if es_microsoft else DriveAdapter(db)
+            return await drive_adapter.download_file(usuario_id, link.file_id)
+    except Exception as exc:
+        await logger.awarning(
+            "evidencia_link_download_failed", source=link.source, link=link.link[:200], error=str(exc)
+        )
+    return None
 
 
 def _parse_obligacion_id(value: str) -> uuid.UUID | None:
@@ -139,9 +181,11 @@ async def persistir_evidencias(
     For each obligación entry: upsert one Actividad (by cuenta_id + obligacion_id).
     An existing Actividad's descripcion/justificacion are REPLACED when the new
     discovery produced text (regeneration = the user wants a fresh draft); an
-    empty generation never blanks existing text. Each EvidenceLink becomes a
-    link-type Evidencia (storage_key=None, url set); re-persisting the same
-    link on the same actividad is a no-op (deduped by url).
+    empty generation never blanks existing text. Each EvidenceLink becomes an
+    Evidencia (url always set); when the link carries a provider file id its
+    bytes are snapshotted into storage too (`storage_key` set) — see
+    `_descargar_bytes_link`. Re-persisting the same link on the same actividad
+    is a no-op (deduped by url).
 
     Security: every `obligacion_id` referencing a real UUID must belong to the
     cuenta's own contrato. Without this check a malicious client could pass an
@@ -164,6 +208,8 @@ async def persistir_evidencias(
     actividades_actualizadas = 0
     evidencias_creadas = 0
     evidencias_omitidas = 0
+    evidencias_con_archivo = 0
+    evidencias_descarga_fallida = 0
 
     for ob in obligaciones:
         obligacion_uuid = _parse_obligacion_id(ob.obligacion_id)
@@ -178,6 +224,7 @@ async def persistir_evidencias(
                 obligacion_id=obligacion_uuid,
                 descripcion=ob.actividad.strip() or _descripcion_fallback(ob),
                 justificacion=ob.justificacion,
+                justificacion_origen=ob.origen or JustificacionOrigen.SEED.value,
             )
             db.add(actividad)
             await db.flush()
@@ -185,10 +232,27 @@ async def persistir_evidencias(
         elif ob.justificacion.strip() or ob.actividad.strip():
             # Regenerar REEMPLAZA el texto existente (pedido de producto): quien
             # vuelve a dar "Generar" quiere descartar la redacción anterior.
-            # Solo se pisa cuando la nueva generación trae texto real.
-            actividad.descripcion = ob.actividad.strip() or _descripcion_fallback(ob)
-            actividad.justificacion = ob.justificacion
-            actividades_actualizadas += 1
+            # Solo se pisa cuando la nueva generación trae texto real, Y el seed
+            # nunca pisa una justificación real ya persistida (llm/manual) — B3.
+            incoming_origen = ob.origen or JustificacionOrigen.SEED.value
+            existing_origen = actividad.justificacion_origen or JustificacionOrigen.SEED.value
+            existing_texto = (actividad.justificacion or "").strip()
+            puede_reemplazar = (
+                incoming_origen in (JustificacionOrigen.LLM.value, JustificacionOrigen.MANUAL.value)
+                or existing_origen in (JustificacionOrigen.SEED.value, JustificacionOrigen.SIN_LABORES.value)
+                or not existing_texto
+            )
+            if puede_reemplazar:
+                actividad.descripcion = ob.actividad.strip() or _descripcion_fallback(ob)
+                actividad.justificacion = ob.justificacion
+                actividad.justificacion_origen = incoming_origen
+                actividades_actualizadas += 1
+            else:
+                await logger.ainfo(
+                    "evidencias_persistidas_seed_no_pisa_real",
+                    actividad_id=str(actividad.id),
+                    cuenta_id=str(cuenta_id),
+                )
 
         existing_urls = await _existing_evidencia_urls(db, actividad.id)
 
@@ -196,15 +260,44 @@ async def persistir_evidencias(
             if link.link in existing_urls:
                 evidencias_omitidas += 1
                 continue
+
+            storage_key: str | None = None
+            tipo_archivo: str | None = None
+            tamano_bytes: int | None = None
+            tiene_archivo_provider = bool(
+                (link.source == "email" and link.attachment_id) or (link.source == "drive" and link.file_id)
+            )
+            if tiene_archivo_provider:
+                contenido = await _descargar_bytes_link(db, usuario_id, link)
+                if contenido is not None:
+                    from app.services.informe_service import get_evidencia_storage
+
+                    safe_filename = sanitize_filename(link.titulo or link.link)
+                    key = f"evidencias/{usuario_id}/{actividad.id}/{uuid.uuid4()}_{safe_filename}"
+                    try:
+                        storage = get_evidencia_storage()
+                        await storage.upload(  # type: ignore[attr-defined]
+                            key=key, data=contenido, content_type=link.mime_type or "application/octet-stream"
+                        )
+                        storage_key = key
+                        tipo_archivo = link.mime_type or None
+                        tamano_bytes = len(contenido)
+                        evidencias_con_archivo += 1
+                    except Exception as exc:
+                        await logger.awarning("evidencia_link_upload_failed", link=link.link[:200], error=str(exc))
+                        evidencias_descarga_fallida += 1
+                else:
+                    evidencias_descarga_fallida += 1
+
             evidencia = Evidencia(
                 id=uuid.uuid4(),
                 actividad_id=actividad.id,
                 fuente=link.source,
                 url=link.link,
                 nombre_archivo=(link.titulo or link.link)[:_NOMBRE_ARCHIVO_MAX_LEN],
-                storage_key=None,
-                tipo_archivo=None,
-                tamano_bytes=None,
+                storage_key=storage_key,
+                tipo_archivo=tipo_archivo,
+                tamano_bytes=tamano_bytes,
             )
             db.add(evidencia)
             existing_urls.add(link.link)
@@ -237,6 +330,8 @@ async def persistir_evidencias(
         actividades_actualizadas=actividades_actualizadas,
         evidencias_creadas=evidencias_creadas,
         evidencias_omitidas=evidencias_omitidas,
+        evidencias_con_archivo=evidencias_con_archivo,
+        evidencias_descarga_fallida=evidencias_descarga_fallida,
     )
 
     return EvidencePersistSummary(
