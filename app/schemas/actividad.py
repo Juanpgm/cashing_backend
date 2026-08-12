@@ -57,6 +57,7 @@ class ActividadResponse(BaseModel):
     obligacion_id: uuid.UUID | None
     descripcion: str
     justificacion: str | None
+    justificacion_origen: str
     fecha_realizacion: date | None
     evidencias: list[EvidenciaResponse] = []
     created_at: datetime
