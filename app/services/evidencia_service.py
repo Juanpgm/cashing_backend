@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import mimetypes
+import shutil
 import uuid
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -15,8 +18,10 @@ from app.adapters.llm import get_llm
 from app.adapters.storage.port import StoragePort
 from app.agent.nodes.evidence_matcher import clasificar_evidencia, confidence_bucket, evidence_matcher_node
 from app.agent.state import AgentState
+from app.agent.tools import document_parser
 from app.core.exceptions import ExternalServiceError, NotFoundError, ValidationError
 from app.core.file_validation import (
+    JUNK_PATH_SEGMENTS,
     sanitize_filename,
     validate_evidence_file,
     validate_file_extension,
@@ -478,6 +483,106 @@ async def _clasificar_y_enlazar_lote(
         await _avanzar_progreso(db, job)
 
 
+_ARCHIVE_SUFFIXES = {".zip", ".rar"}
+_MENSAJE_RAR_NO_DISPONIBLE = "El soporte para archivos .rar no está disponible en este servidor; usá .zip."
+
+
+class _ResultadosConAvisos(list[EvidenciaClasificadaResponse]):
+    """`list[EvidenciaClasificadaResponse]` that also carries archive-expansion
+    avisos (skipped/omitted members, rar degradation, cap truncation).
+
+    A list SUBCLASS rather than a wrapper object — every existing caller that
+    treats the return value as a plain list (indexing, iterating, `len()`,
+    the pre-B2 test suite) keeps working unchanged. Only the API route opts
+    into reading `.avisos` for the `EvidenciasCuentaSubidaResponse` schema.
+    """
+
+    def __init__(self, items: list[EvidenciaClasificadaResponse], avisos: list[str]) -> None:
+        super().__init__(items)
+        self.avisos = avisos
+
+
+def _normalizar_ruta_miembro(nombre: str) -> str:
+    """Normalize an archive member's internal path for use as `nombre_archivo`.
+
+    Mirrors the frontend's `webkitRelativePath` convention ("folder/sub/file.pdf")
+    so downstream classification/grouping treats archive members exactly like a
+    folder-uploaded file. Defense in depth even though `iter_archive_members`
+    extracts in-memory (no filesystem write, so zip-slip can't escape to disk):
+    strips a leading slash and any `..`/empty segments.
+    """
+    ruta = nombre.replace("\\", "/").lstrip("/")
+    partes = [p for p in ruta.split("/") if p not in ("", ".", "..")]
+    return "/".join(partes)
+
+
+def _es_miembro_junk(ruta: str) -> bool:
+    """True when any path segment is a known-junk name or starts with `.`
+    (mirrors the frontend's `JUNK_DIR_SEGMENTS` + `d.startsWith(".")`)."""
+    return any(seg in JUNK_PATH_SEGMENTS or seg.startswith(".") for seg in ruta.split("/"))
+
+
+def _expandir_archivos_comprimidos(
+    archivos: list[tuple[str, str, bytes]],
+) -> tuple[list[tuple[str, str, bytes]], list[str]]:
+    """Expand any top-level `.zip`/`.rar` entry in `archivos` into its member
+    files, replacing the archive in the returned list. Non-archive files pass
+    through unchanged. The archive itself is NEVER stored — only its members
+    enter the pipeline.
+
+    Reuses `document_parser.iter_archive_members` verbatim (in-memory
+    extraction, own member-count/size caps) — no second extraction path.
+    Junk members (`JUNK_PATH_SEGMENTS`), zero-byte members, and members with a
+    blocked extension are skipped WITH an aviso instead of failing the whole
+    batch (unlike a directly-uploaded top-level file, which still keeps the
+    existing all-or-nothing contract via the validation loop that runs after
+    this). An archive that yields zero usable members raises — same
+    all-or-nothing contract a single bad top-level file already has.
+    """
+    avisos: list[str] = []
+    expandido: list[tuple[str, str, bytes]] = []
+
+    for filename, _content_type, data in archivos:
+        ext = Path(filename).suffix.lower()
+        if ext not in _ARCHIVE_SUFFIXES:
+            expandido.append((filename, _content_type, data))
+            continue
+
+        if ext == ".rar" and not (shutil.which("unrar") or shutil.which("bsdtar")):
+            raise ValidationError(_MENSAJE_RAR_NO_DISPONIBLE)
+
+        miembros = list(document_parser.iter_archive_members(data, filename))
+        if len(miembros) >= document_parser._ARCHIVE_MAX_MEMBERS:  # mirrors requisito_inference_service
+            avisos.append(
+                f"{filename}: el comprimido excede el límite de "
+                f"{document_parser._ARCHIVE_MAX_MEMBERS} archivos; se procesaron solo los primeros."
+            )
+
+        usables = 0
+        for nombre_miembro, datos_miembro in miembros:
+            ruta = _normalizar_ruta_miembro(nombre_miembro)
+            if not ruta or _es_miembro_junk(ruta):
+                avisos.append(f"{filename}: se omitió '{ruta or nombre_miembro}' (archivo o carpeta no relevante).")
+                continue
+
+            content_type_miembro = mimetypes.guess_type(ruta)[0] or "application/octet-stream"
+            try:
+                validate_evidence_file(
+                    filename=ruta, size=len(datos_miembro), content_type=content_type_miembro, content=datos_miembro
+                )
+            except ValidationError as exc:
+                avisos.append(f"{filename}: se omitió '{ruta}' ({exc.detail}).")
+                continue
+
+            expandido.append((ruta, content_type_miembro, datos_miembro))
+            usables += 1
+
+        if usables == 0:
+            raise ValidationError("El comprimido no contiene evidencias válidas.")
+
+    return expandido, avisos
+
+
 async def subir_evidencias_cuenta(
     db: AsyncSession,
     storage: StoragePort,
@@ -485,7 +590,7 @@ async def subir_evidencias_cuenta(
     cuenta_id: uuid.UUID,
     archivos: list[tuple[str, str, bytes]],
     background_tasks: BackgroundTasks | None = None,
-) -> list[EvidenciaClasificadaResponse]:
+) -> _ResultadosConAvisos:
     """Upload evidence files scoped to a CuentaCobro, BEFORE any Actividad exists.
 
     The Evidencias step now runs before Justificaciones, so there is no
@@ -500,6 +605,14 @@ async def subir_evidencias_cuenta(
     ALL files are validated up front (same all-or-nothing contract as
     `subir_evidencias`) before anything is written.
 
+    `.zip`/`.rar` entries in `archivos` are expanded server-side into their
+    member files BEFORE that validation loop (Req 6) — see
+    `_expandir_archivos_comprimidos`. The archive itself is never stored; each
+    usable member flows through the exact same pipeline as a folder-uploaded
+    file. Junk/zero-byte/blocked-extension members inside an archive are
+    skipped with an aviso rather than failing the batch; a directly-uploaded
+    top-level file keeps the strict all-or-nothing contract.
+
     `background_tasks` (evidence-classification-jobs: Fast upload response):
     when provided (the real request path, wired from the API route), the
     multi-obligación link-table classification (`_clasificar_y_enlazar_lote`)
@@ -510,6 +623,11 @@ async def subir_evidencias_cuenta(
     """
     if not archivos:
         raise ValidationError("Debe incluir al menos un archivo.")
+
+    # `_expandir_archivos_comprimidos` never returns an empty list when its
+    # input isn't empty — an archive yielding zero usable members raises
+    # instead (see its docstring), so no extra empty-check is needed here.
+    archivos, avisos = _expandir_archivos_comprimidos(archivos)
 
     for filename, content_type, data in archivos:
         validate_evidence_file(filename=filename, size=len(data), content_type=content_type, content=data)
@@ -637,7 +755,7 @@ async def subir_evidencias_cuenta(
     else:
         await _clasificar_y_enlazar_lote(db, obligaciones, evidencias_creadas)
 
-    return resultados
+    return _ResultadosConAvisos(resultados, avisos)
 
 
 async def listar_evidencias(

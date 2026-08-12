@@ -234,6 +234,32 @@ def _final_extension(filename: str) -> str:
     return "." + safe.rsplit(".", maxsplit=1)[-1].lower()
 
 
+# Path segments considered junk when expanding an uploaded .zip/.rar archive —
+# same 9 values as the frontend's `JUNK_DIR_SEGMENTS`
+# (components/stepper/steps/step-4-evidencias.tsx), plus the Mac/Windows
+# zip-specific entries (`__MACOSX`, `.DS_Store`, `Thumbs.db`) that folder-picker
+# junk filtering never needed (a real filesystem folder select never contains
+# those) but an archive built by Finder/Explorer commonly does. Any path
+# segment matching this set, OR starting with `.`, is skipped — mirrors the
+# frontend's `d.startsWith(".")` catch-all for dot-directories.
+JUNK_PATH_SEGMENTS: frozenset[str] = frozenset(
+    {
+        ".git",
+        "node_modules",
+        "__pycache__",
+        ".venv",
+        "venv",
+        "dist",
+        "build",
+        ".next",
+        ".pytest_cache",
+        "__MACOSX",
+        ".DS_Store",
+        "Thumbs.db",
+    }
+)
+
+
 def validate_evidence_file(filename: str, size: int, content_type: str, content: bytes) -> None:
     """Validate an evidence file upload. Raises ValidationError, returns None if OK.
 

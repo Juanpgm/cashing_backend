@@ -73,6 +73,18 @@ class EvidenciaClasificadaResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class EvidenciasCuentaSubidaResponse(BaseModel):
+    """Response for POST .../evidencias/subir — wraps the per-file classification
+    results plus batch-level avisos (skipped/omitted .zip/.rar archive members,
+    rar-support degradation, member-count cap truncation). Mirrors
+    `AnalizarArchivoResponse`'s resultados+avisos shape used for the analogous
+    `archivo:analizar` plantillas-organismo endpoint.
+    """
+
+    resultados: list[EvidenciaClasificadaResponse]
+    avisos: list[str] = Field(default_factory=list)
+
+
 class EvidenciaPresignedResponse(BaseModel):
     """Presigned download URL for a file."""
 

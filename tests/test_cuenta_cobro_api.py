@@ -699,12 +699,15 @@ async def test_subir_evidencias_cuenta_201_clasifica(
 
     assert resp.status_code == 201, resp.text
     data = resp.json()
-    assert isinstance(data, list)
-    assert len(data) == 1
-    assert data[0]["clasificado"] is True
-    assert data[0]["obligacion_id"] == str(ob.id)
-    assert data[0]["obligacion_etiqueta"] == "OB1"
-    assert data[0]["nombre_archivo"] == "informe.txt"
+    # Response shape (Req 6, archive-expansion avisos): {resultados, avisos},
+    # not a bare list — see EvidenciasCuentaSubidaResponse.
+    assert data["avisos"] == []
+    resultados = data["resultados"]
+    assert len(resultados) == 1
+    assert resultados[0]["clasificado"] is True
+    assert resultados[0]["obligacion_id"] == str(ob.id)
+    assert resultados[0]["obligacion_etiqueta"] == "OB1"
+    assert resultados[0]["nombre_archivo"] == "informe.txt"
 
 
 @pytest.mark.asyncio

@@ -38,7 +38,7 @@ from app.schemas.cuenta_cobro import (
     GenerarPDFResponse,
     PDFUrlResponse,
 )
-from app.schemas.evidencia import EvidenciaClasificadaResponse
+from app.schemas.evidencia import EvidenciasCuentaSubidaResponse
 from app.schemas.evidencia_clasificacion import (
     ClasificacionEstadoResponse,
     ClasificacionJobResponse,
@@ -396,7 +396,7 @@ async def auto_evidencias(
 
 @router.post(
     "/{cuenta_id}/evidencias/subir",
-    response_model=list[EvidenciaClasificadaResponse],
+    response_model=EvidenciasCuentaSubidaResponse,
     status_code=status.HTTP_201_CREATED,
 )
 async def subir_evidencias_cuenta(
@@ -406,7 +406,7 @@ async def subir_evidencias_cuenta(
     files: list[UploadFile] = File(...),
     db: AsyncSession = Depends(get_db),
     storage: S3StorageAdapter = Depends(get_pdf_storage),
-) -> list[EvidenciaClasificadaResponse]:
+) -> EvidenciasCuentaSubidaResponse:
     """Sube uno o varios archivos de evidencia para una cuenta de cobro, ANTES de
     que existan actividades (paso Evidencias, ahora anterior a Justificaciones).
 
@@ -415,6 +415,12 @@ async def subir_evidencias_cuenta(
     la generación de justificaciones y el paquete de radicación puedan usar esa
     clasificación más adelante. Todos los archivos se validan antes de persistir
     cualquiera; un archivo inválido rechaza el lote completo.
+
+    Un `.zip`/`.rar` entre los archivos se expande server-side y cada miembro
+    entra al mismo pipeline que un archivo de carpeta; el comprimido en sí
+    nunca se almacena. Los miembros omitidos (basura, vacíos, extensión
+    bloqueada) o el truncado por límite de miembros se reportan en `avisos`,
+    sin rechazar el lote.
 
     La clasificación multi-obligación (tabla `evidencia_obligacion`) se ejecuta
     en segundo plano (evidence-classification-jobs: Fast upload response) — esta
@@ -433,7 +439,7 @@ async def subir_evidencias_cuenta(
         )
         for f in files
     ]
-    return await evidencia_service.subir_evidencias_cuenta(
+    resultados = await evidencia_service.subir_evidencias_cuenta(
         db=db,
         storage=storage,
         usuario_id=user.id,
@@ -441,6 +447,7 @@ async def subir_evidencias_cuenta(
         archivos=archivos,
         background_tasks=background_tasks,
     )
+    return EvidenciasCuentaSubidaResponse(resultados=resultados, avisos=resultados.avisos)
 
 
 @router.post(
