@@ -97,7 +97,10 @@ class S3StorageAdapter:
                 Prefix=prefix,
             ),
         )
-        return [StorageObjectInfo(key=item["Key"], size_bytes=item["Size"]) for item in response.get("Contents", [])]
+        return [
+            StorageObjectInfo(key=item["Key"], size_bytes=item["Size"], last_modified=item.get("LastModified"))
+            for item in response.get("Contents", [])
+        ]
 
     async def stat(self, key: str) -> StorageObjectInfo | None:
         loop = asyncio.get_running_loop()
@@ -114,7 +117,9 @@ class S3StorageAdapter:
             if exc.response.get("Error", {}).get("Code") in ("404", "NoSuchKey"):
                 return None
             raise
-        return StorageObjectInfo(key=key, size_bytes=response["ContentLength"])
+        return StorageObjectInfo(
+            key=key, size_bytes=response["ContentLength"], last_modified=response.get("LastModified")
+        )
 
 
 def get_storage() -> S3StorageAdapter:

@@ -52,6 +52,10 @@ test-pg:
 test-cov:
 	uv run pytest --cov=app --cov-report=html --cov-report=term-missing
 
+# Report-only storage orphan audit (never deletes) — see scripts/audit_storage_orphans.py
+audit-storage:
+	uv run python -m scripts.audit_storage_orphans --scope all
+
 # Linting
 lint:
 	uv run ruff check .

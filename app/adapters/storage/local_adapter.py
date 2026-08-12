@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 from app.adapters.storage.port import StorageObjectInfo
@@ -117,14 +118,19 @@ class LocalStorageAdapter:
             safe_root = _winsafe(self._root)
             if not safe_base.exists():
                 return []
-            return [
-                StorageObjectInfo(
-                    key=str(path.relative_to(safe_root)).replace("\\", "/"),
-                    size_bytes=path.stat().st_size,
+            infos = []
+            for path in sorted(safe_base.rglob("*")):
+                if not path.is_file():
+                    continue
+                stat_result = path.stat()
+                infos.append(
+                    StorageObjectInfo(
+                        key=str(path.relative_to(safe_root)).replace("\\", "/"),
+                        size_bytes=stat_result.st_size,
+                        last_modified=datetime.fromtimestamp(stat_result.st_mtime, tz=UTC),
+                    )
                 )
-                for path in sorted(safe_base.rglob("*"))
-                if path.is_file()
-            ]
+            return infos
 
         return await loop.run_in_executor(None, _scan)
 
@@ -138,6 +144,11 @@ class LocalStorageAdapter:
         def _stat() -> StorageObjectInfo | None:
             if not path.exists():
                 return None
-            return StorageObjectInfo(key=key, size_bytes=path.stat().st_size)
+            stat_result = path.stat()
+            return StorageObjectInfo(
+                key=key,
+                size_bytes=stat_result.st_size,
+                last_modified=datetime.fromtimestamp(stat_result.st_mtime, tz=UTC),
+            )
 
         return await loop.run_in_executor(None, _stat)

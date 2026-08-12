@@ -1,16 +1,20 @@
 """Storage port (interface) for file persistence."""
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Protocol
 
 
 @dataclass(frozen=True)
 class StorageObjectInfo:
-    """Metadata for a single object returned by `StoragePort.list_objects` —
-    no bytes are read, just the key and size (radicacion-stepper, work unit B5)."""
+    """Metadata for a single object returned by `StoragePort.list_objects` or
+    `StoragePort.stat` — no bytes are read, just key/size/mtime (radicacion-stepper,
+    work unit B5). `last_modified` is `None` only if an adapter genuinely can't
+    determine it — callers doing age-gated deletes must treat that as "too young"."""
 
     key: str
     size_bytes: int
+    last_modified: datetime | None = None
 
 
 class StoragePort(Protocol):
