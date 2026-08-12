@@ -19,6 +19,10 @@ class EvidenciaUploadResponse(BaseModel):
     tamano_bytes: int
     presigned_url: str | None = None
     created_at: datetime
+    duplicada: bool = Field(
+        default=False,
+        description="True cuando el archivo ya existía (mismo contenido) y no se volvió a subir.",
+    )
 
     model_config = {"from_attributes": True}
 
@@ -61,6 +65,10 @@ class EvidenciaClasificadaResponse(BaseModel):
     presigned_url: str | None = None
     clasificado: bool
     created_at: datetime
+    duplicada: bool = Field(
+        default=False,
+        description="True cuando el archivo ya existía (mismo contenido) y no se volvió a subir.",
+    )
 
     model_config = {"from_attributes": True}
 

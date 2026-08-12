@@ -30,6 +30,10 @@ class Evidencia(UUIDMixin, TimestampMixin, Base):
     # LLM can ground on what the evidence actually says, not just its filename.
     # NULL for link evidence and for files where extraction yielded nothing.
     texto_extraido: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # SHA-256 hex digest of the uploaded file's bytes (migration 038) — lets
+    # upload sites dedup re-uploads of the same file before touching storage.
+    # NULL for link evidence and for pre-existing rows (no backfill).
+    sha256: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
 
     # Relationships
     actividad: Mapped["Actividad"] = relationship(back_populates="evidencias")  # type: ignore[name-defined]  # noqa: F821

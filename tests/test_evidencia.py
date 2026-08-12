@@ -125,6 +125,8 @@ async def test_listar_evidencias(db: AsyncSession, test_user: dict[str, Any], ac
     user = test_user["user"]
     storage = _mock_storage()
     for i in range(2):
+        # Distinct content per file — identical bytes would dedup to a single
+        # row (Req 10a), which isn't what this test is exercising.
         await evidencia_service.subir_evidencia(
             db=db,
             storage=storage,
@@ -132,7 +134,7 @@ async def test_listar_evidencias(db: AsyncSession, test_user: dict[str, Any], ac
             actividad_id=actividad.id,
             filename=f"doc{i}.pdf",
             content_type="application/pdf",
-            data=_PDF_MAGIC,
+            data=_PDF_MAGIC + str(i).encode(),
         )
     evidencias = await evidencia_service.listar_evidencias(db, user.id, actividad.id)
     assert len(evidencias) == 2

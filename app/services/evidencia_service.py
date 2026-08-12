@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from typing import Any
 
@@ -112,6 +113,57 @@ def _enlazar_si_actividad_tiene_obligacion(db: AsyncSession, evidencia: Evidenci
     )
 
 
+async def _buscar_evidencia_duplicada_actividad(
+    db: AsyncSession, actividad_id: uuid.UUID, sha256: str
+) -> Evidencia | None:
+    """Find an existing stored (storage_key set) Evidencia with the same
+    content hash under the same actividad — re-uploading identical bytes must
+    not create a second row or storage object (Req 10a)."""
+    result = await db.execute(
+        select(Evidencia).where(
+            Evidencia.actividad_id == actividad_id,
+            Evidencia.sha256 == sha256,
+            Evidencia.storage_key.isnot(None),
+        )
+    )
+    return result.scalars().first()
+
+
+async def _buscar_evidencia_duplicada_cuenta(db: AsyncSession, cuenta_id: uuid.UUID, sha256: str) -> Evidencia | None:
+    """Same dedup as `_buscar_evidencia_duplicada_actividad` but scoped to a
+    CuentaCobro (subir_evidencias_cuenta has no actividad_id yet at call time —
+    evidence can land on any stub actividad under the cuenta)."""
+    result = await db.execute(
+        select(Evidencia)
+        .join(Actividad, Actividad.id == Evidencia.actividad_id)
+        .where(
+            Actividad.cuenta_cobro_id == cuenta_id,
+            Evidencia.sha256 == sha256,
+            Evidencia.storage_key.isnot(None),
+        )
+    )
+    return result.scalars().first()
+
+
+async def _commit_or_limpiar_storage(db: AsyncSession, storage: StoragePort, key: str) -> None:
+    """Commit the pending Evidencia insert; if the commit itself raises,
+    best-effort delete the just-uploaded storage object so a failed commit
+    never leaves an orphaned S3-compatible object behind, then roll back and
+    re-raise. Upload-then-insert ordering is kept (not swapped to
+    insert-then-upload): a committed row pointing at a missing object is worse
+    than a transient orphan cleaned up here.
+    """
+    try:
+        await db.commit()
+    except Exception:
+        try:
+            await storage.delete(key=key)
+        except Exception:
+            logger.warning("evidencia_orphan_storage_cleanup_failed", key=key)
+        await db.rollback()
+        raise
+
+
 async def subir_evidencia(
     db: AsyncSession,
     storage: StoragePort,
@@ -131,6 +183,26 @@ async def subir_evidencia(
 
     actividad = await _get_actividad_owned(db, actividad_id, usuario_id)
 
+    sha256 = hashlib.sha256(data).hexdigest()
+    duplicada = await _buscar_evidencia_duplicada_actividad(db, actividad_id, sha256)
+    if duplicada is not None:
+        logger.info("evidencia_duplicada_detectada", id=str(duplicada.id), actividad_id=str(actividad_id))
+        try:
+            presigned = await storage.presigned_url(key=duplicada.storage_key, expires_in=3600)  # type: ignore[arg-type]
+        except Exception:
+            presigned = None
+        return EvidenciaUploadResponse(
+            id=duplicada.id,
+            actividad_id=duplicada.actividad_id,
+            storage_key=duplicada.storage_key,
+            nombre_archivo=duplicada.nombre_archivo,
+            tipo_archivo=duplicada.tipo_archivo,
+            tamano_bytes=duplicada.tamano_bytes,
+            presigned_url=presigned,
+            created_at=duplicada.created_at,
+            duplicada=True,
+        )
+
     key = f"evidencias/{usuario_id}/{actividad_id}/{uuid.uuid4()}_{filename}"
     await storage.upload(key=key, data=data, content_type=content_type)
 
@@ -142,10 +214,11 @@ async def subir_evidencia(
         tipo_archivo=content_type,
         tamano_bytes=len(data),
         texto_extraido=await _extraer_texto_seguro(filename, data),
+        sha256=sha256,
     )
     db.add(evidencia)
     _enlazar_si_actividad_tiene_obligacion(db, evidencia, actividad)
-    await db.commit()
+    await _commit_or_limpiar_storage(db, storage, key)
     await db.refresh(evidencia)
 
     try:
@@ -201,6 +274,35 @@ async def subir_evidencias(
 
     resultados: list[EvidenciaUploadResponse] = []
     for filename, content_type, data in archivos:
+        sha256 = hashlib.sha256(data).hexdigest()
+        duplicada = await _buscar_evidencia_duplicada_actividad(db, actividad_id, sha256)
+        if duplicada is not None:
+            # Also covers within-batch duplicates: each iteration commits
+            # before the next runs, so a repeat hash later in this SAME
+            # request already finds the row this loop just inserted.
+            logger.info("evidencia_duplicada_detectada", id=str(duplicada.id), actividad_id=str(actividad_id))
+            try:
+                presigned = await storage.presigned_url(
+                    key=duplicada.storage_key,  # type: ignore[arg-type]
+                    expires_in=3600,
+                )
+            except Exception:
+                presigned = None
+            resultados.append(
+                EvidenciaUploadResponse(
+                    id=duplicada.id,
+                    actividad_id=duplicada.actividad_id,
+                    storage_key=duplicada.storage_key,
+                    nombre_archivo=duplicada.nombre_archivo,
+                    tipo_archivo=duplicada.tipo_archivo,
+                    tamano_bytes=duplicada.tamano_bytes,
+                    presigned_url=presigned,
+                    created_at=duplicada.created_at,
+                    duplicada=True,
+                )
+            )
+            continue
+
         # Sanitize before building the storage key — the filename itself is
         # attacker-controlled and evidence allows arbitrary extensions/characters.
         safe_filename = sanitize_filename(filename)
@@ -231,10 +333,11 @@ async def subir_evidencias(
             tipo_archivo=content_type,
             tamano_bytes=len(data),
             texto_extraido=await _extraer_texto_seguro(filename, data),
+            sha256=sha256,
         )
         db.add(evidencia)
         _enlazar_si_actividad_tiene_obligacion(db, evidencia, actividad)
-        await db.commit()
+        await _commit_or_limpiar_storage(db, storage, key)
         await db.refresh(evidencia)
 
         try:
@@ -426,6 +529,40 @@ async def subir_evidencias_cuenta(
     resultados: list[EvidenciaClasificadaResponse] = []
     evidencias_creadas: list[Evidencia] = []
     for filename, content_type, data in archivos:
+        sha256 = hashlib.sha256(data).hexdigest()
+        duplicada = await _buscar_evidencia_duplicada_cuenta(db, cuenta_id, sha256)
+        if duplicada is not None:
+            # Also covers within-batch duplicates: each iteration commits
+            # before the next runs, so a repeat hash later in this SAME
+            # request already finds the row this loop just inserted.
+            logger.info("evidencia_duplicada_detectada", id=str(duplicada.id), cuenta_id=str(cuenta_id))
+            actividad_dup = await db.get(Actividad, duplicada.actividad_id)
+            ob_id_dup = actividad_dup.obligacion_id if actividad_dup is not None else None
+            etiqueta_dup = next((ob.etiqueta or None for ob in obligaciones if ob.id == ob_id_dup), None)
+            try:
+                presigned = await storage.presigned_url(
+                    key=duplicada.storage_key,  # type: ignore[arg-type]
+                    expires_in=3600,
+                )
+            except Exception:
+                presigned = None
+            resultados.append(
+                EvidenciaClasificadaResponse(
+                    id=duplicada.id,
+                    actividad_id=duplicada.actividad_id,
+                    obligacion_id=ob_id_dup,
+                    obligacion_etiqueta=etiqueta_dup,
+                    nombre_archivo=duplicada.nombre_archivo,
+                    tipo_archivo=duplicada.tipo_archivo,
+                    tamano_bytes=duplicada.tamano_bytes,
+                    presigned_url=presigned,
+                    clasificado=ob_id_dup is not None,
+                    created_at=duplicada.created_at,
+                    duplicada=True,
+                )
+            )
+            continue
+
         texto = await _extraer_texto_seguro(filename, data)
         matched_ob = await clasificar_evidencia(texto, obligaciones, llm=llm) if texto and obligaciones else None
         ob_id = matched_ob.id if matched_ob is not None else None
@@ -446,9 +583,10 @@ async def subir_evidencias_cuenta(
             tipo_archivo=content_type,
             tamano_bytes=len(data),
             texto_extraido=texto,
+            sha256=sha256,
         )
         db.add(evidencia)
-        await db.commit()
+        await _commit_or_limpiar_storage(db, storage, key)
         await db.refresh(evidencia)
         evidencias_creadas.append(evidencia)
 
