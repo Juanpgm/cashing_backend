@@ -17,6 +17,10 @@ class TipoDocumentoFuente(enum.StrEnum):
     PLANTILLA = "plantilla"
     # Checklist requirements for cuenta de cobro (added in migration 011)
     RPC = "rpc"
+    # Certificado de Disponibilidad Presupuestal (added in migration 037 — fixes
+    # a bug where checklist_service seeded the CDP requisito with this value
+    # while the enum had no matching member).
+    CDP = "cdp"
     SEGURIDAD_SOCIAL = "seguridad_social"
     COMPROBANTE_PAGO_SS = "comprobante_pago_ss"
     INFORME_ACTIVIDADES = "informe_actividades"

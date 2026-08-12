@@ -13,8 +13,8 @@ from sqlalchemy.orm import selectinload
 from app.core.exceptions import NotFoundError, ValidationError
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
-from app.models.secop import SecopContrato, SecopDocumento
 from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
+from app.models.secop import SecopContrato, SecopDocumento
 from app.models.obligacion import Obligacion
 from app.models.usuario import Usuario
 from app.schemas.agent import ObligacionExtraida
@@ -597,5 +597,38 @@ async def vincular_secop_documento(
     # Persistence-only follow-up (best-effort, never raises): the download above
     # extracted obligaciones but discarded the bytes — Checklist reads DocumentoFuente
     # directly and would otherwise show this contract's document as permanently missing.
-    await checklist_service._persistir_contrato_documento_si_falta(db, usuario_id, contrato_id, doc)
+    await checklist_service.asignar_secop_documento(
+        db, usuario_id, contrato, doc, TipoDocumentoFuente.CONTRATO, best_effort=True
+    )
+    return resultado
+
+
+async def asignar_secop_documento_a_contrato(
+    db: AsyncSession,
+    usuario_id: uuid.UUID,
+    contrato_id: uuid.UUID,
+    secop_documento_id: uuid.UUID,
+    tipo: TipoDocumentoFuente,
+) -> tuple[DocumentoFuente, bool]:
+    """Assigns a SECOP-cached document to a contract-level checklist slot (`tipo`).
+
+    Unlike `vincular_secop_documento`, this never extracts obligaciones — it only
+    verifies pertenencia and persists the document, raising a domain exception on any
+    failure (no best-effort swallowing; the caller directly waits on this result).
+    """
+    contrato = await _get_contrato_con_ownership(db, usuario_id, contrato_id)
+
+    doc_result = await db.execute(select(SecopDocumento).where(SecopDocumento.id == secop_documento_id))
+    doc = doc_result.scalar_one_or_none()
+    if doc is None:
+        raise NotFoundError("SecopDocumento", str(secop_documento_id))
+
+    # Function-level import: avoids a checklist_service <-> contrato_service
+    # import cycle if one is ever introduced (existing codebase convention).
+    from app.services import checklist_service
+
+    resultado = await checklist_service.asignar_secop_documento(
+        db, usuario_id, contrato, doc, tipo, best_effort=False
+    )
+    assert resultado is not None  # best_effort=False always returns or raises
     return resultado

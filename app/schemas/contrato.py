@@ -7,6 +7,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from app.models.documento_fuente import TipoDocumentoFuente
 from app.models.obligacion import TipoObligacion
 
 
@@ -43,6 +44,24 @@ class VincularSecopDocumentoRequest(BaseModel):
     """Body for POST /contratos/{id}/vincular-secop-documento."""
 
     secop_documento_id: uuid.UUID
+
+
+class AsignarSecopDocumentoRequest(BaseModel):
+    """Body for POST /contratos/{id}/secop-documentos/{doc_id}/asignar.
+
+    Restricted to the contract-level checklist requisitos (excludes
+    instrucciones/plantilla, which are not part of that catalog).
+    """
+
+    tipo: Literal[
+        TipoDocumentoFuente.CONTRATO,
+        TipoDocumentoFuente.RPC,
+        TipoDocumentoFuente.CDP,
+        TipoDocumentoFuente.CEDULA,
+        TipoDocumentoFuente.RUT,
+        TipoDocumentoFuente.ACTA_INICIO,
+        TipoDocumentoFuente.SEGURIDAD_SOCIAL,
+    ]
 
 
 class ContratoCreate(BaseModel):

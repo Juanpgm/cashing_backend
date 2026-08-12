@@ -27,6 +27,12 @@ class DocumentoFuenteResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class AsignarSecopDocumentoResponse(DocumentoFuenteResponse):
+    """Response for POST /contratos/{id}/secop-documentos/{doc_id}/asignar."""
+
+    ya_existia: bool
+
+
 class ContratoConfiguracionResponse(BaseModel):
     contrato_id: uuid.UUID
     listo: bool

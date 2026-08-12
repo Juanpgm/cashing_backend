@@ -10,6 +10,7 @@ never copied from a previous cuenta.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
 import time
 import uuid
@@ -1025,54 +1026,78 @@ async def _asegurar_texto_extraido_manual(doc: SecopDocumento) -> None:
     doc.texto_estado = "ok"
 
 
-async def _persistir_contrato_documento_si_falta(
-    db: AsyncSession, user_id: uuid.UUID, contrato_id: uuid.UUID, doc: SecopDocumento
-) -> None:
-    """Persists the SECOP doc Vincular just used to extract obligaciones as the
-    contract's CONTRATO-typed DocumentoFuente, if one doesn't already exist.
+async def asignar_secop_documento(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    contrato: Contrato,
+    doc: SecopDocumento,
+    tipo: TipoDocumentoFuente = TipoDocumentoFuente.CONTRATO,
+    *,
+    best_effort: bool = True,
+) -> tuple[DocumentoFuente, bool] | None:
+    """Assigns a SECOP-cached document to a contract-level DocumentoFuente slot (`tipo`).
 
-    Live-reproduced bug: `extraer_obligaciones_desde_secop_doc` downloads the
-    doc's bytes to extract text/obligaciones but discards them — Checklist
-    (which correctly reads `DocumentoFuente` directly, since that's what the
-    physical radicación package needs) never learns the document was
-    provided. Persistence-only: does NOT re-run text/OCR/vision extraction
-    (`doc.texto_extraido` is already populated by the caller) or re-extract
-    obligaciones (already done, would duplicate `Obligacion` rows) — this
-    only stores the bytes + creates the DB record, mirroring
-    `secop_scraper_service.py`'s persistence call (~line 309) minus its
-    extraction side effects. Best-effort: logs and swallows any failure
-    (network, storage) rather than raising — a persistence hiccup here must
-    never break the obligaciones-extraction the user is actually waiting on.
+    Generalizes what used to be `_persistir_contrato_documento_si_falta` (CONTRATO-only,
+    fire-and-forget follow-up of the Vincular flow) into a reusable idempotent primitive
+    shared with `POST /contratos/{id}/secop-documentos/{doc_id}/asignar`. Persistence-only:
+    does NOT re-run text/OCR/vision extraction (`doc.texto_extraido` is reused as-is) and
+    NEVER triggers obligaciones extraction (exclusive to Vincular) — only stores the bytes
+    + creates the DB record, mirroring `secop_scraper_service.py`'s persistence call.
+
+    ``best_effort=True`` (the Vincular caller) logs and swallows any failure — a persistence
+    hiccup there must never break the obligaciones-extraction the user is actually waiting
+    on. ``best_effort=False`` (the explicit Asignar endpoint) raises a domain exception
+    instead, since the user is directly waiting on this action's result.
+
+    Idempotent: if a contract-level DocumentoFuente of `tipo` already exists, it's returned
+    unchanged (``ya_existia=True``) instead of creating a duplicate.
     """
+    if not await verificar_pertenencia_secop_documento(db, contrato, doc):
+        if best_effort:
+            await logger.awarning(
+                "contrato_documento_persistencia_fallida",
+                contrato_id=str(contrato.id),
+                secop_documento_id=str(doc.id),
+                error="documento no pertenece al contrato",
+            )
+            return None
+        raise NotFoundError("SecopDocumento", str(doc.id))
+
     existing = await db.execute(
         select(DocumentoFuente).where(
-            DocumentoFuente.contrato_id == contrato_id,
+            DocumentoFuente.contrato_id == contrato.id,
             DocumentoFuente.cuenta_cobro_id.is_(None),
-            DocumentoFuente.tipo == TipoDocumentoFuente.CONTRATO,
+            DocumentoFuente.tipo == tipo,
         )
     )
-    if existing.scalar_one_or_none() is not None:
-        return
+    existing_doc = existing.scalar_one_or_none()
+    if existing_doc is not None:
+        return existing_doc, True
 
     if not doc.url_descarga:
-        await logger.awarning(
-            "contrato_documento_persistencia_fallida",
-            contrato_id=str(contrato_id),
-            secop_documento_id=str(doc.id),
-            error="documento sin url_descarga",
-        )
-        return
+        error = "documento sin url_descarga"
+        if best_effort:
+            await logger.awarning(
+                "contrato_documento_persistencia_fallida",
+                contrato_id=str(contrato.id),
+                secop_documento_id=str(doc.id),
+                error=error,
+            )
+            return None
+        raise ValidationError(f"No se pudo asignar el documento: {error}.")
 
     try:
         data = await _descargar_secop_bytes(doc.url_descarga, _VINCULAR_HTTP_TIMEOUT)
     except Exception as exc:
-        await logger.awarning(
-            "contrato_documento_persistencia_fallida",
-            contrato_id=str(contrato_id),
-            secop_documento_id=str(doc.id),
-            error=str(exc),
-        )
-        return
+        if best_effort:
+            await logger.awarning(
+                "contrato_documento_persistencia_fallida",
+                contrato_id=str(contrato.id),
+                secop_documento_id=str(doc.id),
+                error=str(exc),
+            )
+            return None
+        raise ValidationError(f"No se pudo descargar el documento SECOP: {exc}") from exc
 
     # Function-level import: multimodal_parser is only needed for mime sniffing here
     # (mirrors the function-level import convention already used in this module).
@@ -1081,39 +1106,52 @@ async def _persistir_contrato_documento_si_falta(
     filename = doc.nombre_archivo or "documento"
     safe_filename = get_safe_filename(filename)
     storage_key = f"usuarios/{user_id}/documentos/{uuid.uuid4()}/{safe_filename}"
+    storage = _get_storage(settings.S3_BUCKET_DOCUMENTOS)
     try:
-        storage = _get_storage(settings.S3_BUCKET_DOCUMENTOS)
         await storage.upload(key=storage_key, data=data, content_type=guess_mime_type(filename))
     except Exception as exc:
-        await logger.awarning(
-            "contrato_documento_persistencia_fallida",
-            contrato_id=str(contrato_id),
-            secop_documento_id=str(doc.id),
-            error=str(exc),
-        )
-        return
+        if best_effort:
+            await logger.awarning(
+                "contrato_documento_persistencia_fallida",
+                contrato_id=str(contrato.id),
+                secop_documento_id=str(doc.id),
+                error=str(exc),
+            )
+            return None
+        raise ValidationError(f"No se pudo subir el documento: {exc}") from exc
 
     try:
         nuevo_doc = DocumentoFuente(
             usuario_id=user_id,
-            contrato_id=contrato_id,
+            contrato_id=contrato.id,
             cuenta_cobro_id=None,
             storage_key=storage_key,
             nombre=safe_filename,
-            tipo=TipoDocumentoFuente.CONTRATO,
+            tipo=tipo,
             texto_extraido=doc.texto_extraido,
             categoria=doc.categoria,
         )
         db.add(nuevo_doc)
         await db.commit()
+        await db.refresh(nuevo_doc)
     except Exception as exc:
         await db.rollback()
-        await logger.awarning(
-            "contrato_documento_persistencia_fallida",
-            contrato_id=str(contrato_id),
-            secop_documento_id=str(doc.id),
-            error=str(exc),
-        )
+        # Orphan guard: storage upload succeeded but the DB commit failed — clean up the
+        # now-unreferenced object rather than leaking it (best-effort, mirrors the
+        # existing "storage miss must not block" tolerance elsewhere in this module).
+        with contextlib.suppress(Exception):
+            await storage.delete(storage_key)
+        if best_effort:
+            await logger.awarning(
+                "contrato_documento_persistencia_fallida",
+                contrato_id=str(contrato.id),
+                secop_documento_id=str(doc.id),
+                error=str(exc),
+            )
+            return None
+        raise ValidationError(f"No se pudo guardar el documento: {exc}") from exc
+
+    return nuevo_doc, False
 
 
 def _score_contenido_para_requisito(doc: SecopDocumento, req_codigo: str) -> Decimal | None:

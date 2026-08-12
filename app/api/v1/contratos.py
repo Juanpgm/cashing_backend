@@ -13,6 +13,7 @@ from app.core.database import get_db
 from app.schemas.agent import ObligacionesExtraerResponse
 from app.schemas.semantic_search import ObligacionSimilar
 from app.schemas.contrato import (
+    AsignarSecopDocumentoRequest,
     ContratoContextoAgenteResponse,
     ContratoCreate,
     ContratoListItem,
@@ -23,7 +24,7 @@ from app.schemas.contrato import (
     PeriodoPendienteResponse,
     VincularSecopDocumentoRequest,
 )
-from app.schemas.documento_fuente import ContratoConfiguracionResponse
+from app.schemas.documento_fuente import AsignarSecopDocumentoResponse, ContratoConfiguracionResponse
 from app.services import contrato_service, document_service, semantic_search_service
 
 logger = structlog.get_logger("api.contratos")
@@ -196,6 +197,40 @@ async def vincular_secop_documento(
         obligaciones=obligaciones,
         total=len(obligaciones),
         avisos=avisos,
+    )
+
+
+@router.post(
+    "/{contrato_id}/secop-documentos/{doc_id}/asignar",
+    response_model=AsignarSecopDocumentoResponse,
+)
+async def asignar_secop_documento(
+    contrato_id: uuid.UUID,
+    doc_id: uuid.UUID,
+    data: AsignarSecopDocumentoRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> AsignarSecopDocumentoResponse:
+    """Asigna un documento SECOP cacheado a un slot de tipo de documento del contrato.
+
+    Idempotente: repetir la llamada con el mismo `tipo` no duplica el documento —
+    retorna el existente con `ya_existia=True`. No extrae obligaciones (eso es
+    exclusivo de `vincular-secop-documento`).
+    """
+    doc, ya_existia = await contrato_service.asignar_secop_documento_a_contrato(
+        db, user.id, contrato_id, doc_id, data.tipo
+    )
+    return AsignarSecopDocumentoResponse(
+        id=doc.id,
+        nombre=doc.nombre,
+        tipo=doc.tipo,
+        contrato_id=doc.contrato_id,
+        tiene_texto=bool(doc.texto_extraido),
+        created_at=doc.created_at,
+        categoria=doc.categoria,
+        categoria_confianza=doc.categoria_confianza,
+        categoria_override=doc.categoria_override,
+        ya_existia=ya_existia,
     )
 
 
