@@ -247,6 +247,64 @@ async def test_fallo_de_extraccion_no_rompe_deteccion(
     assert await _obligaciones(db, contrato.id) == []
 
 
+async def test_doc_sin_metadata_y_sin_numero_en_texto_bloquea_extraccion(
+    db: AsyncSession, contrato: Contrato, extraccion: dict[str, Any]
+) -> None:
+    """Cross-contract contamination guard: a doc that carries NO confirming
+    metadata (numero_contrato/proceso/secop_contrato_id all unset) and whose
+    extracted text mentions no usable contract-number token must be BLOCKED --
+    auto-extraction now requires positive confirmation, it no longer passes
+    unknown documents through by default (root cause of the contamination bug:
+    the old guard granted auto-extraction whenever nothing could be positively
+    disproved). Direct call to the trigger (same pattern as
+    test_checklist_secop_auto_wrapper_regression.py) isolates the pertenencia
+    guard from the unrelated doc-discovery/content-sniff machinery."""
+    doc = SecopDocumento(
+        id_documento_secop=f"DOC-{uuid.uuid4().hex[:10]}",
+        nombre_archivo="documento_generico.docx",
+        datos_raw={},
+        texto_estado="ok",
+        texto_extraido=TEXTO_CONTRATO,  # "No. 99" is < 4 chars, undetectable as a real identifier
+    )
+    db.add(doc)
+    await db.commit()
+    presupuesto = checklist_service._PresupuestoSniff()
+
+    await checklist_service._auto_extraer_obligaciones_contrato(db, contrato, doc, presupuesto)
+    await db.commit()
+
+    assert extraccion["llamadas"] == []
+    assert await _obligaciones(db, contrato.id) == []
+
+
+async def test_doc_sin_metadata_con_numero_propio_en_texto_permite_extraccion(
+    db: AsyncSession, contrato: Contrato, extraccion: dict[str, Any]
+) -> None:
+    """Text-rescue path: a doc with no confirming metadata whose extracted text
+    explicitly mentions THIS contrato's own numero_contrato (a "CONTRATO No. X"
+    style mention) is positively confirmed and extraction proceeds."""
+    texto = (
+        f"CONTRATO DE PRESTACIÓN DE SERVICIOS PROFESIONALES No. {contrato.numero_contrato}\n"
+        "Entre la entidad y el contratista se celebra el presente contrato, cuyo clausulado se detalla."
+    )
+    doc = SecopDocumento(
+        id_documento_secop=f"DOC-{uuid.uuid4().hex[:10]}",
+        nombre_archivo="documento_generico.docx",
+        datos_raw={},
+        texto_estado="ok",
+        texto_extraido=texto,
+    )
+    db.add(doc)
+    await db.commit()
+    presupuesto = checklist_service._PresupuestoSniff()
+
+    await checklist_service._auto_extraer_obligaciones_contrato(db, contrato, doc, presupuesto)
+    await db.commit()
+
+    assert len(extraccion["llamadas"]) == 1
+    assert len(await _obligaciones(db, contrato.id)) == 1
+
+
 async def test_vinculo_manual_no_dispara_extraccion(
     db: AsyncSession, contrato: Contrato, descargas: dict[str, Any], extraccion: dict[str, Any]
 ) -> None:

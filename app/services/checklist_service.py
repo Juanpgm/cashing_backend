@@ -78,12 +78,8 @@ TOP_N_CANDIDATES = 3
 # on AUTO_LINK_THRESHOLD unchanged.
 AUTO_LINK_THRESHOLD_CONTRATO = Decimal("0.75")
 
-# Minimum fuzzy similarity between a contract identifier (numero_contrato) and a
-# SECOP record's identifier to consider them the same contract. Tolerates case,
-# spaces, accents and punctuation while still rejecting unrelated numbers.
-_SECOP_ID_SIMIL_THRESHOLD = Decimal("0.850")
-# Safety cap for the fuzzy fallback scan when no cedula/number anchor matches.
-_SECOP_FUZZY_SCAN_LIMIT = 1000
+# Safety cap for the fallback scan when no cedula/number anchor matches.
+_SECOP_SCAN_LIMIT = 1000
 
 # Two-tier document model. Contract-level requisitos are satisfied by a SINGLE
 # shared document (cuenta_cobro_id IS NULL) that auto-fulfils the requisito in
@@ -621,29 +617,53 @@ async def _detectar_alias_cdp(
 
 
 def _num_matches_contrato(num: str, sc: SecopContrato) -> bool:
-    """Whether a hand-entered contract number fuzzy-matches any SECOP contract identifier.
+    """Whether a hand-entered contract number nucleo-exact-matches a SECOP contract identifier.
 
     In SECOP the user-facing number can live in `numero_contrato`, `referencia_del_contrato`
-    (the CO1.PCCNTR.xxx code) or `proceso_de_compra`, and hand entry adds case/space/punct
-    noise — so we compare against all three with tolerant similarity.
+    (the CO1.PCCNTR.xxx code) or `proceso_de_compra` — compared against all three. Tolerance
+    comes only from `_similar`'s alphanumeric-core normalization (case, spaces, punctuation,
+    accents, leading zeros); anything short of the same core is a DIFFERENT contract.
+    # ponytail: nucleo-exact; re-add fuzzy behind a cedula anchor if typo recall is ever needed.
     """
     best = max(
         _similar(num, sc.numero_contrato),
         _similar(num, sc.referencia_del_contrato),
         _similar(num, sc.proceso_de_compra),
     )
-    return best >= _SECOP_ID_SIMIL_THRESHOLD
+    return best == Decimal("1.000")
+
+
+def _cedula_contradice(cedula_contratista: str | None, ced_key: str) -> bool:
+    """Whether a SECOP-side cedula/NIT DEFINITIVELY contradicts the contrato's own
+    ``documento_proveedor`` (digits-only, leading-zero tolerant). ``True`` only when
+    BOTH are known and differ — an unknown cedula on either side is never a veto,
+    it's simply insufficient evidence. Shared by every cross-contract contamination
+    veto (FK-based, numero-resolved, and pooled-document filtering).
+    """
+    if not ced_key:
+        return False
+    otra = _solo_digitos(cedula_contratista)
+    return bool(otra) and otra != ced_key
 
 
 async def _secop_documentos_del_contrato(db: AsyncSession, contrato: Contrato) -> list[SecopDocumento]:
     """Find the SECOP documents for a contract, tolerant of hand-entry differences.
 
-    Matching is fuzzy and multi-identifier so a minor mismatch (case, spaces, accents,
-    special characters, leading zeros) no longer yields zero results:
+    Matching is nucleo-exact and multi-identifier: a minor hand-entry mismatch (case,
+    spaces, accents, special characters, leading zeros) still resolves, but a genuinely
+    different identifier (e.g. a typo'd last digit) never does — cross-contract
+    contamination guard.
       1. Direct hit on the document's own `numero_contrato` / `proceso` (indexed, exact).
       2. Via the SECOP contract, anchored by the contractor's cedula/NIT (digits-only,
-         leading-zero tolerant) and/or a fuzzy match on any contract-number field.
-      3. Fallback fuzzy scan over a bounded pool when neither anchor resolves.
+         leading-zero tolerant) and/or a nucleo-exact match on any contract-number field.
+         A SecopContrato whose cedula is known and contradicts the contrato's is vetoed
+         outright, even if a numero field would otherwise match.
+      3. Fallback scan over a bounded pool when neither anchor resolves.
+
+    Final guard (applies to the WHOLE pool, all three branches): any pooled document
+    FK-linked (`secop_contrato_id`) to a SecopContrato whose cedula is known and
+    contradicts the contrato's is dropped — branches 1 and 3 pool documents purely by
+    numero/proceso and never check the linked contract's cedula on their own.
     """
     num = contrato.numero_contrato
     ced = contrato.documento_proveedor
@@ -677,7 +697,13 @@ async def _secop_documentos_del_contrato(db: AsyncSession, contrato: Contrato) -
     if conds:
         sc_rows = (await db.execute(select(SecopContrato).where(or_(*conds)))).scalars().all()
         for sc in sc_rows:
-            ced_ok = bool(ced_key) and _solo_digitos(sc.cedula_contratista) == ced_key
+            # Cross-contract contamination guard: a SecopContrato whose cedula is
+            # KNOWN and DIFFERENT from this contrato's contractor is definitively
+            # foreign — veto it before ced_ok/num_ok, regardless of a numero hit.
+            sc_ced = _solo_digitos(sc.cedula_contratista)
+            if _cedula_contradice(sc.cedula_contratista, ced_key):
+                continue
+            ced_ok = bool(ced_key) and sc_ced == ced_key
             num_ok = bool(num) and _num_matches_contrato(num, sc)
             if ced_ok or num_ok:
                 matched_sc_ids.add(sc.id)
@@ -687,22 +713,37 @@ async def _secop_documentos_del_contrato(db: AsyncSession, contrato: Contrato) -
             pool[d.id] = d
 
     # (3) Fallback: no anchor resolved (typo in the number and no cedula link).
-    # Fuzzy-scan a bounded pool of documents that carry any identifier.
+    # Scan a bounded pool of documents that carry any identifier, nucleo-exact only.
     if not pool and num:
         scan = await db.execute(
             select(SecopDocumento)
             .where(or_(SecopDocumento.numero_contrato.isnot(None), SecopDocumento.proceso.isnot(None)))
-            .limit(_SECOP_FUZZY_SCAN_LIMIT)
+            .limit(_SECOP_SCAN_LIMIT)
         )
         candidatos = scan.scalars().all()
-        if len(candidatos) >= _SECOP_FUZZY_SCAN_LIMIT:
-            await logger.awarning(
-                "secop_fuzzy_scan_capped", contrato_id=str(contrato.id), limit=_SECOP_FUZZY_SCAN_LIMIT
-            )
+        if len(candidatos) >= _SECOP_SCAN_LIMIT:
+            await logger.awarning("secop_scan_capped", contrato_id=str(contrato.id), limit=_SECOP_SCAN_LIMIT)
         for d in candidatos:
             best = max(_similar(num, d.numero_contrato), _similar(num, d.proceso))
-            if best >= _SECOP_ID_SIMIL_THRESHOLD:
+            if best == Decimal("1.000"):
                 pool[d.id] = d
+
+    # Final guard: drop any pooled document FK-linked to a contradicting-cedula
+    # SecopContrato — branches (1) and (3) above pool by numero/proceso alone and
+    # never check the linked contract's cedula themselves (only branch 2 does, on
+    # its own query results). Docs with no FK stay; they go through the hardened
+    # `verificar_pertenencia_secop_documento` predicate downstream.
+    if ced_key and pool:
+        fk_ids = {d.secop_contrato_id for d in pool.values() if d.secop_contrato_id is not None}
+        if fk_ids:
+            sc_rows = (await db.execute(select(SecopContrato).where(SecopContrato.id.in_(fk_ids)))).scalars().all()
+            cedula_por_sc_id = {sc.id: sc.cedula_contratista for sc in sc_rows}
+            pool = {
+                doc_id: d
+                for doc_id, d in pool.items()
+                if d.secop_contrato_id is None
+                or not _cedula_contradice(cedula_por_sc_id.get(d.secop_contrato_id), ced_key)
+            }
 
     return list(pool.values())
 
@@ -716,9 +757,32 @@ async def verificar_pertenencia_secop_documento(db: AsyncSession, contrato: Cont
     naive equality rejects legit docs — accept when EITHER the naive match OR the
     resolved-SecopContrato predicate passes (mirrors `_secop_documentos_del_contrato`'s own
     identifier resolution); reject only when both fail.
+
+    Two cedula vetoes (necessary, NOT sufficient — a cedula match alone never returns
+    ``True`` on its own, a numero match is always still required):
+      1. FK-based: when the doc is linked to a SecopContrato (``doc.secop_contrato_id``)
+         and both cedulas are known, a mismatch is DEFINITIVELY foreign — returns
+         ``False`` immediately, before any numero comparison.
+      2. Numero-resolved: the SecopContrato rows resolved by ``contrato.numero_contrato``
+         (below) are split into cedula-compatible and cedula-contradictory. Only the
+         compatible ones back a membership match. If EVERY resolved SecopContrato for
+         this numero contradicts the cedula, a raw numero-equality claim (own numero or
+         nucleo-exact) is treated as worthless — it's evidence for a FOREIGN contract
+         reusing the same identifier, not this one. A cache-miss (no SecopContrato at
+         all for this numero) never blocks — that's today's legitimate behavior for
+         contracts absent from the cache.
     """
-    if doc.numero_contrato == contrato.numero_contrato:
-        return True
+    ced_key = _solo_digitos(contrato.documento_proveedor)
+
+    # (1) FK-based veto.
+    if doc.secop_contrato_id is not None:
+        doc_sc = (
+            await db.execute(select(SecopContrato).where(SecopContrato.id == doc.secop_contrato_id))
+        ).scalar_one_or_none()
+        if doc_sc is not None and _cedula_contradice(doc_sc.cedula_contratista, ced_key):
+            return False
+
+    # (2) Numero-resolved SecopContrato lookup, split by cedula compatibility.
     secop_result = await db.execute(
         select(SecopContrato).where(
             or_(
@@ -728,13 +792,25 @@ async def verificar_pertenencia_secop_documento(db: AsyncSession, contrato: Cont
             )
         )
     )
-    secop_contratos = secop_result.scalars().all()
-    secop_ids = {sc.id for sc in secop_contratos}
-    keys = {contrato.numero_contrato}
-    for sc in secop_contratos:
+    todos_los_sc = secop_result.scalars().all()
+    compatibles = [sc for sc in todos_los_sc if not _cedula_contradice(sc.cedula_contratista, ced_key)]
+
+    secop_ids = {sc.id for sc in compatibles}
+    keys: set[str] = set()
+    for sc in compatibles:
         keys.update(k for k in (sc.numero_contrato, sc.referencia_del_contrato, sc.id_contrato_secop) if k)
-    procesos = {sc.proceso_de_compra for sc in secop_contratos if sc.proceso_de_compra}
-    return doc.secop_contrato_id in secop_ids or doc.numero_contrato in keys or doc.proceso in procesos
+    procesos = {sc.proceso_de_compra for sc in compatibles if sc.proceso_de_compra}
+    if doc.secop_contrato_id in secop_ids or doc.numero_contrato in keys or doc.proceso in procesos:
+        return True
+
+    # Every known owner of this numero contradicts the cedula: a raw numero-equality
+    # claim (own numero or the tolerant nucleo-exact match) does not confirm pertenencia.
+    if ced_key and todos_los_sc and not compatibles:
+        return False
+
+    return doc.numero_contrato == contrato.numero_contrato or (
+        _similar(doc.numero_contrato, contrato.numero_contrato) == Decimal("1.000")
+    )
 
 
 # Mentions like "CONTRATO ... No. 4161.010.26.1.155.2026" or "Contrato No. CTR-001"
@@ -749,10 +825,10 @@ _CONTRATO_NUMERO_TEXTO_RE = re.compile(
 def _detectar_pertenencia_por_texto(texto: str | None, numero_contrato: str | None) -> bool | None:
     """Scan free text for a contract-number mention near the word "contrato".
 
-    Returns ``True`` when a detected token fuzzy-matches ``numero_contrato``, ``False``
-    when a token is found but does NOT match (the text plausibly belongs to a DIFFERENT
-    contract), or ``None`` when no such token is detectable at all — UNDETERMINABLE,
-    callers must not block on this (do not over-block).
+    Returns ``True`` when a detected token nucleo-exact-matches ``numero_contrato``,
+    ``False`` when a token is found but does NOT match (the text plausibly belongs to a
+    DIFFERENT contract), or ``None`` when no such token is detectable at all —
+    UNDETERMINABLE, callers must not block on this (do not over-block).
     """
     if not texto or not numero_contrato:
         return None
@@ -764,23 +840,31 @@ def _detectar_pertenencia_por_texto(texto: str | None, numero_contrato: str | No
     candidatos = [c for c in candidatos if len(c) >= 4]
     if not candidatos:
         return None
-    return any(_similar(numero_contrato, c) >= _SECOP_ID_SIMIL_THRESHOLD for c in candidatos)
+    return any(_similar(numero_contrato, c) == Decimal("1.000") for c in candidatos)
 
 
 async def _verificar_pertenencia_documento_auto(db: AsyncSession, contrato: Contrato, doc: SecopDocumento) -> bool:
     """Auto-link pertenencia guard (root cause of the DAGMA incident: a foreign contract's
     document was auto-linked as CONTRATO and its obligaciones extracted wholesale).
 
-    Unlike ``verificar_pertenencia_secop_documento`` (the explicit Vincular action, which
-    blocks whenever pertenencia can't be confirmed), this ONLY blocks when a DIFFERENT
-    contract is positively detected — via doc metadata or a contract-number mention in its
-    extracted text. When nothing is detectable at all it returns ``True`` (do not over-block;
-    preserves current behavior for docs that simply carry no identifier).
+    Auto-extraction now requires POSITIVE confirmation instead of merely failing to
+    disprove pertenencia: either the shared metadata predicate
+    (``verificar_pertenencia_secop_documento``) confirms the doc, or its extracted text
+    explicitly mentions this contrato's own number. A document with no confirming
+    metadata and no confirming text is skipped — the caller logs the rejection
+    (``checklist_auto_extraccion_pertenencia_rechazada``) and never silently extracts
+    obligaciones from a document nothing actually ties to this contrato.
+
+    A text mention of a DIFFERENT contract's number is a hard veto even when the
+    metadata looked fine (a leaked/misfiled document can carry correct-looking
+    metadata but foreign content, the original DAGMA incident shape) — checked
+    first, before the metadata predicate gets a chance to short-circuit it.
     """
-    tiene_metadata = bool(doc.numero_contrato or doc.secop_contrato_id or doc.proceso)
-    if tiene_metadata and not await verificar_pertenencia_secop_documento(db, contrato, doc):
+    if _detectar_pertenencia_por_texto(doc.texto_extraido, contrato.numero_contrato) is False:
         return False
-    return _detectar_pertenencia_por_texto(doc.texto_extraido, contrato.numero_contrato) is not False
+    if await verificar_pertenencia_secop_documento(db, contrato, doc):
+        return True
+    return _detectar_pertenencia_por_texto(doc.texto_extraido, contrato.numero_contrato) is True
 
 
 # ── borderline content sniff (clasificacion-documentos-secop, design D2) ───

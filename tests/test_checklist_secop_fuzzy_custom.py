@@ -144,6 +144,70 @@ async def test_lookup_sin_match_devuelve_vacio(db: AsyncSession, test_user: dict
     assert docs == []
 
 
+async def test_lookup_numero_con_typo_no_es_nucleo_exacto_devuelve_vacio(
+    db: AsyncSession, test_user: dict[str, Any]
+) -> None:
+    """Cross-contract contamination guard: a near-miss (last digit differs) used
+    to pass the old >= 0.850 fuzzy bar and leak a DIFFERENT contract's document
+    (e.g. CD-045-2025 vs CD-045-2026). Matching is now nucleo-exact — only
+    case/spaces/punctuation/accents/leading-zero differences are tolerated."""
+    c = await _contrato(db, test_user["user"].id, numero="CD-045-2025")
+    await _secop_doc(db, id_doc="D1", numero_contrato="CD-045-2026")
+    docs = await checklist_service._secop_documentos_del_contrato(db, c)
+    assert docs == []
+
+
+async def test_cedula_contradictoria_excluye_documentos_del_secop_contrato(
+    db: AsyncSession, test_user: dict[str, Any]
+) -> None:
+    """Cross-contract contamination guard: a SecopContrato whose numero_contrato
+    coincides but whose cedula_contratista belongs to a DIFFERENT contractor must
+    be vetoed entirely — its documents are never selected, regardless of the
+    numero match."""
+    c = await _contrato(db, test_user["user"].id, numero="CD-200-2025", documento_proveedor="111222333")
+    sc = SecopContrato(
+        id_contrato_secop="SC-CED-VETO",
+        cedula_contratista="999888777",  # contradicts the contrato's documento_proveedor
+        numero_contrato="CD-200-2025",
+        referencia_del_contrato="CD-200-2025",
+        datos_raw={},
+    )
+    db.add(sc)
+    await db.commit()
+    await db.refresh(sc)
+    # Doc is linked ONLY via secop_contrato_id — no direct numero_contrato/proceso
+    # of its own, so it can only surface through the (vetoed) branch-2 anchor.
+    await _secop_doc(db, id_doc="D-CED-VETO", secop_contrato_id=sc.id)
+
+    docs = await checklist_service._secop_documentos_del_contrato(db, c)
+    assert docs == []
+
+
+async def test_cedula_contradictoria_excluye_documento_pooled_por_numero_directo(
+    db: AsyncSession, test_user: dict[str, Any]
+) -> None:
+    """F2: a doc pooled via the DIRECT exact numero_contrato hit (branch 1 — the
+    document's own `numero_contrato` field, indexed lookup) but FK-linked
+    (`secop_contrato_id`) to a SecopContrato whose cedula contradicts the
+    contrato's must still be dropped from the pool. Branch 1 never cedula-checked
+    before this fix — only branch 2 (the SecopContrato-anchored lookup) did."""
+    c = await _contrato(db, test_user["user"].id, numero="CD-300-2025", documento_proveedor="111222333")
+    sc = SecopContrato(
+        id_contrato_secop="SC-CED-VETO-2",
+        cedula_contratista="999888777",  # contradicts the contrato's documento_proveedor
+        numero_contrato="CD-300-2025",
+        datos_raw={},
+    )
+    db.add(sc)
+    await db.commit()
+    await db.refresh(sc)
+    # numero_contrato matches directly (branch 1) AND the doc is FK-linked to sc.
+    await _secop_doc(db, id_doc="D-CED-VETO-2", numero_contrato="CD-300-2025", secop_contrato_id=sc.id)
+
+    docs = await checklist_service._secop_documentos_del_contrato(db, c)
+    assert docs == []
+
+
 # ── Custom requisito detection ───────────────────────────────────────────────
 
 

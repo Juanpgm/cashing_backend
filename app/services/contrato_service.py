@@ -587,7 +587,10 @@ async def vincular_secop_documento(
     # DAGMA incident fix) — kept as a single tolerant, multi-field predicate so both
     # paths agree on what "belongs to this contrato" means.
     if not await checklist_service.verificar_pertenencia_secop_documento(db, contrato, doc):
-        raise ValidationError("El documento SECOP no pertenece a este contrato.")
+        raise ValidationError(
+            f"No se pudo confirmar que el documento pertenezca al contrato {contrato.numero_contrato}. "
+            "Verifique el número de contrato y el documento del contratista, o seleccione otro documento."
+        )
 
     try:
         resultado = await checklist_service.extraer_obligaciones_desde_secop_doc(db, contrato, doc, manual=True)

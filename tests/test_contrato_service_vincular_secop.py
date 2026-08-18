@@ -103,6 +103,114 @@ async def test_numero_contrato_no_coincide_lanza_validation_error(
     assert called["core"] is False
 
 
+async def test_cedula_contradictoria_lanza_validation_error(
+    db: AsyncSession, test_user: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cross-contract contamination guard: even when the doc's own numero_contrato
+    matches the contrato (which used to be an unconditional shortcut), a resolved
+    SecopContrato whose cedula_contratista belongs to a DIFFERENT contractor must
+    veto the match definitively -- this is the DAGMA-style incident this fix
+    closes (correct-looking numero, foreign contractor)."""
+    contrato = Contrato(
+        usuario_id=test_user["user"].id,
+        numero_contrato="CTR-VETO-CED-001",
+        objeto="Servicios de extracción",
+        valor_total=12_000_000,
+        valor_mensual=1_000_000,
+        fecha_inicio=date(2024, 1, 1),
+        fecha_fin=date(2024, 12, 31),
+        entidad="MinTIC",
+        dependencia="Sistemas",
+        supervisor_nombre="Sup",
+        documento_proveedor="123456789",
+    )
+    db.add(contrato)
+    await db.commit()
+    await db.refresh(contrato)
+
+    secop_contrato = SecopContrato(
+        id_contrato_secop=f"SECOP-{uuid.uuid4().hex[:10]}",
+        cedula_contratista="999999999",  # contradicts contrato.documento_proveedor
+        numero_contrato=contrato.numero_contrato,
+        datos_raw={},
+    )
+    db.add(secop_contrato)
+    await db.commit()
+    await db.refresh(secop_contrato)
+
+    called = {"core": False}
+
+    async def _core_spy(*args: Any, **kwargs: Any) -> tuple[list[ObligacionExtraida], list[str]]:
+        called["core"] = True
+        return [], []
+
+    monkeypatch.setattr(checklist_service, "extraer_obligaciones_desde_secop_doc", _core_spy)
+
+    doc = _secop_doc(contrato.numero_contrato, secop_contrato_id=secop_contrato.id)
+    db.add(doc)
+    await db.commit()
+    await db.refresh(doc)
+
+    with pytest.raises(ValidationError):
+        await contrato_service.vincular_secop_documento(db, test_user["user"].id, contrato.id, doc.id)
+
+    assert called["core"] is False
+
+
+async def test_cedula_contradictoria_sin_fk_via_numero_resuelto_lanza_validation_error(
+    db: AsyncSession, test_user: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F1: the doc has NO `secop_contrato_id` FK (so the FK-based veto never runs),
+    and its `numero_contrato` is a LITERAL exact match of the contrato's own number
+    — the shape that used to short-circuit via the nucleo-exact fast path with zero
+    cedula verification. A SecopContrato resolvable by that same numero, with a
+    contradicting `cedula_contratista`, must still veto the match."""
+    contrato = Contrato(
+        usuario_id=test_user["user"].id,
+        numero_contrato="CTR-VETO-NOFK-001",
+        objeto="Servicios de extracción",
+        valor_total=12_000_000,
+        valor_mensual=1_000_000,
+        fecha_inicio=date(2024, 1, 1),
+        fecha_fin=date(2024, 12, 31),
+        entidad="MinTIC",
+        dependencia="Sistemas",
+        supervisor_nombre="Sup",
+        documento_proveedor="123456789",
+    )
+    db.add(contrato)
+    await db.commit()
+    await db.refresh(contrato)
+
+    secop_contrato = SecopContrato(
+        id_contrato_secop=f"SECOP-{uuid.uuid4().hex[:10]}",
+        cedula_contratista="999999999",  # contradicts contrato.documento_proveedor
+        numero_contrato=contrato.numero_contrato,
+        datos_raw={},
+    )
+    db.add(secop_contrato)
+    await db.commit()
+
+    called = {"core": False}
+
+    async def _core_spy(*args: Any, **kwargs: Any) -> tuple[list[ObligacionExtraida], list[str]]:
+        called["core"] = True
+        return [], []
+
+    monkeypatch.setattr(checklist_service, "extraer_obligaciones_desde_secop_doc", _core_spy)
+
+    # No secop_contrato_id FK — reachable only through the numero-resolved path.
+    doc = _secop_doc(contrato.numero_contrato)
+    db.add(doc)
+    await db.commit()
+    await db.refresh(doc)
+
+    with pytest.raises(ValidationError):
+        await contrato_service.vincular_secop_documento(db, test_user["user"].id, contrato.id, doc.id)
+
+    assert called["core"] is False
+
+
 async def test_doc_numero_contrato_es_referencia_secop_contrato_permite_vincular(
     db: AsyncSession, contrato: Contrato, test_user: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
