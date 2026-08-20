@@ -29,6 +29,9 @@ CUOTA_POSITION_CONFLICT = "CUOTA_POSITION_CONFLICT"
 # Explicit `numero_cuota` override (cuota-numero-explicito): the requested number
 # collides with another active (non-deleted) cuota of the same contrato.
 CUOTA_NUMERO_CONFLICT = "CUOTA_NUMERO_CONFLICT"
+# A cuenta de cobro already exists for the same (contrato, mes, anio) — lets the
+# frontend show a friendly Spanish message instead of the raw English `detail`.
+CUENTA_MES_DUPLICADA = "CUENTA_MES_DUPLICADA"
 
 
 class DomainError(Exception):
@@ -53,11 +56,11 @@ class NotFoundError(DomainError):
 class AlreadyExistsError(DomainError):
     """Resource already exists."""
 
-    def __init__(self, resource: str = "Resource", field: str = "") -> None:
+    def __init__(self, resource: str = "Resource", field: str = "", code: str | None = None) -> None:
         detail = f"{resource} already exists"
         if field:
             detail = f"{resource} with this {field} already exists"
-        super().__init__(detail)
+        super().__init__(detail, code=code)
 
 
 class ValidationError(DomainError):

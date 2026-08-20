@@ -435,6 +435,26 @@ async def test_crear_cuenta_cobro_duplicate_final_returns_cuota_position_conflic
     assert body["code"] == "CUOTA_POSITION_CONFLICT"
 
 
+async def test_crear_cuenta_cobro_duplicate_mes_returns_cuenta_mes_duplicada_code(
+    client: AsyncClient, test_user: dict[str, Any], contrato: Contrato
+) -> None:
+    """A second cuenta for the same (contrato, mes, anio) returns 409 with the
+    structured `CUENTA_MES_DUPLICADA` code — so the frontend shows a friendly
+    Spanish message instead of the raw English `detail`."""
+    payload = {
+        "contrato_id": str(contrato.id),
+        "mes": 4,
+        "anio": 2024,
+        "valor": "1000000.00",
+    }
+    r1 = await client.post("/api/v1/cuentas-cobro/", json=payload, headers=test_user["headers"])
+    assert r1.status_code == 201, r1.text
+
+    r2 = await client.post("/api/v1/cuentas-cobro/", json=payload, headers=test_user["headers"])
+    assert r2.status_code == 409, r2.text
+    assert r2.json()["code"] == "CUENTA_MES_DUPLICADA"
+
+
 async def test_unrelated_error_keeps_unchanged_envelope_shape(client: AsyncClient, test_user: dict[str, Any]) -> None:
     """Regression guard: an error without an assigned code has an unchanged envelope.
 

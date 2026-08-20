@@ -22,6 +22,7 @@ from app.core.config import settings
 from app.core.exceptions import (
     CHECKLIST_INCOMPLETE,
     COHERENCE_CHECK_FAILED,
+    CUENTA_MES_DUPLICADA,
     CUOTA_NUMERO_CONFLICT,
     CUOTA_POSITION_CONFLICT,
     AlreadyExistsError,
@@ -340,7 +341,9 @@ async def crear_cuenta_cobro(
         )
     )
     if existing.scalar_one_or_none() is not None:
-        raise AlreadyExistsError("CuentaCobro", f"contrato={data.contrato_id} mes={data.mes}/{data.anio}")
+        raise AlreadyExistsError(
+            "CuentaCobro", f"contrato={data.contrato_id} mes={data.mes}/{data.anio}", code=CUENTA_MES_DUPLICADA
+        )
 
     # The DB unique index covers ALL rows including soft-deleted ones.
     # Hard-delete any tombstone that would block the INSERT.
@@ -1579,7 +1582,9 @@ async def actualizar_cuenta_cobro(
             )
         )
         if existing.scalar_one_or_none() is not None:
-            raise AlreadyExistsError("CuentaCobro", f"contrato={cuenta.contrato_id} mes={nuevo_mes}/{nuevo_anio}")
+            raise AlreadyExistsError(
+                "CuentaCobro", f"contrato={cuenta.contrato_id} mes={nuevo_mes}/{nuevo_anio}", code=CUENTA_MES_DUPLICADA
+            )
         cuenta.mes = nuevo_mes
         cuenta.anio = nuevo_anio
 
