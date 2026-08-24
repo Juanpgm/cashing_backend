@@ -28,7 +28,7 @@ class Obligacion(UUIDMixin, TimestampMixin, Base):
     # informe (`posicion != PRIMERA`) — wired into generation in slice #6 (task 6.10).
     una_vez: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
-    # Semantic search embedding (text-embedding-004, 1536 dims, stored as Text JSON)
+    # Semantic search embedding (gemini-embedding-001, 1536 dims, stored as Text JSON)
     # Use app.agent.tools.vector_search.encode/decode helpers to convert to/from list[float]
     embedding: Mapped[str | None] = mapped_column(
         Text,
