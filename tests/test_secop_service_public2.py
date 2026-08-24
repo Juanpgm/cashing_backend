@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -220,3 +221,54 @@ class TestConsultaCompleta:
 
         assert result.total_contratos == 1
         assert len(result.contratos) == 1
+
+    @pytest.mark.asyncio
+    async def test_no_usa_la_sesion_de_forma_concurrente(self) -> None:
+        """Regression: consulta_completa must NOT fan _enriquecer out over a shared
+        AsyncSession. obtener_proceso / buscar_documentos_contrato commit on `db`,
+        and a concurrent commit while another task holds the same session raises
+        `IllegalStateChangeError: close() ... commit() already in progress`.
+        We assert the per-contrato sub-calls never overlap on the shared session.
+        """
+        from app.services.secop_service import consulta_completa
+
+        contratos = []
+        for i in range(3):
+            c = MagicMock()
+            c.proceso_de_compra = f"PROC-{i}"
+            c.numero_contrato = f"CON-{i}"
+            contratos.append(c)
+
+        estado = {"activas": 0, "max_activas": 0}
+
+        async def _track() -> None:
+            estado["activas"] += 1
+            estado["max_activas"] = max(estado["max_activas"], estado["activas"])
+            await asyncio.sleep(0)  # yield: under asyncio.gather other tasks interleave here
+            estado["activas"] -= 1
+
+        async def _fake_proceso(*_a: object, **_k: object) -> MagicMock:
+            await _track()
+            return MagicMock()
+
+        async def _fake_docs(*_a: object, **_k: object) -> list[object]:
+            await _track()
+            return []
+
+        with (
+            patch(
+                "app.services.secop_service.buscar_contratos_cedula",
+                new_callable=AsyncMock,
+                return_value=contratos,
+            ),
+            patch("app.services.secop_service.obtener_proceso", _fake_proceso),
+            patch("app.services.secop_service.buscar_documentos_contrato", _fake_docs),
+            patch("app.services.secop_service.SecopContratoDetalleResponse", return_value=MagicMock()),
+            patch("app.services.secop_service.SecopConsultaCompletaResponse", return_value=MagicMock()),
+        ):
+            await consulta_completa(MagicMock(), "12345678")
+
+        assert estado["max_activas"] == 1, (
+            f"las llamadas a la sesión compartida se solaparon (max={estado['max_activas']}): "
+            "consulta_completa está fan-out con asyncio.gather sobre una única AsyncSession"
+        )

@@ -1135,7 +1135,12 @@ async def consulta_completa(
         docs = await docs_coro
         return SecopContratoDetalleResponse(contrato=contrato, proceso=proceso, documentos=docs or [])
 
-    detalles = list(await asyncio.gather(*[_enriquecer(c) for c in contratos]))
+    # ponytail: enrich sequentially — a single AsyncSession is NOT safe for concurrent
+    # use, and obtener_proceso/buscar_documentos_contrato commit on `db`; asyncio.gather
+    # here raced commits → IllegalStateChangeError ("close() ... commit() in progress").
+    # Upgrade path if per-cédula latency matters: give each task its own session
+    # (async_sessionmaker) instead of sharing `db`.
+    detalles = [await _enriquecer(c) for c in contratos]
 
     return SecopConsultaCompletaResponse(
         cedula=cedula,
