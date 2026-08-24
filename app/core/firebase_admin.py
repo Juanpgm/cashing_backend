@@ -17,6 +17,15 @@ logger = structlog.get_logger("core.firebase")
 _initialized = False
 
 
+class FirebaseNotConfiguredError(RuntimeError):
+    """No Firebase service account is configured, so ID tokens cannot be verified.
+
+    Distinct from an invalid/expired token: this signals a SERVER-SIDE
+    misconfiguration (missing FIREBASE_SERVICE_ACCOUNT_JSON in prod), not a
+    problem with the client's token.
+    """
+
+
 def _init_app() -> None:
     global _initialized
     if _initialized:
@@ -42,8 +51,16 @@ def _init_app() -> None:
         cred = credentials.Certificate(sa_dict)
         firebase_admin.initialize_app(cred, {"projectId": sa_dict["project_id"]})
     else:
-        cred = credentials.ApplicationDefault()
-        firebase_admin.initialize_app(cred)
+        # No service account configured. ApplicationDefault() only resolves on GCP;
+        # on Railway it makes verify_id_token fail later with a misleading "invalid
+        # token" error. Fail loudly here so the real cause — a missing
+        # FIREBASE_SERVICE_ACCOUNT_JSON — is obvious instead of masquerading as a
+        # bad client token.
+        raise FirebaseNotConfiguredError(
+            "Firebase Admin is not configured. Set FIREBASE_SERVICE_ACCOUNT_JSON "
+            "(production) or FIREBASE_SERVICE_ACCOUNT_PATH (local dev) to the service "
+            "account key JSON. Google Sign-in cannot verify ID tokens without it."
+        )
     _initialized = True
     logger.info("firebase_admin_initialized")
 

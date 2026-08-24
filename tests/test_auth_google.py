@@ -48,6 +48,7 @@ async def test_google_auth_creates_new_user(db: AsyncSession) -> None:
     # Google integration consent once at signup.
     assert tokens.is_new is True
 
+
     result = await db.execute(select(Usuario).where(Usuario.email == "google@example.com"))
     user = result.scalar_one()
     assert user.google_id == "google-uid-123"
@@ -56,6 +57,47 @@ async def test_google_auth_creates_new_user(db: AsyncSession) -> None:
     assert user.photo_url == "https://lh3.googleusercontent.com/a/photo.jpg"
     assert user.nombre == "Google User"
     assert user.creditos_disponibles == 30
+
+
+@pytest.mark.asyncio
+async def test_google_auth_missing_service_account_is_server_error_not_bad_token(
+    db: AsyncSession,
+) -> None:
+    """When Firebase Admin has no service account, google_auth must surface a
+    server-config error (ExternalServiceError → 502), NOT a misleading
+    UnauthorizedError ('Invalid or expired Google ID token') that blames the token.
+    This is the exact prod failure: FIREBASE_SERVICE_ACCOUNT_JSON unset on Railway.
+    """
+    from app.core.exceptions import ExternalServiceError
+    from app.core.firebase_admin import FirebaseNotConfiguredError
+
+    with (
+        patch(
+            "app.core.firebase_admin.verify_firebase_token",
+            new=AsyncMock(side_effect=FirebaseNotConfiguredError("no service account")),
+        ),
+        pytest.raises(ExternalServiceError),
+    ):
+        await auth_service.google_auth(db, "any-token")
+
+
+def test_init_app_raises_clearly_when_no_service_account() -> None:
+    """_init_app fails loudly (FirebaseNotConfiguredError) instead of silently
+    falling back to ApplicationDefault() when no service account is configured."""
+    from app.core import firebase_admin
+    from app.core.firebase_admin import FirebaseNotConfiguredError
+
+    original = firebase_admin._initialized
+    firebase_admin._initialized = False
+    try:
+        with (
+            patch("app.core.config.settings.FIREBASE_SERVICE_ACCOUNT_PATH", ""),
+            patch("app.core.config.settings.FIREBASE_SERVICE_ACCOUNT_JSON", ""),
+            pytest.raises(FirebaseNotConfiguredError),
+        ):
+            firebase_admin._init_app()
+    finally:
+        firebase_admin._initialized = original
 
 
 @pytest.mark.asyncio

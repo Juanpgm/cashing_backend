@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.exceptions import (
     AlreadyExistsError,
+    ExternalServiceError,
     InviteRequiredError,
     NotFoundError,
     UnauthorizedError,
@@ -183,10 +184,18 @@ async def google_auth(
        accounts pass through the waitlist gate; existing users log in unimpeded.
     4. Return our own JWT pair — same as email login, so the frontend is token-agnostic.
     """
-    from app.core.firebase_admin import verify_firebase_token
+    from app.core.firebase_admin import FirebaseNotConfiguredError, verify_firebase_token
 
     try:
         claims = await verify_firebase_token(id_token)
+    except FirebaseNotConfiguredError as exc:
+        # Server-side misconfiguration (no service account), NOT a bad token — surface
+        # it as such (502) instead of a misleading 401 that blames the user's token.
+        log.error("google_auth_not_configured", error=str(exc))
+        raise ExternalServiceError(
+            "El inicio de sesión con Google no está disponible: el servicio de "
+            "autenticación no está configurado en el servidor."
+        ) from None
     except Exception as exc:
         log.warning("google_auth_token_invalid", error=str(exc))
         raise UnauthorizedError("Invalid or expired Google ID token") from None
