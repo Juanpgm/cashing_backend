@@ -19,7 +19,8 @@ from app.models.obligacion import Obligacion
 
 logger = structlog.get_logger("agent.tools.vector_search")
 
-# Embedding dimension must match the model used (text-embedding-3-small = 1536)
+# Embedding dimension must match the model used (gemini-embedding-001 at 1536 dims,
+# via settings.LLM_EMBEDDING_MODEL — see app/services/embedding_service.py)
 EMBEDDING_DIM = 1536
 
 
@@ -70,10 +71,7 @@ async def semantic_search_obligaciones(
         List of dicts with keys: id, contrato_id, descripcion, tipo, orden, similarity.
     """
     if len(query_embedding) != EMBEDDING_DIM:
-        raise ValueError(
-            f"Query embedding must have {EMBEDDING_DIM} dimensions, "
-            f"got {len(query_embedding)}."
-        )
+        raise ValueError(f"Query embedding must have {EMBEDDING_DIM} dimensions, got {len(query_embedding)}.")
 
     # pgvector on Postgres (uses the native operator); Python cosine on SQLite so the
     # tool works in local/tests instead of silently returning [] on a raised query.
@@ -177,37 +175,35 @@ async def store_obligacion_embedding(
         embedding: Float list of length EMBEDDING_DIM.
     """
     if len(embedding) != EMBEDDING_DIM:
-        raise ValueError(
-            f"Embedding must have {EMBEDDING_DIM} dimensions, got {len(embedding)}."
-        )
+        raise ValueError(f"Embedding must have {EMBEDDING_DIM} dimensions, got {len(embedding)}.")
 
     encoded = encode_embedding(embedding)
-    sql = text(
-        "UPDATE obligaciones SET embedding = :embedding WHERE id = :id"
-    )
+    sql = text("UPDATE obligaciones SET embedding = :embedding WHERE id = :id")
     await db.execute(sql, {"embedding": encoded, "id": str(obligacion_id)})
 
 
-async def get_embedding_from_llm(text_content: str, llm: Any) -> list[float] | None:
-    """Get embedding for text using the configured LLM adapter.
+async def get_embedding_from_llm(text_content: str, llm: Any = None) -> list[float] | None:
+    """Embed text with the configured embedding model (Gemini, EMBEDDING_DIM dims).
 
-    Falls back to None if the LLM does not support embeddings.
+    Delegates to the shared embedding service so query embeddings match the stored
+    obligation embeddings (same model and dimensions). Returns None when the vector
+    is the wrong size or an all-zeros fallback (embedding API unavailable).
 
     Args:
         text_content: Text to embed.
-        llm: LLM adapter instance from app.adapters.llm.
+        llm: Accepted for backward compatibility; no longer used (the model comes
+            from ``settings.LLM_EMBEDDING_MODEL``, not a hardcoded one).
 
     Returns:
-        List of floats or None if embedding failed.
+        List of floats or None if embedding failed/unavailable.
     """
+    from app.services.embedding_service import generate_embedding_for_text
+
     try:
-        embedding = await llm.embed(text_content, model="text-embedding-004")
-        if embedding and len(embedding) == EMBEDDING_DIM:
-            return embedding
-        return None
-    except (AttributeError, NotImplementedError):
-        # LLM adapter does not support embed() — skip silently
-        return None
+        embedding = await generate_embedding_for_text(text_content)
     except Exception as exc:
         await logger.awarning("embedding_failed", error=str(exc))
         return None
+    if embedding and len(embedding) == EMBEDDING_DIM and any(x != 0.0 for x in embedding):
+        return embedding
+    return None

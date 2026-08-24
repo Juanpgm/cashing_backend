@@ -1,8 +1,8 @@
 """Tests for vector search utilities (Phase 3)."""
+
 from __future__ import annotations
 
 import json
-import unittest
 
 import pytest
 
@@ -27,7 +27,7 @@ class TestEmbeddingCodec:
         assert result == pytest.approx(vec)
 
     def test_encode_decode_roundtrip(self) -> None:
-        from app.agent.tools.vector_search import encode_embedding, decode_embedding
+        from app.agent.tools.vector_search import decode_embedding, encode_embedding
 
         vec = [float(i) / 100 for i in range(10)]
         assert decode_embedding(encode_embedding(vec)) == pytest.approx(vec)
@@ -40,7 +40,7 @@ class TestEmbeddingCodec:
 
     def test_encode_embedding_dim(self) -> None:
         """Vector can hold 1536-dim embeddings."""
-        from app.agent.tools.vector_search import encode_embedding, EMBEDDING_DIM
+        from app.agent.tools.vector_search import EMBEDDING_DIM, encode_embedding
 
         vec = [0.0] * EMBEDDING_DIM
         encoded = encode_embedding(vec)
@@ -53,13 +53,15 @@ class TestGetEmbeddingFromLlm:
 
     def test_returns_list_of_floats(self) -> None:
         import asyncio
-        from unittest.mock import AsyncMock
-        from app.agent.tools.vector_search import get_embedding_from_llm, EMBEDDING_DIM
+        from unittest.mock import AsyncMock, patch
 
-        mock_llm = AsyncMock()
-        mock_llm.embed = AsyncMock(return_value=[0.5] * EMBEDDING_DIM)
+        from app.agent.tools.vector_search import EMBEDDING_DIM, get_embedding_from_llm
 
-        result = asyncio.run(get_embedding_from_llm("hello world", mock_llm))
+        with patch(
+            "app.services.embedding_service.generate_embedding_for_text",
+            new=AsyncMock(return_value=[0.5] * EMBEDDING_DIM),
+        ):
+            result = asyncio.run(get_embedding_from_llm("hello world"))
 
         assert isinstance(result, list)
         assert len(result) == EMBEDDING_DIM
