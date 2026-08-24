@@ -1,4 +1,4 @@
-"""Embedding service — generates and stores text-embedding-3-small (1536-dim) vectors for obligations."""
+"""Embedding service — generates and stores 1536-dim Gemini embedding vectors for obligations."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.models.obligacion import Obligacion
 
 logger = structlog.get_logger("service.embedding")
@@ -17,16 +18,21 @@ EMBEDDING_DIM = 1536
 
 
 async def _call_embedding_api(texts: list[str]) -> list[list[float]]:
-    """Call LiteLLM embedding API for a batch of texts.
+    """Embed a batch of texts via the configured (Gemini) embedding model.
 
-    Falls back to zero vectors when the API is unavailable (dev/test).
+    Uses ``settings.LLM_EMBEDDING_MODEL`` (default ``gemini/gemini-embedding-001``)
+    at ``EMBEDDING_DIM`` dimensions so obligation and query embeddings stay in the
+    same 1536-dim space. Falls back to zero vectors when the API is unavailable
+    (dev/test with no key). litellm reads ``GEMINI_API_KEY`` from the environment.
     """
     try:
         import litellm  # type: ignore[import-untyped]
 
         resp = await litellm.aembedding(
-            model="text-embedding-3-small",
+            model=settings.LLM_EMBEDDING_MODEL,
             input=texts,
+            dimensions=EMBEDDING_DIM,
+            api_key=settings.GEMINI_API_KEY or None,
         )
         return [item["embedding"] for item in resp["data"]]
     except Exception as exc:
