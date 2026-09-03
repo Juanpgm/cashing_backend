@@ -24,6 +24,7 @@ from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
 from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
 from app.services.document_service import upload_document
+from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -472,3 +473,118 @@ class TestLegitimateContractReplacementStillWorks:
                     tipo=TipoDocumentoFuente.CONTRATO,
                     contrato_id=contrato.id,
                 )
+
+
+class TestScopedTipoDefault:
+    """`tipo` defaulting to `contrato` is what turns an omission into a contract-level
+    write. The scope guard above stops the destruction, but an omitted `tipo` still
+    stored a cuenta attachment AS the contract text: ``verificar_configuracion_contrato``
+    loads every document by ``contrato_id`` regardless of cuenta scope, so it would be
+    served to the agent as the contract. The default is therefore resolved per scope:
+    cuenta-scoped requests default to the neutral tipo, everything else is unchanged.
+    """
+
+    async def test_omitted_tipo_on_a_cuenta_scoped_upload_defaults_to_otros(
+        self, client: AsyncClient, db: AsyncSession, test_user: dict[str, Any]
+    ) -> None:
+        user = test_user["user"]
+        contrato = await _crear_contrato(db, user.id)
+        cuenta = await _crear_cuenta(db, contrato)
+
+        with patch(_PATCH_S3) as mock_storage_cls:
+            mock_storage_cls.return_value = _mock_storage()
+            r = await client.post(
+                "/api/v1/documentos/upload",
+                headers=test_user["headers"],
+                params={"cuenta_cobro_id": str(cuenta.id), "requisito_codigo": "EVIDENCIAS"},
+                files={"file": ("adjunto-generico.pdf", b"%PDF-1.4\nadjunto", "application/pdf")},
+            )
+
+        assert r.status_code == 201, r.text
+        assert r.json()["tipo"] == "otros"
+
+    async def test_omitted_tipo_on_a_cuenta_scoped_upload_is_not_read_as_contract_text(
+        self, client: AsyncClient, db: AsyncSession, test_user: dict[str, Any]
+    ) -> None:
+        from app.services.document_service import verificar_configuracion_contrato
+
+        user = test_user["user"]
+        contrato = await _crear_contrato(db, user.id)
+        cuenta = await _crear_cuenta(db, contrato)
+
+        with patch(_PATCH_S3) as mock_storage_cls:
+            mock_storage_cls.return_value = _mock_storage()
+            r = await client.post(
+                "/api/v1/documentos/upload",
+                headers=test_user["headers"],
+                params={"cuenta_cobro_id": str(cuenta.id), "requisito_codigo": "EVIDENCIAS"},
+                files={"file": ("adjunto-generico.txt", _TEXTO_SUFICIENTE.encode(), "text/plain")},
+            )
+        assert r.status_code == 201, r.text
+
+        config = await verificar_configuracion_contrato(db, user.id, contrato.id)
+        assert config.tiene_texto_contrato is False
+
+    async def test_omitted_tipo_without_a_cuenta_still_means_contrato(
+        self, client: AsyncClient, db: AsyncSession, test_user: dict[str, Any]
+    ) -> None:
+        """Backward compatibility: the contract-upload flow keeps its default."""
+        user = test_user["user"]
+        contrato = await _crear_contrato(db, user.id)
+
+        with (
+            patch(_PATCH_S3) as mock_storage_cls,
+            patch(_PATCH_OBLIGACIONES, new=AsyncMock(return_value=([], []))),
+        ):
+            mock_storage_cls.return_value = _mock_storage()
+            r = await client.post(
+                "/api/v1/documentos/upload",
+                headers=test_user["headers"],
+                params={"contrato_id": str(contrato.id)},
+                files={"file": ("contrato-firmado.txt", _TEXTO_SUFICIENTE.encode(), "text/plain")},
+            )
+
+        assert r.status_code == 201, r.text
+        assert r.json()["tipo"] == "contrato"
+
+    async def test_explicit_tipo_is_always_honoured_on_a_cuenta_scoped_upload(
+        self, client: AsyncClient, db: AsyncSession, test_user: dict[str, Any]
+    ) -> None:
+        user = test_user["user"]
+        contrato = await _crear_contrato(db, user.id)
+        cuenta = await _crear_cuenta(db, contrato)
+
+        with patch(_PATCH_S3) as mock_storage_cls:
+            mock_storage_cls.return_value = _mock_storage()
+            r = await client.post(
+                "/api/v1/documentos/upload",
+                headers=test_user["headers"],
+                params={
+                    "tipo": "seguridad_social",
+                    "cuenta_cobro_id": str(cuenta.id),
+                    "requisito_codigo": "SEGURIDAD_SOCIAL",
+                },
+                files={"file": ("planilla.pdf", b"%PDF-1.4\nplanilla", "application/pdf")},
+            )
+
+        assert r.status_code == 201, r.text
+        assert r.json()["tipo"] == "seguridad_social"
+
+    async def test_batch_upload_applies_the_same_scoped_default(
+        self, client: AsyncClient, db: AsyncSession, test_user: dict[str, Any]
+    ) -> None:
+        user = test_user["user"]
+        contrato = await _crear_contrato(db, user.id)
+        cuenta = await _crear_cuenta(db, contrato)
+
+        with patch(_PATCH_S3) as mock_storage_cls:
+            mock_storage_cls.return_value = _mock_storage()
+            r = await client.post(
+                "/api/v1/documentos/upload-batch",
+                headers=test_user["headers"],
+                params={"cuenta_cobro_id": str(cuenta.id), "requisito_codigo": "EVIDENCIAS"},
+                files=[("files", ("adjunto-1.pdf", b"%PDF-1.4\nuno", "application/pdf"))],
+            )
+
+        assert r.status_code == 201, r.text
+        assert [d["tipo"] for d in r.json()] == ["otros"]
