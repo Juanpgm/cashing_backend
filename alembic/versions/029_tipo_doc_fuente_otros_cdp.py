@@ -27,16 +27,22 @@ migration adds both. `ADD VALUE IF NOT EXISTS` makes the redundant one a no-op.
 Postgres only: SQLite (test DB) stores enums as VARCHAR, so there is no type to
 alter. Postgres cannot remove an enum label, hence the no-op downgrade.
 
-Revision ID: 029_tipo_documento_fuente_otros_cdp
+Revision ID: 029_tipo_doc_fuente_otros_cdp
 Revises: 028_cuenta_cobro_fecha_transaccion
 Create Date: 2026-09-02
+
+The revision id is kept at 32 characters or fewer on purpose. Alembic's
+`alembic_version.version_num` column defaults to VARCHAR(32) and `env.py` does
+not override `version_table_column_length`, so a longer id fails to record with
+"value too long for type character varying(32)". Revisions 005, 018, 020 and 028
+already exceed that limit; do not add more.
 """
 
 from __future__ import annotations
 
 from alembic import op
 
-revision = "029_tipo_documento_fuente_otros_cdp"
+revision = "029_tipo_doc_fuente_otros_cdp"
 down_revision = "028_cuenta_cobro_fecha_transaccion"
 branch_labels = None
 depends_on = None
