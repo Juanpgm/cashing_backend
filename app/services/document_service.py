@@ -668,25 +668,11 @@ async def upload_document(
 
     doc_cuenta_cobro_id = None if (requisito_codigo and _es_nivel_contrato(requisito_codigo)) else cuenta_cobro_id
 
-    # Scope invariant. A cuenta-scoped upload (doc_cuenta_cobro_id set) belongs to a
-    # single cuenta and must NEVER mutate contract-level state — neither the shared
-    # CONTRATO document (replace rule below) nor the contract's obligations
-    # (extraction further down). Only a contract-level upload may do that, which
-    # includes re-uploading the contract through a cuenta's CONTRATO checklist row
-    # (a contract-level requisito resolves doc_cuenta_cobro_id back to None).
-    # Without this guard, any upload into a requisito with no declared
-    # tipo_documento_fuente reached here as tipo=CONTRATO and destroyed the user's
-    # contract document.
-    es_upload_nivel_contrato = doc_cuenta_cobro_id is None
-    procesar_como_contrato = tipo == TipoDocumentoFuente.CONTRATO and es_upload_nivel_contrato
-
     # Enforce 1-document-per-contract rule for tipo=CONTRATO.
     # If a CONTRATO document already exists for this contract (any filename),
-    # replace it: the old DB record goes now, the old file is removed from storage
-    # only AFTER the replacement upload succeeds (see below) so a failed upload
-    # rolls the record back to a file that is still there.
-    claves_reemplazadas: list[str] = []
-    if procesar_como_contrato and contrato_id is not None:
+    # replace it: delete the old file from storage and the old DB record so
+    # the new upload becomes the single source of truth.
+    if tipo == TipoDocumentoFuente.CONTRATO and contrato_id is not None:
         prev_result = await db.execute(
             select(DocumentoFuente).where(
                 DocumentoFuente.contrato_id == contrato_id,
@@ -695,7 +681,10 @@ async def upload_document(
         )
         prev_docs = list(prev_result.scalars().all())
         for prev_doc in prev_docs:
-            claves_reemplazadas.append(prev_doc.storage_key)
+            # Best-effort delete of the old file; a storage miss must not block
+            # replacing the DB record (the new upload is the source of truth).
+            with contextlib.suppress(Exception):
+                await _get_storage(settings.S3_BUCKET_DOCUMENTOS).delete(prev_doc.storage_key)
             await db.delete(prev_doc)
         if prev_docs:
             await db.flush()
@@ -818,16 +807,15 @@ async def upload_document(
             texto_suficiente = True
             await logger.ainfo("ocr_recovered_text", filename=filename, chars=len(texto_ocr))
 
-    es_contrato_autocrear = procesar_como_contrato and contrato_id is None
+    es_contrato_autocrear = tipo == TipoDocumentoFuente.CONTRATO and contrato_id is None
 
     # ── Hybrid fallback: scanned PDF / image (poor/no text) → vision extraction ──
-    # Runs for ALL contract-level CONTRATO uploads with insufficient text — both
-    # auto-create and existing-contract uploads. For auto-create, the vision result
-    # also populates contract metadata. For existing contracts, only obligations are
-    # extracted. Never runs for a cuenta-scoped upload (scope invariant above).
+    # Runs for ALL CONTRATO uploads with insufficient text — both auto-create and
+    # existing-contract uploads. For auto-create, the vision result also populates
+    # contract metadata. For existing contracts, only obligations are extracted.
     multimodal_result: ContratoExtractionResult | None = None
     if (
-        procesar_como_contrato
+        tipo == TipoDocumentoFuente.CONTRATO
         and not texto_suficiente
         and settings.EXTRACTION_MULTIMODAL_FALLBACK_ENABLED
         and is_multimodal_supported(guess_mime_type(filename))
@@ -894,10 +882,8 @@ async def upload_document(
             usuario_id=str(user_id),
         )
 
-    # Extract obligations once we have a contract to link them to. Contract-level
-    # uploads only: mining a cuenta's evidence for "obligations" would pollute the
-    # contract's obligation list with text that is not contractual (scope invariant).
-    if procesar_como_contrato and contrato_id is not None:
+    # Extract obligations once we have a contract to link them to.
+    if tipo == TipoDocumentoFuente.CONTRATO and contrato_id is not None:
         if multimodal_result is not None:
             ob_items = _obligacion_items_to_extraidas(multimodal_result.obligaciones)
             obligaciones_extraidas, ob_avisos = await _persist_obligaciones(ob_items, contrato_id, db, [])
@@ -919,15 +905,6 @@ async def upload_document(
             error=str(exc),
         )
         raise
-
-    # Only now that the replacement is safely stored, drop the files of the CONTRATO
-    # documents replaced above. Deleting them earlier meant a failed upload rolled the
-    # transaction back to DB records whose storage objects were already gone.
-    # Best-effort: a storage miss must not block the replacement (the new upload is
-    # the source of truth) — it leaves an orphan object, never a dangling record.
-    for clave in claves_reemplazadas:
-        with contextlib.suppress(Exception):
-            await _get_storage(settings.S3_BUCKET_DOCUMENTOS).delete(clave)
 
     # NOTE: cuenta_cobro_id ownership + contrato_id derivation from the cuenta already
     # happened unconditionally above (before dedup/replace logic), so contrato_id is

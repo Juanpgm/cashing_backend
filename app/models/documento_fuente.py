@@ -15,18 +15,8 @@ class TipoDocumentoFuente(enum.StrEnum):
     CONTRATO = "contrato"
     INSTRUCCIONES = "instrucciones"
     PLANTILLA = "plantilla"
-    # Neutral type for uploads that declare no specific document kind (added in
-    # migration 029). Callers MUST use this instead of inventing a fallback:
-    # defaulting an untyped upload to CONTRATO used to trigger the
-    # 1-document-per-contract replace rule and destroy the user's contract.
-    # OTROS is deliberately absent from document_classifier.TIPO_A_REQUISITO and
-    # carries no special meaning anywhere (unlike INSTRUCCIONES).
-    OTROS = "otros"
     # Checklist requirements for cuenta de cobro (added in migration 011)
     RPC = "rpc"
-    # Certificado de Disponibilidad Presupuestal — contract-level, seeded in the
-    # checklist catalog since the radicacion stepper (added in migration 029).
-    CDP = "cdp"
     SEGURIDAD_SOCIAL = "seguridad_social"
     COMPROBANTE_PAGO_SS = "comprobante_pago_ss"
     INFORME_ACTIVIDADES = "informe_actividades"
