@@ -40,7 +40,15 @@ from app.core.exceptions import DomainError
 from app.core.file_validation import _EXT_TO_MIME
 from app.models.conversacion import Conversacion
 from app.models.usuario import Usuario
-from app.schemas.agent import AgentChatResult, DocumentoAdjuntoResumen, LLMMessage, LLMToolCall, ToolEvent, UiAction
+from app.schemas.agent import (
+    AGENT_RECAP_MARKER,
+    AgentChatResult,
+    DocumentoAdjuntoResumen,
+    LLMMessage,
+    LLMToolCall,
+    ToolEvent,
+    UiAction,
+)
 from app.services import contrato_service
 from app.tools.context import ToolAttachment, ToolContext
 from app.tools.invoke import invoke_tool
@@ -49,7 +57,14 @@ from app.tools.registry import TOOL_REGISTRY
 
 logger = structlog.get_logger("services.agent_chat")
 
-MAX_TOOL_ITERATIONS = 8
+# A full end-to-end radicación chain (listar_contratos → crear_cuenta_cobro →
+# definir_requisitos_checklist → importar_documento xN → auto_vincular_documentos →
+# actividades → 2 informes → resumen_checklist → preparar_radicacion →
+# radicar_cuenta) needs roughly 12-15 tool calls — comfortably past the old cap
+# of 8, which cut the loop off mid-chain and forced the user to say "seguí" into
+# a conversation that (before the recap below existed) had no memory of what
+# already ran. Raised with headroom for a retry or two along the way.
+MAX_TOOL_ITERATIONS = 20
 
 # Tool results fed back to the LLM are truncated so a single verbose tool output
 # (e.g. a full checklist dump) doesn't blow past the model's context window. Live
@@ -97,6 +112,12 @@ formato y tono de supervisor. Usa la herramienta `generar_informe_supervision` p
 producirlo; NUNCA afirmes que no puedes generarlo.
 
 Reglas:
+- EXCEPCIÓN a la autonomía: `radicar_cuenta` SIEMPRE requiere confirmación explícita del usuario \
+en la conversación antes de ejecutarse. Antes de llamarla, decile claramente qué cuenta de cobro \
+estás por radicar (mes, año, entidad si la conocés) y esperá una respuesta afirmativa clara del \
+usuario en su próximo mensaje — nunca la llames de forma autónoma ni encadenada con otras \
+herramientas en el mismo turno. Todo lo demás del flujo (crear la cuenta, definir el checklist, \
+importar documentos, generar actividades e informes) sí es autónomo.
 - Responde siempre en el mismo idioma en el que te escribe el usuario.
 - NUNCA respondas con un "lo siento, no puedo" ni te niegues a una tarea que tus \
 herramientas cubren (crear cuentas de cobro, checklist, informes de actividades y de \
@@ -163,7 +184,29 @@ también son importables de forma individual por su nombre exacto — revisa la 
 NUNCA escribas el nombre de una herramienta ni sus argumentos en formato JSON como texto \
 plano en tu respuesta — eso no ejecuta nada; si necesitas llamar a una herramienta, hazlo \
 mediante una llamada de función real, nunca describiéndola en el contenido del mensaje.
-- Sé conciso, directo y profesional."""
+- Sé conciso, directo y profesional.
+
+Orden canónico de punta a punta para radicar una cuenta de cobro (encadena lo que aplique \
+según lo que el usuario ya tenga hecho — no repitas un paso ya resuelto):
+1. Descubrí el contrato: `listar_contratos` (o `importar_documento` tipo=contrato / \
+`importar_contrato_secop` si aún no existe) — obtené el contrato_id.
+2. Si el contrato no tiene obligaciones registradas, llamá a `extraer_obligaciones_contrato`.
+3. Creá la cuenta con `crear_cuenta_cobro` (mes/año).
+4. INMEDIATAMENTE después, llamá a `definir_requisitos_checklist` (modo `estandar` salvo que \
+el usuario te haya dado un documento de requisitos de la entidad) — OBLIGATORIO antes de \
+cualquier otra herramienta sobre esa cuenta; sin esto el checklist queda vacío y los informes \
+fallan.
+5. Importá cada soporte con `importar_documento` usando el `tipo` correcto (RPC, cédula, RUT, \
+acta de inicio, seguridad social, etc.) y usá `auto_vincular_documentos`/`detectar_desde_secop` \
+para vincular lo ya cargado.
+6. Generá actividades: preferí `crear_actividades_desde_obligaciones` (determinístico, sin IA); \
+si el usuario quiere actividades redactadas usá `generar_actividades_agente`; si no hay \
+obligaciones ni documento, usá `agregar_actividades_desde_texto`.
+7. Evidencias: `descubrir_evidencias` + `persistir_evidencias` si el usuario tiene Google \
+conectado, o `subir_evidencias_desde_chat` si adjuntó los soportes directamente en el chat.
+8. Generá los informes con `generar_informe_actividades` y `generar_informe_supervision`.
+9. Usá `resumen_checklist` para confirmar qué falta.
+10. Cuando el checklist esté completo, `preparar_radicacion` y luego `radicar_cuenta`."""
 
 
 _MAX_OBJETO_CONTEXT_CHARS = 200
@@ -613,7 +656,10 @@ def _format_tool_error(exc: Exception, tool_name: str) -> tuple[str, str]:
 # of parsing prose. Builders are best-effort: an exception is logged and treated
 # as "no action" (see `_run_ui_action_builder`), never breaking the tool loop.
 
-_MAX_UI_ACTIONS = 8
+# Kept >= MAX_TOOL_ITERATIONS (see test_max_ui_actions_cap_independent_of_max_tool_iterations) —
+# otherwise this cap alone, not the loop's own iteration bound, is what keeps
+# `ui_actions` finite on a turn that ran many distinct write tools.
+_MAX_UI_ACTIONS = MAX_TOOL_ITERATIONS
 
 
 def _build_seleccionar_contrato(output: BaseModel) -> UiAction | None:
@@ -715,6 +761,11 @@ _UI_ACTION_BUILDERS: dict[str, Any] = {
     "listar_contratos": _build_seleccionar_contrato,
     "crear_cuenta_cobro": _build_abrir_radicacion,
     "resumen_checklist": _build_checklist_resumen,
+    # `DefinirRequisitosChecklistOutput` carries the same `cuenta_cobro_id`/`items`/
+    # `resumen` shape as `ChecklistResponse` — reuses the builder as-is (duck-typed,
+    # no isinstance check) instead of inventing a new UiAction `type` string the
+    # frontend wouldn't know how to render.
+    "definir_requisitos_checklist": _build_checklist_resumen,
     "descubrir_evidencias": _build_evidencias_descubiertas,
     "preparar_radicacion": _build_paquete_listo_desde_preparacion,
     "generar_paquete_evidencias": _build_paquete_listo_desde_paquete,
@@ -743,6 +794,83 @@ def _record_ui_action(ui_actions: list[UiAction], action: UiAction) -> None:
         ui_actions.append(action)
     while len(ui_actions) > _MAX_UI_ACTIONS:
         ui_actions.pop(0)
+
+
+# --- Cross-turn tool-context recap (T9) ---
+#
+# `chat_with_tools` only ever persists the user message and the final assistant
+# text (see the docstring below) — tool-call/tool-result exchanges live only
+# within a single call's `messages` list. That means a CONTINUATION turn on the
+# same session_id (the user says "seguí") replays history with zero memory of
+# which tools already ran or which real UUIDs (contrato_id, cuenta_id, ...) they
+# returned, forcing the model to re-discover everything or invent a UUID (which
+# the system prompt explicitly forbids). The recap below is a SINGLE, bounded,
+# best-effort text line — refreshed (not accumulated) every turn that ran at
+# least one tool call — carrying just enough for the model to pick up where it
+# left off, without replaying raw tool output or growing without bound.
+
+# A couple hundred characters, matching the task's explicit bound — enough for a
+# handful of "tool:status id=value" entries, never enough to meaningfully eat
+# into the model's context budget even after many turns.
+_RECAP_MAX_CHARS = 240
+_RECAP_ROLE = "system"
+
+
+def _extract_recap_ids(dumped: dict[str, Any]) -> dict[str, str]:
+    """Pull UUID-shaped `id`/`*_id` fields straight off a successful tool's dumped
+    output — the only identifiers a recap is allowed to carry, since they came
+    from a call THIS user's own context just made (never another user's data)."""
+    ids: dict[str, str] = {}
+    for key, value in dumped.items():
+        if not isinstance(value, str) or not (key == "id" or key.endswith("_id")):
+            continue
+        try:
+            uuid.UUID(value)
+        except (ValueError, AttributeError, TypeError):
+            continue
+        ids[key] = value
+    return ids
+
+
+def _build_tool_context_recap(call_results: list[tuple[str, str, dict[str, Any] | None]]) -> str | None:
+    """Build ONE bounded recap line from this turn's tool calls, newest-first (the
+    most recent call is the most likely to matter for "seguí con eso"). Returns
+    `None` when there is nothing to say (no calls this turn) so a pure-chat turn
+    never gets a recap message at all."""
+    if not call_results:
+        return None
+
+    lines: list[str] = []
+    budget = len(AGENT_RECAP_MARKER) + 1
+    for tool_name, status, dumped in reversed(call_results):
+        if status == "ok" and dumped:
+            ids = _extract_recap_ids(dumped)
+            id_part = " ".join(f"{k}={v}" for k, v in ids.items())
+            line = f"{tool_name}:ok {id_part}".strip()
+        else:
+            # Never fabricate an id for a failed/unknown call — status only.
+            line = f"{tool_name}:{status}"
+        added = len(line) + 3  # separator " | "
+        if budget + added > _RECAP_MAX_CHARS:
+            # The cap applies to the FIRST line too — a single oversized result
+            # (e.g. a tool returning many id fields) must never blow the cap
+            # outright just because `lines` was still empty. Truncate it to fit
+            # rather than skipping the check.
+            if not lines:
+                allowed = max(_RECAP_MAX_CHARS - budget, 0)
+                if allowed > 0:
+                    lines.append(line[:allowed])
+            break
+        lines.append(line)
+        budget += added
+
+    if not lines:
+        return None
+    return f"{AGENT_RECAP_MARKER} " + " | ".join(lines)
+
+
+def _is_recap_message(msg: dict[str, Any]) -> bool:
+    return msg.get("role") == _RECAP_ROLE and str(msg.get("content", "")).startswith(AGENT_RECAP_MARKER)
 
 
 async def _load_or_create_conversation(db: AsyncSession, usuario: Usuario, session_id: str | None) -> Conversacion:
@@ -781,7 +909,12 @@ async def chat_with_tools(
 
     Tool-call/tool-result messages are exchanged with the LLM within this call only
     — they are never written to `Conversacion.mensajes_json`. Only the user message
-    and the final assistant answer are persisted, mirroring `agent_service.chat`.
+    and the final assistant answer are persisted, mirroring `agent_service.chat` —
+    PLUS, when this turn ran at least one tool call, a single bounded recap message
+    (role="system", prefixed `AGENT_RECAP_MARKER`) is refreshed so a continuation
+    turn on the same session_id knows what already ran (see
+    `_build_tool_context_recap`). `agent_service.get_conversation_history` filters
+    this recap out of client-facing history.
 
     `contrato_id` is an OPTIONAL contract context supplied by the caller (e.g. the
     contract the user currently has open in the UI) — see `_resolve_contrato_context`.
@@ -824,11 +957,35 @@ async def chat_with_tools(
 
     tool_events: list[ToolEvent] = []
     ui_actions: list[UiAction] = []
+    # (tool_name, status, dumped_output_or_None) per call, in call order — feeds the
+    # cross-turn recap built below (`_build_tool_context_recap`). Only successful
+    # calls carry a payload; a failed call is recorded as a bare status so the recap
+    # never fabricates an identifier for something that didn't actually happen.
+    call_results: list[tuple[str, str, dict[str, Any] | None]] = []
     tokens_used = 0
     final_content = ""
 
     for _ in range(MAX_TOOL_ITERATIONS):
-        response = await llm.complete(messages, tools=tools, temperature=0.2, max_tokens=1024)
+        try:
+            response = await llm.complete(messages, tools=tools, temperature=0.2, max_tokens=1024)
+        except Exception as exc:
+            # Broad by design, mirroring the per-tool-call exception boundary below:
+            # `LiteLLMAdapter.complete` raises `RuntimeError` when its ENTIRE model
+            # fallback chain fails, but a provider SDK could raise anything network-
+            # shaped. Letting this escape `chat_with_tools` used to 500 the whole
+            # request AND skip the final `db.commit()` below — losing the user
+            # message, the assistant reply, and the recap of tool calls that
+            # already succeeded and committed in an EARLIER iteration this same
+            # turn. BaseException (KeyboardInterrupt/SystemExit/CancelledError) is
+            # intentionally NOT caught here.
+            await logger.awarning("agent_chat_llm_unreachable", error=str(exc))
+            final_content = (
+                "No pude contactar al modelo de IA en este momento. Lo que ya se alcanzó a "
+                "completar en esta solicitud quedó guardado — escribime de nuevo en un momento "
+                "para continuar."
+            )
+            messages.append(LLMMessage(role="assistant", content=final_content))
+            break
         tokens_used += response.total_tokens
 
         calls = response.tool_calls
@@ -874,6 +1031,7 @@ async def chat_with_tools(
                 user_resumen = f"No reconozco la herramienta solicitada ({call.name})."
                 tool_events.append(ToolEvent(tool=call.name, status="error", resumen=user_resumen))
                 result_payload: Any = {"error": llm_detail}
+                call_results.append((call.name, "error", None))
             else:
                 try:
                     output = await invoke_tool(call.name, tool_ctx, _normalize_tool_args(call.arguments))
@@ -883,6 +1041,7 @@ async def chat_with_tools(
                     dumped = output.model_dump(mode="json")
                     result_payload = dumped
                     tool_events.append(ToolEvent(tool=call.name, status="ok", resumen=_summarize_tool_result(dumped)))
+                    call_results.append((call.name, "ok", dumped))
                     action = _run_ui_action_builder(call.name, output)
                     if action is not None:
                         _record_ui_action(ui_actions, action)
@@ -906,6 +1065,7 @@ async def chat_with_tools(
                     user_resumen, llm_detail = _format_tool_error(exc, call.name)
                     result_payload = {"error": llm_detail}
                     tool_events.append(ToolEvent(tool=call.name, status="error", resumen=user_resumen))
+                    call_results.append((call.name, "error", None))
                     await logger.awarning("agent_chat_tool_error", tool=call.name, error=str(exc))
 
             messages.append(
@@ -928,11 +1088,21 @@ async def chat_with_tools(
     # writer's messages. Appending to whatever is currently persisted keeps both.
     await db.refresh(convo)
     current_messages = list(convo.mensajes_json or [])
-    convo.mensajes_json = [
-        *current_messages,
+
+    new_messages = [
         LLMMessage(role="user", content=message).model_dump(),
         LLMMessage(role="assistant", content=final_content).model_dump(),
     ]
+    # Refresh (never accumulate) the recap: a turn that ran tools drops any prior
+    # recap message and appends a fresh one, keeping exactly one in history no
+    # matter how many turns the conversation runs — a turn with zero tool calls
+    # leaves a previous recap untouched (still useful context) and adds no new one.
+    recap_text = _build_tool_context_recap(call_results)
+    if recap_text:
+        current_messages = [m for m in current_messages if not _is_recap_message(m)]
+        new_messages.append(LLMMessage(role=_RECAP_ROLE, content=recap_text).model_dump())
+
+    convo.mensajes_json = [*current_messages, *new_messages]
     await db.commit()
 
     await logger.ainfo(

@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agent.graph import build_graph
 from app.agent.state import AgentState
 from app.models.conversacion import Conversacion
-from app.schemas.agent import AgentMode, ChatMessageResponse, LLMMessage
+from app.schemas.agent import AGENT_RECAP_MARKER, AgentMode, ChatMessageResponse, LLMMessage
 
 logger = structlog.get_logger("services.agent")
 
@@ -106,7 +106,17 @@ async def get_conversation_history(
     convo = result.scalar_one_or_none()
     if convo is None:
         return []
-    return convo.mensajes_json  # type: ignore[return-value]
+
+    # `agent_chat_service.chat_with_tools` (a different writer of the SAME
+    # `Conversacion` table) persists an internal cross-turn recap message
+    # (role="system", prefixed `AGENT_RECAP_MARKER`) that must never reach the
+    # client — it exists purely so a continuation turn on the same session_id
+    # remembers which tools already ran.
+    return [
+        m
+        for m in convo.mensajes_json  # type: ignore[union-attr]
+        if not (m.get("role") == "system" and str(m.get("content", "")).startswith(AGENT_RECAP_MARKER))
+    ]
 
 
 async def run_full(

@@ -274,6 +274,14 @@ class ActividadesDesdeTextoRequest(BaseModel):
 class ActividadesBulkResponse(BaseModel):
     creadas: int
     actividades: list[ActividadResponse]
+    saltadas: int = Field(
+        default=0,
+        description=(
+            "How many were skipped because an Actividad already existed for that obligación on "
+            "this cuenta (only meaningfully non-zero for crear_actividades_desde_obligaciones' "
+            "idempotent re-call)."
+        ),
+    )
 
 
 class CambiarEstadoRequest(BaseModel):

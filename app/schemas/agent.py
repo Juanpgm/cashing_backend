@@ -10,6 +10,16 @@ from pydantic import BaseModel, Field
 
 # --- LLM schemas ---
 
+# Marker prefix for the compact cross-turn tool-context recap `agent_chat_service.
+# chat_with_tools` persists into `Conversacion.mensajes_json` (role="system") so a
+# CONTINUATION turn on the same session_id knows which tools already ran and which
+# identifiers (contrato_id, cuenta_id, ...) they returned — without replaying raw
+# tool output. Defined here (not in agent_chat_service.py) so `agent_service.
+# get_conversation_history` can filter it out of client-facing history without a
+# cross-module import into agent_chat_service (which pulls in the whole tool
+# catalog at import time).
+AGENT_RECAP_MARKER = "[[contexto_previo]]"
+
 
 class LLMMessage(BaseModel):
     role: str = Field(description="Role: system, user, assistant, or tool")
