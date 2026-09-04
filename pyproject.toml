@@ -1,6 +1,6 @@
 [project]
 name = "cashin-backend"
-version = "0.1.0"
+version = "0.2.0"
 description = "AI Agent-first backend for automating Colombian contractor billing (cuentas de cobro)"
 requires-python = ">=3.12"
 readme = "README.md"

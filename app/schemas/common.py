@@ -23,7 +23,7 @@ class PaginatedResponse[T](BaseModel):
 class HealthResponse(BaseModel):
     status: str = "ok"
     environment: str
-    version: str = "0.1.0"
+    version: str = "0.2.0"
 
 
 class LLMModelStatus(BaseModel):

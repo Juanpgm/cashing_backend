@@ -264,7 +264,14 @@ async def test_tool_runtime_error_is_caught_and_loop_continues(db: AsyncSession,
 
     convo = await db.get(Conversacion, uuid.UUID(result.session_id))
     assert convo is not None
-    assert convo.mensajes_json[-1]["content"] == "Ocurrió un error inesperado al consultar el checklist."
+    # The final assistant message is no longer guaranteed to be the LAST entry:
+    # a turn that ran at least one tool call also appends a bounded internal
+    # recap message after it (T9, `_build_tool_context_recap`) — assert the
+    # assistant message is present instead of assuming a fixed trailing position.
+    assert any(
+        m["role"] == "assistant" and m["content"] == "Ocurrió un error inesperado al consultar el checklist."
+        for m in convo.mensajes_json
+    )
 
 
 @pytest.mark.asyncio
@@ -569,11 +576,13 @@ def test_record_ui_action_replaces_consecutive_same_type() -> None:
 
 
 def test_record_ui_action_drops_oldest_beyond_cap() -> None:
-    """9 alternating-type actions (so none collapse into each other) must leave
-    exactly `_MAX_UI_ACTIONS` entries, with the single oldest one dropped."""
+    """`_MAX_UI_ACTIONS + 1` alternating-type actions (so none collapse into each
+    other) must leave exactly `_MAX_UI_ACTIONS` entries, with the single oldest
+    one dropped."""
     ui_actions: list[UiAction] = []
     actions = [
-        UiAction(type="checklist_resumen" if i % 2 == 0 else "abrir_radicacion", payload={"i": i}) for i in range(9)
+        UiAction(type="checklist_resumen" if i % 2 == 0 else "abrir_radicacion", payload={"i": i})
+        for i in range(agent_chat_service._MAX_UI_ACTIONS + 1)
     ]
 
     for action in actions:

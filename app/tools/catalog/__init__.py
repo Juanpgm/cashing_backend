@@ -14,6 +14,7 @@ evidence.
 """
 
 from app.tools.catalog import (
+    actividades,
     adiciones,
     checklist,
     coherence,
@@ -23,6 +24,7 @@ from app.tools.catalog import (
     informes,
     listar_contratos,
     listar_cuentas_cobro,
+    obligaciones,
     paquete,
     plantillas_organismo,
     radicacion,
@@ -31,6 +33,7 @@ from app.tools.catalog import (
 )
 
 __all__ = [
+    "actividades",
     "adiciones",
     "checklist",
     "coherence",
@@ -40,6 +43,7 @@ __all__ = [
     "informes",
     "listar_contratos",
     "listar_cuentas_cobro",
+    "obligaciones",
     "paquete",
     "plantillas_organismo",
     "radicacion",

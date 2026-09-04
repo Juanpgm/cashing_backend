@@ -38,6 +38,16 @@ EXPECTED_TOOL_NAMES = {
     "crear_cuenta_cobro",
     "radicar_cuenta",
     "validar_coherencia_cuenta",
+    "definir_requisitos_checklist",
+    "crear_actividades_desde_obligaciones",
+    "generar_actividades_agente",
+    "agregar_actividades_desde_texto",
+    "extraer_obligaciones_contrato",
+    # NOTE: subir_evidencias_desde_chat is deliberately excluded here — like
+    # importar_documento, it carries the extra "chat_only" tag, which the strict
+    # tags-subset check below (test_catalog_tools_have_rich_descriptions_and_valid_schemas)
+    # doesn't allow. It's covered by its own registration test in
+    # tests/test_tool_catalog_evidencias_chat.py.
 }
 
 FORBIDDEN_NAME_KEYWORDS = (

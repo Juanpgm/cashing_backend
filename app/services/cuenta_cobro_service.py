@@ -917,6 +917,12 @@ async def crear_actividades_desde_obligaciones(
     becomes a baseline activity (descripcion = the obligation text, linked by
     obligacion_id) that the user then edits. Lets the informe be generated when only
     obligaciones were loaded.
+
+    Idempotent (F2 regression fix): an obligación that already has an Actividad on
+    THIS cuenta is skipped rather than duplicated — a re-call (e.g. the agent
+    retrying, or the user clicking the button twice) must never double the
+    activities that flow straight into the filed informe de actividades /
+    informe de supervisión.
     """
     from app.models.obligacion import Obligacion as Ob
 
@@ -935,8 +941,19 @@ async def crear_actividades_desde_obligaciones(
             "POST /contratos/{id}/obligaciones o ingrese actividades manualmente."
         )
 
+    existentes_result = await db.execute(
+        select(Actividad.obligacion_id).where(
+            Actividad.cuenta_cobro_id == cuenta_id, Actividad.obligacion_id.is_not(None)
+        )
+    )
+    obligacion_ids_con_actividad = {row[0] for row in existentes_result.all()}
+
     created: list[ActividadResponse] = []
+    saltadas = 0
     for ob in obligaciones:
+        if ob.id in obligacion_ids_con_actividad:
+            saltadas += 1
+            continue
         act = Actividad(
             cuenta_cobro_id=cuenta_id,
             obligacion_id=ob.id,
@@ -954,8 +971,9 @@ async def crear_actividades_desde_obligaciones(
         cuenta_id=str(cuenta_id),
         usuario_id=str(usuario_id),
         cantidad=len(created),
+        saltadas=saltadas,
     )
-    return ActividadesBulkResponse(creadas=len(created), actividades=created)
+    return ActividadesBulkResponse(creadas=len(created), actividades=created, saltadas=saltadas)
 
 
 async def cambiar_estado(
