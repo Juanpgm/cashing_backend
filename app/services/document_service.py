@@ -11,7 +11,7 @@ from decimal import Decimal, InvalidOperation
 
 import structlog
 from pydantic import ValidationError
-from sqlalchemy import or_, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -796,14 +796,29 @@ async def upload_document(
     #
     # `doc_cuenta_cobro_id is None` is necessary but NOT sufficient: contract-level
     # requisitos (RUT, CEDULA, RPC, CDP, FICHA_TECNICA, ACTA_INICIO) legitimately
-    # resolve to None too, and a RUT is not the contract. So the requisito, when the
-    # caller declares one, must be the CONTRATO requisito itself.
-    alcance_documento_del_contrato = doc_cuenta_cobro_id is None and requisito_codigo in (None, "CONTRATO")
+    # resolve to None too, and a RUT is not the contract.
+    #
+    # B3 hardening: treating an OMITTED `requisito_codigo` as "this is the contract"
+    # (the previous `requisito_codigo in (None, "CONTRATO")` test) was still too
+    # loose — any direct `upload_document` caller (agent tools, background jobs) that
+    # passed `tipo=CONTRATO` + `contrato_id` with no cuenta and no requisito (e.g. an
+    # "certificado de experiencia" uploaded for context) was silently treated as THE
+    # contract, replacing the real one and feeding its (possibly unrelated) text into
+    # obligation extraction. The requisito must now be declared EXPLICITLY as
+    # "CONTRATO" (case-insensitive) — no more implicit-by-omission scoping. The
+    # HTTP router does NOT default/synthesize it either: the frontend's
+    # `buildContratoUploadParams` already sends `requisito_codigo=CONTRATO`
+    # explicitly whenever `tipo=contrato` for its contract-upload call sites, and
+    # every other first-party caller (SECOP scraper, `importar_documento` tool)
+    # passes it directly too.
+    requisito_es_contrato = requisito_codigo is not None and requisito_codigo.strip().upper() == "CONTRATO"
+    alcance_documento_del_contrato = doc_cuenta_cobro_id is None and requisito_es_contrato
 
     # Enforce 1-document-per-contract rule for tipo=CONTRATO.
     # If a CONTRATO document already exists for this contract (any filename),
     # replace it: delete the old file from storage and the old DB record so
     # the new upload becomes the single source of truth.
+    contrato_documento_reemplazado = False
     if tipo == TipoDocumentoFuente.CONTRATO and alcance_documento_del_contrato and contrato_id is not None:
         prev_result = await db.execute(
             select(DocumentoFuente).where(
@@ -819,6 +834,16 @@ async def upload_document(
                 await _get_storage(settings.S3_BUCKET_DOCUMENTOS).delete(prev_doc.storage_key)
             await db.delete(prev_doc)
         if prev_docs:
+            contrato_documento_reemplazado = True
+            # B4: `_persist_obligaciones` only APPENDS (dedup by normalized text),
+            # so obligations from the REPLACED document survived every subsequent
+            # replace and kept accumulating. The replaced document's text is gone
+            # (or about to be superseded) — its obligations are no longer backed
+            # by anything the user can see, so clear them in the SAME transaction
+            # as the replace. Always clear, even if the new extraction below ends
+            # up yielding 0 items (logged as a warning there) — per design, a
+            # contract with no readable obligations must show none, not stale ones.
+            await db.execute(delete(Obligacion).where(Obligacion.contrato_id == contrato_id))
             await db.flush()
             await logger.ainfo(
                 "contrato_documento_replaced",
@@ -1126,6 +1151,13 @@ async def upload_document(
         elif texto_extraido:
             obligaciones_extraidas, ob_avisos = await _extraer_obligaciones(texto_extraido, contrato_id, db)
             avisos.extend(ob_avisos)
+
+        if contrato_documento_reemplazado and not obligaciones_extraidas:
+            await logger.awarning(
+                "contrato_reemplazado_sin_obligaciones",
+                contrato_id=str(contrato_id),
+                new_nombre=filename,
+            )
 
     # Upload to storage (local filesystem or S3, depending on STORAGE_PROVIDER).
     safe_filename = get_safe_filename(filename)
@@ -1610,16 +1642,24 @@ async def extraer_obligaciones_documento(
     Returns (obligaciones, avisos).
     Raises NotFoundError si no hay documento de contrato vinculado.
     """
+    # B5: the contract's own document is always contract-level (cuenta_cobro_id
+    # IS NULL) — without that filter, a cuenta-scoped attachment that happened to
+    # keep tipo=CONTRATO (e.g. from before the B3 scope guard existed) could match
+    # too. ORDER BY created_at DESC + LIMIT 1 also makes this deterministic: an
+    # unordered LIMIT 1 could return whichever row the DB happened to scan first,
+    # not the current/most-recent contract document.
     result = await db.execute(
         select(DocumentoFuente)
         .join(Contrato, DocumentoFuente.contrato_id == Contrato.id)
         .where(
             DocumentoFuente.contrato_id == contrato_id,
             DocumentoFuente.tipo == TipoDocumentoFuente.CONTRATO,
+            DocumentoFuente.cuenta_cobro_id.is_(None),
             DocumentoFuente.texto_extraido.is_not(None),
             Contrato.usuario_id == user_id,
             Contrato.deleted_at.is_(None),
         )
+        .order_by(DocumentoFuente.created_at.desc())
         .limit(1)
     )
     doc = result.scalar_one_or_none()

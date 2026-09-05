@@ -42,6 +42,19 @@ def _resolver_tipo(tipo: TipoDocumentoFuente | None, cuenta_cobro_id: uuid.UUID 
     return TipoDocumentoFuente.OTROS if cuenta_cobro_id is not None else TipoDocumentoFuente.CONTRATO
 
 
+# B3 hardening: ``document_service.upload_document`` now requires an EXPLICIT
+# ``requisito_codigo == "CONTRATO"`` before treating an upload as the contract
+# itself (replace rule + obligation extraction) — ``tipo == CONTRATO`` alone is
+# no longer sufficient, and this router does NOT default/synthesize it: the
+# frontend's `buildContratoUploadParams` (cashing-frontend/lib/documentos-api.ts)
+# already sends `requisito_codigo=CONTRATO` explicitly whenever `tipo=contrato`
+# for its three contract-upload call sites. Backend-side defaulting here would
+# reintroduce the exact bug this hardening fixes: any direct/agent caller that
+# passes `tipo=CONTRATO` without meaning "this is the contract" (e.g. a
+# certificado de experiencia uploaded via the same dropzone) would be silently
+# treated as the contract again.
+
+
 @router.post("/upload", response_model=DocumentUploadResponse, status_code=201)
 @limiter.limit("10/minute")
 async def upload_document(
