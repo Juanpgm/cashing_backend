@@ -24,7 +24,7 @@ from __future__ import annotations
 import os
 import uuid
 from collections.abc import AsyncGenerator
-from datetime import date
+from datetime import UTC, date, datetime
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -587,3 +587,41 @@ class TestActiveCuentaProtectsOnlyReferencedObligaciones:
 
         await db.refresh(actividad)
         assert actividad.obligacion_id is None
+
+
+class TestSoftDeletedCuentaProtectsNothing:
+    """The per-obligación protection filters `CuentaCobro.deleted_at IS NULL`
+    (like the sibling guard in `eliminar_contrato`), but the all-or-nothing guard
+    inside `limpiar_obligaciones` did not. That divergence is unreachable today
+    (cuenta deletion is a HARD delete — nothing in `app/` writes
+    `CuentaCobro.deleted_at`), but the day soft-delete returns it would make the
+    reconcile hand `limpiar_obligaciones` an id the guard then rejects, turning a
+    legitimate contract replace into a 422 for the whole upload."""
+
+    async def test_a_soft_deleted_enviada_cuenta_does_not_block_the_replace(
+        self, db: AsyncSession, test_user: dict[str, Any], sqlite_fk_enforcement: None
+    ) -> None:
+        user_id = test_user["user"].id
+        contrato = await _crear_contrato(db, user_id, numero="CD-GATE-D")
+        contrato_id = contrato.id
+
+        await _subir_contrato(db, user_id, contrato_id, "contrato.txt", _TEXTO_CINCO)
+        referenciada = next(
+            o for o in await _obligaciones(db, contrato_id) if o.descripcion.startswith("Elaborar")
+        )
+        actividad = await _referenciar_obligacion(db, referenciada, EstadoCuentaCobro.ENVIADA)
+        cuenta = await db.get(CuentaCobro, actividad.cuenta_cobro_id)
+        assert cuenta is not None
+        cuenta.deleted_at = datetime.now(UTC)
+        await db.commit()
+
+        resultado = await _subir_contrato(
+            db, user_id, contrato_id, "contrato-v2.txt", _TEXTO_CINCO_CORREGIDO
+        )
+
+        descripciones = {o.descripcion for o in await _obligaciones(db, contrato_id)}
+        assert not any(d.startswith("Elaborar") for d in descripciones), (
+            f"a soft-deleted cuenta must not protect anything: {descripciones}"
+        )
+        assert not any(d.startswith("Revisar") for d in descripciones), descripciones
+        assert not any("Se conservaron" in a for a in resultado.avisos), resultado.avisos

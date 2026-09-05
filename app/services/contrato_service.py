@@ -380,7 +380,11 @@ async def limpiar_obligaciones(
 
     # Guard BEFORE any mutation: same protection contrato delete has via
     # _ESTADOS_ACTIVOS — a radicada/aprobada/pagada cuenta's actividades must
-    # keep their obligacion references.
+    # keep their obligacion references. `deleted_at IS NULL` matches both
+    # `eliminar_contrato`'s sibling guard and
+    # `obligaciones_referenciadas_por_cuenta_activa`: without it the reconcile
+    # would hand this guard an id it deliberately left out of `solo_ids`,
+    # turning a legitimate contract replace into a 422 for the whole upload.
     if ob_ids:
         ref = await db.execute(
             select(Actividad.id)
@@ -388,6 +392,7 @@ async def limpiar_obligaciones(
             .where(
                 Actividad.obligacion_id.in_(ob_ids),
                 CuentaCobro.estado.in_(_ESTADOS_ACTIVOS),
+                CuentaCobro.deleted_at.is_(None),
             )
             .limit(1)
         )
