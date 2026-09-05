@@ -247,8 +247,10 @@ async def upload_documents_batch(
     - **422** — la validación previa rechazó el lote (nombre, extensión, tamaño,
       MIME): no se guardó ningún archivo.
     - **502** (`code: CHECKLIST_LINK_FAILED`) — al menos un archivo se guardó pero no
-      pudo vincularse al checklist. El resto del lote sí se procesó y guardó; volver
-      a subir los archivos nombrados en `detail` repara la vinculación.
+      pudo vincularse al checklist; volver a subir los archivos nombrados en
+      `detail` repara la vinculación. Si `detail` también trae un segmento
+      "No se guardaron: …", esos archivos NUNCA se persistieron (p. ej. un error
+      de almacenamiento) y deben resubirse desde cero, no solo revincularse.
     - **429** — se superó el límite de 10 peticiones por minuto.
 
     Cada elemento de `results` incluye `nombre_original` (el nombre tal como lo envió
