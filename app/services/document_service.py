@@ -304,6 +304,72 @@ async def _persist_obligaciones(
     return extraidas, avisos
 
 
+async def _resolver_texto_obligaciones_archivo(
+    content: bytes,
+    filename: str,
+    texto_extraido: str,
+    contrato_id: uuid.UUID,
+    db: AsyncSession,
+) -> tuple[str | None, list[str]]:
+    """Select the text obligation extraction should see for `filename` (B6).
+
+    A plain (non-archive) document passes `texto_extraido` through unchanged.
+    An archive's generic text (``document_parser.parse_archive``, used by
+    ``parse_document``/``extraer_texto_documento``) is the CONCATENATION of
+    every member — mixing unrelated contracts' text into one blob feeds
+    obligation extraction from documents that have nothing to do with the
+    selected contract (e.g. a zip bundling the real clausulado with an
+    unrelated certificado de experiencia).
+
+    Instead: extract each member's text SEPARATELY and use only the member(s)
+    whose text núcleo-exact-matches this contract's número (reusing
+    ``checklist_service._detectar_pertenencia_por_texto``, the same matcher
+    the SECOP auto-link pertenencia guard uses); failing that, the single
+    member whose CONTENT is classified as CONTRATO. If no member qualifies,
+    extract nothing — NEVER fall back to the concatenation — and log a
+    warning plus a user-facing aviso.
+    """
+    from app.agent.tools.document_parser import extract_archive_member_texts, is_archive_filename
+
+    if not is_archive_filename(filename):
+        return texto_extraido, []
+
+    miembros = extract_archive_member_texts(content, filename)
+    if not miembros:
+        return None, []
+
+    contrato_row = await db.get(Contrato, contrato_id)
+    numero_contrato = contrato_row.numero_contrato if contrato_row else None
+
+    if numero_contrato:
+        from app.services.checklist_service import _detectar_pertenencia_por_texto
+
+        coincidencias = [
+            texto for _, texto in miembros if _detectar_pertenencia_por_texto(texto, numero_contrato) is True
+        ]
+        if coincidencias:
+            return "\n\n".join(coincidencias), []
+
+    from app.services.document_classifier import clasificar_contenido
+
+    clasificados_contrato = [
+        (nombre, texto) for nombre, texto in miembros if clasificar_contenido(texto)[0] == CategoriaDocumento.CONTRATO
+    ]
+    if len(clasificados_contrato) == 1:
+        return clasificados_contrato[0][1], []
+
+    await logger.awarning(
+        "archivo_sin_miembro_contrato_identificado",
+        filename=filename,
+        contrato_id=str(contrato_id),
+        total_miembros=len(miembros),
+    )
+    return None, [
+        "El archivo comprimido no tiene un miembro identificable como el contrato seleccionado; "
+        "no se extrajeron obligaciones desde el archivo."
+    ]
+
+
 def _safe_decimal(val: str | None) -> Decimal:
     if not val:
         return Decimal("0.00")
@@ -1149,8 +1215,15 @@ async def upload_document(
             obligaciones_extraidas, ob_avisos = await _persist_obligaciones(ob_items, contrato_id, db, [])
             avisos.extend(ob_avisos)
         elif texto_extraido:
-            obligaciones_extraidas, ob_avisos = await _extraer_obligaciones(texto_extraido, contrato_id, db)
-            avisos.extend(ob_avisos)
+            texto_para_obligaciones, archivo_avisos = await _resolver_texto_obligaciones_archivo(
+                content, filename, texto_extraido, contrato_id, db
+            )
+            avisos.extend(archivo_avisos)
+            if texto_para_obligaciones:
+                obligaciones_extraidas, ob_avisos = await _extraer_obligaciones(
+                    texto_para_obligaciones, contrato_id, db
+                )
+                avisos.extend(ob_avisos)
 
         if contrato_documento_reemplazado and not obligaciones_extraidas:
             await logger.awarning(
