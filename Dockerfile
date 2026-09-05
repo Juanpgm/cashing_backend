@@ -29,4 +29,9 @@ USER cashin
 
 EXPOSE 8000
 
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1"]
+# --proxy-headers / --forwarded-allow-ips: Railway terminates TLS in front of the
+# container, so without these every request looks like it came from the platform
+# proxy — client IPs are lost from the audit log and IP-keyed rate limits collapse
+# into a single global bucket. Trusting "*" is the documented setup when the only
+# reachable path to the container is through the platform's own proxy.
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1 --proxy-headers --forwarded-allow-ips='*'"]
