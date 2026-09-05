@@ -233,6 +233,94 @@ class TestRetryRelinks:
         assert docs[0].id in await _fuentes_vinculadas(db, cuenta.id), "the retry must repair the link"
 
 
+def _falla_el_storage_en(indices: set[int]) -> AsyncMock:
+    """Storage mock whose upload() raises on the Nth (1-based) call, one per file
+    processed in input order — simulates a non-link failure (the document is
+    never persisted)."""
+    storage = AsyncMock()
+    storage.delete = AsyncMock()
+    contador = {"n": 0}
+
+    async def _upload(**kwargs: Any) -> None:
+        contador["n"] += 1
+        if contador["n"] in indices:
+            raise RuntimeError("storage backend unreachable")
+
+    storage.upload = AsyncMock(side_effect=_upload)
+    return storage
+
+
+class TestNonLinkFailureIsUnaffectedByLinkHandling:
+    async def test_a_storage_failure_alone_still_returns_422_naming_the_file(
+        self, client: AsyncClient, db: AsyncSession, test_user: dict[str, Any]
+    ) -> None:
+        """No checklist link failure in this batch: the pre-existing 422 contract
+        for a partially-failed batch must be unchanged."""
+        cuenta = await _crear_cuenta(db, test_user["user"].id)
+
+        with (
+            patch(_PATCH_S3, return_value=_falla_el_storage_en({2})),
+            patch(_PATCH_OBLIGACIONES, new=AsyncMock(return_value=([], []))),
+        ):
+            r = await client.post(
+                _ENDPOINT,
+                headers=test_user["headers"],
+                params=_params(cuenta),
+                files=[
+                    ("files", _archivo("soporte-1.pdf", 1)),
+                    ("files", _archivo("soporte-2.pdf", 2)),
+                ],
+            )
+
+        assert r.status_code == 422, r.text
+        cuerpo = r.json()
+        assert "soporte-2.pdf" in cuerpo["detail"], cuerpo
+
+        docs = await _documentos(db)
+        assert len(docs) == 1, f"only the file that did not fail must be persisted: {[d.nombre for d in docs]}"
+
+
+class TestMixedLinkAndNonLinkFailures:
+    async def test_502_detail_names_the_unlinked_file_and_the_unsaved_file_separately(
+        self, client: AsyncClient, db: AsyncSession, test_user: dict[str, Any]
+    ) -> None:
+        """Three files: #1 persists and links fine, #2 persists but fails to link,
+        #3 never persists at all (storage failure). Before this fix, `link_failed`
+        short-circuited the response and #3 was never named anywhere — the
+        frontend then marked a file that was never saved as done."""
+        cuenta = await _crear_cuenta(db, test_user["user"].id)
+
+        with (
+            patch(_PATCH_S3, return_value=_falla_el_storage_en({3})),
+            patch(_PATCH_OBLIGACIONES, new=AsyncMock(return_value=([], []))),
+            _falla_el_enlace_en({2}),
+        ):
+            r = await client.post(
+                _ENDPOINT,
+                headers=test_user["headers"],
+                params=_params(cuenta),
+                files=[
+                    ("files", _archivo("soporte-1.pdf", 1)),
+                    ("files", _archivo("soporte-2.pdf", 2)),
+                    ("files", _archivo("soporte-3.pdf", 3)),
+                ],
+            )
+
+        assert r.status_code == 502, r.text
+        cuerpo = r.json()
+        assert cuerpo["code"] == "CHECKLIST_LINK_FAILED", cuerpo
+        detalle = cuerpo["detail"]
+        assert "'soporte-2.pdf'" in detalle, detalle
+        assert "'soporte-3.pdf'" in detalle, detalle
+        assert "soporte-1.pdf" not in detalle, detalle
+
+        docs = await _documentos(db)
+        por_nombre = {d.nombre for d in docs}
+        assert por_nombre == {"soporte-1.pdf", "soporte-2.pdf"}, (
+            f"soporte-3.pdf must never have been persisted: {por_nombre}"
+        )
+
+
 class TestResultsCarryTheOriginalFilename:
     async def test_results_are_in_input_order_and_expose_nombre_original(
         self, client: AsyncClient, db: AsyncSession, test_user: dict[str, Any]

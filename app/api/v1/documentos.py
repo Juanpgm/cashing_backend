@@ -327,11 +327,21 @@ async def upload_documents_batch(
             await db.rollback()
 
     if link_failed:
-        raise ChecklistLinkError(
+        link_error = ChecklistLinkError(
             requisito_codigo or "",
             "no se pudo completar la vinculación con el checklist",
             archivos=link_failed,
         )
+        if errors:
+            # A mixed batch: some files persisted but failed to link (named
+            # above by ChecklistLinkError itself), others never persisted at
+            # all (a non-link failure, e.g. a storage error). Both groups must
+            # be named — the frontend marks any file NOT named in `detail` as
+            # done, so a non-persisted file left unnamed here would be shown
+            # to the user as successfully uploaded.
+            nombres_no_guardados = ", ".join(f"'{err.split(':', 1)[0]}'" for err in errors)
+            link_error.detail += f" No se guardaron: {nombres_no_guardados}."
+        raise link_error
 
     if errors and not results:
         raise ValidationError(f"Ningún archivo pudo subirse: {'; '.join(errors)}")
