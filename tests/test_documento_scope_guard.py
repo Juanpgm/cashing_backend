@@ -361,6 +361,11 @@ class TestLegitimateContractReplacementStillWorks:
                 content_type="text/plain",
                 tipo=TipoDocumentoFuente.CONTRATO,
                 contrato_id=contrato.id,
+                # B3: upload_document requires an EXPLICIT requisito_codigo=="CONTRATO"
+                # to treat this call as the contract (this class's whole point is
+                # exercising the legitimate replace path via a direct service call,
+                # bypassing the router's Opción A/B default synthesis).
+                requisito_codigo="CONTRATO",
             )
 
         assert _CONTRATO_STORAGE_KEY in _deleted_keys(storage)
@@ -422,6 +427,11 @@ class TestLegitimateContractReplacementStillWorks:
                 content_type="text/plain",
                 tipo=TipoDocumentoFuente.CONTRATO,
                 contrato_id=contrato.id,
+                # B3: upload_document requires an EXPLICIT requisito_codigo=="CONTRATO"
+                # to treat this call as the contract (this class's whole point is
+                # exercising the legitimate replace path via a direct service call,
+                # bypassing the router's Opción A/B default synthesis).
+                requisito_codigo="CONTRATO",
             )
 
         storage.delete.assert_not_called()
@@ -452,6 +462,11 @@ class TestLegitimateContractReplacementStillWorks:
                 content_type="text/plain",
                 tipo=TipoDocumentoFuente.CONTRATO,
                 contrato_id=contrato.id,
+                # B3: upload_document requires an EXPLICIT requisito_codigo=="CONTRATO"
+                # to treat this call as the contract (this class's whole point is
+                # exercising the legitimate replace path via a direct service call,
+                # bypassing the router's Opción A/B default synthesis).
+                requisito_codigo="CONTRATO",
             )
 
         assert await db.get(DocumentoFuente, doc_contrato.id) is None
@@ -481,6 +496,7 @@ class TestLegitimateContractReplacementStillWorks:
                     content_type="text/plain",
                     tipo=TipoDocumentoFuente.CONTRATO,
                     contrato_id=contrato.id,
+                    requisito_codigo="CONTRATO",
                 )
 
 
