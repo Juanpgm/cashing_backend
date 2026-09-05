@@ -143,3 +143,24 @@ class TestArchiveObligationsUseOnlyTheMatchingMember:
         assert any("archivo comprimido" in a.lower() for a in result.avisos), (
             f"expected an aviso about no matching archive member, got: {result.avisos}"
         )
+
+
+class TestEmptyArchiveIsExplained:
+    async def test_archive_with_no_readable_members_warns_instead_of_failing_silently(
+        self, db: AsyncSession, test_user: dict[str, Any]
+    ) -> None:
+        """An archive whose members yield no text extracted nothing AND said
+        nothing — the user saw a successful upload with zero obligations and no
+        explanation."""
+        user = test_user["user"]
+        contrato = await _crear_contrato(db, user.id, _NUMERO_SELECCIONADO)
+        # A .png member is on the never-read-as-text list, so the archive yields
+        # no members with usable text at all.
+        content = _make_zip({"captura.png": bytes([0x89]) + b"PNG" + b"0" * 64})
+
+        result = await _subir_zip(db, user.id, contrato.id, content, "soportes.zip")
+
+        assert await _obligaciones(db, contrato.id) == []
+        assert any("archivo comprimido" in a.lower() for a in result.avisos), (
+            f"expected an aviso about the unreadable archive, got: {result.avisos}"
+        )
