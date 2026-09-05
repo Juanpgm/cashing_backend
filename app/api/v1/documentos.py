@@ -23,6 +23,25 @@ from app.services import document_service
 router = APIRouter(prefix="/documentos", tags=["documentos"])
 
 
+def _resolver_tipo(tipo: TipoDocumentoFuente | None, cuenta_cobro_id: uuid.UUID | None) -> TipoDocumentoFuente:
+    """Resolve the effective document type when the caller omitted ``tipo``.
+
+    ``tipo`` used to default to ``contrato`` unconditionally, which made an OMISSION a
+    contract-level write: the document was stored as the contract's text and read back
+    as such by ``verificar_configuracion_contrato`` (which loads documents by
+    ``contrato_id`` regardless of cuenta scope).
+
+    The default is now scope-aware instead of removing it outright — making ``tipo``
+    required would 422 every existing caller. A request carrying ``cuenta_cobro_id`` is
+    a checklist attachment, so it falls back to the neutral ``otros``; the plain
+    contract-upload flow keeps ``contrato``. Callers that send ``tipo`` explicitly (all
+    current first-party clients do) are unaffected.
+    """
+    if tipo is not None:
+        return tipo
+    return TipoDocumentoFuente.OTROS if cuenta_cobro_id is not None else TipoDocumentoFuente.CONTRATO
+
+
 @router.post("/upload", response_model=DocumentUploadResponse, status_code=201)
 @limiter.limit("10/minute")
 async def upload_document(
@@ -30,13 +49,16 @@ async def upload_document(
     file: UploadFile,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
-    tipo: TipoDocumentoFuente = Query(
-        TipoDocumentoFuente.CONTRATO,
+    tipo: TipoDocumentoFuente | None = Query(
+        None,
         description=(
             "Tipo de documento: "
             "**contrato** = texto del contrato firmado (PDF/Word), "
             "**instrucciones** = directivas del usuario para el agente IA, "
-            "**plantilla** = plantilla HTML personalizada para el PDF de cuenta de cobro."
+            "**plantilla** = plantilla HTML personalizada para el PDF de cuenta de cobro, "
+            "**otros** = tipo neutro para adjuntos sin tipo declarado (EVIDENCIAS y "
+            "requisitos personalizados). "
+            "Si se omite: **otros** cuando se envía `cuenta_cobro_id`, **contrato** en caso contrario."
         ),
     ),
     contrato_id: uuid.UUID | None = Query(
@@ -115,7 +137,7 @@ async def upload_document(
         filename=file.filename,
         content=content,
         content_type=file.content_type or "application/octet-stream",
-        tipo=tipo,
+        tipo=_resolver_tipo(tipo, cuenta_cobro_id),
         contrato_id=contrato_id,
         cuenta_cobro_id=cuenta_cobro_id,
         requisito_codigo=requisito_codigo,
@@ -160,9 +182,12 @@ async def upload_documents_batch(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
     files: list[UploadFile] = File(..., description="One or more files to upload (PDF, DOCX, JPG, PNG, etc.)"),
-    tipo: TipoDocumentoFuente = Query(
-        TipoDocumentoFuente.CONTRATO,
-        description="Document type applied to ALL files in the batch.",
+    tipo: TipoDocumentoFuente | None = Query(
+        None,
+        description=(
+            "Document type applied to ALL files in the batch. "
+            "If omitted: `otros` when `cuenta_cobro_id` is sent, `contrato` otherwise."
+        ),
     ),
     contrato_id: uuid.UUID | None = Query(
         None,
@@ -192,6 +217,8 @@ async def upload_documents_batch(
     if len(files) > MAX_BATCH_SIZE:
         raise ValidationError(f"Batch exceeds maximum of {MAX_BATCH_SIZE} files.")
 
+    tipo_efectivo = _resolver_tipo(tipo, cuenta_cobro_id)
+
     results: list[DocumentUploadResponse] = []
     errors: list[str] = []
 
@@ -217,7 +244,7 @@ async def upload_documents_batch(
                 filename=file.filename,
                 content=content,
                 content_type=file.content_type or "application/octet-stream",
-                tipo=tipo,
+                tipo=tipo_efectivo,
                 contrato_id=contrato_id,
                 cuenta_cobro_id=cuenta_cobro_id,
                 requisito_codigo=requisito_codigo,

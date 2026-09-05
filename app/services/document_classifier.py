@@ -222,6 +222,10 @@ CATEGORIA_A_REQUISITO: dict[CategoriaDocumento, str | None] = {
 # CategoriaDocumento equivalent (INFORME_*, COMPROBANTE_PAGO_SS, DS_CONSECUTIVO,
 # FICHA_TECNICA, DEPENDIENTES) and acts as a reliable fallback for the rest.
 # "instrucciones" and "plantilla" intentionally excluded — utility docs, not checklist items.
+# "otros" is ALSO intentionally excluded and must stay that way: it is the neutral tipo
+# for uploads with no declared document type, so mapping it would auto-link arbitrary
+# attachments to a checklist requisito. Pinned by
+# tests/test_tipo_documento_fuente_otros.py::test_otros_never_auto_links_to_a_checklist_requisito.
 TIPO_A_REQUISITO: dict[str, str] = {
     "contrato": "CONTRATO",
     "rpc": "RPC",

@@ -31,6 +31,13 @@ class TipoDocumentoFuente(enum.StrEnum):
     FICHA_TECNICA = "ficha_tecnica"
     ACTA_INICIO = "acta_inicio"
     DEPENDIENTES = "dependientes"
+    # Neutral type for uploads with no declared document type (added in migration 040).
+    # Requisitos that declare no `tipo_documento_fuente` — EVIDENCIAS and every
+    # user-defined per-cuenta requisito — must use this instead of falling back to
+    # CONTRATO, which triggers the 1-document-per-contract replace rule.
+    # Deliberately inert: never mapped in `document_classifier.TIPO_A_REQUISITO` (so it
+    # can never auto-link to a checklist row) and never read as agent instructions.
+    OTROS = "otros"
 
 
 class DocumentoFuente(UUIDMixin, TimestampMixin, Base):

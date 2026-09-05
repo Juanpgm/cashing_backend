@@ -785,11 +785,26 @@ async def upload_document(
 
     doc_cuenta_cobro_id = None if (requisito_codigo and _es_nivel_contrato(requisito_codigo)) else cuenta_cobro_id
 
+    # Scope guard. Everything that MUTATES CONTRACT-LEVEL STATE below (replacing the
+    # single contract document, auto-creating the Contrato, vision extraction of
+    # contract data, persisting obligaciones) is only legitimate when this upload can
+    # actually BE the contract. `tipo == CONTRATO` alone is not that test: the API's
+    # `tipo` query param DEFAULTS to `contrato`, and `contrato_id` is derived from the
+    # cuenta a few lines above, so every checklist upload that omitted `tipo` used to
+    # satisfy `tipo == CONTRATO and contrato_id is not None` and delete the contract's
+    # file from storage AND its DB row (live data loss).
+    #
+    # `doc_cuenta_cobro_id is None` is necessary but NOT sufficient: contract-level
+    # requisitos (RUT, CEDULA, RPC, CDP, FICHA_TECNICA, ACTA_INICIO) legitimately
+    # resolve to None too, and a RUT is not the contract. So the requisito, when the
+    # caller declares one, must be the CONTRATO requisito itself.
+    alcance_documento_del_contrato = doc_cuenta_cobro_id is None and requisito_codigo in (None, "CONTRATO")
+
     # Enforce 1-document-per-contract rule for tipo=CONTRATO.
     # If a CONTRATO document already exists for this contract (any filename),
     # replace it: delete the old file from storage and the old DB record so
     # the new upload becomes the single source of truth.
-    if tipo == TipoDocumentoFuente.CONTRATO and contrato_id is not None:
+    if tipo == TipoDocumentoFuente.CONTRATO and alcance_documento_del_contrato and contrato_id is not None:
         prev_result = await db.execute(
             select(DocumentoFuente).where(
                 DocumentoFuente.contrato_id == contrato_id,
@@ -997,7 +1012,11 @@ async def upload_document(
                 confianza=float(cat_confianza),
             )
 
-    es_contrato_autocrear = tipo == TipoDocumentoFuente.CONTRATO and contrato_id is None
+    # `alcance_documento_del_contrato` re-applied at every contract-level mutation
+    # below. `tipo` is read live because the A1 corrector above may have re-derived it.
+    es_contrato_autocrear = (
+        tipo == TipoDocumentoFuente.CONTRATO and alcance_documento_del_contrato and contrato_id is None
+    )
 
     # ── Hybrid fallback: scanned PDF / image (poor/no text) → vision extraction ──
     # Runs for ALL CONTRATO uploads with insufficient text — both auto-create and
@@ -1006,6 +1025,7 @@ async def upload_document(
     multimodal_result: ContratoExtractionResult | None = None
     if (
         tipo == TipoDocumentoFuente.CONTRATO
+        and alcance_documento_del_contrato
         and not texto_suficiente
         and settings.EXTRACTION_MULTIMODAL_FALLBACK_ENABLED
         and is_multimodal_supported(guess_mime_type(filename))
@@ -1072,8 +1092,10 @@ async def upload_document(
             usuario_id=str(user_id),
         )
 
-    # Extract obligations once we have a contract to link them to.
-    if tipo == TipoDocumentoFuente.CONTRATO and contrato_id is not None:
+    # Extract obligations once we have a contract to link them to. Same scope guard as
+    # the replace rule: a checklist attachment must never write obligaciones onto the
+    # contract just because the caller let `tipo` default to `contrato`.
+    if tipo == TipoDocumentoFuente.CONTRATO and alcance_documento_del_contrato and contrato_id is not None:
         if multimodal_result is not None:
             ob_items = _obligacion_items_to_extraidas(multimodal_result.obligaciones)
             obligaciones_extraidas, ob_avisos = await _persist_obligaciones(ob_items, contrato_id, db, [])
