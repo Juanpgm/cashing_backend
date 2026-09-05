@@ -186,6 +186,14 @@ class TipoCorregido(BaseModel):
 class DocumentUploadResponse(BaseModel):
     id: uuid.UUID
     nombre: str
+    nombre_original: str | None = Field(
+        default=None,
+        description=(
+            "Nombre del archivo tal como lo envió el cliente. `nombre` es la versión "
+            "saneada para almacenamiento (`get_safe_filename`), por lo que el cliente "
+            "necesita este campo para emparejar cada resultado con el archivo que subió."
+        ),
+    )
     tipo: str
     texto_extraido: str | None = None
     contrato_id: uuid.UUID | None = Field(

@@ -120,11 +120,23 @@ class ChecklistLinkError(DomainError):
     requisito failed. Re-uploading the same file content re-attempts the link
     (see the content-hash dedup fast path in document_service.upload_document)."""
 
-    def __init__(self, requisito_codigo: str, reason: str) -> None:
-        detail = (
-            f"El archivo se guardó correctamente pero no pudo vincularse al requisito "
-            f"'{requisito_codigo}': {reason}. Volvé a subir el mismo archivo para reintentar la vinculación."
-        )
+    def __init__(self, requisito_codigo: str, reason: str, archivos: list[str] | None = None) -> None:
+        if archivos:
+            # Batch flavour: name the affected files so the client knows exactly
+            # which ones need a retry (the others in the batch are fine).
+            nombres = ", ".join(f"'{a}'" for a in archivos)
+            sujeto = "Los archivos" if len(archivos) > 1 else "El archivo"
+            verbo = "se guardaron" if len(archivos) > 1 else "se guardó"
+            pudieron = "pudieron" if len(archivos) > 1 else "pudo"
+            detail = (
+                f"{sujeto} {nombres} {verbo} correctamente pero no {pudieron} vincularse al requisito "
+                f"'{requisito_codigo}': {reason}. Volvé a subir el mismo archivo para reintentar la vinculación."
+            )
+        else:
+            detail = (
+                f"El archivo se guardó correctamente pero no pudo vincularse al requisito "
+                f"'{requisito_codigo}': {reason}. Volvé a subir el mismo archivo para reintentar la vinculación."
+            )
         super().__init__(detail, code=CHECKLIST_LINK_FAILED)
 
 
