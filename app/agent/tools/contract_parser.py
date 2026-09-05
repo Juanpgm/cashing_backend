@@ -416,27 +416,41 @@ _ENUM_RE = re.compile(
 )
 
 
-def _candidate_starts(texto_upper: str) -> list[tuple[int, int]]:
-    """Return (offset, tier) pairs right AFTER every obligation-section header.
+def _candidate_starts(texto: str) -> list[tuple[int, int, bool]]:
+    """Return (offset, tier, es_encabezado) right AFTER every obligation-section header.
 
     Unlike a first-match lookup, this yields ALL candidate sections so the caller
     can score them (see ``extract_obligaciones_verbatim``) instead of taking
     whichever comes first in the text. ``tier`` is 1 for "OBLIGACIONES/
     ACTIVIDADES ESPECÍFICAS" (preferred) and 2 for the broader fallback
     keywords; tier-1 offsets are listed before tier-2 offsets.
+
+    ``es_encabezado`` is True when the keyword occurrence is UPPERCASE in the
+    ORIGINAL text — a real section heading ("CLÁUSULA TERCERA — OBLIGACIONES
+    ESPECÍFICAS DEL CONTRATISTA:") rather than a lowercase prose mention
+    ("…las obligaciones específicas del contratista consisten en lo siguiente:").
+    Keyword matching runs against the uppercased text, so a prose mention is a
+    tier-1 candidate by keyword alone; this flag is what tells them apart. It is
+    the same signal ``_find_section_end`` and ``_is_section_break`` already use
+    to distinguish a heading from an inline mention.
     """
-    starts: list[tuple[int, int]] = []
+    texto_upper = texto.upper()
+    starts: list[tuple[int, int, bool]] = []
     for tier, keywords in enumerate((OBLIGACION_SECTION_KW_TIER1, OBLIGACION_SECTION_KW_TIER2), start=1):
-        tier_offsets: set[int] = set()
+        # Keyed by END offset: several keywords ("OBLIGACIONES ESPECÍFICAS" and
+        # "OBLIGACIONES ESPECÍFICAS DEL CONTRATISTA") can describe the same
+        # heading. A single uppercase hit is enough to call the offset a heading.
+        tier_offsets: dict[int, bool] = {}
         for kw in keywords:
             pos = 0
             while True:
                 idx = texto_upper.find(kw, pos)
                 if idx == -1:
                     break
-                tier_offsets.add(idx + len(kw))
-                pos = idx + len(kw)
-        starts.extend((offset, tier) for offset in sorted(tier_offsets))
+                fin = idx + len(kw)
+                tier_offsets[fin] = tier_offsets.get(fin, False) or texto[idx:fin].isupper()
+                pos = fin
+        starts.extend((offset, tier, tier_offsets[offset]) for offset in sorted(tier_offsets))
     return starts
 
 
@@ -687,22 +701,32 @@ def extract_obligaciones_verbatim(texto: str) -> list[ObligacionExtraida]:
 
     Candidates are scored rather than taking the first match, in this order:
 
-      1. A tier-1 heading (OBLIGACIONES/ACTIVIDADES ESPECÍFICAS) with AT LEAST
-         TWO items beats tier-2 outright. Tier is the strongest signal the
-         text gives us, and item count used to outrank it: a tier-2
-         "OBLIGACIONES DEL CONTRATISTA" clause listing 12 general duties beat
-         the real 5-item ESPECÍFICAS enumeration, so general duties were
-         stored as specific obligations. The >=2 guard exists because a
-         PARÁGRAFO that merely MENTIONS "obligaciones específicas" in prose
-         and closes with a single catch-all item is tier-1 by keyword match
-         alone but is not a real enumeration; without the guard that 1-item
-         block beat the real 12-item tier-2 list, reintroducing the same
-         class of bug this scoring was meant to fix.
-      2. A section closing with the catch-all beats one that doesn't.
-      3. Among further ties, the one with the most items wins.
+      1. A REAL SECTION HEADING beats a prose mention, whatever the tier.
+         Keyword matching runs against the uppercased text, so a PARÁGRAFO that
+         merely MENTIONS "obligaciones específicas" in running prose is a tier-1
+         candidate by keyword alone. ``_candidate_starts`` marks an occurrence
+         as a heading only when it is UPPERCASE in the original text.
+      2. Within the same class, tier-1 (OBLIGACIONES/ACTIVIDADES ESPECÍFICAS)
+         beats tier-2 (the broader keywords, which mix in general duties).
+      3. Then the section with the MOST items.
+      4. Then, as the last tiebreak, one closing with the catch-all.
 
     The first candidate found keeps a tie (stable, matches the original
     position/tier-1-first preference).
+
+    Why the structure rather than a bullet-count threshold: a threshold cannot
+    separate a prose mention from a real enumeration (a PARÁGRAFO with two
+    throwaway bullets clears any ``>= 2`` guard, while a GENUINE single-
+    obligation ESPECÍFICAS clause fails it), and it structurally cannot order
+    two candidates of the SAME tier — a 2-item prose block closing with "las
+    demás" used to beat a real 12-item ESPECÍFICAS enumeration on ``catch_all``
+    alone. Item count is now ranked above ``catch_all`` for the same reason: a
+    catch-all closer is one line of evidence, an enumeration's length is many.
+
+    Known limitation: in a document typeset ENTIRELY in uppercase every
+    occurrence looks like a heading, so scoring degrades to tier then item
+    count — no worse than the previous behaviour, and never worse than
+    preferring a shorter prose block.
 
     Returns an empty list when no usable section is found, OR when any item
     still carries a strong footer signature (NIT / e-mail / TEL-FAX-WEB label —
@@ -719,18 +743,18 @@ def extract_obligaciones_verbatim(texto: str) -> list[ObligacionExtraida]:
             for i, (marker, text) in enumerate(items)
         ]
 
-    texto_upper = texto.upper()
-    best_score: tuple[int, int, int] | None = None
+    best_score: tuple[int, int, int, int] | None = None
     best_items: list[tuple[str, str]] | None = None
-    for start, tier in _candidate_starts(texto_upper):
+    for start, tier, es_encabezado in _candidate_starts(texto):
         end = _find_section_end(texto, start)
         items = _extract_items_from_block(texto[start:end])
         if not items:
             continue
         score = (
-            1 if tier == 1 and len(items) >= 2 else 0,  # a real ESPECÍFICAS enumeration wins outright
-            1 if _is_catch_all(items[-1][1]) else 0,  # closes with the catch-all
-            len(items),  # most items
+            1 if es_encabezado else 0,  # a real heading beats a prose mention, any tier
+            -tier,  # then ESPECÍFICAS (tier 1) over the broader keywords (tier 2)
+            len(items),  # then the longer enumeration
+            1 if _is_catch_all(items[-1][1]) else 0,  # last: closes with the catch-all
         )
         if best_score is None or score > best_score:
             best_score = score
