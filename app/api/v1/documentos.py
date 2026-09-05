@@ -125,6 +125,9 @@ async def upload_document(
 
     content = await file.read()
 
+    if len(content) == 0:
+        raise ValidationError(f"File '{file.filename}' is empty.")
+
     if not validate_file_size(len(content)):
         raise ValidationError("File exceeds maximum size of 10MB")
 
@@ -219,9 +222,12 @@ async def upload_documents_batch(
 
     tipo_efectivo = _resolver_tipo(tipo, cuenta_cobro_id)
 
-    results: list[DocumentUploadResponse] = []
-    errors: list[str] = []
-
+    # Pass 1 — validate EVERY file (filename, extension, size, MIME) before persisting
+    # any of them. Reading+validating file N used to happen only after file N-1 had
+    # already been committed to the DB, so a batch of [valid.pdf, bad.exe] left
+    # valid.pdf persisted and the whole 422 response discarded — the client had no way
+    # to know a document was actually written, and a retry duplicated it.
+    payloads: list[tuple[UploadFile, bytes]] = []
     for file in files:
         if not file.filename:
             raise ValidationError("All files must have a filename.")
@@ -231,17 +237,29 @@ async def upload_documents_batch(
 
         content = await file.read()
 
+        if len(content) == 0:
+            raise ValidationError(f"File '{file.filename}' is empty.")
+
         if not validate_file_size(len(content)):
             raise ValidationError(f"File '{file.filename}' exceeds maximum size of 10 MB.")
 
         if file.content_type and not validate_mime_type(content, file.content_type):
             raise ValidationError(f"Invalid MIME type for '{file.filename}': {file.content_type}")
 
+        payloads.append((file, content))
+
+    # Pass 2 — all files passed validation, now persist. Per-file persistence errors
+    # (business logic, e.g. checklist link failures) are still collected as partial
+    # results/avisos rather than aborting the whole batch.
+    results: list[DocumentUploadResponse] = []
+    errors: list[str] = []
+
+    for file, content in payloads:
         try:
             result = await document_service.upload_document(
                 db=db,
                 user_id=user.id,
-                filename=file.filename,
+                filename=file.filename,  # type: ignore[arg-type]
                 content=content,
                 content_type=file.content_type or "application/octet-stream",
                 tipo=tipo_efectivo,
