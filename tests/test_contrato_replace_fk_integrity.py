@@ -81,6 +81,27 @@ _TEXTO_CUATRO = (
     "3. Actualizar el inventario de bienes asignados para el desarrollo del contrato.\n"
     "4. Las demás actividades que le asigne la supervisión relacionadas con el objeto del contrato.\n"
 )
+# Five obligations (four real + the catch-all) — the fine-grained active-cuenta
+# gate needs more than one deletable row to show it deletes some and keeps others.
+_TEXTO_CINCO = (
+    "CLÁUSULA SEGUNDA. OBLIGACIONES ESPECÍFICAS DEL CONTRATISTA:\n"
+    "1. Elaborar los estudios previos de los procesos de contratacion.\n"
+    "2. Revisar los actos administrativos que expida la entidad.\n"
+    "3. Apoyar la supervision de los contratos suscritos por la entidad.\n"
+    "4. Proyectar las respuestas a los derechos de peticion radicados.\n"
+    "5. Las demás actividades que le asigne la supervisión relacionadas con el objeto del contrato.\n"
+)
+# Drops items 1 and 2 of `_TEXTO_CINCO` and adds three genuinely new ones.
+_TEXTO_CINCO_CORREGIDO = (
+    "CLÁUSULA SEGUNDA. OBLIGACIONES ESPECÍFICAS DEL CONTRATISTA:\n"
+    "1. Apoyar la supervision de los contratos suscritos por la entidad.\n"
+    "2. Proyectar las respuestas a los derechos de peticion radicados.\n"
+    "3. Actualizar el inventario de bienes asignados para el desarrollo del contrato.\n"
+    "4. Consolidar los informes mensuales de gestion de la dependencia.\n"
+    "5. Custodiar los expedientes contractuales asignados al despacho.\n"
+    "6. Las demás actividades que le asigne la supervisión relacionadas con el objeto del contrato.\n"
+)
+
 # Same three obligations, differing only by case/accents/whitespace — must
 # normalize to the SAME key as `_TEXTO_TRES` (`app.core.text_match.normalize`).
 _TEXTO_TRES_VARIANTE = (
@@ -246,14 +267,17 @@ class TestReplaceRespectsForeignKeys:
 
 class TestActiveCuentaAcceptsReplaceButKeepsObligaciones:
     """MAJOR 4 (round-2 review obs #492): an active cuenta must not block the
-    document replace itself — only the destructive reconcile is skipped. The old
-    behaviour (422 for the whole upload) meant a contractor could never fix a
-    wrong/outdated contract file once any cuenta moved past BORRADOR, and — worse
-    — only fired when the new document was actually readable, so an unreadable
-    replacement was silently accepted while a good one was rejected."""
+    document replace itself. The old behaviour (422 for the whole upload) meant a
+    contractor could never fix a wrong/outdated contract file once any cuenta
+    moved past BORRADOR, and — worse — only fired when the new document was
+    actually readable, so an unreadable replacement was silently accepted while a
+    good one was rejected.
 
-    async def test_enviada_cuenta_replaces_the_document_and_keeps_obligaciones_untouched(
-        self, db: AsyncSession, test_user: dict[str, Any]
+    MAJOR 2 (round-3 review obs #495) narrowed what an active cuenta protects:
+    the referenced obligación, not the whole contract."""
+
+    async def test_enviada_cuenta_replaces_the_document_and_keeps_its_own_obligacion(
+        self, db: AsyncSession, test_user: dict[str, Any], sqlite_fk_enforcement: None
     ) -> None:
         user_id = test_user["user"].id
         contrato = await _crear_contrato(db, user_id, numero="CD-FK-002")
@@ -261,22 +285,30 @@ class TestActiveCuentaAcceptsReplaceButKeepsObligaciones:
 
         await _subir_contrato(db, user_id, contrato_id, "contrato-v1.txt", _TEXTO_V1)
         obligacion, actividad = await _referenciar_primera_obligacion(db, contrato_id, EstadoCuentaCobro.ENVIADA)
-        ids_antes = {o.id: o.descripcion for o in await _obligaciones(db, contrato_id)}
 
         storage = _mock_storage()
         resultado = await _subir_contrato(db, user_id, contrato_id, "contrato-v2.txt", _TEXTO_V2, storage=storage)
 
         assert any(
-            "cuentas de cobro enviadas" in a and "conservaron las obligaciones existentes" in a
+            "Se conservaron 1 obligaciones referenciadas por cuentas de cobro "
+            "enviadas, aprobadas o pagadas." in a
             for a in resultado.avisos
-        ), f"expected the active-cuenta aviso, got: {resultado.avisos}"
+        ), f"expected the protected-obligaciones aviso, got: {resultado.avisos}"
 
         nombres = (await db.execute(_nombres_documentos(contrato_id))).scalars().all()
         assert list(nombres) == ["contrato-v2.txt"], f"the document must be replaced: {nombres}"
         storage.upload.assert_awaited_once()
 
-        ids_despues = {o.id: o.descripcion for o in await _obligaciones(db, contrato_id)}
-        assert ids_despues == ids_antes, f"obligaciones (and their ids) must be untouched: {ids_despues}"
+        despues = {o.descripcion: o.id for o in await _obligaciones(db, contrato_id)}
+        assert obligacion.descripcion in despues, (
+            f"the obligación the ENVIADA cuenta references must survive: {despues}"
+        )
+        assert despues[obligacion.descripcion] == obligacion.id, "and keep its id"
+        assert not any("Revisar" in d and "V1" in d for d in despues), (
+            f"the unreferenced V1 obligación must still be reconciled away: {despues}"
+        )
+        assert any("Elaborar" in d and "V2" in d for d in despues), despues
+        assert any("Revisar" in d and "V2" in d for d in despues), despues
 
         await db.refresh(actividad)
         assert actividad.obligacion_id == obligacion.id, "the actividad's link must survive untouched"
@@ -441,3 +473,117 @@ class TestReconcileObligacionesOnReplace:
             f"a whitespace/case/accent-only difference must not touch any id: {ids_despues} vs {ids_antes}"
         )
         assert not any("eliminaron" in a for a in resultado.avisos), resultado.avisos
+
+
+class TestActiveCuentaProtectsOnlyReferencedObligaciones:
+    """MAJOR 2 (round-3 review obs #495): the gate asked "does this contract have
+    ANY active cuenta?" and, if so, skipped extraction entirely. The guard it
+    short-circuited (`contrato_service.limpiar_obligaciones`) asks the far
+    narrower "does an ACTIVE cuenta's actividad reference one of the obligaciones
+    I am about to delete?".
+
+    Concretely: one ENVIADA cuenta referencing obligación #1 froze the whole
+    contract — three genuinely new obligaciones in a corrected contract were
+    silently never added — and because PAGADA is terminal, a single paid cuenta
+    froze the obligaciones forever."""
+
+    async def test_only_the_referenced_obligacion_survives_the_drop(
+        self, db: AsyncSession, test_user: dict[str, Any], sqlite_fk_enforcement: None
+    ) -> None:
+        user_id = test_user["user"].id
+        contrato = await _crear_contrato(db, user_id, numero="CD-GATE-A")
+        contrato_id = contrato.id
+
+        await _subir_contrato(db, user_id, contrato_id, "contrato.txt", _TEXTO_CINCO)
+        antes = await _obligaciones(db, contrato_id)
+        assert len(antes) == 5, [o.descripcion for o in antes]
+        referenciada = next(o for o in antes if o.descripcion.startswith("Elaborar"))
+        soltada = next(o for o in antes if o.descripcion.startswith("Revisar"))
+        actividad = await _referenciar_obligacion(db, referenciada, EstadoCuentaCobro.ENVIADA)
+
+        resultado = await _subir_contrato(
+            db, user_id, contrato_id, "contrato-v2.txt", _TEXTO_CINCO_CORREGIDO
+        )
+
+        descripciones = {o.descripcion for o in await _obligaciones(db, contrato_id)}
+        assert any(d.startswith("Elaborar") for d in descripciones), (
+            f"the obligación an ENVIADA cuenta references must survive: {descripciones}"
+        )
+        assert not any(d.startswith("Revisar") for d in descripciones), (
+            f"the unreferenced dropped obligación must be deleted: {descripciones}"
+        )
+        for nueva in ("Actualizar el inventario", "Consolidar los informes", "Custodiar los expedientes"):
+            assert any(d.startswith(nueva) for d in descripciones), (
+                f"the corrected contract's new obligaciones must be added: {descripciones}"
+            )
+
+        assert any(
+            "Se conservaron 1 obligaciones referenciadas por cuentas de cobro "
+            "enviadas, aprobadas o pagadas." in a
+            for a in resultado.avisos
+        ), f"expected the protected-obligaciones aviso, got: {resultado.avisos}"
+
+        await db.refresh(actividad)
+        assert actividad.obligacion_id == referenciada.id, "the protected link must survive untouched"
+        enlaces = (
+            await db.execute(
+                select(EvidenciaObligacion).where(EvidenciaObligacion.obligacion_id == referenciada.id)
+            )
+        ).scalars().all()
+        assert len(enlaces) == 1, "the protected obligación's evidencia link must survive"
+        enlaces_soltada = (
+            await db.execute(
+                select(EvidenciaObligacion).where(EvidenciaObligacion.obligacion_id == soltada.id)
+            )
+        ).scalars().all()
+        assert enlaces_soltada == [], "the deleted obligación's evidencia links must be removed"
+
+    async def test_pagada_cuenta_protects_its_obligacion_the_same_way(
+        self, db: AsyncSession, test_user: dict[str, Any], sqlite_fk_enforcement: None
+    ) -> None:
+        """PAGADA is terminal, so the coarse gate froze the contract's obligaciones
+        forever. It must still protect the rows it actually references."""
+        user_id = test_user["user"].id
+        contrato = await _crear_contrato(db, user_id, numero="CD-GATE-B")
+        contrato_id = contrato.id
+
+        await _subir_contrato(db, user_id, contrato_id, "contrato.txt", _TEXTO_CINCO)
+        referenciada = next(
+            o for o in await _obligaciones(db, contrato_id) if o.descripcion.startswith("Elaborar")
+        )
+        await _referenciar_obligacion(db, referenciada, EstadoCuentaCobro.PAGADA)
+
+        await _subir_contrato(db, user_id, contrato_id, "contrato-v2.txt", _TEXTO_CINCO_CORREGIDO)
+
+        descripciones = {o.descripcion for o in await _obligaciones(db, contrato_id)}
+        assert any(d.startswith("Elaborar") for d in descripciones), descripciones
+        assert not any(d.startswith("Revisar") for d in descripciones), descripciones
+        assert any(d.startswith("Custodiar los expedientes") for d in descripciones), descripciones
+
+    async def test_borrador_cuenta_protects_nothing(
+        self, db: AsyncSession, test_user: dict[str, Any], sqlite_fk_enforcement: None
+    ) -> None:
+        """A BORRADOR cuenta is not active: both dropped obligaciones go, and the
+        actividad keeps existing with its reference nulled."""
+        user_id = test_user["user"].id
+        contrato = await _crear_contrato(db, user_id, numero="CD-GATE-C")
+        contrato_id = contrato.id
+
+        await _subir_contrato(db, user_id, contrato_id, "contrato.txt", _TEXTO_CINCO)
+        referenciada = next(
+            o for o in await _obligaciones(db, contrato_id) if o.descripcion.startswith("Elaborar")
+        )
+        actividad = await _referenciar_obligacion(db, referenciada, EstadoCuentaCobro.BORRADOR)
+
+        resultado = await _subir_contrato(
+            db, user_id, contrato_id, "contrato-v2.txt", _TEXTO_CINCO_CORREGIDO
+        )
+
+        descripciones = {o.descripcion for o in await _obligaciones(db, contrato_id)}
+        assert not any(d.startswith("Elaborar") for d in descripciones), descripciones
+        assert not any(d.startswith("Revisar") for d in descripciones), descripciones
+        assert any("Se eliminaron 2 obligaciones" in a for a in resultado.avisos), resultado.avisos
+        assert not any("Se conservaron" in a for a in resultado.avisos), resultado.avisos
+
+        await db.refresh(actividad)
+        assert actividad.obligacion_id is None
