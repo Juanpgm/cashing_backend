@@ -353,7 +353,57 @@ async def _reconcile_obligaciones(
                 "las actividades vinculadas quedaron sin obligación."
             )
 
-    return await _persist_obligaciones(extraidas, contrato_id, db, avisos)
+    resultado, avisos = await _persist_obligaciones(extraidas, contrato_id, db, avisos)
+    await _renumerar_obligaciones(extraidas, contrato_id, db)
+    return resultado, avisos
+
+
+async def _renumerar_obligaciones(
+    extraidas: list[ObligacionExtraida],
+    contrato_id: uuid.UUID,
+    db: AsyncSession,
+) -> None:
+    """Renumber ``orden`` (and refresh ``etiqueta``) to follow the NEW document.
+
+    Reconcile keeps matched rows in place, so without this an obligación added
+    at document position 3 is appended by ``_persist_obligaciones`` with
+    ``max(orden) + 1`` and therefore sorts AFTER the catch-all ("Las demás
+    actividades…"), which the extractor always emits last. ``orden`` drives the
+    informe, cobertura and coherencia output, so it must mirror the document,
+    not the insertion history. ``etiqueta`` (the contract's own bullet marker)
+    is refreshed for the same reason — a kept row would otherwise keep the
+    previous document's numbering.
+
+    Rows still present in the DB but absent from the new extraction (kept
+    because an active cuenta's actividad references them) are pushed after the
+    extracted block, preserving their previous relative order.
+    """
+    result = await db.execute(select(Obligacion).where(Obligacion.contrato_id == contrato_id))
+    filas = list(result.scalars().all())
+    por_norm = {_normalize_texto(ob.descripcion): ob for ob in filas}
+
+    siguiente = 0
+    asignadas: set[uuid.UUID] = set()
+    vistos: set[str] = set()
+    for item in extraidas:
+        norm = _normalize_texto(item.descripcion)
+        if norm in vistos:
+            continue
+        vistos.add(norm)
+        fila = por_norm.get(norm)
+        if fila is None:
+            continue
+        siguiente += 1
+        fila.orden = siguiente
+        if item.etiqueta:
+            fila.etiqueta = item.etiqueta
+        asignadas.add(fila.id)
+
+    for fila in sorted((f for f in filas if f.id not in asignadas), key=lambda f: f.orden):
+        siguiente += 1
+        fila.orden = siguiente
+
+    await db.flush()
 
 
 async def _resolver_texto_obligaciones_archivo(

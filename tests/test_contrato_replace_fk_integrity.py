@@ -357,7 +357,14 @@ class TestReconcileObligacionesOnReplace:
         self, db: AsyncSession, test_user: dict[str, Any]
     ) -> None:
         """(c) The new document adds a 4th obligación: the original 3 keep their
-        ids, the new one is appended."""
+        ids, the new one is appended — and `orden` follows the NEW document's
+        order, not `max(orden) + 1`.
+
+        MAJOR 1 (round-3 review obs #495): the added item sits at document
+        position 3, before the catch-all. Appending it with `max(orden) + 1 = 4`
+        sorted the catch-all ("Las demás actividades…") BEFORE a real
+        obligación, and `orden` drives informe/cobertura/coherencia output.
+        """
         user_id = test_user["user"].id
         contrato = await _crear_contrato(db, user_id, numero="CD-RECONCILE-C")
         contrato_id = contrato.id
@@ -374,6 +381,43 @@ class TestReconcileObligacionesOnReplace:
             coincidencia = next(o for o in despues if o.descripcion == descripcion)
             assert coincidencia.id == id_, f"'{descripcion}' must keep its original id"
         assert any("inventario de bienes" in o.descripcion for o in despues), despues
+
+        por_orden = [o.descripcion for o in sorted(despues, key=lambda o: o.orden)]
+        assert [o.orden for o in sorted(despues, key=lambda o: o.orden)] == [1, 2, 3, 4], (
+            f"orden must be renumbered 1..N: {[(o.orden, o.descripcion) for o in despues]}"
+        )
+        assert por_orden[0].startswith("Elaborar los estudios previos"), por_orden
+        assert por_orden[1].startswith("Revisar los actos administrativos"), por_orden
+        assert por_orden[2].startswith("Actualizar el inventario de bienes"), por_orden
+        assert por_orden[3].startswith("Las demás actividades"), (
+            f"the catch-all must stay last after the insert: {por_orden}"
+        )
+
+    async def test_reconcile_refreshes_etiqueta_on_kept_rows(
+        self, db: AsyncSession, test_user: dict[str, Any]
+    ) -> None:
+        """(f) A kept row's `etiqueta` (the contract's own bullet marker) must
+        follow the NEW document too — otherwise the marker keeps the previous
+        document's numbering while `orden` shows the new one."""
+        user_id = test_user["user"].id
+        contrato = await _crear_contrato(db, user_id, numero="CD-RECONCILE-F")
+        contrato_id = contrato.id
+
+        await _subir_contrato(db, user_id, contrato_id, "contrato.txt", _TEXTO_TRES)
+        catch_all_antes = next(
+            o for o in await _obligaciones(db, contrato_id) if o.descripcion.startswith("Las demás")
+        )
+        assert catch_all_antes.etiqueta == "3", catch_all_antes.etiqueta
+
+        await _subir_contrato(db, user_id, contrato_id, "contrato-v2.txt", _TEXTO_CUATRO)
+
+        catch_all_despues = next(
+            o for o in await _obligaciones(db, contrato_id) if o.descripcion.startswith("Las demás")
+        )
+        assert catch_all_despues.id == catch_all_antes.id, "the catch-all must keep its id"
+        assert catch_all_despues.etiqueta == "4", (
+            f"etiqueta must follow the new document's marker: {catch_all_despues.etiqueta}"
+        )
 
     async def test_case_accent_and_whitespace_only_differences_are_treated_as_the_same_text(
         self, db: AsyncSession, test_user: dict[str, Any]
