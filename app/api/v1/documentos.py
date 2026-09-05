@@ -7,7 +7,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser
 from app.core.database import get_db
-from app.core.exceptions import ChecklistLinkError, ValidationError
+from app.core.exceptions import (
+    ChecklistLinkError,
+    DomainError,
+    ValidationError,
+    documento_fue_persistido,
+)
 from app.core.file_validation import (
     formatos_aceptados,
     tamano_maximo_legible,
@@ -297,6 +302,12 @@ async def upload_documents_batch(
     results: list[DocumentUploadResponse] = []
     link_failed: list[str] = []
     errors: list[str] = []
+    # Kept in lockstep with `errors`: the ORIGINAL client filenames of the files that
+    # were NEVER persisted. Recovering them from the error strings instead
+    # (`err.split(':', 1)[0]`) truncated any filename containing a colon, and the
+    # frontend marks every file NOT named in `detail` as done — so a file that was
+    # never saved was shown to the user as uploaded.
+    no_guardados: list[str] = []
     # Read the id ONCE: rolling back a failed file expires every ORM instance in the
     # session, `user` (loaded by the auth dependency) included, and a later `user.id`
     # would then trigger a lazy refresh from sync context (MissingGreenlet).
@@ -322,8 +333,20 @@ async def upload_documents_batch(
             # Drop whatever the failed link left pending so the next file starts from
             # a clean session.
             await db.rollback()
+        except DomainError as exc:
+            # `upload_document` commits the document BEFORE attempting the checklist
+            # link, so a DomainError flagged as post-commit belongs to a file that IS
+            # saved — reporting it as "no se guardó" would send the user to re-upload
+            # a file that only needs relinking.
+            if documento_fue_persistido(exc):
+                link_failed.append(file.filename or "")
+            else:
+                errors.append(f"{file.filename}: {exc}")
+                no_guardados.append(file.filename or "")
+            await db.rollback()
         except Exception as exc:
             errors.append(f"{file.filename}: {exc}")
+            no_guardados.append(file.filename or "")
             await db.rollback()
 
     if link_failed:
@@ -332,14 +355,14 @@ async def upload_documents_batch(
             "no se pudo completar la vinculación con el checklist",
             archivos=link_failed,
         )
-        if errors:
+        if no_guardados:
             # A mixed batch: some files persisted but failed to link (named
             # above by ChecklistLinkError itself), others never persisted at
             # all (a non-link failure, e.g. a storage error). Both groups must
             # be named — the frontend marks any file NOT named in `detail` as
             # done, so a non-persisted file left unnamed here would be shown
             # to the user as successfully uploaded.
-            nombres_no_guardados = ", ".join(f"'{err.split(':', 1)[0]}'" for err in errors)
+            nombres_no_guardados = ", ".join(f"'{nombre}'" for nombre in no_guardados)
             link_error.detail += f" No se guardaron: {nombres_no_guardados}."
         raise link_error
 
