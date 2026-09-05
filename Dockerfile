@@ -29,9 +29,11 @@ USER cashin
 
 EXPOSE 8000
 
-# --proxy-headers / --forwarded-allow-ips: Railway terminates TLS in front of the
-# container, so without these every request looks like it came from the platform
-# proxy — client IPs are lost from the audit log and IP-keyed rate limits collapse
-# into a single global bucket. Trusting "*" is the documented setup when the only
-# reachable path to the container is through the platform's own proxy.
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1 --proxy-headers --forwarded-allow-ips='*'"]
+# No --forwarded-allow-ips here: with `always_trust` uvicorn takes the LEFTMOST
+# X-Forwarded-For hop as the client address, and a proxy only APPENDS to that
+# header — the leftmost hop is fully attacker-controlled. That forged address
+# would flow into every get_remote_address-keyed rate limit (auth login/register,
+# agent_chat, configuracion, the global default) and into the audit log's
+# request.client.host. --proxy-headers is uvicorn's default already, so omitting
+# both flags here is a no-op change of behaviour vs before, not a new default.
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1"]

@@ -1,13 +1,12 @@
-"""Upload rate limiting must not be keyed on the reverse proxy's IP.
+"""Upload rate limiting must not be keyed on a client-controlled header.
 
-Railway terminates TLS in front of the container, so every request reaches uvicorn
-from the proxy. Without `--proxy-headers`, `get_remote_address` returns that single
-proxy IP for EVERY user, and the 10/minute upload budget becomes a global 10/minute
-shared by the whole platform: one contractor dropping 10 files silently 429s
-everybody else.
-
-The key falls back through: authenticated user → first hop of `X-Forwarded-For` →
-the socket peer.
+The upload endpoints are always authenticated, so `upload_rate_limit_key` keys on
+`request.state.user_id` (set by the auth dependency before slowapi evaluates this
+function). There is no reachable anonymous branch on these endpoints: falling back
+to `X-Forwarded-For` would let any caller forge their rate-limit bucket by rotating
+the header, since a Railway-style proxy only APPENDS to that header — the leftmost
+hop is fully attacker-controlled. The only safe fallback is the socket peer
+(`get_remote_address`), same as every other limiter in this app.
 """
 
 from __future__ import annotations
@@ -58,19 +57,22 @@ class TestUploadRateLimitKey:
         assert upload_rate_limit_key(uno) == "user:user-a"
         assert upload_rate_limit_key(uno) != upload_rate_limit_key(otro)
 
-    def test_anonymous_request_is_keyed_by_the_first_forwarded_hop(self) -> None:
-        """`X-Forwarded-For` is `client, proxy1, proxy2` — only the first hop is the
-        actual caller."""
-        anonimo = _request(headers={"x-forwarded-for": "198.51.100.4, 10.0.0.7, 10.0.0.8"})
+    def test_spoofed_forwarded_header_does_not_change_the_key(self) -> None:
+        """A caller rotating `X-Forwarded-For` must not get a fresh rate-limit bucket."""
+        sin_cabecera = _request()
+        con_cabecera_falsa = _request(headers={"x-forwarded-for": "198.51.100.4, 10.0.0.7, 10.0.0.8"})
 
-        assert upload_rate_limit_key(anonimo) == "198.51.100.4"
+        assert upload_rate_limit_key(sin_cabecera) == "203.0.113.9"
+        assert upload_rate_limit_key(con_cabecera_falsa) == "203.0.113.9"
 
     def test_falls_back_to_the_socket_peer_without_user_or_forwarded_header(self) -> None:
         assert upload_rate_limit_key(_request()) == "203.0.113.9"
 
-    def test_blank_forwarded_header_does_not_produce_an_empty_key(self) -> None:
-        """An empty key would bucket every caller together — worse than the bug."""
-        assert upload_rate_limit_key(_request(headers={"x-forwarded-for": "  ,  "})) == "203.0.113.9"
+    def test_authenticated_user_key_ignores_a_spoofed_forwarded_header(self) -> None:
+        """The user-keyed branch must not be swayed by a client-controlled header either."""
+        con_cabecera_falsa = _request(headers={"x-forwarded-for": "6.6.6.6"}, user_id="user-a")
+
+        assert upload_rate_limit_key(con_cabecera_falsa) == "user:user-a"
 
 
 async def _crear_cuenta(db: AsyncSession, user_id: uuid.UUID, numero: str) -> CuentaCobro:

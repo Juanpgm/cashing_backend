@@ -13,31 +13,24 @@ limiter = Limiter(key_func=get_remote_address, default_limits=["100/minute"])
 
 
 def upload_rate_limit_key(request: Request) -> str:
-    """Rate-limit key for upload endpoints: the CALLER, not the reverse proxy.
+    """Rate-limit key for upload endpoints: the authenticated CALLER.
 
-    Railway terminates TLS in front of the container, so `get_remote_address`
-    (which reads the socket peer) returns the same proxy IP for every user. The
-    10/minute upload budget then becomes a single global budget: one contractor
-    dropping ten files 429s everybody else on the platform.
+    Every upload endpoint requires auth, so `request.state.user_id` (set by
+    `app.api.deps.get_current_user` before the endpoint body runs) is the only
+    key that is both stable and actually per-caller. slowapi's `key_func` runs
+    AFTER dependency resolution, so on these authenticated endpoints the
+    anonymous branch below is never reachable in practice — it only guards
+    against a misconfigured route that forgets the auth dependency.
 
-    Resolution order:
-
-    1. ``request.state.user_id`` — set by the auth dependency
-       (``app.api.deps.get_current_user``) before the endpoint body runs, which is
-       also when slowapi evaluates this function. This is the only key that is
-       both stable and actually per-caller.
-    2. The FIRST hop of ``X-Forwarded-For`` (``client, proxy1, proxy2``) for
-       unauthenticated callers, so the limit still separates them once
-       ``--proxy-headers`` is on.
-    3. The socket peer, as before.
+    We deliberately do NOT read `X-Forwarded-For` here: it is a plain request
+    header, fully controlled by whoever sends the HTTP request. A reverse
+    proxy only APPENDS to it, so the LEFTMOST hop — the one this function would
+    read — can be forged by any client, letting an attacker rotate their
+    rate-limit bucket at will. The socket peer (`get_remote_address`) is the
+    only fallback that isn't spoofable from outside the container.
     """
     user_id = getattr(request.state, "user_id", None)
     if user_id:
         return f"user:{user_id}"
-
-    forwarded = request.headers.get("x-forwarded-for", "")
-    primer_salto = forwarded.split(",")[0].strip()
-    if primer_salto:
-        return primer_salto
 
     return get_remote_address(request)
