@@ -179,7 +179,7 @@ async def listar_documentos_contrato(
 
 
 @router.post("/upload-batch", response_model=list[DocumentUploadResponse], status_code=201)
-@limiter.limit("3/minute")
+@limiter.limit("10/minute")
 async def upload_documents_batch(
     request: Request,
     user: CurrentUser,
