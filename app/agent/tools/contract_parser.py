@@ -685,14 +685,21 @@ def extract_obligaciones_verbatim(texto: str) -> list[ObligacionExtraida]:
     whitespace collapsed to single spaces; items shorter than 10 characters are
     dropped as noise and anything after the catch-all closer is excluded.
 
-    Candidates are scored rather than taking the first match: a section closing
-    with the catch-all wins over one that doesn't; among ties, the one with the
-    most items wins (a 1-item candidate never beats a >=2-item one just because
-    it happened to appear first in the text — a PARÁGRAFO merely mentioning
-    "obligaciones específicas" and closing with a single catch-all bullet used
-    to beat the real 5-item enumerated list that follows it); among further
-    ties, a tier-1 heading (OBLIGACIONES/ACTIVIDADES ESPECÍFICAS) wins over
-    tier-2. The first candidate found keeps a tie (stable, matches the original
+    Candidates are scored rather than taking the first match, in this order:
+
+      1. A tier-1 heading (OBLIGACIONES/ACTIVIDADES ESPECÍFICAS) beats tier-2
+         outright. Tier is the strongest signal the text gives us, and item
+         count used to outrank it: a tier-2 "OBLIGACIONES DEL CONTRATISTA"
+         clause listing 12 general duties beat the real 5-item ESPECÍFICAS
+         enumeration, so general duties were stored as specific obligations.
+      2. A section closing with the catch-all beats one that doesn't.
+      3. Among further ties, the one with the most items wins — a 1-item
+         candidate never beats a >=2-item one just because it appears first
+         (a PARÁGRAFO merely mentioning "obligaciones específicas" and closing
+         with a single catch-all bullet used to beat the real 5-item list that
+         follows it).
+
+    The first candidate found keeps a tie (stable, matches the original
     position/tier-1-first preference).
 
     Returns an empty list when no usable section is found, OR when any item
@@ -719,9 +726,9 @@ def extract_obligaciones_verbatim(texto: str) -> list[ObligacionExtraida]:
         if not items:
             continue
         score = (
+            1 if tier == 1 else 0,  # an explicit "ESPECÍFICAS" heading wins outright
             1 if _is_catch_all(items[-1][1]) else 0,  # closes with the catch-all
             len(items),  # most items
-            1 if tier == 1 else 0,  # tier-1 heading over tier-2
         )
         if best_score is None or score > best_score:
             best_score = score
