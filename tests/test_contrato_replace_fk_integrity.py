@@ -289,7 +289,7 @@ class TestReconcileObligacionesOnReplace:
     evidencia link built on them) for obligaciones that are still present."""
 
     async def test_identical_reupload_keeps_every_id_and_every_link(
-        self, db: AsyncSession, test_user: dict[str, Any]
+        self, db: AsyncSession, test_user: dict[str, Any], sqlite_fk_enforcement: None
     ) -> None:
         """(a) The exact same content re-uploaded (double-click, retry after a
         timeout) must not touch a single obligación or link."""
@@ -315,7 +315,7 @@ class TestReconcileObligacionesOnReplace:
         assert len(enlaces) == 1, "the evidencia_obligacion row must survive"
 
     async def test_dropped_obligacion_is_removed_fk_safely_the_rest_keep_their_ids(
-        self, db: AsyncSession, test_user: dict[str, Any]
+        self, db: AsyncSession, test_user: dict[str, Any], sqlite_fk_enforcement: None
     ) -> None:
         """(b) The new document drops item 2 of 3: only item 2 is removed
         (FK-safely — its actividad/evidencia links are cleared, not orphaned),
@@ -354,7 +354,7 @@ class TestReconcileObligacionesOnReplace:
         assert enlaces == [], "the dropped obligación's evidencia links must be removed"
 
     async def test_added_obligacion_keeps_the_three_original_ids_and_appends_a_fourth(
-        self, db: AsyncSession, test_user: dict[str, Any]
+        self, db: AsyncSession, test_user: dict[str, Any], sqlite_fk_enforcement: None
     ) -> None:
         """(c) The new document adds a 4th obligación: the original 3 keep their
         ids, the new one is appended — and `orden` follows the NEW document's
@@ -394,7 +394,7 @@ class TestReconcileObligacionesOnReplace:
         )
 
     async def test_reconcile_refreshes_etiqueta_on_kept_rows(
-        self, db: AsyncSession, test_user: dict[str, Any]
+        self, db: AsyncSession, test_user: dict[str, Any], sqlite_fk_enforcement: None
     ) -> None:
         """(f) A kept row's `etiqueta` (the contract's own bullet marker) must
         follow the NEW document too — otherwise the marker keeps the previous
@@ -420,7 +420,7 @@ class TestReconcileObligacionesOnReplace:
         )
 
     async def test_case_accent_and_whitespace_only_differences_are_treated_as_the_same_text(
-        self, db: AsyncSession, test_user: dict[str, Any]
+        self, db: AsyncSession, test_user: dict[str, Any], sqlite_fk_enforcement: None
     ) -> None:
         """(e) A re-extraction that differs only by case/accents/whitespace must
         normalize to the same key (`app.core.text_match.normalize`) and therefore
