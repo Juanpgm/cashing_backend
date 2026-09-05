@@ -416,121 +416,27 @@ _ENUM_RE = re.compile(
 )
 
 
-# ── Structural heading detection ─────────────────────────────────────────────
-# A section keyword is a real HEADING (as opposed to a prose mention) purely by
-# where it sits in the document's line structure. Capitalisation is deliberately
-# NOT part of the signal: Word title-cases clause headings, numbered sub-headings
-# come in sentence case, OCR flips single accented characters, and scanned
-# contracts arrive entirely in uppercase — every one of those is typography, not
-# structure.
-
-# Spanish ordinal clause numbering, feminine and masculine ("CLÁUSULA TERCERA",
-# "ARTÍCULO TERCERO"). ``D[ÉE]CIM[AO]\w*`` covers DÉCIMA, DECIMOPRIMERA, …
-_ORDINAL_ALT = (
-    r"PRIMER[AO]|SEGUND[AO]|TERCER[AO]|CUART[AO]|QUINT[AO]|SEXT[AO]|S[ÉE]PTIM[AO]|"
-    r"OCTAV[AO]|NOVEN[AO]|D[ÉE]CIM[AO]\w*|UND[ÉE]CIM[AO]|DUOD[ÉE]CIM[AO]|VIG[ÉE]SIM[AO]\w*"
-)
-
-# What may legitimately sit between the start of a line and the keyword: a clause
-# label — "CLÁUSULA TERCERA —", "ARTÍCULO 5.", "TERCERA.", "3.", "3.1" — case
-# insensitive by construction.
-_CLAUSE_LABEL_RE = re.compile(
-    r"^(?:"
-    rf"(?:CL[ÁA]USULA|ART[ÍI]CULO)\b[\s.)\-\u2013\u2014]*(?:(?:{_ORDINAL_ALT})\b|\d{{1,3}}(?:\.\d{{1,3}})*)?"
-    rf"|(?:{_ORDINAL_ALT})\b"
-    r"|\d{1,3}(?:\.\d{1,3})*"
-    r")[\s.)\-\u2013\u2014]*",
-    re.IGNORECASE,
-)
-
-# A PARÁGRAFO is a sub-clause that qualifies the clause before it; it never
-# introduces the contract's enumerated obligations. Every prose mention reported
-# from production so far hid behind one.
-_PARAGRAFO_RE = re.compile(r"PAR[ÁA]GRAFO", re.IGNORECASE)
-
-# How much of its own title a heading may carry between the clause label and the
-# keyword ("CLÁUSULA SEGUNDA. ALCANCE DEL OBJETO CONTRACTUAL Y OBLIGACIONES
-# ESPECÍFICAS…"). Past this it is a sentence, not a label.
-_MAX_HEADING_PREFIX_WORDS = 8
-
-
-def _prefix_is_clause_label(prefix: str) -> bool:
-    """Return True when what precedes the keyword ON ITS LINE is heading scaffolding.
-
-    Accepts an empty prefix (the keyword opens the line) or a clause label
-    optionally followed by the rest of the heading's own noun phrase
-    ("CLÁUSULA SEGUNDA. ALCANCE DEL OBJETO CONTRACTUAL Y OBLIGACIONES…").
-
-    A ``:`` terminates a label, so anything after the LAST colon must be empty —
-    that is what separates the heading "CLÁUSULA TERCERA: OBLIGACIONES
-    ESPECÍFICAS…" from the prose "CLÁUSULA PRIMERA — OBJETO: definir las
-    obligaciones específicas del contratista…".
-    """
-    if ":" in prefix:
-        head, _, tail = prefix.rpartition(":")
-        if tail.strip():
-            return False
-        prefix = head
-    prefix = prefix.strip()
-    if not prefix:
-        return True
-    if _PARAGRAFO_RE.search(prefix):
-        return False
-    m = _CLAUSE_LABEL_RE.match(prefix)
-    if m is None:
-        return False
-    return len(prefix[m.end() :].split()) <= _MAX_HEADING_PREFIX_WORDS
-
-
-def _is_heading_occurrence(texto: str, idx: int, fin: int) -> bool:
-    """Return True when the keyword occurrence at ``texto[idx:fin]`` is a section heading.
-
-    The other half of "a heading introduces an enumerated block" is enforced by
-    ``extract_obligaciones_verbatim``, which drops any candidate whose section
-    yields no items — and enforces it without a distance bound, deliberately:
-    an ESPECÍFICAS clause routinely opens with an "El contratista se obliga a …
-    así:" paragraph before its first item, and requiring a marker within N
-    characters of the keyword would demote that real heading to a prose mention
-    for a reason that is layout, not structure.
-    """
-    line_start = texto.rfind("\n", 0, idx) + 1
-    return _prefix_is_clause_label(texto[line_start:idx])
-
-
-def _candidate_starts(texto: str) -> list[tuple[int, int, bool]]:
-    """Return (offset, tier, es_encabezado) right AFTER every obligation-section header.
+def _candidate_starts(texto_upper: str) -> list[tuple[int, int]]:
+    """Return (offset, tier) pairs right AFTER every obligation-section header.
 
     Unlike a first-match lookup, this yields ALL candidate sections so the caller
     can score them (see ``extract_obligaciones_verbatim``) instead of taking
     whichever comes first in the text. ``tier`` is 1 for "OBLIGACIONES/
     ACTIVIDADES ESPECÍFICAS" (preferred) and 2 for the broader fallback
     keywords; tier-1 offsets are listed before tier-2 offsets.
-
-    ``es_encabezado`` is True when the occurrence is a real section HEADING
-    rather than a prose mention, decided STRUCTURALLY and case-insensitively
-    (see ``_is_heading_occurrence``): the keyword begins its own line — bar a
-    clause label such as "CLÁUSULA TERCERA —", "3." or "3.1", never a
-    "PARÁGRAFO" and never running text after a colon. Keyword matching runs
-    against the uppercased text, so a mention buried in a sentence is a tier-1
-    candidate by keyword alone; this flag is what tells them apart.
     """
-    texto_upper = texto.upper()
-    starts: list[tuple[int, int, bool]] = []
+    starts: list[tuple[int, int]] = []
     for tier, keywords in enumerate((OBLIGACION_SECTION_KW_TIER1, OBLIGACION_SECTION_KW_TIER2), start=1):
-        # Keyed by END offset: several keywords ("OBLIGACIONES ESPECÍFICAS" and
-        # "OBLIGACIONES ESPECÍFICAS DEL CONTRATISTA") can describe the same
-        # heading. A single structural hit is enough to call the offset a heading.
-        tier_offsets: dict[int, bool] = {}
+        tier_offsets: set[int] = set()
         for kw in keywords:
             pos = 0
             while True:
                 idx = texto_upper.find(kw, pos)
                 if idx == -1:
                     break
-                fin = idx + len(kw)
-                tier_offsets[fin] = tier_offsets.get(fin, False) or _is_heading_occurrence(texto, idx, fin)
-                pos = fin
-        starts.extend((offset, tier, tier_offsets[offset]) for offset in sorted(tier_offsets))
+                tier_offsets.add(idx + len(kw))
+                pos = idx + len(kw)
+        starts.extend((offset, tier) for offset in sorted(tier_offsets))
     return starts
 
 
@@ -779,42 +685,15 @@ def extract_obligaciones_verbatim(texto: str) -> list[ObligacionExtraida]:
     whitespace collapsed to single spaces; items shorter than 10 characters are
     dropped as noise and anything after the catch-all closer is excluded.
 
-    Candidates are scored rather than taking the first match, in this order:
-
-      1. A REAL SECTION HEADING beats a prose mention, whatever the tier.
-         Keyword matching runs against the uppercased text, so a PARÁGRAFO that
-         merely MENTIONS "obligaciones específicas" in running prose is a tier-1
-         candidate by keyword alone. ``_candidate_starts`` separates the two
-         STRUCTURALLY and case-insensitively: an occurrence is a heading when it
-         begins its own line — bar a clause label ("CLÁUSULA TERCERA —",
-         "TERCERA.", "3.", "3.1"), never a "PARÁGRAFO" and never running text
-         after a colon. The rule's other half, "a heading introduces an
-         enumerated block", is the ``if not items: continue`` below: a section
-         with no items never reaches the score at all.
-      2. Within the same class, tier-1 (OBLIGACIONES/ACTIVIDADES ESPECÍFICAS)
-         beats tier-2 (the broader keywords, which mix in general duties).
-      3. Then the section with the MOST items.
-      4. Then, as the last tiebreak, one closing with the catch-all.
-
-    The first candidate found keeps a tie (stable, matches the original
+    Candidates are scored rather than taking the first match: a section closing
+    with the catch-all wins over one that doesn't; among ties, the one with the
+    most items wins (a 1-item candidate never beats a >=2-item one just because
+    it happened to appear first in the text — a PARÁGRAFO merely mentioning
+    "obligaciones específicas" and closing with a single catch-all bullet used
+    to beat the real 5-item enumerated list that follows it); among further
+    ties, a tier-1 heading (OBLIGACIONES/ACTIVIDADES ESPECÍFICAS) wins over
+    tier-2. The first candidate found keeps a tie (stable, matches the original
     position/tier-1-first preference).
-
-    Why the structure rather than a bullet-count threshold: a threshold cannot
-    separate a prose mention from a real enumeration (a PARÁGRAFO with two
-    throwaway bullets clears any ``>= 2`` guard, while a GENUINE single-
-    obligation ESPECÍFICAS clause fails it), and it structurally cannot order
-    two candidates of the SAME tier — a 2-item prose block closing with "las
-    demás" used to beat a real 12-item ESPECÍFICAS enumeration on ``catch_all``
-    alone. Item count is now ranked above ``catch_all`` for the same reason: a
-    catch-all closer is one line of evidence, an enumeration's length is many.
-
-    Why not capitalisation: ``str.isupper()`` over the keyword span is a
-    typography proxy, not a structure detector. It demotes a Title Case Word
-    heading, a sentence-case numbered sub-heading and an OCR'd heading carrying
-    one lowercase accented character to "prose mention" — handing the document
-    to an UPPERCASE generic tier-2 clause — and it says nothing at all about a
-    contract typeset ENTIRELY in uppercase, where every occurrence ties. Line
-    structure is the same in all four documents.
 
     Returns an empty list when no usable section is found, OR when any item
     still carries a strong footer signature (NIT / e-mail / TEL-FAX-WEB label —
@@ -831,18 +710,18 @@ def extract_obligaciones_verbatim(texto: str) -> list[ObligacionExtraida]:
             for i, (marker, text) in enumerate(items)
         ]
 
-    best_score: tuple[int, int, int, int] | None = None
+    texto_upper = texto.upper()
+    best_score: tuple[int, int, int] | None = None
     best_items: list[tuple[str, str]] | None = None
-    for start, tier, es_encabezado in _candidate_starts(texto):
+    for start, tier in _candidate_starts(texto_upper):
         end = _find_section_end(texto, start)
         items = _extract_items_from_block(texto[start:end])
         if not items:
             continue
         score = (
-            1 if es_encabezado else 0,  # a real heading beats a prose mention, any tier
-            -tier,  # then ESPECÍFICAS (tier 1) over the broader keywords (tier 2)
-            len(items),  # then the longer enumeration
-            1 if _is_catch_all(items[-1][1]) else 0,  # last: closes with the catch-all
+            1 if _is_catch_all(items[-1][1]) else 0,  # closes with the catch-all
+            len(items),  # most items
+            1 if tier == 1 else 0,  # tier-1 heading over tier-2
         )
         if best_score is None or score > best_score:
             best_score = score
