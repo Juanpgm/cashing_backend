@@ -79,6 +79,7 @@ class TestUploadBatchRateLimitMatchesSingleUpload:
     ) -> None:
         """`/upload-batch` must allow the same 10/minute as `/upload`."""
         cuenta = await _crear_cuenta(db, test_user["user"].id)
+        enabled_previo = limiter.enabled
         limiter.enabled = True
         limiter.reset()
         statuses: list[int] = []
@@ -101,7 +102,12 @@ class TestUploadBatchRateLimitMatchesSingleUpload:
                     )
                     statuses.append(r.status_code)
         finally:
-            limiter.enabled = False
+            # Reset the window too: leaving used-up buckets behind makes the NEXT
+            # test that enables the limiter fail depending on execution order.
+            # And restore the previous flag instead of hardcoding False, so this
+            # never silently disables a limiter a caller had turned on.
+            limiter.reset()
+            limiter.enabled = enabled_previo
 
         assert 429 not in statuses, f"rate-limited within the 10/minute budget: {statuses}"
 
@@ -113,6 +119,7 @@ class TestRateLimit429BodyIncludesDetail:
         """The frontend's error formatter reads `detail`; slowapi's default body
         only carries `error`, so the message is silently dropped client-side."""
         cuenta = await _crear_cuenta(db, test_user["user"].id)
+        enabled_previo = limiter.enabled
         limiter.enabled = True
         limiter.reset()
         responses = []
@@ -135,7 +142,12 @@ class TestRateLimit429BodyIncludesDetail:
                     )
                     responses.append(r)
         finally:
-            limiter.enabled = False
+            # Reset the window too: leaving used-up buckets behind makes the NEXT
+            # test that enables the limiter fail depending on execution order.
+            # And restore the previous flag instead of hardcoding False, so this
+            # never silently disables a limiter a caller had turned on.
+            limiter.reset()
+            limiter.enabled = enabled_previo
 
         rate_limited = [r for r in responses if r.status_code == 429]
         assert rate_limited, f"expected the 11th request to be rate-limited: {[r.status_code for r in responses]}"

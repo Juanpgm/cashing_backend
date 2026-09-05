@@ -344,7 +344,18 @@ async def _resolver_texto_obligaciones_archivo(
 
     miembros = extract_archive_member_texts(content, filename)
     if not miembros:
-        return None, []
+        # Nothing readable inside (only images/binaries, or every member was
+        # skipped by the size caps). Returning silently left the user looking at a
+        # successful upload with zero obligations and no explanation.
+        await logger.awarning(
+            "archivo_sin_miembros_legibles",
+            filename=filename,
+            contrato_id=str(contrato_id),
+        )
+        return None, [
+            "El archivo comprimido no contiene documentos con texto legible; "
+            "no se extrajeron obligaciones desde el archivo."
+        ]
 
     contrato_row = await db.get(Contrato, contrato_id)
     numero_contrato = contrato_row.numero_contrato if contrato_row else None
@@ -1222,11 +1233,16 @@ async def upload_document(
     if tipo == TipoDocumentoFuente.CONTRATO and alcance_documento_del_contrato and contrato_id is not None:
         ob_items: list[ObligacionExtraida] = []
         ob_avisos: list[str] = []
+        from app.agent.tools.document_parser import is_archive_filename as _es_archivo
+
         if multimodal_result is not None:
             ob_items = _obligacion_items_to_extraidas(multimodal_result.obligaciones)
-        elif texto_extraido:
+        # An archive still goes through the resolver even when it yielded NO text:
+        # that is the case that most needs the aviso explaining why zero obligations
+        # came back (a zip of scans, or one whose members hit the size caps).
+        elif texto_extraido or _es_archivo(filename):
             texto_para_obligaciones, archivo_avisos = await _resolver_texto_obligaciones_archivo(
-                content, filename, texto_extraido, contrato_id, db
+                content, filename, texto_extraido or "", contrato_id, db
             )
             avisos.extend(archivo_avisos)
             if texto_para_obligaciones:
