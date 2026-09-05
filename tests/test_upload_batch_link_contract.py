@@ -232,6 +232,12 @@ class TestRetryRelinks:
         assert len(docs) == 1, "the retry must reuse the deduped document, not create a second one"
         assert docs[0].id in await _fuentes_vinculadas(db, cuenta.id), "the retry must repair the link"
 
+        cuerpo = reintento.json()
+        assert len(cuerpo) == 1, cuerpo
+        assert cuerpo[0]["nombre_original"] == "soporte-1.pdf", (
+            f"the dedup fast path must still expose nombre_original: {cuerpo}"
+        )
+
 
 def _falla_el_storage_en(indices: set[int]) -> AsyncMock:
     """Storage mock whose upload() raises on the Nth (1-based) call, one per file
