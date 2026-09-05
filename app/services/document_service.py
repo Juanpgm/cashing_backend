@@ -1011,6 +1011,7 @@ async def upload_document(
         return DocumentUploadResponse(
             id=existing_doc.id,
             nombre=existing_doc.nombre,
+            nombre_original=filename,
             tipo=existing_doc.tipo.value,
             texto_extraido=existing_doc.texto_extraido,
             contrato_id=effective_contrato_id,
@@ -1369,6 +1370,7 @@ async def upload_document(
     return DocumentUploadResponse(
         id=doc.id,
         nombre=doc.nombre,
+        nombre_original=filename,
         tipo=doc.tipo.value,
         texto_extraido=texto_extraido,
         contrato_id=contrato_id,

@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser
 from app.core.database import get_db
-from app.core.exceptions import ValidationError
+from app.core.exceptions import ChecklistLinkError, ValidationError
 from app.core.file_validation import (
     validate_file_extension,
     validate_file_size,
@@ -21,6 +21,9 @@ from app.schemas.documento_fuente import DocumentoFuenteResponse
 from app.services import document_service
 
 router = APIRouter(prefix="/documentos", tags=["documentos"])
+
+# Upper bound on files per `/upload-batch` request.
+MAX_BATCH_SIZE = 20
 
 
 def _resolver_tipo(tipo: TipoDocumentoFuente | None, cuenta_cobro_id: uuid.UUID | None) -> TipoDocumentoFuente:
@@ -221,15 +224,25 @@ async def upload_documents_batch(
         description=("Código del requisito del checklist al que se vinculan los documentos. Aplica al lote completo."),
     ),
 ) -> list[DocumentUploadResponse]:
-    """Upload multiple documents in a single request (multipart/form-data).
+    """Sube varios documentos en una sola petición (multipart/form-data).
 
-    Each file is validated individually; failures raise 422 with the filename.
-    Successful uploads are returned as a list in the same order as the input files.
+    Acepta cualquier mezcla de PDF, DOCX, TXT, JPG, PNG de hasta 10 MB cada uno.
+    Máximo 20 archivos por petición.
 
-    Accepts any mix of PDF, DOCX, TXT, JPG, PNG files up to 10 MB each.
-    Maximum 20 files per request.
+    ### Contrato de la respuesta
+    - **201** — *todos* los archivos se guardaron **y** se vincularon. La lista trae
+      un elemento por archivo, en el mismo orden de entrada.
+    - **422** — la validación previa rechazó el lote (nombre, extensión, tamaño,
+      MIME): no se guardó ningún archivo.
+    - **502** (`code: CHECKLIST_LINK_FAILED`) — al menos un archivo se guardó pero no
+      pudo vincularse al checklist. El resto del lote sí se procesó y guardó; volver
+      a subir los archivos nombrados en `detail` repara la vinculación.
+    - **429** — se superó el límite de 10 peticiones por minuto.
+
+    Cada elemento de `results` incluye `nombre_original` (el nombre tal como lo envió
+    el cliente) para poder emparejar resultados con archivos sin replicar el saneado
+    de nombres del backend.
     """
-    MAX_BATCH_SIZE = 20
     if len(files) > MAX_BATCH_SIZE:
         raise ValidationError(f"Batch exceeds maximum of {MAX_BATCH_SIZE} files.")
 
@@ -261,17 +274,30 @@ async def upload_documents_batch(
 
         payloads.append((file, content))
 
-    # Pass 2 — all files passed validation, now persist. Per-file persistence errors
-    # (business logic, e.g. checklist link failures) are still collected as partial
-    # results/avisos rather than aborting the whole batch.
+    # Pass 2 — all files passed validation, now persist, in input order.
+    #
+    # A 2xx from this endpoint means EVERY file was persisted AND linked. A
+    # `ChecklistLinkError` (document written, checklist link failed) used to be
+    # swallowed here by the blanket `except Exception` and downgraded to an
+    # `[Error] ...` string on the LAST result's avisos, with the response still 201 —
+    # the frontend showed green while the requisito stayed Pendiente, which is exactly
+    # what raising it from `upload_document` was meant to stop.
+    #
+    # The loop still FINISHES on a link failure (the remaining files deserve to be
+    # persisted), and the 502 is raised afterwards naming the affected files.
     results: list[DocumentUploadResponse] = []
+    link_failed: list[str] = []
     errors: list[str] = []
+    # Read the id ONCE: rolling back a failed file expires every ORM instance in the
+    # session, `user` (loaded by the auth dependency) included, and a later `user.id`
+    # would then trigger a lazy refresh from sync context (MissingGreenlet).
+    user_id = user.id
 
     for file, content in payloads:
         try:
             result = await document_service.upload_document(
                 db=db,
-                user_id=user.id,
+                user_id=user_id,
                 filename=file.filename,  # type: ignore[arg-type]
                 content=content,
                 content_type=file.content_type or "application/octet-stream",
@@ -281,14 +307,30 @@ async def upload_documents_batch(
                 requisito_codigo=requisito_codigo,
             )
             results.append(result)
+        except ChecklistLinkError:
+            # The document IS persisted and committed; only the link is missing.
+            link_failed.append(file.filename or "")
+            # Drop whatever the failed link left pending so the next file starts from
+            # a clean session.
+            await db.rollback()
         except Exception as exc:
             errors.append(f"{file.filename}: {exc}")
+            await db.rollback()
+
+    if link_failed:
+        raise ChecklistLinkError(
+            requisito_codigo or "",
+            "no se pudo completar la vinculación con el checklist",
+            archivos=link_failed,
+        )
 
     if errors and not results:
-        raise ValidationError(f"All files failed to upload: {'; '.join(errors)}")
+        raise ValidationError(f"Ningún archivo pudo subirse: {'; '.join(errors)}")
 
-    if errors and results:
-        results[-1].avisos.extend([f"[Error] {e}" for e in errors])
+    if errors:
+        # Never return 2xx for a partially failed batch: the caller cannot tell which
+        # of its files made it, and a blind retry duplicates the ones that did.
+        raise ValidationError(f"Algunos archivos no pudieron subirse: {'; '.join(errors)}")
 
     return results
 
