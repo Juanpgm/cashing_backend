@@ -29,7 +29,6 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from app.core.exceptions import ValidationError
 from app.models.actividad import Actividad
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
@@ -57,6 +56,39 @@ _TEXTO_BASE = (
 )
 _TEXTO_V1 = _TEXTO_BASE.format(marca="V1")
 _TEXTO_V2 = _TEXTO_BASE.format(marca="V2")
+
+# Reconcile fixtures (BLOCKER B, round-2 review obs #492): a replace must match the
+# new extraction against the existing obligations by normalized text and only touch
+# the ones that genuinely differ, instead of wiping and reinserting everything.
+_TEXTO_TRES = (
+    "CLÁUSULA SEGUNDA. OBLIGACIONES ESPECÍFICAS DEL CONTRATISTA:\n"
+    "1. Elaborar los estudios previos de los procesos de contratacion.\n"
+    "2. Revisar los actos administrativos que expida la entidad.\n"
+    "3. Las demás actividades que le asigne la supervisión relacionadas con el objeto del contrato.\n"
+)
+# Same three obligations, item 2 dropped.
+_TEXTO_DOS = (
+    "CLÁUSULA SEGUNDA. OBLIGACIONES ESPECÍFICAS DEL CONTRATISTA:\n"
+    "1. Elaborar los estudios previos de los procesos de contratacion.\n"
+    "2. Las demás actividades que le asigne la supervisión relacionadas con el objeto del contrato.\n"
+)
+# Same three obligations plus a new one (inserted before the catch-all, which must
+# stay last — see `_split_items`'s "stop after the catch-all" rule).
+_TEXTO_CUATRO = (
+    "CLÁUSULA SEGUNDA. OBLIGACIONES ESPECÍFICAS DEL CONTRATISTA:\n"
+    "1. Elaborar los estudios previos de los procesos de contratacion.\n"
+    "2. Revisar los actos administrativos que expida la entidad.\n"
+    "3. Actualizar el inventario de bienes asignados para el desarrollo del contrato.\n"
+    "4. Las demás actividades que le asigne la supervisión relacionadas con el objeto del contrato.\n"
+)
+# Same three obligations, differing only by case/accents/whitespace — must
+# normalize to the SAME key as `_TEXTO_TRES` (`app.core.text_match.normalize`).
+_TEXTO_TRES_VARIANTE = (
+    "CLÁUSULA SEGUNDA. OBLIGACIONES ESPECÍFICAS DEL CONTRATISTA:\n"
+    "1.   ELABORAR   los  Estudios Previos de los procesos de contratación.\n"
+    "2. revisar   LOS actos administrativos que expida la entidad.\n"
+    "3. Las demás actividades que le asigne la supervisión relacionadas con el objeto del contrato.\n"
+)
 
 
 @pytest.fixture
@@ -148,15 +180,11 @@ async def _subir_contrato(
         )
 
 
-async def _referenciar_primera_obligacion(
-    db: AsyncSession, contrato_id: uuid.UUID, estado: EstadoCuentaCobro
-) -> tuple[Obligacion, Actividad]:
-    """Attach an Actividad + EvidenciaObligacion to the contract's first obligación."""
-    obligaciones = await _obligaciones(db, contrato_id)
-    assert obligaciones, "precondition: v1 must have produced obligations"
-    obligacion = obligaciones[0]
-
-    cuenta = await _crear_cuenta(db, contrato_id, estado)
+async def _referenciar_obligacion(
+    db: AsyncSession, obligacion: Obligacion, estado: EstadoCuentaCobro
+) -> Actividad:
+    """Attach an Actividad + EvidenciaObligacion to the given obligación."""
+    cuenta = await _crear_cuenta(db, obligacion.contrato_id, estado)
     actividad = Actividad(
         cuenta_cobro_id=cuenta.id,
         obligacion_id=obligacion.id,
@@ -173,6 +201,17 @@ async def _referenciar_primera_obligacion(
 
     db.add(EvidenciaObligacion(evidencia_id=evidencia.id, obligacion_id=obligacion.id))
     await db.commit()
+    return actividad
+
+
+async def _referenciar_primera_obligacion(
+    db: AsyncSession, contrato_id: uuid.UUID, estado: EstadoCuentaCobro
+) -> tuple[Obligacion, Actividad]:
+    """Attach an Actividad + EvidenciaObligacion to the contract's first obligación."""
+    obligaciones = await _obligaciones(db, contrato_id)
+    assert obligaciones, "precondition: v1 must have produced obligations"
+    obligacion = obligaciones[0]
+    actividad = await _referenciar_obligacion(db, obligacion, estado)
     return obligacion, actividad
 
 
@@ -205,30 +244,156 @@ class TestReplaceRespectsForeignKeys:
         assert enlaces == [], "evidencia_obligacion rows pointing at deleted obligaciones must be removed"
 
 
-class TestActiveCuentaBlocksReplace:
-    async def test_enviada_cuenta_blocks_replace_and_leaves_previous_document_intact(
+class TestActiveCuentaAcceptsReplaceButKeepsObligaciones:
+    """MAJOR 4 (round-2 review obs #492): an active cuenta must not block the
+    document replace itself — only the destructive reconcile is skipped. The old
+    behaviour (422 for the whole upload) meant a contractor could never fix a
+    wrong/outdated contract file once any cuenta moved past BORRADOR, and — worse
+    — only fired when the new document was actually readable, so an unreadable
+    replacement was silently accepted while a good one was rejected."""
+
+    async def test_enviada_cuenta_replaces_the_document_and_keeps_obligaciones_untouched(
         self, db: AsyncSession, test_user: dict[str, Any]
     ) -> None:
-        """An `enviada` cuenta referencing an obligación must reject the replace
-        BEFORE anything (storage object or DB row) is touched."""
         user_id = test_user["user"].id
         contrato = await _crear_contrato(db, user_id, numero="CD-FK-002")
         contrato_id = contrato.id
 
         await _subir_contrato(db, user_id, contrato_id, "contrato-v1.txt", _TEXTO_V1)
-        await _referenciar_primera_obligacion(db, contrato_id, EstadoCuentaCobro.ENVIADA)
-        obligaciones_antes = {o.descripcion for o in await _obligaciones(db, contrato_id)}
+        obligacion, actividad = await _referenciar_primera_obligacion(db, contrato_id, EstadoCuentaCobro.ENVIADA)
+        ids_antes = {o.id: o.descripcion for o in await _obligaciones(db, contrato_id)}
 
         storage = _mock_storage()
-        with pytest.raises(ValidationError) as exc_info:
-            await _subir_contrato(db, user_id, contrato_id, "contrato-v2.txt", _TEXTO_V2, storage=storage)
+        resultado = await _subir_contrato(db, user_id, contrato_id, "contrato-v2.txt", _TEXTO_V2, storage=storage)
 
-        assert "enviada" in str(exc_info.value.detail).lower()
-        storage.delete.assert_not_called()
-        storage.upload.assert_not_called()
+        assert any(
+            "cuentas de cobro enviadas" in a and "conservaron las obligaciones existentes" in a
+            for a in resultado.avisos
+        ), f"expected the active-cuenta aviso, got: {resultado.avisos}"
 
-        await db.rollback()
-        db.expunge_all()  # rollback expires the identity map; force a fresh read
         nombres = (await db.execute(_nombres_documentos(contrato_id))).scalars().all()
-        assert list(nombres) == ["contrato-v1.txt"], f"the old document must be intact: {nombres}"
-        assert {o.descripcion for o in await _obligaciones(db, contrato_id)} == obligaciones_antes
+        assert list(nombres) == ["contrato-v2.txt"], f"the document must be replaced: {nombres}"
+        storage.upload.assert_awaited_once()
+
+        ids_despues = {o.id: o.descripcion for o in await _obligaciones(db, contrato_id)}
+        assert ids_despues == ids_antes, f"obligaciones (and their ids) must be untouched: {ids_despues}"
+
+        await db.refresh(actividad)
+        assert actividad.obligacion_id == obligacion.id, "the actividad's link must survive untouched"
+
+
+class TestReconcileObligacionesOnReplace:
+    """BLOCKER B (round-2 review obs #492): a replace must reconcile the new
+    extraction against the existing obligaciones by normalized text instead of
+    wiping and reinserting everything — preserving ids (and every actividad/
+    evidencia link built on them) for obligaciones that are still present."""
+
+    async def test_identical_reupload_keeps_every_id_and_every_link(
+        self, db: AsyncSession, test_user: dict[str, Any]
+    ) -> None:
+        """(a) The exact same content re-uploaded (double-click, retry after a
+        timeout) must not touch a single obligación or link."""
+        user_id = test_user["user"].id
+        contrato = await _crear_contrato(db, user_id, numero="CD-RECONCILE-A")
+        contrato_id = contrato.id
+
+        await _subir_contrato(db, user_id, contrato_id, "contrato.txt", _TEXTO_TRES)
+        obligacion, actividad = await _referenciar_primera_obligacion(db, contrato_id, EstadoCuentaCobro.BORRADOR)
+        ids_antes = {o.id: o.descripcion for o in await _obligaciones(db, contrato_id)}
+
+        resultado = await _subir_contrato(db, user_id, contrato_id, "contrato.txt", _TEXTO_TRES)
+
+        ids_despues = {o.id: o.descripcion for o in await _obligaciones(db, contrato_id)}
+        assert ids_despues == ids_antes, f"identical re-upload must not change a single id: {ids_despues}"
+        assert not any("eliminaron" in a for a in resultado.avisos), resultado.avisos
+
+        await db.refresh(actividad)
+        assert actividad.obligacion_id == obligacion.id, "the actividad's link must survive"
+        enlaces = (
+            await db.execute(select(EvidenciaObligacion).where(EvidenciaObligacion.obligacion_id == obligacion.id))
+        ).scalars().all()
+        assert len(enlaces) == 1, "the evidencia_obligacion row must survive"
+
+    async def test_dropped_obligacion_is_removed_fk_safely_the_rest_keep_their_ids(
+        self, db: AsyncSession, test_user: dict[str, Any]
+    ) -> None:
+        """(b) The new document drops item 2 of 3: only item 2 is removed
+        (FK-safely — its actividad/evidencia links are cleared, not orphaned),
+        items 1 and 3 keep their ids untouched."""
+        user_id = test_user["user"].id
+        contrato = await _crear_contrato(db, user_id, numero="CD-RECONCILE-B")
+        contrato_id = contrato.id
+
+        await _subir_contrato(db, user_id, contrato_id, "contrato.txt", _TEXTO_TRES)
+        obligaciones_antes = await _obligaciones(db, contrato_id)
+        assert len(obligaciones_antes) == 3, obligaciones_antes
+        por_desc = {o.descripcion: o for o in obligaciones_antes}
+        item2 = next(o for o in obligaciones_antes if "actos administrativos" in o.descripcion)
+        actividad = await _referenciar_obligacion(db, item2, EstadoCuentaCobro.BORRADOR)
+
+        resultado = await _subir_contrato(db, user_id, contrato_id, "contrato-v2.txt", _TEXTO_DOS)
+
+        assert any("Se eliminaron 1 obligaciones" in a for a in resultado.avisos), resultado.avisos
+
+        despues = await _obligaciones(db, contrato_id)
+        assert len(despues) == 2, [o.descripcion for o in despues]
+        ids_despues = {o.descripcion: o.id for o in despues}
+        item1 = "Elaborar los estudios previos de los procesos de contratacion"
+        item3_catch_all = (
+            "Las demás actividades que le asigne la supervisión relacionadas con el objeto del contrato"
+        )
+        assert ids_despues[item1] == por_desc[item1].id
+        assert ids_despues[item3_catch_all] == por_desc[item3_catch_all].id
+        assert not any(d.startswith("Revisar los actos administrativos") for d in ids_despues), ids_despues
+
+        await db.refresh(actividad)
+        assert actividad.obligacion_id is None, "the dropped obligación's actividad link must be nulled"
+        enlaces = (
+            await db.execute(select(EvidenciaObligacion).where(EvidenciaObligacion.obligacion_id == item2.id))
+        ).scalars().all()
+        assert enlaces == [], "the dropped obligación's evidencia links must be removed"
+
+    async def test_added_obligacion_keeps_the_three_original_ids_and_appends_a_fourth(
+        self, db: AsyncSession, test_user: dict[str, Any]
+    ) -> None:
+        """(c) The new document adds a 4th obligación: the original 3 keep their
+        ids, the new one is appended."""
+        user_id = test_user["user"].id
+        contrato = await _crear_contrato(db, user_id, numero="CD-RECONCILE-C")
+        contrato_id = contrato.id
+
+        await _subir_contrato(db, user_id, contrato_id, "contrato.txt", _TEXTO_TRES)
+        ids_antes = {o.descripcion: o.id for o in await _obligaciones(db, contrato_id)}
+        assert len(ids_antes) == 3, ids_antes
+
+        await _subir_contrato(db, user_id, contrato_id, "contrato-v2.txt", _TEXTO_CUATRO)
+
+        despues = await _obligaciones(db, contrato_id)
+        assert len(despues) == 4, [o.descripcion for o in despues]
+        for descripcion, id_ in ids_antes.items():
+            coincidencia = next(o for o in despues if o.descripcion == descripcion)
+            assert coincidencia.id == id_, f"'{descripcion}' must keep its original id"
+        assert any("inventario de bienes" in o.descripcion for o in despues), despues
+
+    async def test_case_accent_and_whitespace_only_differences_are_treated_as_the_same_text(
+        self, db: AsyncSession, test_user: dict[str, Any]
+    ) -> None:
+        """(e) A re-extraction that differs only by case/accents/whitespace must
+        normalize to the same key (`app.core.text_match.normalize`) and therefore
+        change nothing."""
+        user_id = test_user["user"].id
+        contrato = await _crear_contrato(db, user_id, numero="CD-RECONCILE-E")
+        contrato_id = contrato.id
+
+        await _subir_contrato(db, user_id, contrato_id, "contrato.txt", _TEXTO_TRES)
+        ids_antes = {o.descripcion: o.id for o in await _obligaciones(db, contrato_id)}
+        assert len(ids_antes) == 3, ids_antes
+
+        resultado = await _subir_contrato(db, user_id, contrato_id, "contrato-v2.txt", _TEXTO_TRES_VARIANTE)
+
+        ids_despues = {o.descripcion: o.id for o in await _obligaciones(db, contrato_id)}
+        assert len(ids_despues) == 3, ids_despues
+        assert set(ids_despues.values()) == set(ids_antes.values()), (
+            f"a whitespace/case/accent-only difference must not touch any id: {ids_despues} vs {ids_antes}"
+        )
+        assert not any("eliminaron" in a for a in resultado.avisos), resultado.avisos

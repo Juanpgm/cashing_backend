@@ -315,27 +315,51 @@ async def eliminar_obligacion(
     await db.flush()
 
 
+async def tiene_cuenta_activa(db: AsyncSession, contrato_id: uuid.UUID) -> bool:
+    """Whether the contract has any cuenta de cobro in enviada/aprobada/pagada.
+
+    Used to gate the obligaciones reconcile on a contract document replace
+    (see ``document_service.upload_document``): an active cuenta must not
+    block the replace itself, only the destructive part (touching obligations)
+    is skipped when this returns True.
+    """
+    result = await db.execute(
+        select(CuentaCobro.id)
+        .where(CuentaCobro.contrato_id == contrato_id, CuentaCobro.estado.in_(_ESTADOS_ACTIVOS))
+        .limit(1)
+    )
+    return result.first() is not None
+
+
 async def limpiar_obligaciones(
     db: AsyncSession,
     usuario_id: uuid.UUID,
     contrato_id: uuid.UUID,
+    solo_ids: list[uuid.UUID] | None = None,
 ) -> int:
-    """Reset a contract's obligations: bulk-delete them all.
+    """Reset a contract's obligations: bulk-delete them all, or — when
+    ``solo_ids`` is given — only that subset.
+
+    The subset form is what the replace-time reconcile uses (see
+    ``document_service._reconcile_obligaciones``) to remove FK-safely just the
+    obligaciones the new document no longer mentions, leaving the rest (and
+    ``obligaciones_extraidas``) untouched.
 
     Nullifies FK references in actividades and removes evidence-obligation link
-    rows before deleting so no constraint violation occurs. Also clears
-    `obligaciones_extraidas` (back to None = "no extraction signal") so the
-    contrato becomes eligible for the Vincular fallback again. Returns the
-    number of deleted rows.
+    rows before deleting so no constraint violation occurs. On a full reset
+    (``solo_ids`` is None) also clears `obligaciones_extraidas` (back to None =
+    "no extraction signal") so the contrato becomes eligible for the Vincular
+    fallback again. Returns the number of deleted rows.
     """
     from app.models.actividad import Actividad
     from app.models.evidencia_obligacion import EvidenciaObligacion
 
     contrato = await _get_contrato_con_ownership(db, usuario_id, contrato_id)
 
-    ob_ids_result = await db.execute(
-        select(Obligacion.id).where(Obligacion.contrato_id == contrato_id)
-    )
+    ob_ids_query = select(Obligacion.id).where(Obligacion.contrato_id == contrato_id)
+    if solo_ids is not None:
+        ob_ids_query = ob_ids_query.where(Obligacion.id.in_(solo_ids))
+    ob_ids_result = await db.execute(ob_ids_query)
     ob_ids = [row[0] for row in ob_ids_result.all()]
 
     # Guard BEFORE any mutation: same protection contrato delete has via
@@ -357,10 +381,14 @@ async def limpiar_obligaciones(
                 "enviada, aprobada o pagada que las referencian."
             )
 
-    # After a reset there is genuinely no extraction signal anymore — None (not
-    # False) per the model's semantics, and `!== true` re-enables Vincular in
-    # the frontend gate either way.
-    contrato.obligaciones_extraidas = None
+    if solo_ids is None:
+        # After a full reset there is genuinely no extraction signal anymore —
+        # None (not False) per the model's semantics, and `!== true` re-enables
+        # Vincular in the frontend gate either way. A partial (reconcile-driven)
+        # removal must NOT touch this: the contract was just re-extracted and
+        # DID yield obligations, some of which are about to be inserted/kept by
+        # the caller.
+        contrato.obligaciones_extraidas = None
     if not ob_ids:
         await db.flush()
         return 0
@@ -371,9 +399,7 @@ async def limpiar_obligaciones(
         .values(obligacion_id=None)
     )
     await db.execute(delete(EvidenciaObligacion).where(EvidenciaObligacion.obligacion_id.in_(ob_ids)))
-    result = await db.execute(
-        delete(Obligacion).where(Obligacion.contrato_id == contrato_id)
-    )
+    result = await db.execute(delete(Obligacion).where(Obligacion.id.in_(ob_ids)))
     await db.flush()
     return result.rowcount or 0
 

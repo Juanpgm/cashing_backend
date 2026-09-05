@@ -312,6 +312,50 @@ async def _persist_obligaciones(
     return extraidas, avisos
 
 
+async def _reconcile_obligaciones(
+    extraidas: list[ObligacionExtraida],
+    contrato_id: uuid.UUID,
+    usuario_id: uuid.UUID,
+    db: AsyncSession,
+    avisos: list[str],
+) -> tuple[list[ObligacionExtraida], list[str]]:
+    """Reconcile a contract replace's obligaciones against the newly extracted
+    set instead of wiping and reinserting everything (BLOCKER B).
+
+    Matches existing obligaciones against the new extraction by normalized text
+    (``_normalize_texto``, the same key ``_persist_obligaciones`` already dedups
+    on): a row whose text still appears in the new document keeps its id — and
+    every actividad/evidencia link built on it — untouched. A row absent from
+    the new extraction is removed through an FK-safe subset delete
+    (``contrato_service.limpiar_obligaciones(..., solo_ids=...)``), never a raw
+    bulk delete. Genuinely new items are appended by ``_persist_obligaciones``.
+
+    An identical re-upload (same file, double-click, retry after a timeout)
+    therefore produces zero deletes and zero inserts — every id and every link
+    survives. The old wipe-then-reinsert path churned every id on every single
+    replace, silently orphaning every actividad/evidencia link the contractor
+    had already built on top of the previous extraction.
+    """
+    from app.services import contrato_service as _contrato_service
+
+    existing_result = await db.execute(select(Obligacion).where(Obligacion.contrato_id == contrato_id))
+    existing_obs = list(existing_result.scalars().all())
+    nuevos_norms = {_normalize_texto(item.descripcion) for item in extraidas}
+
+    ids_a_eliminar = [ob.id for ob in existing_obs if _normalize_texto(ob.descripcion) not in nuevos_norms]
+    if ids_a_eliminar:
+        eliminadas = await _contrato_service.limpiar_obligaciones(
+            db=db, usuario_id=usuario_id, contrato_id=contrato_id, solo_ids=ids_a_eliminar
+        )
+        if eliminadas:
+            avisos.append(
+                f"Se eliminaron {eliminadas} obligaciones que ya no aparecen en el nuevo contrato; "
+                "las actividades vinculadas quedaron sin obligación."
+            )
+
+    return await _persist_obligaciones(extraidas, contrato_id, db, avisos)
+
+
 async def _resolver_texto_obligaciones_archivo(
     content: bytes,
     filename: str,
@@ -1231,46 +1275,59 @@ async def upload_document(
     # yields. Wiping first and extracting after turned an unreadable or mis-scanned
     # replacement into total loss of the user's obligations.
     if tipo == TipoDocumentoFuente.CONTRATO and alcance_documento_del_contrato and contrato_id is not None:
-        ob_items: list[ObligacionExtraida] = []
-        ob_avisos: list[str] = []
-        from app.agent.tools.document_parser import is_archive_filename as _es_archivo
+        from app.services import contrato_service as _contrato_service
 
-        if multimodal_result is not None:
-            ob_items = _obligacion_items_to_extraidas(multimodal_result.obligaciones)
-        # An archive still goes through the resolver even when it yielded NO text:
-        # that is the case that most needs the aviso explaining why zero obligations
-        # came back (a zip of scans, or one whose members hit the size caps).
-        elif texto_extraido or _es_archivo(filename):
-            texto_para_obligaciones, archivo_avisos = await _resolver_texto_obligaciones_archivo(
-                content, filename, texto_extraido or "", contrato_id, db
-            )
-            avisos.extend(archivo_avisos)
-            if texto_para_obligaciones:
-                ob_items, ob_avisos = await _extraer_obligaciones(
-                    texto_para_obligaciones, contrato_id, db, persistir=False
-                )
-
-        if prev_docs and not ob_items:
-            # The document is still replaced (it IS the file the user wants stored),
-            # but its obligations could not be read — keeping the previous ones is
-            # strictly better than replacing them with nothing.
-            avisos.append("No se extrajeron obligaciones del nuevo documento; se conservaron las existentes.")
-            await logger.awarning(
-                "contrato_reemplazado_sin_obligaciones",
-                contrato_id=str(contrato_id),
-                new_nombre=filename,
+        # MAJOR 4: an active cuenta (enviada/aprobada/pagada) must not block the
+        # document replace itself, only the destructive part — reconciling
+        # obligaciones — is skipped. Extraction never even runs: there would be
+        # nothing safe to reconcile against, and every actividad/evidencia link
+        # built on the existing obligaciones must survive untouched.
+        cuenta_activa = bool(prev_docs) and await _contrato_service.tiene_cuenta_activa(db, contrato_id)
+        if cuenta_activa:
+            avisos.append(
+                "El contrato tiene cuentas de cobro enviadas; se conservaron las obligaciones existentes."
             )
         else:
-            if prev_docs:
-                # FK-safe wipe + active-cuenta guard, in the same transaction as the
-                # new obligations. `_persist_obligaciones` only APPENDS (dedup by
-                # normalized text), so without this the replaced document's
-                # obligations survived every subsequent replace and accumulated.
-                from app.services import contrato_service as _contrato_service
+            ob_items: list[ObligacionExtraida] = []
+            ob_avisos: list[str] = []
+            from app.agent.tools.document_parser import is_archive_filename as _es_archivo
 
-                await _contrato_service.limpiar_obligaciones(db=db, usuario_id=user_id, contrato_id=contrato_id)
-            obligaciones_extraidas, ob_avisos = await _persist_obligaciones(ob_items, contrato_id, db, ob_avisos)
-        avisos.extend(ob_avisos)
+            if multimodal_result is not None:
+                ob_items = _obligacion_items_to_extraidas(multimodal_result.obligaciones)
+            # An archive still goes through the resolver even when it yielded NO text:
+            # that is the case that most needs the aviso explaining why zero obligations
+            # came back (a zip of scans, or one whose members hit the size caps).
+            elif texto_extraido or _es_archivo(filename):
+                texto_para_obligaciones, archivo_avisos = await _resolver_texto_obligaciones_archivo(
+                    content, filename, texto_extraido or "", contrato_id, db
+                )
+                avisos.extend(archivo_avisos)
+                if texto_para_obligaciones:
+                    ob_items, ob_avisos = await _extraer_obligaciones(
+                        texto_para_obligaciones, contrato_id, db, persistir=False
+                    )
+
+            if prev_docs and not ob_items:
+                # The document is still replaced (it IS the file the user wants stored),
+                # but its obligations could not be read — keeping the previous ones is
+                # strictly better than replacing them with nothing.
+                avisos.append("No se extrajeron obligaciones del nuevo documento; se conservaron las existentes.")
+                await logger.awarning(
+                    "contrato_reemplazado_sin_obligaciones",
+                    contrato_id=str(contrato_id),
+                    new_nombre=filename,
+                )
+            elif prev_docs:
+                # Reconcile against the new extraction instead of wipe-and-reinsert
+                # (BLOCKER B): obligaciones whose normalized text still appears in
+                # the new document keep their id — and every actividad/evidencia
+                # link built on it — untouched.
+                obligaciones_extraidas, ob_avisos = await _reconcile_obligaciones(
+                    ob_items, contrato_id, user_id, db, ob_avisos
+                )
+            else:
+                obligaciones_extraidas, ob_avisos = await _persist_obligaciones(ob_items, contrato_id, db, ob_avisos)
+            avisos.extend(ob_avisos)
 
     # ── Replace the previous contract document ───────────────────────────────────
     # Deferred all the way down here on purpose: the content-based tipo corrector and
