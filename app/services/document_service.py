@@ -11,7 +11,7 @@ from decimal import Decimal, InvalidOperation
 
 import structlog
 from pydantic import ValidationError
-from sqlalchemy import delete, or_, select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -893,12 +893,6 @@ async def upload_document(
             )
         )
         prev_docs = list(prev_result.scalars().all())
-        for prev_doc in prev_docs:
-            # Best-effort delete of the old file; a storage miss must not block
-            # replacing the DB record (the new upload is the source of truth).
-            with contextlib.suppress(Exception):
-                await _get_storage(settings.S3_BUCKET_DOCUMENTOS).delete(prev_doc.storage_key)
-            await db.delete(prev_doc)
         if prev_docs:
             contrato_documento_reemplazado = True
             # B4: `_persist_obligaciones` only APPENDS (dedup by normalized text),
@@ -906,10 +900,29 @@ async def upload_document(
             # replace and kept accumulating. The replaced document's text is gone
             # (or about to be superseded) — its obligations are no longer backed
             # by anything the user can see, so clear them in the SAME transaction
-            # as the replace. Always clear, even if the new extraction below ends
-            # up yielding 0 items (logged as a warning there) — per design, a
-            # contract with no readable obligations must show none, not stale ones.
-            await db.execute(delete(Obligacion).where(Obligacion.contrato_id == contrato_id))
+            # as the replace.
+            #
+            # The wipe MUST go through `contrato_service.limpiar_obligaciones`, not
+            # a raw `delete(Obligacion)`: neither `actividades.obligacion_id` nor
+            # `evidencia_obligacion.obligacion_id` declares an `ondelete`, so on
+            # Postgres the raw delete raised ForeignKeyViolation → 500. SQLite test
+            # runs never caught it because the test DB runs with
+            # `PRAGMA foreign_keys=OFF`. `limpiar_obligaciones` nulls the actividad
+            # references and removes the evidencia links first.
+            #
+            # It also runs the active-cuenta guard (enviada/aprobada/pagada), and it
+            # runs BEFORE the old file is removed from storage: that deletion is
+            # non-transactional, so a guard raising afterwards would leave the
+            # contract PDF permanently gone while the DB rolled back.
+            from app.services import contrato_service as _contrato_service
+
+            await _contrato_service.limpiar_obligaciones(db=db, usuario_id=user_id, contrato_id=contrato_id)
+            for prev_doc in prev_docs:
+                # Best-effort delete of the old file; a storage miss must not block
+                # replacing the DB record (the new upload is the source of truth).
+                with contextlib.suppress(Exception):
+                    await _get_storage(settings.S3_BUCKET_DOCUMENTOS).delete(prev_doc.storage_key)
+                await db.delete(prev_doc)
             await db.flush()
             await logger.ainfo(
                 "contrato_documento_replaced",
