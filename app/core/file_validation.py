@@ -18,6 +18,21 @@ ALLOWED_MIME_TYPES: dict[str, list[str]] = {
 
 MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10MB
 
+
+def formatos_aceptados() -> str:
+    """Accepted extensions as user-facing copy, e.g. ``"DOCX, JPG, PDF, …"``.
+
+    Derived from ``ALLOWED_MIME_TYPES`` so the message the user reads can never
+    drift from what the validator actually accepts.
+    """
+    extensiones = {ext.lstrip(".").upper() for exts in ALLOWED_MIME_TYPES.values() for ext in exts}
+    return ", ".join(sorted(extensiones))
+
+
+def tamano_maximo_legible() -> str:
+    """``MAX_FILE_SIZE_BYTES`` as user-facing copy, e.g. ``"10 MB"``."""
+    return f"{MAX_FILE_SIZE_BYTES // (1024 * 1024)} MB"
+
 # Safe filename pattern: alphanumeric, hyphens, underscores, dots
 SAFE_FILENAME_RE = re.compile(r"^[a-zA-Z0-9_\-][a-zA-Z0-9_\-\.]*$")
 

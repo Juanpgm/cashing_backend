@@ -138,7 +138,7 @@ class TestUploadBatchRealFilename:
             )
 
         assert r.status_code == 201, r.text
-        assert "File type not allowed" not in r.text
+        assert "Tipo de archivo no permitido" not in r.text
 
     async def test_control_same_pdf_without_double_dot_succeeds(
         self, client: AsyncClient, db: AsyncSession, test_user: dict[str, Any]
