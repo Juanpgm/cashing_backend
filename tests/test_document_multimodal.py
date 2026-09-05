@@ -76,6 +76,8 @@ class TestHybridMultimodalFallback:
                 content_type="application/pdf",
                 tipo="contrato",
                 contrato_id=None,
+                # B3: an upload is the contract only when it declares requisito_codigo=CONTRATO
+                requisito_codigo="CONTRATO",
             )
 
         assert result.contrato_id is not None
@@ -108,6 +110,8 @@ class TestHybridMultimodalFallback:
                 content_type="image/jpeg",
                 tipo="contrato",
                 contrato_id=None,
+                # B3: an upload is the contract only when it declares requisito_codigo=CONTRATO
+                requisito_codigo="CONTRATO",
             )
 
         mock_mm.assert_awaited_once()
@@ -165,6 +169,8 @@ class TestHybridMultimodalFallback:
                 content_type="application/pdf",
                 tipo="contrato",
                 contrato_id=None,
+                # B3: an upload is the contract only when it declares requisito_codigo=CONTRATO
+                requisito_codigo="CONTRATO",
             )
 
         mock_multimodal.assert_not_awaited()
