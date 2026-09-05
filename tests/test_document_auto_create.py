@@ -334,6 +334,8 @@ class TestUploadDocumentAutoCreate:
                 content_type="application/pdf",
                 tipo="contrato",
                 contrato_id=None,
+                # B3: an upload is the contract only when it declares requisito_codigo=CONTRATO
+                requisito_codigo="CONTRATO",
             )
 
         assert result.contrato_id is not None
@@ -412,6 +414,8 @@ class TestUploadDocumentAutoCreate:
                 content_type="application/pdf",
                 tipo="contrato",
                 contrato_id=None,
+                # B3: an upload is the contract only when it declares requisito_codigo=CONTRATO
+                requisito_codigo="CONTRATO",
             )
 
         assert result.contrato_creado is not None
@@ -488,6 +492,8 @@ class TestUploadDocumentAutoCreate:
                 content_type="application/pdf",
                 tipo="contrato",
                 contrato_id=None,
+                # B3: an upload is the contract only when it declares requisito_codigo=CONTRATO
+                requisito_codigo="CONTRATO",
             )
 
         assert result.contrato_id is not None
@@ -547,6 +553,8 @@ class TestUploadDocumentAutoCreate:
                 content_type="application/pdf",
                 tipo="contrato",
                 contrato_id=contrato.id,
+                # B3: an upload is the contract only when it declares requisito_codigo=CONTRATO
+                requisito_codigo="CONTRATO",
             )
 
         assert result.contrato_id == contrato.id
@@ -623,6 +631,8 @@ class TestUploadDocumentAutoCreate:
                     content_type="application/pdf",
                     tipo="contrato",
                     contrato_id=None,
+                    # B3: an upload is the contract only when it declares requisito_codigo=CONTRATO
+                    requisito_codigo="CONTRATO",
                 )
 
         # 1) First upload auto-creates contrato A.
