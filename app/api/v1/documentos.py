@@ -13,7 +13,7 @@ from app.core.file_validation import (
     validate_file_size,
     validate_mime_type,
 )
-from app.core.rate_limit import limiter
+from app.core.rate_limit import limiter, upload_rate_limit_key
 from app.models.documento_fuente import TipoDocumentoFuente
 from app.schemas.agent import DocumentProcessRequest, DocumentProcessResponse, DocumentUploadResponse
 from app.schemas.checklist import CategoriaUpdateBody
@@ -59,7 +59,7 @@ def _resolver_tipo(tipo: TipoDocumentoFuente | None, cuenta_cobro_id: uuid.UUID 
 
 
 @router.post("/upload", response_model=DocumentUploadResponse, status_code=201)
-@limiter.limit("10/minute")
+@limiter.limit("10/minute", key_func=upload_rate_limit_key)
 async def upload_document(
     request: Request,
     file: UploadFile,
@@ -195,7 +195,7 @@ async def listar_documentos_contrato(
 
 
 @router.post("/upload-batch", response_model=list[DocumentUploadResponse], status_code=201)
-@limiter.limit("10/minute")
+@limiter.limit("10/minute", key_func=upload_rate_limit_key)
 async def upload_documents_batch(
     request: Request,
     user: CurrentUser,
