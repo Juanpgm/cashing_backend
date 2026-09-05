@@ -687,17 +687,19 @@ def extract_obligaciones_verbatim(texto: str) -> list[ObligacionExtraida]:
 
     Candidates are scored rather than taking the first match, in this order:
 
-      1. A tier-1 heading (OBLIGACIONES/ACTIVIDADES ESPECÍFICAS) beats tier-2
-         outright. Tier is the strongest signal the text gives us, and item
-         count used to outrank it: a tier-2 "OBLIGACIONES DEL CONTRATISTA"
-         clause listing 12 general duties beat the real 5-item ESPECÍFICAS
-         enumeration, so general duties were stored as specific obligations.
+      1. A tier-1 heading (OBLIGACIONES/ACTIVIDADES ESPECÍFICAS) with AT LEAST
+         TWO items beats tier-2 outright. Tier is the strongest signal the
+         text gives us, and item count used to outrank it: a tier-2
+         "OBLIGACIONES DEL CONTRATISTA" clause listing 12 general duties beat
+         the real 5-item ESPECÍFICAS enumeration, so general duties were
+         stored as specific obligations. The >=2 guard exists because a
+         PARÁGRAFO that merely MENTIONS "obligaciones específicas" in prose
+         and closes with a single catch-all item is tier-1 by keyword match
+         alone but is not a real enumeration; without the guard that 1-item
+         block beat the real 12-item tier-2 list, reintroducing the same
+         class of bug this scoring was meant to fix.
       2. A section closing with the catch-all beats one that doesn't.
-      3. Among further ties, the one with the most items wins — a 1-item
-         candidate never beats a >=2-item one just because it appears first
-         (a PARÁGRAFO merely mentioning "obligaciones específicas" and closing
-         with a single catch-all bullet used to beat the real 5-item list that
-         follows it).
+      3. Among further ties, the one with the most items wins.
 
     The first candidate found keeps a tie (stable, matches the original
     position/tier-1-first preference).
@@ -726,7 +728,7 @@ def extract_obligaciones_verbatim(texto: str) -> list[ObligacionExtraida]:
         if not items:
             continue
         score = (
-            1 if tier == 1 else 0,  # an explicit "ESPECÍFICAS" heading wins outright
+            1 if tier == 1 and len(items) >= 2 else 0,  # a real ESPECÍFICAS enumeration wins outright
             1 if _is_catch_all(items[-1][1]) else 0,  # closes with the catch-all
             len(items),  # most items
         )

@@ -72,3 +72,37 @@ class TestTierBeatsItemCount:
         assert not any("lealtad y buena fe" in d for d in descripciones), (
             f"general duties leaked into the specific obligations: {descripciones}"
         )
+
+
+# Counter-example from the round-2 review (engram obs #492): a PARÁGRAFO merely
+# MENTIONING "obligaciones específicas" in prose and closing with a single
+# catch-all item is tier-1 by keyword match alone, but it is not a real
+# enumeration. Scoring tier ahead of everything else let this 1-item tier-1
+# block beat the real 12-item tier-2 "OBLIGACIONES DEL CONTRATISTA" list.
+TEXTO_PARAGRAFO_MENCION = f"""
+CONTRATO DE PRESTACIÓN DE SERVICIOS PROFESIONALES Nº 2025-0789
+
+CLÁUSULA PRIMERA — OBJETO: desarrollo del sistema de información.
+
+CLÁUSULA SEGUNDA — PARÁGRAFO: para los efectos de este contrato,
+las obligaciones específicas del contratista consisten en lo siguiente:
+
+1. Cumplir con las demás actividades inherentes al objeto contractual.
+
+CLÁUSULA TERCERA — OBLIGACIONES DEL CONTRATISTA:
+
+{_enumerar(_GENERALES)}
+
+CLÁUSULA CUARTA — VALOR DEL CONTRATO: dieciocho millones de pesos.
+"""
+
+
+class TestTier1NeedsAtLeastTwoItemsToOutrankTier2:
+    def test_single_item_tier1_paragrafo_does_not_beat_real_tier2_list(self) -> None:
+        obligaciones = extract_obligaciones_verbatim(TEXTO_PARAGRAFO_MENCION)
+
+        descripciones = [o.descripcion for o in obligaciones]
+        assert len(descripciones) == len(_GENERALES), (
+            f"expected the real tier-2 12-item list, got {len(descripciones)} items: {descripciones}"
+        )
+        assert descripciones[0].startswith("Cumplir con el objeto"), descripciones
