@@ -32,6 +32,11 @@ CUOTA_NUMERO_CONFLICT = "CUOTA_NUMERO_CONFLICT"
 # A cuenta de cobro already exists for the same (contrato, mes, anio) — lets the
 # frontend show a friendly Spanish message instead of the raw English `detail`.
 CUENTA_MES_DUPLICADA = "CUENTA_MES_DUPLICADA"
+# The document itself was persisted, but linking it to its checklist requisito
+# failed. Distinct from a plain upload failure: the client must not assume the
+# file is lost — re-uploading the same content repairs the link (see
+# document_service.upload_document's content-hash dedup fast path).
+CHECKLIST_LINK_FAILED = "CHECKLIST_LINK_FAILED"
 
 
 class DomainError(Exception):
@@ -110,6 +115,19 @@ class ExternalServiceError(DomainError):
         super().__init__(f"{service}: {detail}", code=code)
 
 
+class ChecklistLinkError(DomainError):
+    """The document was uploaded and persisted, but linking it to a checklist
+    requisito failed. Re-uploading the same file content re-attempts the link
+    (see the content-hash dedup fast path in document_service.upload_document)."""
+
+    def __init__(self, requisito_codigo: str, reason: str) -> None:
+        detail = (
+            f"El archivo se guardó correctamente pero no pudo vincularse al requisito "
+            f"'{requisito_codigo}': {reason}. Volvé a subir el mismo archivo para reintentar la vinculación."
+        )
+        super().__init__(detail, code=CHECKLIST_LINK_FAILED)
+
+
 # --- HTTP Exception mapping ---
 
 EXCEPTION_STATUS_MAP: dict[type[DomainError], int] = {
@@ -122,6 +140,7 @@ EXCEPTION_STATUS_MAP: dict[type[DomainError], int] = {
     RateLimitExceededError: status.HTTP_429_TOO_MANY_REQUESTS,
     ExternalServiceError: status.HTTP_502_BAD_GATEWAY,
     InviteRequiredError: status.HTTP_403_FORBIDDEN,
+    ChecklistLinkError: status.HTTP_502_BAD_GATEWAY,
 }
 
 
