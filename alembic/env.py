@@ -18,7 +18,6 @@ from app.models import (  # noqa: F401
     documento_fuente,
     evidencia,
     google_token,
-    integracion,
     obligacion,
     pago,
     plantilla,
@@ -49,13 +48,14 @@ def run_migrations_offline() -> None:
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
+        version_table_column_length=64,
     )
     with context.begin_transaction():
         context.run_migrations()
 
 
 def do_run_migrations(connection) -> None:  # type: ignore[no-untyped-def]
-    context.configure(connection=connection, target_metadata=target_metadata)
+    context.configure(connection=connection, target_metadata=target_metadata, version_table_column_length=64)
     with context.begin_transaction():
         context.run_migrations()
 

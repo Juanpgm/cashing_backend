@@ -26,6 +26,23 @@ depends_on = None
 
 
 def upgrade() -> None:
+    # `alembic_version.version_num` defaults to VARCHAR(32) — this revision's own
+    # id is 34 chars, so on any database whose alembic_version table was created
+    # with the stock width (never widened before now), the version bump that
+    # Alembic runs right after this function returns would fail with "value too
+    # long for type character varying(32)". Widen it first, once, here — the
+    # earliest point in the chain this project has organically reached where a
+    # too-long id is about to be written (005/018/020 are longer still but sit
+    # before this environment's starting point and were never actually replayed
+    # through Alembic — see the alembic-chain-broken finding in project memory).
+    # Safe/idempotent: widening a varchar never truncates existing data, and this
+    # runs regardless of dialect (SQLite ignores column length constraints, so it
+    # only matters for Postgres — but this migration only touches Postgres real
+    # environments in practice, and running it there is what fixes them).
+    bind = op.get_bind()
+    if bind.dialect.name == "postgresql":
+        op.execute("ALTER TABLE alembic_version ALTER COLUMN version_num TYPE VARCHAR(64)")
+
     op.add_column("cuentas_cobro", sa.Column("fecha_transaccion", sa.Date(), nullable=True))
 
 
