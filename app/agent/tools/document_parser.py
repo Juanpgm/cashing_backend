@@ -275,6 +275,26 @@ def iter_archive_members(content: bytes, filename: str) -> Iterator[tuple[str, b
         yield name, data
 
 
+def extract_archive_member_texts(content: bytes, filename: str) -> list[tuple[str, str]]:
+    """Yield `(member_name, text)` for each archive member with usable text,
+    WITHOUT concatenating them.
+
+    Same iteration (`iter_archive_members`, same caps) and per-format dispatch
+    (`_extract_member`) as `parse_archive` — but callers that need to pick ONE
+    member instead of reading every member's text as a single blob (e.g.
+    obligation extraction matching a member to a specific contract, B6) get
+    the members separately, unprefixed. Does not change `parse_archive`'s own
+    concatenation behavior for its existing callers (generic text preview/OCR
+    fallback).
+    """
+    resultados: list[tuple[str, str]] = []
+    for name, data in iter_archive_members(content, filename):
+        texto = _extract_member(name, data)
+        if texto.strip():
+            resultados.append((name, texto.strip()))
+    return resultados
+
+
 def parse_archive(content: bytes, filename: str) -> str:
     """Expand a zip/tar/gz/rar archive and concatenate the text of its members.
 
