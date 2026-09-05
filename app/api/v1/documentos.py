@@ -9,6 +9,8 @@ from app.api.deps import CurrentUser
 from app.core.database import get_db
 from app.core.exceptions import ChecklistLinkError, ValidationError
 from app.core.file_validation import (
+    formatos_aceptados,
+    tamano_maximo_legible,
     validate_file_extension,
     validate_file_size,
     validate_mime_type,
@@ -133,22 +135,27 @@ async def upload_document(
 
     4. Verificar: `GET /contratos/{id}/configuracion`
     """
+    # User-facing copy: the frontend renders `detail` verbatim, and this is a
+    # Spanish-only product. The accepted-format list is derived from the validator's
+    # own allowlist so the two can never drift apart.
     if not file.filename:
-        raise ValidationError("Filename is required")
+        raise ValidationError("Se requiere el nombre del archivo.")
 
     if not validate_file_extension(file.filename):
-        raise ValidationError(f"File type not allowed: {file.filename}")
+        raise ValidationError(
+            f"Tipo de archivo no permitido: {file.filename}. Formatos aceptados: {formatos_aceptados()}."
+        )
 
     content = await file.read()
 
     if len(content) == 0:
-        raise ValidationError(f"File '{file.filename}' is empty.")
+        raise ValidationError(f"El archivo '{file.filename}' está vacío.")
 
     if not validate_file_size(len(content)):
-        raise ValidationError("File exceeds maximum size of 10MB")
+        raise ValidationError(f"El archivo '{file.filename}' supera el máximo de {tamano_maximo_legible()}.")
 
     if file.content_type and not validate_mime_type(content, file.content_type):
-        raise ValidationError(f"Invalid MIME type: {file.content_type}")
+        raise ValidationError(f"El contenido de '{file.filename}' no coincide con su extensión.")
 
     return await document_service.upload_document(
         db=db,
@@ -244,7 +251,7 @@ async def upload_documents_batch(
     de nombres del backend.
     """
     if len(files) > MAX_BATCH_SIZE:
-        raise ValidationError(f"Batch exceeds maximum of {MAX_BATCH_SIZE} files.")
+        raise ValidationError(f"El lote supera el máximo de {MAX_BATCH_SIZE} archivos.")
 
     tipo_efectivo = _resolver_tipo(tipo, cuenta_cobro_id)
 
@@ -256,21 +263,23 @@ async def upload_documents_batch(
     payloads: list[tuple[UploadFile, bytes]] = []
     for file in files:
         if not file.filename:
-            raise ValidationError("All files must have a filename.")
+            raise ValidationError("Todos los archivos deben tener nombre.")
 
         if not validate_file_extension(file.filename):
-            raise ValidationError(f"File type not allowed: {file.filename}")
+            raise ValidationError(
+                f"Tipo de archivo no permitido: {file.filename}. Formatos aceptados: {formatos_aceptados()}."
+            )
 
         content = await file.read()
 
         if len(content) == 0:
-            raise ValidationError(f"File '{file.filename}' is empty.")
+            raise ValidationError(f"El archivo '{file.filename}' está vacío.")
 
         if not validate_file_size(len(content)):
-            raise ValidationError(f"File '{file.filename}' exceeds maximum size of 10 MB.")
+            raise ValidationError(f"El archivo '{file.filename}' supera el máximo de {tamano_maximo_legible()}.")
 
         if file.content_type and not validate_mime_type(content, file.content_type):
-            raise ValidationError(f"Invalid MIME type for '{file.filename}': {file.content_type}")
+            raise ValidationError(f"El contenido de '{file.filename}' no coincide con su extensión.")
 
         payloads.append((file, content))
 

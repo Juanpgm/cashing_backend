@@ -17,6 +17,8 @@ from app.api.deps import CurrentUser
 from app.core.database import get_db
 from app.core.exceptions import ValidationError
 from app.core.file_validation import (
+    formatos_aceptados,
+    tamano_maximo_legible,
     validate_file_extension,
     validate_file_size,
     validate_mime_type,
@@ -72,16 +74,21 @@ async def inferir_desde_archivo(
     """
     await cuenta_cobro_service._get_cuenta_con_ownership(db, user.id, cuenta_id)
 
+    # Same user-facing copy as /documentos/upload — this dropzone shares the flow.
     if not file.filename:
-        raise ValidationError("Filename is required")
+        raise ValidationError("Se requiere el nombre del archivo.")
     if not validate_file_extension(file.filename):
-        raise ValidationError(f"File type not allowed: {file.filename}")
+        raise ValidationError(
+            f"Tipo de archivo no permitido: {file.filename}. Formatos aceptados: {formatos_aceptados()}."
+        )
 
     content = await file.read()
+    if len(content) == 0:
+        raise ValidationError(f"El archivo '{file.filename}' está vacío.")
     if not validate_file_size(len(content)):
-        raise ValidationError("File exceeds maximum size of 10MB")
+        raise ValidationError(f"El archivo '{file.filename}' supera el máximo de {tamano_maximo_legible()}.")
     if file.content_type and not validate_mime_type(content, file.content_type):
-        raise ValidationError(f"Invalid MIME type: {file.content_type}")
+        raise ValidationError(f"El contenido de '{file.filename}' no coincide con su extensión.")
 
     preview = await requisito_inference_service.inferir_requisitos_desde_archivo(
         db,

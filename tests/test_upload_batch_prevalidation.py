@@ -134,8 +134,8 @@ class TestBatchPreValidatesBeforePersisting:
             )
 
         assert r.status_code == 422, r.text
-        assert "exceeds maximum size" not in r.text
-        assert "empty" in r.text.lower() or "vac" in r.text.lower()
+        assert "supera el máximo" not in r.text, "a 0-byte file is not an oversized file"
+        assert "está vacío" in r.json()["detail"], r.text
 
     async def test_valid_batch_still_persists_all_files(
         self, client: AsyncClient, db: AsyncSession, test_user: dict[str, Any]
@@ -191,5 +191,5 @@ class TestSingleUploadEmptyFileMessage:
             )
 
         assert r.status_code == 422, r.text
-        assert "exceeds maximum size" not in r.text
-        assert "empty" in r.text.lower() or "vac" in r.text.lower()
+        assert "supera el máximo" not in r.text, "a 0-byte file is not an oversized file"
+        assert "está vacío" in r.json()["detail"], r.text
