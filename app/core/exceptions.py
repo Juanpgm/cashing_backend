@@ -140,6 +140,27 @@ class ChecklistLinkError(DomainError):
         super().__init__(detail, code=CHECKLIST_LINK_FAILED)
 
 
+_ATRIBUTO_DOCUMENTO_PERSISTIDO = "_documento_persistido"
+
+
+def marcar_documento_persistido(exc: DomainError) -> None:
+    """Flag a `DomainError` raised AFTER the document was already committed.
+
+    `document_service.upload_document` commits the document and only then
+    attempts the checklist link, so a `DomainError` escaping that block (a
+    `ChecklistLinkError` or any other, e.g. a `ValidationError` from
+    `vincular_documento_fuente`) belongs to a file that IS saved. Batch callers
+    must classify it as unlinked, never as "no se guardó" — the difference
+    decides whether the user retries the upload or only the link.
+    """
+    setattr(exc, _ATRIBUTO_DOCUMENTO_PERSISTIDO, True)
+
+
+def documento_fue_persistido(exc: BaseException) -> bool:
+    """Whether `exc` was flagged by `marcar_documento_persistido`."""
+    return bool(getattr(exc, _ATRIBUTO_DOCUMENTO_PERSISTIDO, False))
+
+
 # --- HTTP Exception mapping ---
 
 EXCEPTION_STATUS_MAP: dict[type[DomainError], int] = {

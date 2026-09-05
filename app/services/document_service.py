@@ -42,7 +42,12 @@ from app.agent.tools.multimodal_parser import (
 from app.agent.tools.ocr import extract_text as ocr_extract_text
 from app.agent.tools.ocr import ocr_available
 from app.core.config import settings
-from app.core.exceptions import ChecklistLinkError, DomainError, NotFoundError
+from app.core.exceptions import (
+    ChecklistLinkError,
+    DomainError,
+    NotFoundError,
+    marcar_documento_persistido,
+)
 from app.core.file_validation import get_safe_filename
 from app.core.text_match import normalize as _normalize_texto
 from app.models.categoria_documento import CategoriaDocumento
@@ -1108,7 +1113,10 @@ async def upload_document(
                     documento_fuente_id=existing_doc.id,
                 )
                 await db.commit()
-            except DomainError:
+            except DomainError as exc:
+                # Dedup fast path: the document was persisted by an EARLIER upload,
+                # so this failure is a link failure too. See `marcar_documento_persistido`.
+                marcar_documento_persistido(exc)
                 raise
             except Exception as exc:
                 raise ChecklistLinkError(requisito_codigo, str(exc)[:200]) from exc
@@ -1469,10 +1477,13 @@ async def upload_document(
                 documento_fuente_id=doc.id,
             )
             await db.commit()
-        except DomainError:
+        except DomainError as exc:
             # The document above is already committed — only the link failed.
             # Propagate so the client sees WHY (e.g. a missing checklist row)
-            # instead of a false 201 while the requisito stays Pendiente.
+            # instead of a false 201 while the requisito stays Pendiente. Mark it
+            # so a batch caller classifies this file as persisted-but-unlinked
+            # rather than never-saved (see `marcar_documento_persistido`).
+            marcar_documento_persistido(exc)
             await logger.awarning(
                 "checklist_link_failed",
                 doc_id=str(doc.id),

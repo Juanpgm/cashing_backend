@@ -353,3 +353,96 @@ class TestResultsCarryTheOriginalFilename:
         assert len(cuerpo) == len(nombres), cuerpo
         assert [item["nombre_original"] for item in cuerpo] == nombres, cuerpo
         assert cuerpo[0]["nombre"] != nombres[0], "precondition: the stored name is sanitized"
+
+
+def _falla_el_enlace_con_domain_error_en(indices: set[int]):  # type: ignore[no-untyped-def]
+    """Patch context whose Nth (1-based) checklist link attempt raises a
+    ``DomainError`` that is NOT a ``ChecklistLinkError``.
+
+    `upload_document` commits the document BEFORE attempting the link and
+    re-raises a `DomainError` from that block untouched, so the file IS
+    persisted — the batch endpoint must classify it as unlinked, never as
+    "no se guardó".
+    """
+    from app.core.exceptions import ValidationError as _ValidationError
+    from app.services import checklist_service
+
+    real = checklist_service.vincular_documento_fuente
+    contador = {"n": 0}
+
+    async def _flaky(**kwargs: Any) -> Any:
+        contador["n"] += 1
+        if contador["n"] in indices:
+            raise _ValidationError("el requisito no admite este documento")
+        return await real(**kwargs)
+
+    return patch.object(checklist_service, "vincular_documento_fuente", _flaky)
+
+
+class TestMixedFailureFilenamesAreNotReverseEngineered:
+    """MAJOR 3 (round-3 review obs #495): the unsaved group was rebuilt from the
+    error STRING (`err.split(':', 1)[0]` over `f"{filename}: {exc}"`), which
+    truncates any filename containing a colon. The frontend marks every file NOT
+    named in `detail` as done, so a never-persisted file was shown as uploaded."""
+
+    async def test_unsaved_filename_containing_a_colon_is_named_in_full(
+        self, client: AsyncClient, db: AsyncSession, test_user: dict[str, Any]
+    ) -> None:
+        cuenta = await _crear_cuenta(db, test_user["user"].id)
+
+        with (
+            patch(_PATCH_S3, return_value=_falla_el_storage_en({3})),
+            patch(_PATCH_OBLIGACIONES, new=AsyncMock(return_value=([], []))),
+            _falla_el_enlace_en({2}),
+        ):
+            r = await client.post(
+                _ENDPOINT,
+                headers=test_user["headers"],
+                params=_params(cuenta),
+                files=[
+                    ("files", _archivo("soporte-1.pdf", 1)),
+                    ("files", _archivo("soporte-2.pdf", 2)),
+                    ("files", _archivo("reporte:final.pdf", 3)),
+                ],
+            )
+
+        assert r.status_code == 502, r.text
+        detalle = r.json()["detail"]
+        assert "'reporte:final.pdf'" in detalle, (
+            f"the unsaved file must be named with its FULL original filename: {detalle}"
+        )
+        assert "'reporte'" not in detalle, f"the name must not be truncated at the colon: {detalle}"
+
+    async def test_domain_error_after_the_commit_is_reported_as_unlinked_not_unsaved(
+        self, client: AsyncClient, db: AsyncSession, test_user: dict[str, Any]
+    ) -> None:
+        """`upload_document` commits the document, THEN links. A non-
+        `ChecklistLinkError` `DomainError` from the link block therefore belongs
+        to a file that IS on disk and in the DB — reporting "No se guardaron"
+        for it is a lie, and a 422 hides that a retry would only need to relink."""
+        cuenta = await _crear_cuenta(db, test_user["user"].id)
+
+        with (
+            patch(_PATCH_S3) as mock_storage_cls,
+            patch(_PATCH_OBLIGACIONES, new=AsyncMock(return_value=([], []))),
+            _falla_el_enlace_con_domain_error_en({1}),
+        ):
+            mock_storage_cls.return_value = _mock_storage()
+            r = await client.post(
+                _ENDPOINT,
+                headers=test_user["headers"],
+                params=_params(cuenta),
+                files=[("files", _archivo("soporte-1.pdf", 1))],
+            )
+
+        assert r.status_code == 502, r.text
+        cuerpo = r.json()
+        assert cuerpo["code"] == "CHECKLIST_LINK_FAILED", cuerpo
+        detalle = cuerpo["detail"]
+        assert "'soporte-1.pdf'" in detalle, detalle
+        assert "No se guardaron" not in detalle, f"the file WAS saved: {detalle}"
+
+        docs = await _documentos(db)
+        assert [d.nombre for d in docs] == ["soporte-1.pdf"], (
+            f"precondition: the document is committed before the link is attempted: {docs}"
+        )
