@@ -66,6 +66,14 @@ async def _crear_cuenta(db: AsyncSession, user_id: uuid.UUID) -> CuentaCobro:
     db.add(cuenta)
     await db.commit()
     await db.refresh(cuenta)
+
+    # Seed the checklist rows the real cuenta-creation flow always creates (A3:
+    # upload_document now propagates a failed checklist link instead of
+    # swallowing it).
+    from app.services import checklist_service
+
+    await checklist_service.asegurar_checklist(db, cuenta)
+    await db.commit()
     return cuenta
 
 

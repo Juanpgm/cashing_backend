@@ -78,6 +78,15 @@ async def _crear_cuenta(db: AsyncSession, contrato: Contrato, mes: int = 1) -> C
     db.add(cuenta)
     await db.commit()
     await db.refresh(cuenta)
+
+    # Seed the checklist rows the real cuenta-creation flow always creates (A3:
+    # upload_document now propagates a failed checklist link instead of
+    # swallowing it, so tests that upload against a requisito_codigo need the
+    # matching DocumentoCuentaCobro row to exist, exactly as production does).
+    from app.services import checklist_service
+
+    await checklist_service.asegurar_checklist(db, cuenta)
+    await db.commit()
     return cuenta
 
 

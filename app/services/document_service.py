@@ -42,7 +42,7 @@ from app.agent.tools.multimodal_parser import (
 from app.agent.tools.ocr import extract_text as ocr_extract_text
 from app.agent.tools.ocr import ocr_available
 from app.core.config import settings
-from app.core.exceptions import NotFoundError
+from app.core.exceptions import ChecklistLinkError, DomainError, NotFoundError
 from app.core.file_validation import get_safe_filename
 from app.core.text_match import normalize as _normalize_texto
 from app.models.categoria_documento import CategoriaDocumento
@@ -898,6 +898,29 @@ async def upload_document(
                 f"El archivo '{filename}' ya estaba cargado. Se retorna el documento existente. "
                 "Si querés reemplazarlo, eliminá el documento anterior y subí el nuevo."
             )
+
+        # A3 retry-repair: the previous upload of this exact content may have
+        # persisted the document but failed to link it to the checklist requisito
+        # (see the fresh-upload link block below). vincular_documento_fuente is
+        # idempotent, so re-attempting here on every dedup hit is safe and lets a
+        # simple re-upload of the same file ("Reintentar" in the UI) repair a
+        # missing/incomplete vinculo instead of silently short-circuiting.
+        if cuenta_cobro_id is not None and requisito_codigo is not None:
+            from app.services import checklist_service
+
+            try:
+                await checklist_service.vincular_documento_fuente(
+                    db=db,
+                    cuenta_id=cuenta_cobro_id,
+                    requisito_codigo=requisito_codigo,
+                    documento_fuente_id=existing_doc.id,
+                )
+                await db.commit()
+            except DomainError:
+                raise
+            except Exception as exc:
+                raise ChecklistLinkError(requisito_codigo, str(exc)[:200]) from exc
+
         return DocumentUploadResponse(
             id=existing_doc.id,
             nombre=existing_doc.nombre,
@@ -1168,6 +1191,17 @@ async def upload_document(
                 documento_fuente_id=doc.id,
             )
             await db.commit()
+        except DomainError:
+            # The document above is already committed — only the link failed.
+            # Propagate so the client sees WHY (e.g. a missing checklist row)
+            # instead of a false 201 while the requisito stays Pendiente.
+            await logger.awarning(
+                "checklist_link_failed",
+                doc_id=str(doc.id),
+                cuenta_cobro_id=str(cuenta_cobro_id),
+                requisito_codigo=requisito_codigo,
+            )
+            raise
         except Exception as exc:
             await logger.awarning(
                 "checklist_link_failed",
@@ -1176,6 +1210,7 @@ async def upload_document(
                 requisito_codigo=requisito_codigo,
                 error=str(exc),
             )
+            raise ChecklistLinkError(requisito_codigo, str(exc)[:200]) from exc
 
     return DocumentUploadResponse(
         id=doc.id,
