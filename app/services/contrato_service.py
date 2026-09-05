@@ -315,20 +315,36 @@ async def eliminar_obligacion(
     await db.flush()
 
 
-async def tiene_cuenta_activa(db: AsyncSession, contrato_id: uuid.UUID) -> bool:
-    """Whether the contract has any cuenta de cobro in enviada/aprobada/pagada.
+async def obligaciones_referenciadas_por_cuenta_activa(
+    db: AsyncSession, obligacion_ids: list[uuid.UUID]
+) -> set[uuid.UUID]:
+    """Subset of ``obligacion_ids`` still referenced by an actividad of an
+    active (enviada/aprobada/pagada, not deleted) cuenta de cobro.
 
-    Used to gate the obligaciones reconcile on a contract document replace
-    (see ``document_service.upload_document``): an active cuenta must not
-    block the replace itself, only the destructive part (touching obligations)
-    is skipped when this returns True.
+    Same protection as the all-or-nothing guard inside ``limpiar_obligaciones``,
+    but resolved PER obligación. The replace-time reconcile
+    (``document_service._reconcile_obligaciones``) uses it to delete everything
+    the new document dropped EXCEPT these, instead of refusing to touch the
+    contract's obligaciones because some unrelated cuenta happens to be active —
+    which froze the whole contract, and forever once a cuenta reached the
+    terminal PAGADA state.
     """
+    if not obligacion_ids:
+        return set()
+
+    from app.models.actividad import Actividad
+
     result = await db.execute(
-        select(CuentaCobro.id)
-        .where(CuentaCobro.contrato_id == contrato_id, CuentaCobro.estado.in_(_ESTADOS_ACTIVOS))
-        .limit(1)
+        select(Actividad.obligacion_id)
+        .join(CuentaCobro, Actividad.cuenta_cobro_id == CuentaCobro.id)
+        .where(
+            Actividad.obligacion_id.in_(obligacion_ids),
+            CuentaCobro.estado.in_(_ESTADOS_ACTIVOS),
+            CuentaCobro.deleted_at.is_(None),
+        )
+        .distinct()
     )
-    return result.first() is not None
+    return {row[0] for row in result.all() if row[0] is not None}
 
 
 async def limpiar_obligaciones(
