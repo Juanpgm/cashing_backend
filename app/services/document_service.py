@@ -340,6 +340,17 @@ async def _reconcile_obligaciones(
     survives. The old wipe-then-reinsert path churned every id on every single
     replace, silently orphaning every actividad/evidencia link the contractor
     had already built on top of the previous extraction.
+
+    Two rules qualify the deletion set:
+
+    * A dropped obligación an ACTIVE cuenta's actividad still references is
+      NOT deleted (``obligaciones_referenciadas_por_cuenta_activa``), and the
+      caller is told how many were kept. Everything else the new document
+      dropped still goes and the new items are still inserted — an active
+      cuenta protects the rows it uses, never the whole contract.
+    * ``orden`` is renumbered and ``etiqueta`` refreshed afterwards
+      (``_renumerar_obligaciones``) so the surviving rows follow the NEW
+      document's order rather than their insertion history.
     """
     from app.services import contrato_service as _contrato_service
 
