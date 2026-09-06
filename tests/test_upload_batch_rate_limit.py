@@ -157,3 +157,64 @@ class TestRateLimit429BodyIncludesDetail:
         assert "error" in body, f"429 body missing 'error' key: {body}"
         assert body["detail"] == body["error"]
         assert body["detail"]
+
+    async def test_429_response_does_not_carry_rate_limit_headers(
+        self, client: AsyncClient, db: AsyncSession, test_user: dict[str, Any]
+    ) -> None:
+        """`app.core.rate_limit.limiter` is built without `headers_enabled=True`
+        and no `RATELIMIT_HEADERS_ENABLED` env var is set anywhere in this
+        repo, so slowapi's `_inject_headers` (slowapi 0.1.10,
+        `extension.py::Limiter._inject_headers`) early-exits on
+        `self._headers_enabled` being falsy and injects nothing at all — not
+        even `Retry-After`. This is pre-existing behavior, not a regression
+        from this PR; enabling these headers is tracked separately because it
+        affects every `@limiter.limit(...)` route, not just this endpoint:
+        https://github.com/Juanpgm/cashing_backend/issues/53"""
+        cuenta = await _crear_cuenta(db, test_user["user"].id)
+        enabled_previo = limiter.enabled
+        limiter.enabled = True
+        limiter.reset()
+        responses = []
+        try:
+            with (
+                patch(_PATCH_S3) as mock_storage_cls,
+                patch(_PATCH_OBLIGACIONES, new=AsyncMock(return_value=([], []))),
+            ):
+                mock_storage_cls.return_value = _mock_storage()
+                for i in range(11):
+                    r = await client.post(
+                        "/api/v1/documentos/upload-batch",
+                        headers=test_user["headers"],
+                        params={
+                            "tipo": "otros",
+                            "cuenta_cobro_id": str(cuenta.id),
+                            "requisito_codigo": "EVIDENCIAS",
+                        },
+                        files={"files": (f"soporte-{i}.pdf", _PDF_MAGIC + bytes([i]) * 2048, "application/pdf")},
+                    )
+                    responses.append(r)
+        finally:
+            # Reset the window too: leaving used-up buckets behind makes the NEXT
+            # test that enables the limiter fail depending on execution order.
+            # And restore the previous flag instead of hardcoding False, so this
+            # never silently disables a limiter a caller had turned on.
+            limiter.reset()
+            limiter.enabled = enabled_previo
+
+        rate_limited = [r for r in responses if r.status_code == 429]
+        assert rate_limited, f"expected the 11th request to be rate-limited: {[r.status_code for r in responses]}"
+
+        headers = rate_limited[0].headers
+        # `headers_enabled` defaults to False in slowapi and nothing in this
+        # repo turns it on, so `_inject_headers` in app/main.py is a no-op
+        # today. Follow-up to actually enable these headers:
+        # https://github.com/Juanpgm/cashing_backend/issues/53
+        assert "retry-after" not in headers, (
+            f"expected no 'Retry-After' header (headers_enabled is not set on the "
+            f"limiter); headers present: {dict(headers)}"
+        )
+        for header_name in ("x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-reset"):
+            assert header_name not in headers, (
+                f"expected no '{header_name}' header (headers_enabled is not set on the "
+                f"limiter); headers present: {dict(headers)}"
+            )
