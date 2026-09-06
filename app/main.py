@@ -236,6 +236,14 @@ async def rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded) 
     below), but slowapi's built-in handler returns `{"error": ...}` only, so a
     429 was silently dropped client-side and the user saw the raw axios
     string instead of a useful message.
+
+    The `_inject_headers` call below is kept for forward-compatibility with
+    slowapi's own default handler, but it is a no-op today: `limiter` is
+    built in `app/core/rate_limit.py` without `headers_enabled=True`, so no
+    `Retry-After` / `X-RateLimit-*` header is actually added to the response.
+    Enabling that is tracked separately since it would affect every
+    `@limiter.limit(...)` route, not just this handler:
+    https://github.com/Juanpgm/cashing_backend/issues/53
     """
     message = f"Rate limit exceeded: {exc.detail}"
     response = JSONResponse({"error": message, "detail": message}, status_code=429)
