@@ -146,17 +146,18 @@ class TestRateLimit429BodyIncludesDetail:
         assert body["detail"] == body["error"]
         assert body["detail"]
 
-    async def test_429_response_carries_rate_limit_headers(
+    async def test_429_response_does_not_carry_rate_limit_headers(
         self, client: AsyncClient, db: AsyncSession, test_user: dict[str, Any]
     ) -> None:
-        """PR #27's commit message documents the backend contract for the
-        frontend as: "headers unchanged — still carries slowapi's
-        X-RateLimit-* / Retry-After". `app.core.rate_limit.limiter` is built
-        without `headers_enabled=True` and no `RATELIMIT_HEADERS_ENABLED` env
-        var is set anywhere in this repo, so slowapi's `_inject_headers`
-        (slowapi 0.1.10, `extension.py::Limiter._inject_headers`) early-exits
-        on `self._headers_enabled` being falsy and injects nothing at all —
-        not even `Retry-After`."""
+        """`app.core.rate_limit.limiter` is built without `headers_enabled=True`
+        and no `RATELIMIT_HEADERS_ENABLED` env var is set anywhere in this
+        repo, so slowapi's `_inject_headers` (slowapi 0.1.10,
+        `extension.py::Limiter._inject_headers`) early-exits on
+        `self._headers_enabled` being falsy and injects nothing at all — not
+        even `Retry-After`. This is pre-existing behavior, not a regression
+        from this PR; enabling these headers is tracked separately because it
+        affects every `@limiter.limit(...)` route, not just this endpoint:
+        https://github.com/Juanpgm/cashing_backend/issues/53"""
         cuenta = await _crear_cuenta(db, test_user["user"].id)
         limiter.enabled = True
         limiter.reset()
@@ -186,13 +187,16 @@ class TestRateLimit429BodyIncludesDetail:
         assert rate_limited, f"expected the 11th request to be rate-limited: {[r.status_code for r in responses]}"
 
         headers = rate_limited[0].headers
-        assert "retry-after" in headers, (
-            f"429 response missing 'Retry-After' header documented in PR #27's commit "
-            f"message ('headers unchanged — still carries slowapi's X-RateLimit-* / "
-            f"Retry-After'); headers present: {dict(headers)}"
+        # `headers_enabled` defaults to False in slowapi and nothing in this
+        # repo turns it on, so `_inject_headers` in app/main.py is a no-op
+        # today. Follow-up to actually enable these headers:
+        # https://github.com/Juanpgm/cashing_backend/issues/53
+        assert "retry-after" not in headers, (
+            f"expected no 'Retry-After' header (headers_enabled is not set on the "
+            f"limiter); headers present: {dict(headers)}"
         )
         for header_name in ("x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-reset"):
-            assert header_name in headers, (
-                f"429 response missing '{header_name}' header documented in PR #27's "
-                f"commit message; headers present: {dict(headers)}"
+            assert header_name not in headers, (
+                f"expected no '{header_name}' header (headers_enabled is not set on the "
+                f"limiter); headers present: {dict(headers)}"
             )
