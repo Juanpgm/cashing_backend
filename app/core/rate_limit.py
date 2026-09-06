@@ -22,12 +22,14 @@ def upload_rate_limit_key(request: Request) -> str:
     anonymous branch below is never reachable in practice — it only guards
     against a misconfigured route that forgets the auth dependency.
 
-    We deliberately do NOT read `X-Forwarded-For` here: it is a plain request
-    header, fully controlled by whoever sends the HTTP request. A reverse
-    proxy only APPENDS to it, so the LEFTMOST hop — the one this function would
-    read — can be forged by any client, letting an attacker rotate their
-    rate-limit bucket at will. The socket peer (`get_remote_address`) is the
-    only fallback that isn't spoofable from outside the container.
+    We deliberately do NOT read `X-Forwarded-For` here ourselves: reading it
+    naively (e.g. the leftmost hop) would let an attacker forge it and rotate
+    their rate-limit bucket at will. `get_remote_address` below reads
+    `request.client.host`, which `app/core/client_ip.py`'s
+    `TrustedProxyClientMiddleware` already resolves safely (X-Real-IP, else
+    X-Forwarded-For walked right-to-left for the first public address) when
+    `TRUST_PROXY_HEADERS` is on — so this fallback gets the real caller IP in
+    production without parsing headers a second time here.
     """
     user_id = getattr(request.state, "user_id", None)
     if user_id:
