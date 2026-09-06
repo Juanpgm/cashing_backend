@@ -1,5 +1,6 @@
 """Application configuration via Pydantic Settings."""
 
+import os
 from typing import Any
 
 import structlog
@@ -25,6 +26,17 @@ class Settings(BaseSettings):
     # Off by default (pilot hardening): opt in explicitly via .env once the surface
     # has been reviewed for the deployment target, rather than exposing it by default.
     MCP_ENABLED: bool = False
+
+    # Trust reverse-proxy client-IP headers (X-Real-IP / X-Forwarded-For)?
+    # See app/core/client_ip.py for the full resolution algorithm and the
+    # rationale (Railway's edge proxy hides the real client IP behind its own
+    # socket peer address). `None` (default) means "auto-detect": explicit
+    # True/False always wins; otherwise `trust_proxy_headers_effective` treats
+    # the presence of `RAILWAY_ENVIRONMENT` (an env var Railway injects into
+    # every deployment) as "running on Railway" and trusts the headers, so
+    # local dev stays untrusting without needing an env var and prod does not
+    # depend on remembering to set one.
+    TRUST_PROXY_HEADERS: bool | None = None
 
     # Database
     DATABASE_URL: str = "postgresql+asyncpg://cashin:password@localhost:5432/cashin"
@@ -335,6 +347,18 @@ class Settings(BaseSettings):
     @property
     def is_development(self) -> bool:
         return self.ENVIRONMENT == "development"
+
+    @property
+    def trust_proxy_headers_effective(self) -> bool:
+        """Whether `app/core/client_ip.py` should trust proxy headers.
+
+        Explicit `TRUST_PROXY_HEADERS` always wins over auto-detection.
+        Otherwise: True iff `RAILWAY_ENVIRONMENT` is present in the process
+        environment (Railway injects it into every deployment), else False.
+        """
+        if self.TRUST_PROXY_HEADERS is not None:
+            return self.TRUST_PROXY_HEADERS
+        return "RAILWAY_ENVIRONMENT" in os.environ
 
 
 settings = Settings()

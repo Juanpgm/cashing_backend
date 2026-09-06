@@ -13,6 +13,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.api.router import api_v1_router
 from app.core.audit import AuditMiddleware
+from app.core.client_ip import TrustedProxyClientMiddleware
 from app.core.config import settings
 from app.core.error_response import internal_error_response
 from app.core.exceptions import DomainError, domain_to_http
@@ -222,6 +223,14 @@ app.add_middleware(
     # to name the saved file silently falls back to a broken filename.
     expose_headers=["Content-Disposition"],
 )
+
+# Resolves the real client IP behind Railway's proxy (see
+# app/core/client_ip.py). Added LAST so it is OUTERMOST — Starlette's
+# add_middleware wraps last-added outermost, and this must run BEFORE
+# SecurityHeadersMiddleware/AuditMiddleware/CORSMiddleware/the slowapi rate
+# limiter so they all observe the resolved `request.client.host`, not the raw
+# socket peer (the proxy's own address).
+app.add_middleware(TrustedProxyClientMiddleware)
 
 # Rate limiting
 app.state.limiter = limiter
