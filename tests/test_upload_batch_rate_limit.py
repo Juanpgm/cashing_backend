@@ -145,3 +145,54 @@ class TestRateLimit429BodyIncludesDetail:
         assert "error" in body, f"429 body missing 'error' key: {body}"
         assert body["detail"] == body["error"]
         assert body["detail"]
+
+    async def test_429_response_carries_rate_limit_headers(
+        self, client: AsyncClient, db: AsyncSession, test_user: dict[str, Any]
+    ) -> None:
+        """PR #27's commit message documents the backend contract for the
+        frontend as: "headers unchanged — still carries slowapi's
+        X-RateLimit-* / Retry-After". `app.core.rate_limit.limiter` is built
+        without `headers_enabled=True` and no `RATELIMIT_HEADERS_ENABLED` env
+        var is set anywhere in this repo, so slowapi's `_inject_headers`
+        (slowapi 0.1.10, `extension.py::Limiter._inject_headers`) early-exits
+        on `self._headers_enabled` being falsy and injects nothing at all —
+        not even `Retry-After`."""
+        cuenta = await _crear_cuenta(db, test_user["user"].id)
+        limiter.enabled = True
+        limiter.reset()
+        responses = []
+        try:
+            with (
+                patch(_PATCH_S3) as mock_storage_cls,
+                patch(_PATCH_OBLIGACIONES, new=AsyncMock(return_value=([], []))),
+            ):
+                mock_storage_cls.return_value = _mock_storage()
+                for i in range(11):
+                    r = await client.post(
+                        "/api/v1/documentos/upload-batch",
+                        headers=test_user["headers"],
+                        params={
+                            "tipo": "otros",
+                            "cuenta_cobro_id": str(cuenta.id),
+                            "requisito_codigo": "EVIDENCIAS",
+                        },
+                        files={"files": (f"soporte-{i}.pdf", _PDF_MAGIC + bytes([i]) * 2048, "application/pdf")},
+                    )
+                    responses.append(r)
+        finally:
+            limiter.enabled = False
+
+        rate_limited = [r for r in responses if r.status_code == 429]
+        assert rate_limited, f"expected the 11th request to be rate-limited: {[r.status_code for r in responses]}"
+
+        headers = rate_limited[0].headers
+        assert "retry-after" in headers, (
+            f"429 response missing 'Retry-After' header documented in PR #27's commit "
+            f"message ('headers unchanged — still carries slowapi's X-RateLimit-* / "
+            f"Retry-After'); headers present: {dict(headers)}"
+        )
+        for header_name in ("x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-reset"):
+            assert header_name in headers, (
+                f"429 response missing '{header_name}' header documented in PR #27's "
+                f"commit message; headers present: {dict(headers)}"
+            )
