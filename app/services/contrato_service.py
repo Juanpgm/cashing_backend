@@ -315,32 +315,76 @@ async def eliminar_obligacion(
     await db.flush()
 
 
+async def obligaciones_referenciadas_por_cuenta_activa(
+    db: AsyncSession, obligacion_ids: list[uuid.UUID]
+) -> set[uuid.UUID]:
+    """Subset of ``obligacion_ids`` still referenced by an actividad of an
+    active (enviada/aprobada/pagada, not deleted) cuenta de cobro.
+
+    Same protection as the all-or-nothing guard inside ``limpiar_obligaciones``,
+    but resolved PER obligación. The replace-time reconcile
+    (``document_service._reconcile_obligaciones``) uses it to delete everything
+    the new document dropped EXCEPT these, instead of refusing to touch the
+    contract's obligaciones because some unrelated cuenta happens to be active —
+    which froze the whole contract, and forever once a cuenta reached the
+    terminal PAGADA state.
+    """
+    if not obligacion_ids:
+        return set()
+
+    from app.models.actividad import Actividad
+
+    result = await db.execute(
+        select(Actividad.obligacion_id)
+        .join(CuentaCobro, Actividad.cuenta_cobro_id == CuentaCobro.id)
+        .where(
+            Actividad.obligacion_id.in_(obligacion_ids),
+            CuentaCobro.estado.in_(_ESTADOS_ACTIVOS),
+            CuentaCobro.deleted_at.is_(None),
+        )
+        .distinct()
+    )
+    return {row[0] for row in result.all() if row[0] is not None}
+
+
 async def limpiar_obligaciones(
     db: AsyncSession,
     usuario_id: uuid.UUID,
     contrato_id: uuid.UUID,
+    solo_ids: list[uuid.UUID] | None = None,
 ) -> int:
-    """Reset a contract's obligations: bulk-delete them all.
+    """Reset a contract's obligations: bulk-delete them all, or — when
+    ``solo_ids`` is given — only that subset.
+
+    The subset form is what the replace-time reconcile uses (see
+    ``document_service._reconcile_obligaciones``) to remove FK-safely just the
+    obligaciones the new document no longer mentions, leaving the rest (and
+    ``obligaciones_extraidas``) untouched.
 
     Nullifies FK references in actividades and removes evidence-obligation link
-    rows before deleting so no constraint violation occurs. Also clears
-    `obligaciones_extraidas` (back to None = "no extraction signal") so the
-    contrato becomes eligible for the Vincular fallback again. Returns the
-    number of deleted rows.
+    rows before deleting so no constraint violation occurs. On a full reset
+    (``solo_ids`` is None) also clears `obligaciones_extraidas` (back to None =
+    "no extraction signal") so the contrato becomes eligible for the Vincular
+    fallback again. Returns the number of deleted rows.
     """
     from app.models.actividad import Actividad
     from app.models.evidencia_obligacion import EvidenciaObligacion
 
     contrato = await _get_contrato_con_ownership(db, usuario_id, contrato_id)
 
-    ob_ids_result = await db.execute(
-        select(Obligacion.id).where(Obligacion.contrato_id == contrato_id)
-    )
+    ob_ids_query = select(Obligacion.id).where(Obligacion.contrato_id == contrato_id)
+    if solo_ids is not None:
+        ob_ids_query = ob_ids_query.where(Obligacion.id.in_(solo_ids))
+    ob_ids_result = await db.execute(ob_ids_query)
     ob_ids = [row[0] for row in ob_ids_result.all()]
 
     # Guard BEFORE any mutation: same protection contrato delete has via
     # _ESTADOS_ACTIVOS — a radicada/aprobada/pagada cuenta's actividades must
-    # keep their obligacion references.
+    # keep their obligacion references. `deleted_at IS NULL` matches both
+    # `eliminar_contrato`'s sibling guard and
+    # `obligaciones_referenciadas_por_cuenta_activa`: without it the reconcile
+    # would hand this guard an id it deliberately left out of `solo_ids`,
+    # turning a legitimate contract replace into a 422 for the whole upload.
     if ob_ids:
         ref = await db.execute(
             select(Actividad.id)
@@ -348,6 +392,7 @@ async def limpiar_obligaciones(
             .where(
                 Actividad.obligacion_id.in_(ob_ids),
                 CuentaCobro.estado.in_(_ESTADOS_ACTIVOS),
+                CuentaCobro.deleted_at.is_(None),
             )
             .limit(1)
         )
@@ -357,10 +402,14 @@ async def limpiar_obligaciones(
                 "enviada, aprobada o pagada que las referencian."
             )
 
-    # After a reset there is genuinely no extraction signal anymore — None (not
-    # False) per the model's semantics, and `!== true` re-enables Vincular in
-    # the frontend gate either way.
-    contrato.obligaciones_extraidas = None
+    if solo_ids is None:
+        # After a full reset there is genuinely no extraction signal anymore —
+        # None (not False) per the model's semantics, and `!== true` re-enables
+        # Vincular in the frontend gate either way. A partial (reconcile-driven)
+        # removal must NOT touch this: the contract was just re-extracted and
+        # DID yield obligations, some of which are about to be inserted/kept by
+        # the caller.
+        contrato.obligaciones_extraidas = None
     if not ob_ids:
         await db.flush()
         return 0
@@ -371,9 +420,7 @@ async def limpiar_obligaciones(
         .values(obligacion_id=None)
     )
     await db.execute(delete(EvidenciaObligacion).where(EvidenciaObligacion.obligacion_id.in_(ob_ids)))
-    result = await db.execute(
-        delete(Obligacion).where(Obligacion.contrato_id == contrato_id)
-    )
+    result = await db.execute(delete(Obligacion).where(Obligacion.id.in_(ob_ids)))
     await db.flush()
     return result.rowcount or 0
 

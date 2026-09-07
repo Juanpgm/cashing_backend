@@ -275,6 +275,39 @@ def iter_archive_members(content: bytes, filename: str) -> Iterator[tuple[str, b
         yield name, data
 
 
+def extract_archive_member_texts(content: bytes, filename: str) -> list[tuple[str, str]]:
+    """Yield `(member_name, text)` for each archive member with usable text,
+    WITHOUT concatenating them.
+
+    Same iteration (`iter_archive_members`, same caps) and per-format dispatch
+    (`_extract_member`) as `parse_archive` — but callers that need to pick ONE
+    member instead of reading every member's text as a single blob (e.g.
+    obligation extraction matching a member to a specific contract, B6) get
+    the members separately, unprefixed. Does not change `parse_archive`'s own
+    concatenation behavior for its existing callers (generic text preview/OCR
+    fallback).
+
+    `_ARCHIVE_MAX_TEXT_CHARS` bounds BOTH a single member's text and the total
+    across members, exactly as it bounds `parse_archive`'s concatenation. Without
+    it this function returned every member's full text and its caller
+    (`document_service._resolver_texto_obligaciones_archivo`) fed unbounded text
+    into obligation extraction — the blow-up the cap exists to prevent.
+    """
+    resultados: list[tuple[str, str]] = []
+    total_chars = 0
+    for name, data in iter_archive_members(content, filename):
+        restante = _ARCHIVE_MAX_TEXT_CHARS - total_chars
+        if restante <= 0:
+            break
+        texto = _extract_member(name, data).strip()
+        if not texto:
+            continue
+        texto = texto[:restante]
+        total_chars += len(texto)
+        resultados.append((name, texto))
+    return resultados
+
+
 def parse_archive(content: bytes, filename: str) -> str:
     """Expand a zip/tar/gz/rar archive and concatenate the text of its members.
 

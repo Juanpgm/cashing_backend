@@ -12,7 +12,13 @@ import tarfile
 import zipfile
 
 import pytest
-from app.agent.tools.document_parser import iter_archive_members, parse_archive, parse_document, parse_text
+from app.agent.tools.document_parser import (
+    extract_archive_member_texts,
+    iter_archive_members,
+    parse_archive,
+    parse_document,
+    parse_text,
+)
 
 
 def _make_zip(files: dict[str, bytes]) -> bytes:
@@ -91,6 +97,47 @@ class TestZip:
         files = {f"f{i}.txt": f"contenido {i}".encode() for i in range(80)}
         result = parse_archive(_make_zip(files), "muchos.zip")
         assert "se omitieron miembros adicionales" in result
+
+
+class TestExtractArchiveMemberTexts:
+    """Per-member text extraction (B6) — same iteration/dispatch as `parse_archive`,
+    but returns members SEPARATELY instead of concatenating, so a caller can pick
+    the right member instead of mixing every member's text into one blob."""
+
+    def test_returns_one_entry_per_member_with_text(self) -> None:
+        content = _make_zip(
+            {
+                "contrato-a.txt": b"CONTRATO No. 111-2026 obligaciones del contratista",
+                "contrato-b.txt": b"CONTRATO No. 222-2026 obligaciones del contratista",
+            }
+        )
+        result = extract_archive_member_texts(content, "soportes.zip")
+        names = dict(result)
+        assert set(names) == {"contrato-a.txt", "contrato-b.txt"}
+        assert "111-2026" in names["contrato-a.txt"]
+        assert "222-2026" in names["contrato-b.txt"]
+
+    def test_skips_binary_members(self) -> None:
+        content = _make_zip(
+            {
+                "readme.txt": b"contenido legible",
+                "tool.exe": b"MZ\x00\x00\x01\x02binary",
+            }
+        )
+        result = extract_archive_member_texts(content, "mixto.zip")
+        assert [name for name, _ in result] == ["readme.txt"]
+
+    def test_empty_archive_returns_empty_list(self) -> None:
+        content = _make_zip({})
+        assert extract_archive_member_texts(content, "vacio.zip") == []
+
+    def test_does_not_concatenate_members(self) -> None:
+        """Distinguishes this from `parse_archive`: no `### <name>` headers, no
+        joining — each member's text stays separate and unprefixed."""
+        content = _make_zip({"uno.txt": b"texto uno", "dos.txt": b"texto dos"})
+        result = extract_archive_member_texts(content, "dos.zip")
+        for _, texto in result:
+            assert "###" not in texto
 
 
 class TestTarGz:

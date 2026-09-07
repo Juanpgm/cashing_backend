@@ -7,13 +7,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser
 from app.core.database import get_db
-from app.core.exceptions import ValidationError
+from app.core.exceptions import (
+    ChecklistLinkError,
+    DomainError,
+    ValidationError,
+    documento_fue_persistido,
+)
 from app.core.file_validation import (
+    formatos_aceptados,
+    tamano_maximo_legible,
     validate_file_extension,
     validate_file_size,
     validate_mime_type,
 )
-from app.core.rate_limit import limiter
+from app.core.rate_limit import limiter, upload_rate_limit_key
 from app.models.documento_fuente import TipoDocumentoFuente
 from app.schemas.agent import DocumentProcessRequest, DocumentProcessResponse, DocumentUploadResponse
 from app.schemas.checklist import CategoriaUpdateBody
@@ -21,6 +28,9 @@ from app.schemas.documento_fuente import DocumentoFuenteResponse
 from app.services import document_service
 
 router = APIRouter(prefix="/documentos", tags=["documentos"])
+
+# Upper bound on files per `/upload-batch` request.
+MAX_BATCH_SIZE = 20
 
 
 def _resolver_tipo(tipo: TipoDocumentoFuente | None, cuenta_cobro_id: uuid.UUID | None) -> TipoDocumentoFuente:
@@ -42,8 +52,21 @@ def _resolver_tipo(tipo: TipoDocumentoFuente | None, cuenta_cobro_id: uuid.UUID 
     return TipoDocumentoFuente.OTROS if cuenta_cobro_id is not None else TipoDocumentoFuente.CONTRATO
 
 
+# B3 hardening: ``document_service.upload_document`` now requires an EXPLICIT
+# ``requisito_codigo == "CONTRATO"`` before treating an upload as the contract
+# itself (replace rule + obligation extraction) — ``tipo == CONTRATO`` alone is
+# no longer sufficient, and this router does NOT default/synthesize it: the
+# frontend's `buildContratoUploadParams` (cashing-frontend/lib/documentos-api.ts)
+# already sends `requisito_codigo=CONTRATO` explicitly whenever `tipo=contrato`
+# for its three contract-upload call sites. Backend-side defaulting here would
+# reintroduce the exact bug this hardening fixes: any direct/agent caller that
+# passes `tipo=CONTRATO` without meaning "this is the contract" (e.g. a
+# certificado de experiencia uploaded via the same dropzone) would be silently
+# treated as the contract again.
+
+
 @router.post("/upload", response_model=DocumentUploadResponse, status_code=201)
-@limiter.limit("10/minute")
+@limiter.limit("10/minute", key_func=upload_rate_limit_key)
 async def upload_document(
     request: Request,
     file: UploadFile,
@@ -117,19 +140,27 @@ async def upload_document(
 
     4. Verificar: `GET /contratos/{id}/configuracion`
     """
+    # User-facing copy: the frontend renders `detail` verbatim, and this is a
+    # Spanish-only product. The accepted-format list is derived from the validator's
+    # own allowlist so the two can never drift apart.
     if not file.filename:
-        raise ValidationError("Filename is required")
+        raise ValidationError("Se requiere el nombre del archivo.")
 
     if not validate_file_extension(file.filename):
-        raise ValidationError(f"File type not allowed: {file.filename}")
+        raise ValidationError(
+            f"Tipo de archivo no permitido: {file.filename}. Formatos aceptados: {formatos_aceptados()}."
+        )
 
     content = await file.read()
 
+    if len(content) == 0:
+        raise ValidationError(f"El archivo '{file.filename}' está vacío.")
+
     if not validate_file_size(len(content)):
-        raise ValidationError("File exceeds maximum size of 10MB")
+        raise ValidationError(f"El archivo '{file.filename}' supera el máximo de {tamano_maximo_legible()}.")
 
     if file.content_type and not validate_mime_type(content, file.content_type):
-        raise ValidationError(f"Invalid MIME type: {file.content_type}")
+        raise ValidationError(f"El contenido de '{file.filename}' no coincide con su extensión.")
 
     return await document_service.upload_document(
         db=db,
@@ -176,7 +207,7 @@ async def listar_documentos_contrato(
 
 
 @router.post("/upload-batch", response_model=list[DocumentUploadResponse], status_code=201)
-@limiter.limit("3/minute")
+@limiter.limit("10/minute", key_func=upload_rate_limit_key)
 async def upload_documents_batch(
     request: Request,
     user: CurrentUser,
@@ -205,43 +236,91 @@ async def upload_documents_batch(
         description=("Código del requisito del checklist al que se vinculan los documentos. Aplica al lote completo."),
     ),
 ) -> list[DocumentUploadResponse]:
-    """Upload multiple documents in a single request (multipart/form-data).
+    """Sube varios documentos en una sola petición (multipart/form-data).
 
-    Each file is validated individually; failures raise 422 with the filename.
-    Successful uploads are returned as a list in the same order as the input files.
+    Acepta cualquier mezcla de PDF, DOCX, TXT, JPG, PNG de hasta 10 MB cada uno.
+    Máximo 20 archivos por petición.
 
-    Accepts any mix of PDF, DOCX, TXT, JPG, PNG files up to 10 MB each.
-    Maximum 20 files per request.
+    ### Contrato de la respuesta
+    - **201** — *todos* los archivos se guardaron **y** se vincularon. La lista trae
+      un elemento por archivo, en el mismo orden de entrada.
+    - **422** — la validación previa rechazó el lote (nombre, extensión, tamaño,
+      MIME): no se guardó ningún archivo.
+    - **502** (`code: CHECKLIST_LINK_FAILED`) — al menos un archivo se guardó pero no
+      pudo vincularse al checklist; volver a subir los archivos nombrados en
+      `detail` repara la vinculación. Si `detail` también trae un segmento
+      "No se guardaron: …", esos archivos NUNCA se persistieron (p. ej. un error
+      de almacenamiento) y deben resubirse desde cero, no solo revincularse.
+    - **429** — se superó el límite de 10 peticiones por minuto.
+
+    Cada elemento de `results` incluye `nombre_original` (el nombre tal como lo envió
+    el cliente) para poder emparejar resultados con archivos sin replicar el saneado
+    de nombres del backend.
     """
-    MAX_BATCH_SIZE = 20
     if len(files) > MAX_BATCH_SIZE:
-        raise ValidationError(f"Batch exceeds maximum of {MAX_BATCH_SIZE} files.")
+        raise ValidationError(f"El lote supera el máximo de {MAX_BATCH_SIZE} archivos.")
 
     tipo_efectivo = _resolver_tipo(tipo, cuenta_cobro_id)
 
-    results: list[DocumentUploadResponse] = []
-    errors: list[str] = []
-
+    # Pass 1 — validate EVERY file (filename, extension, size, MIME) before persisting
+    # any of them. Reading+validating file N used to happen only after file N-1 had
+    # already been committed to the DB, so a batch of [valid.pdf, bad.exe] left
+    # valid.pdf persisted and the whole 422 response discarded — the client had no way
+    # to know a document was actually written, and a retry duplicated it.
+    payloads: list[tuple[UploadFile, bytes]] = []
     for file in files:
         if not file.filename:
-            raise ValidationError("All files must have a filename.")
+            raise ValidationError("Todos los archivos deben tener nombre.")
 
         if not validate_file_extension(file.filename):
-            raise ValidationError(f"File type not allowed: {file.filename}")
+            raise ValidationError(
+                f"Tipo de archivo no permitido: {file.filename}. Formatos aceptados: {formatos_aceptados()}."
+            )
 
         content = await file.read()
 
+        if len(content) == 0:
+            raise ValidationError(f"El archivo '{file.filename}' está vacío.")
+
         if not validate_file_size(len(content)):
-            raise ValidationError(f"File '{file.filename}' exceeds maximum size of 10 MB.")
+            raise ValidationError(f"El archivo '{file.filename}' supera el máximo de {tamano_maximo_legible()}.")
 
         if file.content_type and not validate_mime_type(content, file.content_type):
-            raise ValidationError(f"Invalid MIME type for '{file.filename}': {file.content_type}")
+            raise ValidationError(f"El contenido de '{file.filename}' no coincide con su extensión.")
 
+        payloads.append((file, content))
+
+    # Pass 2 — all files passed validation, now persist, in input order.
+    #
+    # A 2xx from this endpoint means EVERY file was persisted AND linked. A
+    # `ChecklistLinkError` (document written, checklist link failed) used to be
+    # swallowed here by the blanket `except Exception` and downgraded to an
+    # `[Error] ...` string on the LAST result's avisos, with the response still 201 —
+    # the frontend showed green while the requisito stayed Pendiente, which is exactly
+    # what raising it from `upload_document` was meant to stop.
+    #
+    # The loop still FINISHES on a link failure (the remaining files deserve to be
+    # persisted), and the 502 is raised afterwards naming the affected files.
+    results: list[DocumentUploadResponse] = []
+    link_failed: list[str] = []
+    errors: list[str] = []
+    # Kept in lockstep with `errors`: the ORIGINAL client filenames of the files that
+    # were NEVER persisted. Recovering them from the error strings instead
+    # (`err.split(':', 1)[0]`) truncated any filename containing a colon, and the
+    # frontend marks every file NOT named in `detail` as done — so a file that was
+    # never saved was shown to the user as uploaded.
+    no_guardados: list[str] = []
+    # Read the id ONCE: rolling back a failed file expires every ORM instance in the
+    # session, `user` (loaded by the auth dependency) included, and a later `user.id`
+    # would then trigger a lazy refresh from sync context (MissingGreenlet).
+    user_id = user.id
+
+    for file, content in payloads:
         try:
             result = await document_service.upload_document(
                 db=db,
-                user_id=user.id,
-                filename=file.filename,
+                user_id=user_id,
+                filename=file.filename,  # type: ignore[arg-type]
                 content=content,
                 content_type=file.content_type or "application/octet-stream",
                 tipo=tipo_efectivo,
@@ -250,14 +329,52 @@ async def upload_documents_batch(
                 requisito_codigo=requisito_codigo,
             )
             results.append(result)
+        except ChecklistLinkError:
+            # The document IS persisted and committed; only the link is missing.
+            link_failed.append(file.filename or "")
+            # Drop whatever the failed link left pending so the next file starts from
+            # a clean session.
+            await db.rollback()
+        except DomainError as exc:
+            # `upload_document` commits the document BEFORE attempting the checklist
+            # link, so a DomainError flagged as post-commit belongs to a file that IS
+            # saved — reporting it as "no se guardó" would send the user to re-upload
+            # a file that only needs relinking.
+            if documento_fue_persistido(exc):
+                link_failed.append(file.filename or "")
+            else:
+                errors.append(f"{file.filename}: {exc}")
+                no_guardados.append(file.filename or "")
+            await db.rollback()
         except Exception as exc:
             errors.append(f"{file.filename}: {exc}")
+            no_guardados.append(file.filename or "")
+            await db.rollback()
+
+    if link_failed:
+        link_error = ChecklistLinkError(
+            requisito_codigo or "",
+            "no se pudo completar la vinculación con el checklist",
+            archivos=link_failed,
+        )
+        if no_guardados:
+            # A mixed batch: some files persisted but failed to link (named
+            # above by ChecklistLinkError itself), others never persisted at
+            # all (a non-link failure, e.g. a storage error). Both groups must
+            # be named — the frontend marks any file NOT named in `detail` as
+            # done, so a non-persisted file left unnamed here would be shown
+            # to the user as successfully uploaded.
+            nombres_no_guardados = ", ".join(f"'{nombre}'" for nombre in no_guardados)
+            link_error.detail += f" No se guardaron: {nombres_no_guardados}."
+        raise link_error
 
     if errors and not results:
-        raise ValidationError(f"All files failed to upload: {'; '.join(errors)}")
+        raise ValidationError(f"Ningún archivo pudo subirse: {'; '.join(errors)}")
 
-    if errors and results:
-        results[-1].avisos.extend([f"[Error] {e}" for e in errors])
+    if errors:
+        # Never return 2xx for a partially failed batch: the caller cannot tell which
+        # of its files made it, and a blind retry duplicates the ones that did.
+        raise ValidationError(f"Algunos archivos no pudieron subirse: {'; '.join(errors)}")
 
     return results
 

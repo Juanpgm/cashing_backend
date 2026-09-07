@@ -42,7 +42,12 @@ from app.agent.tools.multimodal_parser import (
 from app.agent.tools.ocr import extract_text as ocr_extract_text
 from app.agent.tools.ocr import ocr_available
 from app.core.config import settings
-from app.core.exceptions import NotFoundError
+from app.core.exceptions import (
+    ChecklistLinkError,
+    DomainError,
+    NotFoundError,
+    marcar_documento_persistido,
+)
 from app.core.file_validation import get_safe_filename
 from app.core.text_match import normalize as _normalize_texto
 from app.models.categoria_documento import CategoriaDocumento
@@ -88,6 +93,8 @@ async def _extraer_obligaciones(
     texto_contrato: str,
     contrato_id: uuid.UUID | None,
     db: AsyncSession,
+    *,
+    persistir: bool = True,
 ) -> tuple[list[ObligacionExtraida], list[str]]:
     """Call LLM to extract obligations and return extracted list + warnings.
 
@@ -95,8 +102,14 @@ async def _extraer_obligaciones(
     When ``contrato_id`` is None (auto-create failed), obligations are extracted
     for display only — no DB persistence.
 
+    ``persistir=False`` runs a DRY extraction: the result is returned but nothing
+    is written, while ``contrato_id`` is still used for logging. The contract
+    replace flow needs it to decide whether the new document yields enough to
+    justify wiping the existing obligations.
+
     Returns ``(obligations, warnings)`` where warnings tracks LLM/parsing issues.
     """
+    persist_contrato_id = contrato_id if persistir else None
     from app.adapters.llm import get_llm
     from app.agent.prompts.obligaciones import (
         OBLIGACIONES_FEWSHOT_SCANNED,
@@ -125,7 +138,7 @@ async def _extraer_obligaciones(
             total_chars=len(texto_contrato),
         )
         extraidas = verbatim
-        return await _persist_obligaciones(extraidas, contrato_id, db, avisos)
+        return await _persist_obligaciones(extraidas, persist_contrato_id, db, avisos)
 
     # ── Step 2: fall back to LLM-based extraction ──────────────────────────
     # Strip the entity-agnostic labeled boilerplate (address, NIT,
@@ -227,7 +240,7 @@ async def _extraer_obligaciones(
             )
         return [], avisos
 
-    return await _persist_obligaciones(extraidas, contrato_id, db, avisos)
+    return await _persist_obligaciones(extraidas, persist_contrato_id, db, avisos)
 
 
 async def extraer_obligaciones_texto(
@@ -302,6 +315,201 @@ async def _persist_obligaciones(
         ya_existentes=len(extraidas) - nuevas,
     )
     return extraidas, avisos
+
+
+async def _reconcile_obligaciones(
+    extraidas: list[ObligacionExtraida],
+    contrato_id: uuid.UUID,
+    usuario_id: uuid.UUID,
+    db: AsyncSession,
+    avisos: list[str],
+) -> tuple[list[ObligacionExtraida], list[str]]:
+    """Reconcile a contract replace's obligaciones against the newly extracted
+    set instead of wiping and reinserting everything (BLOCKER B).
+
+    Matches existing obligaciones against the new extraction by normalized text
+    (``_normalize_texto``, the same key ``_persist_obligaciones`` already dedups
+    on): a row whose text still appears in the new document keeps its id — and
+    every actividad/evidencia link built on it — untouched. A row absent from
+    the new extraction is removed through an FK-safe subset delete
+    (``contrato_service.limpiar_obligaciones(..., solo_ids=...)``), never a raw
+    bulk delete. Genuinely new items are appended by ``_persist_obligaciones``.
+
+    An identical re-upload (same file, double-click, retry after a timeout)
+    therefore produces zero deletes and zero inserts — every id and every link
+    survives. The old wipe-then-reinsert path churned every id on every single
+    replace, silently orphaning every actividad/evidencia link the contractor
+    had already built on top of the previous extraction.
+
+    Two rules qualify the deletion set:
+
+    * A dropped obligación an ACTIVE cuenta's actividad still references is
+      NOT deleted (``obligaciones_referenciadas_por_cuenta_activa``), and the
+      caller is told how many were kept. Everything else the new document
+      dropped still goes and the new items are still inserted — an active
+      cuenta protects the rows it uses, never the whole contract.
+    * ``orden`` is renumbered and ``etiqueta`` refreshed afterwards
+      (``_renumerar_obligaciones``) so the surviving rows follow the NEW
+      document's order rather than their insertion history.
+    """
+    from app.services import contrato_service as _contrato_service
+
+    existing_result = await db.execute(select(Obligacion).where(Obligacion.contrato_id == contrato_id))
+    existing_obs = list(existing_result.scalars().all())
+    nuevos_norms = {_normalize_texto(item.descripcion) for item in extraidas}
+
+    ids_a_eliminar = [ob.id for ob in existing_obs if _normalize_texto(ob.descripcion) not in nuevos_norms]
+
+    # An obligación the new document dropped is still undeletable while an ACTIVE
+    # cuenta's actividad references it — that is exactly the guard inside
+    # `limpiar_obligaciones`, resolved per row instead of all-or-nothing. Anything
+    # else the new document dropped still goes, and the new items are still added.
+    protegidas = await _contrato_service.obligaciones_referenciadas_por_cuenta_activa(db, ids_a_eliminar)
+    if protegidas:
+        ids_a_eliminar = [ob_id for ob_id in ids_a_eliminar if ob_id not in protegidas]
+        avisos.append(
+            f"Se conservaron {len(protegidas)} obligaciones referenciadas por cuentas de cobro "
+            "enviadas, aprobadas o pagadas."
+        )
+
+    if ids_a_eliminar:
+        eliminadas = await _contrato_service.limpiar_obligaciones(
+            db=db, usuario_id=usuario_id, contrato_id=contrato_id, solo_ids=ids_a_eliminar
+        )
+        if eliminadas:
+            avisos.append(
+                f"Se eliminaron {eliminadas} obligaciones que ya no aparecen en el nuevo contrato; "
+                "las actividades vinculadas quedaron sin obligación."
+            )
+
+    resultado, avisos = await _persist_obligaciones(extraidas, contrato_id, db, avisos)
+    await _renumerar_obligaciones(extraidas, contrato_id, db)
+    return resultado, avisos
+
+
+async def _renumerar_obligaciones(
+    extraidas: list[ObligacionExtraida],
+    contrato_id: uuid.UUID,
+    db: AsyncSession,
+) -> None:
+    """Renumber ``orden`` (and refresh ``etiqueta``) to follow the NEW document.
+
+    Reconcile keeps matched rows in place, so without this an obligación added
+    at document position 3 is appended by ``_persist_obligaciones`` with
+    ``max(orden) + 1`` and therefore sorts AFTER the catch-all ("Las demás
+    actividades…"), which the extractor always emits last. ``orden`` drives the
+    informe, cobertura and coherencia output, so it must mirror the document,
+    not the insertion history. ``etiqueta`` (the contract's own bullet marker)
+    is refreshed for the same reason — a kept row would otherwise keep the
+    previous document's numbering.
+
+    Rows still present in the DB but absent from the new extraction (kept
+    because an active cuenta's actividad references them) are pushed after the
+    extracted block, preserving their previous relative order.
+    """
+    result = await db.execute(select(Obligacion).where(Obligacion.contrato_id == contrato_id))
+    filas = list(result.scalars().all())
+    por_norm = {_normalize_texto(ob.descripcion): ob for ob in filas}
+
+    siguiente = 0
+    asignadas: set[uuid.UUID] = set()
+    vistos: set[str] = set()
+    for item in extraidas:
+        norm = _normalize_texto(item.descripcion)
+        if norm in vistos:
+            continue
+        vistos.add(norm)
+        fila = por_norm.get(norm)
+        if fila is None:
+            continue
+        siguiente += 1
+        fila.orden = siguiente
+        if item.etiqueta:
+            fila.etiqueta = item.etiqueta
+        asignadas.add(fila.id)
+
+    for fila in sorted((f for f in filas if f.id not in asignadas), key=lambda f: f.orden):
+        siguiente += 1
+        fila.orden = siguiente
+
+    await db.flush()
+
+
+async def _resolver_texto_obligaciones_archivo(
+    content: bytes,
+    filename: str,
+    texto_extraido: str,
+    contrato_id: uuid.UUID,
+    db: AsyncSession,
+) -> tuple[str | None, list[str]]:
+    """Select the text obligation extraction should see for `filename` (B6).
+
+    A plain (non-archive) document passes `texto_extraido` through unchanged.
+    An archive's generic text (``document_parser.parse_archive``, used by
+    ``parse_document``/``extraer_texto_documento``) is the CONCATENATION of
+    every member — mixing unrelated contracts' text into one blob feeds
+    obligation extraction from documents that have nothing to do with the
+    selected contract (e.g. a zip bundling the real clausulado with an
+    unrelated certificado de experiencia).
+
+    Instead: extract each member's text SEPARATELY and use only the member(s)
+    whose text núcleo-exact-matches this contract's número (reusing
+    ``checklist_service._detectar_pertenencia_por_texto``, the same matcher
+    the SECOP auto-link pertenencia guard uses); failing that, the single
+    member whose CONTENT is classified as CONTRATO. If no member qualifies,
+    extract nothing — NEVER fall back to the concatenation — and log a
+    warning plus a user-facing aviso.
+    """
+    from app.agent.tools.document_parser import extract_archive_member_texts, is_archive_filename
+
+    if not is_archive_filename(filename):
+        return texto_extraido, []
+
+    miembros = extract_archive_member_texts(content, filename)
+    if not miembros:
+        # Nothing readable inside (only images/binaries, or every member was
+        # skipped by the size caps). Returning silently left the user looking at a
+        # successful upload with zero obligations and no explanation.
+        await logger.awarning(
+            "archivo_sin_miembros_legibles",
+            filename=filename,
+            contrato_id=str(contrato_id),
+        )
+        return None, [
+            "El archivo comprimido no contiene documentos con texto legible; "
+            "no se extrajeron obligaciones desde el archivo."
+        ]
+
+    contrato_row = await db.get(Contrato, contrato_id)
+    numero_contrato = contrato_row.numero_contrato if contrato_row else None
+
+    if numero_contrato:
+        from app.services.checklist_service import _detectar_pertenencia_por_texto
+
+        coincidencias = [
+            texto for _, texto in miembros if _detectar_pertenencia_por_texto(texto, numero_contrato) is True
+        ]
+        if coincidencias:
+            return "\n\n".join(coincidencias), []
+
+    from app.services.document_classifier import clasificar_contenido
+
+    clasificados_contrato = [
+        (nombre, texto) for nombre, texto in miembros if clasificar_contenido(texto)[0] == CategoriaDocumento.CONTRATO
+    ]
+    if len(clasificados_contrato) == 1:
+        return clasificados_contrato[0][1], []
+
+    await logger.awarning(
+        "archivo_sin_miembro_contrato_identificado",
+        filename=filename,
+        contrato_id=str(contrato_id),
+        total_miembros=len(miembros),
+    )
+    return None, [
+        "El archivo comprimido no tiene un miembro identificable como el contrato seleccionado; "
+        "no se extrajeron obligaciones desde el archivo."
+    ]
 
 
 def _safe_decimal(val: str | None) -> Decimal:
@@ -796,14 +1004,34 @@ async def upload_document(
     #
     # `doc_cuenta_cobro_id is None` is necessary but NOT sufficient: contract-level
     # requisitos (RUT, CEDULA, RPC, CDP, FICHA_TECNICA, ACTA_INICIO) legitimately
-    # resolve to None too, and a RUT is not the contract. So the requisito, when the
-    # caller declares one, must be the CONTRATO requisito itself.
-    alcance_documento_del_contrato = doc_cuenta_cobro_id is None and requisito_codigo in (None, "CONTRATO")
+    # resolve to None too, and a RUT is not the contract.
+    #
+    # B3 hardening: treating an OMITTED `requisito_codigo` as "this is the contract"
+    # (the previous `requisito_codigo in (None, "CONTRATO")` test) was still too
+    # loose — any direct `upload_document` caller (agent tools, background jobs) that
+    # passed `tipo=CONTRATO` + `contrato_id` with no cuenta and no requisito (e.g. an
+    # "certificado de experiencia" uploaded for context) was silently treated as THE
+    # contract, replacing the real one and feeding its (possibly unrelated) text into
+    # obligation extraction. The requisito must now be declared EXPLICITLY as
+    # "CONTRATO" (case-insensitive) — no more implicit-by-omission scoping. The
+    # HTTP router does NOT default/synthesize it either: the frontend's
+    # `buildContratoUploadParams` already sends `requisito_codigo=CONTRATO`
+    # explicitly whenever `tipo=contrato` for its contract-upload call sites, and
+    # every other first-party caller (SECOP scraper, `importar_documento` tool)
+    # passes it directly too.
+    requisito_es_contrato = requisito_codigo is not None and requisito_codigo.strip().upper() == "CONTRATO"
+    alcance_documento_del_contrato = doc_cuenta_cobro_id is None and requisito_es_contrato
 
-    # Enforce 1-document-per-contract rule for tipo=CONTRATO.
-    # If a CONTRATO document already exists for this contract (any filename),
-    # replace it: delete the old file from storage and the old DB record so
-    # the new upload becomes the single source of truth.
+    # Enforce 1-document-per-contract rule for tipo=CONTRATO: if a CONTRATO document
+    # already exists for this contract (any filename), this upload replaces it.
+    #
+    # This is only the LOOKUP. Nothing is deleted here — the replace is decided and
+    # executed much further down (see "Replace the previous contract document"),
+    # after the content-based tipo corrector has confirmed the new file really is a
+    # contract and after obligations have been extracted from it. Running the wipe
+    # here meant a user who dropped the wrong PDF lost both the stored contract and
+    # every obligation before anything had even looked at the new file's content.
+    prev_docs: list[DocumentoFuente] = []
     if tipo == TipoDocumentoFuente.CONTRATO and alcance_documento_del_contrato and contrato_id is not None:
         prev_result = await db.execute(
             select(DocumentoFuente).where(
@@ -812,20 +1040,6 @@ async def upload_document(
             )
         )
         prev_docs = list(prev_result.scalars().all())
-        for prev_doc in prev_docs:
-            # Best-effort delete of the old file; a storage miss must not block
-            # replacing the DB record (the new upload is the source of truth).
-            with contextlib.suppress(Exception):
-                await _get_storage(settings.S3_BUCKET_DOCUMENTOS).delete(prev_doc.storage_key)
-            await db.delete(prev_doc)
-        if prev_docs:
-            await db.flush()
-            await logger.ainfo(
-                "contrato_documento_replaced",
-                replaced=len(prev_docs),
-                new_nombre=filename,
-                contrato_id=str(contrato_id),
-            )
 
     # Content hash — computed early so dedup can match on content, not just
     # filename (same file re-uploaded under a different name must not create
@@ -856,6 +1070,13 @@ async def upload_document(
         dup_conditions.append(DocumentoFuente.contrato_id == contrato_id)
     else:
         dup_conditions.append(DocumentoFuente.contrato_id.is_not(None))
+    # The contract document(s) this upload is about to REPLACE must never satisfy the
+    # dedup fast path: re-uploading a corrected "contrato.pdf" under the same name
+    # would otherwise short-circuit into "ya estaba cargado" and never replace
+    # anything. (Before the replace was deferred, those rows had already been deleted
+    # by the time this query ran, which is what kept the old flow correct.)
+    if prev_docs:
+        dup_conditions.append(DocumentoFuente.id.not_in([d.id for d in prev_docs]))
     # A matched document whose linked Contrato was soft-deleted must NOT count as
     # "already exists" — otherwise the dedup fast path below returns a contrato_id
     # pointing at a dead row (GET /contratos/{id} filters deleted_at.is_(None) and
@@ -898,9 +1119,36 @@ async def upload_document(
                 f"El archivo '{filename}' ya estaba cargado. Se retorna el documento existente. "
                 "Si querés reemplazarlo, eliminá el documento anterior y subí el nuevo."
             )
+
+        # A3 retry-repair: the previous upload of this exact content may have
+        # persisted the document but failed to link it to the checklist requisito
+        # (see the fresh-upload link block below). vincular_documento_fuente is
+        # idempotent, so re-attempting here on every dedup hit is safe and lets a
+        # simple re-upload of the same file ("Reintentar" in the UI) repair a
+        # missing/incomplete vinculo instead of silently short-circuiting.
+        if cuenta_cobro_id is not None and requisito_codigo is not None:
+            from app.services import checklist_service
+
+            try:
+                await checklist_service.vincular_documento_fuente(
+                    db=db,
+                    cuenta_id=cuenta_cobro_id,
+                    requisito_codigo=requisito_codigo,
+                    documento_fuente_id=existing_doc.id,
+                )
+                await db.commit()
+            except DomainError as exc:
+                # Dedup fast path: the document was persisted by an EARLIER upload,
+                # so this failure is a link failure too. See `marcar_documento_persistido`.
+                marcar_documento_persistido(exc)
+                raise
+            except Exception as exc:
+                raise ChecklistLinkError(requisito_codigo, str(exc)[:200]) from exc
+
         return DocumentUploadResponse(
             id=existing_doc.id,
             nombre=existing_doc.nombre,
+            nombre_original=filename,
             tipo=existing_doc.tipo.value,
             texto_extraido=existing_doc.texto_extraido,
             contrato_id=effective_contrato_id,
@@ -1012,6 +1260,14 @@ async def upload_document(
                 confianza=float(cat_confianza),
             )
 
+    # The corrector just proved this file is NOT a contract, so it cannot replace the
+    # contract document either. Cancelling the pending replace here is the whole point
+    # of having moved the replace below the corrector: the previous flow wiped the
+    # document AND its obligations first, then stored the mis-dropped file under the
+    # corrected tipo — leaving the contract step empty and unrecoverable.
+    if tipo != TipoDocumentoFuente.CONTRATO:
+        prev_docs = []
+
     # `alcance_documento_del_contrato` re-applied at every contract-level mutation
     # below. `tipo` is read live because the A1 corrector above may have re-derived it.
     es_contrato_autocrear = (
@@ -1095,14 +1351,75 @@ async def upload_document(
     # Extract obligations once we have a contract to link them to. Same scope guard as
     # the replace rule: a checklist attachment must never write obligaciones onto the
     # contract just because the caller let `tipo` default to `contrato`.
+    #
+    # On a REPLACE the extraction runs DRY first (nothing persisted) so the decision
+    # to wipe the existing obligations is made from what the NEW document actually
+    # yields. Wiping first and extracting after turned an unreadable or mis-scanned
+    # replacement into total loss of the user's obligations.
     if tipo == TipoDocumentoFuente.CONTRATO and alcance_documento_del_contrato and contrato_id is not None:
+        # An active cuenta (enviada/aprobada/pagada) never blocks the replace, and no
+        # longer blocks the reconcile either: the protection it deserves is per
+        # obligación, applied inside `_reconcile_obligaciones`. Skipping extraction
+        # wholesale because SOME cuenta was active froze the contract — a corrected
+        # contract's genuinely new obligaciones were silently never added, and PAGADA
+        # being terminal made that permanent.
+        ob_items: list[ObligacionExtraida] = []
+        ob_avisos: list[str] = []
+        from app.agent.tools.document_parser import is_archive_filename as _es_archivo
+
         if multimodal_result is not None:
             ob_items = _obligacion_items_to_extraidas(multimodal_result.obligaciones)
-            obligaciones_extraidas, ob_avisos = await _persist_obligaciones(ob_items, contrato_id, db, [])
-            avisos.extend(ob_avisos)
-        elif texto_extraido:
-            obligaciones_extraidas, ob_avisos = await _extraer_obligaciones(texto_extraido, contrato_id, db)
-            avisos.extend(ob_avisos)
+        # An archive still goes through the resolver even when it yielded NO text:
+        # that is the case that most needs the aviso explaining why zero obligations
+        # came back (a zip of scans, or one whose members hit the size caps).
+        elif texto_extraido or _es_archivo(filename):
+            texto_para_obligaciones, archivo_avisos = await _resolver_texto_obligaciones_archivo(
+                content, filename, texto_extraido or "", contrato_id, db
+            )
+            avisos.extend(archivo_avisos)
+            if texto_para_obligaciones:
+                ob_items, ob_avisos = await _extraer_obligaciones(
+                    texto_para_obligaciones, contrato_id, db, persistir=False
+                )
+
+        if prev_docs and not ob_items:
+            # The document is still replaced (it IS the file the user wants stored),
+            # but its obligations could not be read — keeping the previous ones is
+            # strictly better than replacing them with nothing.
+            avisos.append("No se extrajeron obligaciones del nuevo documento; se conservaron las existentes.")
+            await logger.awarning(
+                "contrato_reemplazado_sin_obligaciones",
+                contrato_id=str(contrato_id),
+                new_nombre=filename,
+            )
+        elif prev_docs:
+            # Reconcile against the new extraction instead of wipe-and-reinsert
+            # (BLOCKER B): obligaciones whose normalized text still appears in
+            # the new document keep their id — and every actividad/evidencia
+            # link built on it — untouched.
+            obligaciones_extraidas, ob_avisos = await _reconcile_obligaciones(
+                ob_items, contrato_id, user_id, db, ob_avisos
+            )
+        else:
+            obligaciones_extraidas, ob_avisos = await _persist_obligaciones(ob_items, contrato_id, db, ob_avisos)
+        avisos.extend(ob_avisos)
+
+    # ── Replace the previous contract document ───────────────────────────────────
+    # Deferred all the way down here on purpose: the content-based tipo corrector has
+    # already had its chance to reject this upload without anything having been touched,
+    # and the reconcile above has already decided which obligaciones survive.
+    storage_keys_reemplazados: list[str] = []
+    if prev_docs:
+        for prev_doc in prev_docs:
+            storage_keys_reemplazados.append(prev_doc.storage_key)
+            await db.delete(prev_doc)
+        await db.flush()
+        await logger.ainfo(
+            "contrato_documento_replaced",
+            replaced=len(prev_docs),
+            new_nombre=filename,
+            contrato_id=str(contrato_id),
+        )
 
     # Upload to storage (local filesystem or S3, depending on STORAGE_PROVIDER).
     safe_filename = get_safe_filename(filename)
@@ -1147,6 +1464,15 @@ async def upload_document(
     await db.commit()
     await db.refresh(doc)
 
+    # Storage deletion of the REPLACED objects runs only after the transaction has
+    # committed: it is not transactional, so doing it earlier meant any later failure
+    # (FK violation on the obligation wipe, a storage upload error, a rollback) left
+    # the contract PDF permanently gone with no DB row pointing at it. Best-effort —
+    # a storage miss must not fail an upload that is already committed.
+    for old_storage_key in storage_keys_reemplazados:
+        with contextlib.suppress(Exception):
+            await _get_storage(settings.S3_BUCKET_DOCUMENTOS).delete(old_storage_key)
+
     await logger.ainfo("document_uploaded", doc_id=str(doc.id), filename=filename, contrato_id=str(contrato_id))
 
     # Optional: link uploaded document to a cuenta de cobro checklist requisito.
@@ -1168,6 +1494,20 @@ async def upload_document(
                 documento_fuente_id=doc.id,
             )
             await db.commit()
+        except DomainError as exc:
+            # The document above is already committed — only the link failed.
+            # Propagate so the client sees WHY (e.g. a missing checklist row)
+            # instead of a false 201 while the requisito stays Pendiente. Mark it
+            # so a batch caller classifies this file as persisted-but-unlinked
+            # rather than never-saved (see `marcar_documento_persistido`).
+            marcar_documento_persistido(exc)
+            await logger.awarning(
+                "checklist_link_failed",
+                doc_id=str(doc.id),
+                cuenta_cobro_id=str(cuenta_cobro_id),
+                requisito_codigo=requisito_codigo,
+            )
+            raise
         except Exception as exc:
             await logger.awarning(
                 "checklist_link_failed",
@@ -1176,10 +1516,12 @@ async def upload_document(
                 requisito_codigo=requisito_codigo,
                 error=str(exc),
             )
+            raise ChecklistLinkError(requisito_codigo, str(exc)[:200]) from exc
 
     return DocumentUploadResponse(
         id=doc.id,
         nombre=doc.nombre,
+        nombre_original=filename,
         tipo=doc.tipo.value,
         texto_extraido=texto_extraido,
         contrato_id=contrato_id,
@@ -1575,16 +1917,24 @@ async def extraer_obligaciones_documento(
     Returns (obligaciones, avisos).
     Raises NotFoundError si no hay documento de contrato vinculado.
     """
+    # B5: the contract's own document is always contract-level (cuenta_cobro_id
+    # IS NULL) — without that filter, a cuenta-scoped attachment that happened to
+    # keep tipo=CONTRATO (e.g. from before the B3 scope guard existed) could match
+    # too. ORDER BY created_at DESC + LIMIT 1 also makes this deterministic: an
+    # unordered LIMIT 1 could return whichever row the DB happened to scan first,
+    # not the current/most-recent contract document.
     result = await db.execute(
         select(DocumentoFuente)
         .join(Contrato, DocumentoFuente.contrato_id == Contrato.id)
         .where(
             DocumentoFuente.contrato_id == contrato_id,
             DocumentoFuente.tipo == TipoDocumentoFuente.CONTRATO,
+            DocumentoFuente.cuenta_cobro_id.is_(None),
             DocumentoFuente.texto_extraido.is_not(None),
             Contrato.usuario_id == user_id,
             Contrato.deleted_at.is_(None),
         )
+        .order_by(DocumentoFuente.created_at.desc())
         .limit(1)
     )
     doc = result.scalar_one_or_none()

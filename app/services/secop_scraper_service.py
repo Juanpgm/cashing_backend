@@ -314,6 +314,13 @@ async def _persistir_documento_scrapeado(
             guess_mime_type(dto.nombre_archivo),
             tipo=TipoDocumentoFuente.CONTRATO,
             contrato_id=contrato_id,
+            # B3: upload_document now requires an EXPLICIT requisito_codigo=="CONTRATO"
+            # to treat this as the contract (replace rule + obligation extraction) —
+            # tipo=CONTRATO alone is no longer sufficient. This module always scrapes
+            # into the contract slot by design (see module docstring's "known
+            # limitation" about >1 scraped doc per contract), so the intent here is
+            # genuinely "this is the contract".
+            requisito_codigo="CONTRATO",
         )
     except Exception as exc:
         await log.aexception("secop_scraper_persist_failed", nombre_archivo=dto.nombre_archivo, error=str(exc))

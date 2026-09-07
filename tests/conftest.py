@@ -3,7 +3,7 @@
 import asyncio
 import os
 import sys
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Generator
 from typing import Any
 
 import app.models  # noqa: F401 — register all models for Base.metadata
@@ -25,6 +25,29 @@ limiter.enabled = False
 # The default placeholder in Settings is not a valid 32-byte base64 key.
 if len(settings.TOKEN_ENCRYPTION_KEY) != 44:
     settings.TOKEN_ENCRYPTION_KEY = Fernet.generate_key().decode()
+
+# Filesystem storage for the whole suite. A developer `.env` carrying
+# STORAGE_PROVIDER=minio (or s3) leaked into the tests: every test that does not
+# mock storage attempted a REAL S3 PUT and failed with "Could not connect to the
+# endpoint URL: https://cashin-documentos.s3...". Tests that genuinely exercise S3
+# build `S3StorageAdapter` explicitly against moto (see test_storage_adapters.py),
+# and tests that need a specific root monkeypatch these back per test, so this
+# session default only removes the network dependency.
+_STORAGE_PROVIDER_ORIGINAL = settings.STORAGE_PROVIDER
+_LOCAL_STORAGE_PATH_ORIGINAL = settings.LOCAL_STORAGE_PATH
+
+
+@pytest.fixture(scope="session", autouse=True)
+def storage_local_por_defecto(tmp_path_factory: pytest.TempPathFactory) -> Generator[None, None, None]:
+    """Point storage at a throwaway directory instead of MinIO/S3."""
+    settings.STORAGE_PROVIDER = "local"
+    settings.LOCAL_STORAGE_PATH = str(tmp_path_factory.mktemp("storage"))
+    try:
+        yield
+    finally:
+        settings.STORAGE_PROVIDER = _STORAGE_PROVIDER_ORIGINAL
+        settings.LOCAL_STORAGE_PATH = _LOCAL_STORAGE_PATH_ORIGINAL
+
 
 # In-memory SQLite for tests by default; override with TEST_DATABASE_URL to run
 # the suite against Postgres (e.g. postgresql+asyncpg://cashin:cashin_local@localhost:5432/cashin).

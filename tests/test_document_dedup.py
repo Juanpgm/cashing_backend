@@ -155,6 +155,10 @@ class TestContentHashDedup:
                 content_type="text/plain",
                 tipo=TipoDocumentoFuente.CONTRATO,
                 contrato_id=contrato_id,
+                # B3: upload_document requires an EXPLICIT requisito_codigo=="CONTRATO"
+                # to treat this call as the contract (direct service call, bypassing
+                # the router's Opción A/B default synthesis).
+                requisito_codigo="CONTRATO",
             )
             second = await upload_document(
                 db=db,
@@ -164,6 +168,7 @@ class TestContentHashDedup:
                 content_type="text/plain",
                 tipo=TipoDocumentoFuente.CONTRATO,
                 contrato_id=contrato_id,
+                requisito_codigo="CONTRATO",
             )
 
         assert second.id != first.id

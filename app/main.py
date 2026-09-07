@@ -8,12 +8,12 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy.exc import IntegrityError
 
 from app.api.router import api_v1_router
 from app.core.audit import AuditMiddleware
+from app.core.client_ip import TrustedProxyClientMiddleware
 from app.core.config import settings
 from app.core.error_response import internal_error_response
 from app.core.exceptions import DomainError, domain_to_http
@@ -224,9 +224,31 @@ app.add_middleware(
     expose_headers=["Content-Disposition"],
 )
 
+# Resolves the real client IP behind Railway's proxy (see
+# app/core/client_ip.py). Added LAST so it is OUTERMOST — Starlette's
+# add_middleware wraps last-added outermost, and this must run BEFORE
+# SecurityHeadersMiddleware/AuditMiddleware/CORSMiddleware/the slowapi rate
+# limiter so they all observe the resolved `request.client.host`, not the raw
+# socket peer (the proxy's own address).
+app.add_middleware(TrustedProxyClientMiddleware)
+
 # Rate limiting
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
+    """Same body as slowapi's default handler, PLUS a `detail` key.
+
+    The frontend's error formatter reads `err.response.data.detail` (matching
+    every other error response in this API — see `domain_error_handler`
+    below), but slowapi's built-in handler returns `{"error": ...}` only, so a
+    429 was silently dropped client-side and the user saw the raw axios
+    string instead of a useful message.
+    """
+    message = f"Rate limit exceeded: {exc.detail}"
+    response = JSONResponse({"error": message, "detail": message}, status_code=429)
+    return request.app.state.limiter._inject_headers(response, request.state.view_rate_limit)
 
 
 # --- Exception handlers ---

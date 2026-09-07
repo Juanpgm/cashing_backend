@@ -416,18 +416,19 @@ _ENUM_RE = re.compile(
 )
 
 
-def _candidate_starts(texto_upper: str) -> list[int]:
-    """Return offsets right AFTER every obligation-section header, tier-1 first.
+def _candidate_starts(texto_upper: str) -> list[tuple[int, int]]:
+    """Return (offset, tier) pairs right AFTER every obligation-section header.
 
     Unlike a first-match lookup, this yields ALL candidate sections so the caller
-    can skip false positives (e.g. a header term mentioned in prose with no list)
-    and fall through to the section that actually contains an enumerated list.
-    Tier-1 ("OBLIGACIONES/ACTIVIDADES ESPECÍFICAS") candidates come before tier-2.
+    can score them (see ``extract_obligaciones_verbatim``) instead of taking
+    whichever comes first in the text. ``tier`` is 1 for "OBLIGACIONES/
+    ACTIVIDADES ESPECÍFICAS" (preferred) and 2 for the broader fallback
+    keywords; tier-1 offsets are listed before tier-2 offsets.
     """
-    starts: list[int] = []
-    for tier in (OBLIGACION_SECTION_KW_TIER1, OBLIGACION_SECTION_KW_TIER2):
+    starts: list[tuple[int, int]] = []
+    for tier, keywords in enumerate((OBLIGACION_SECTION_KW_TIER1, OBLIGACION_SECTION_KW_TIER2), start=1):
         tier_offsets: set[int] = set()
-        for kw in tier:
+        for kw in keywords:
             pos = 0
             while True:
                 idx = texto_upper.find(kw, pos)
@@ -435,7 +436,7 @@ def _candidate_starts(texto_upper: str) -> list[int]:
                     break
                 tier_offsets.add(idx + len(kw))
                 pos = idx + len(kw)
-        starts.extend(sorted(tier_offsets))
+        starts.extend((offset, tier) for offset in sorted(tier_offsets))
     return starts
 
 
@@ -462,10 +463,34 @@ def _find_section_end(texto: str, start: int) -> int:
     return end
 
 
+# "Todas aquellas [actividades/obligaciones] inherentes ... objeto contractual /
+# objeto del contrato" and its "Las demás inherentes ..." variant — a second,
+# phrase-anchored catch-all family distinct from the assignment-style closer
+# below ("Las demás ... que asignen/encomienden/relacionen/correspondan").
+# Anchored on the opener + "inherent" + the objeto phrase (not bare keywords)
+# so it does not fire on unrelated prose that happens to mention "inherente".
+_INHERENTES_CATCH_ALL_RE = re.compile(
+    r"(?:las\s+dem[aá]s|todas\s+aquellas)"
+    r"(?:\s+(?:actividades|obligaciones))?"
+    r"[^.]{0,60}?\binherent\w*"
+    r"[^.]{0,80}?(?:objeto\s+contractual|objeto\s+del\s+contrato)"
+)
+
+
 def _is_catch_all(text: str) -> bool:
-    """Return True when text is a catch-all closing clause ('Las demás actividades…')."""
+    """Return True when text is a catch-all closing clause.
+
+    Two phrase families:
+      - Assignment-style: "Las demás [actividades] que [le] asignen/
+        encomienden/relacionen/correspondan..."
+      - Inherencia-style: "Todas aquellas inherentes ... objeto contractual"
+        or "Las demás inherentes ... objeto del contrato" (see
+        ``_INHERENTES_CATCH_ALL_RE``).
+    """
     t = text.lower()
-    return "las dem" in t and any(w in t for w in ("asign", "encomiend", "relacionen", "correspondan"))
+    if "las dem" in t and any(w in t for w in ("asign", "encomiend", "relacionen", "correspondan")):
+        return True
+    return bool(_INHERENTES_CATCH_ALL_RE.search(t))
 
 
 # Ordinal / clause headings that start the NEXT clause (Spanish public contracts).
@@ -660,6 +685,16 @@ def extract_obligaciones_verbatim(texto: str) -> list[ObligacionExtraida]:
     whitespace collapsed to single spaces; items shorter than 10 characters are
     dropped as noise and anything after the catch-all closer is excluded.
 
+    Candidates are scored rather than taking the first match: a section closing
+    with the catch-all wins over one that doesn't; among ties, the one with the
+    most items wins (a 1-item candidate never beats a >=2-item one just because
+    it happened to appear first in the text — a PARÁGRAFO merely mentioning
+    "obligaciones específicas" and closing with a single catch-all bullet used
+    to beat the real 5-item enumerated list that follows it); among further
+    ties, a tier-1 heading (OBLIGACIONES/ACTIVIDADES ESPECÍFICAS) wins over
+    tier-2. The first candidate found keeps a tie (stable, matches the original
+    position/tier-1-first preference).
+
     Returns an empty list when no usable section is found, OR when any item
     still carries a strong footer signature (NIT / e-mail / TEL-FAX-WEB label —
     see ``_has_footer_pollution``) — verbatim text is only trustworthy on clean
@@ -676,19 +711,21 @@ def extract_obligaciones_verbatim(texto: str) -> list[ObligacionExtraida]:
         ]
 
     texto_upper = texto.upper()
-    fallback: list[tuple[str, str]] | None = None
-    for start in _candidate_starts(texto_upper):
+    best_score: tuple[int, int, int] | None = None
+    best_items: list[tuple[str, str]] | None = None
+    for start, tier in _candidate_starts(texto_upper):
         end = _find_section_end(texto, start)
         items = _extract_items_from_block(texto[start:end])
         if not items:
             continue
-        # The real specific-obligations list is the one that closes with the
-        # catch-all ("Las demás actividades…") — prefer it over a general list
-        # (e.g. seguridad social) that merely happens to enumerate items first.
-        if _is_catch_all(items[-1][1]):
-            return [] if _has_footer_pollution(items) else _to_obligaciones(items)
-        if fallback is None:
-            fallback = items
-    if fallback is None or _has_footer_pollution(fallback):
+        score = (
+            1 if _is_catch_all(items[-1][1]) else 0,  # closes with the catch-all
+            len(items),  # most items
+            1 if tier == 1 else 0,  # tier-1 heading over tier-2
+        )
+        if best_score is None or score > best_score:
+            best_score = score
+            best_items = items
+    if best_items is None or _has_footer_pollution(best_items):
         return []
-    return _to_obligaciones(fallback)
+    return _to_obligaciones(best_items)

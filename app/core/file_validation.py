@@ -18,6 +18,21 @@ ALLOWED_MIME_TYPES: dict[str, list[str]] = {
 
 MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10MB
 
+
+def formatos_aceptados() -> str:
+    """Accepted extensions as user-facing copy, e.g. ``"DOCX, JPG, PDF, …"``.
+
+    Derived from ``ALLOWED_MIME_TYPES`` so the message the user reads can never
+    drift from what the validator actually accepts.
+    """
+    extensiones = {ext.lstrip(".").upper() for exts in ALLOWED_MIME_TYPES.values() for ext in exts}
+    return ", ".join(sorted(extensiones))
+
+
+def tamano_maximo_legible() -> str:
+    """``MAX_FILE_SIZE_BYTES`` as user-facing copy, e.g. ``"10 MB"``."""
+    return f"{MAX_FILE_SIZE_BYTES // (1024 * 1024)} MB"
+
 # Safe filename pattern: alphanumeric, hyphens, underscores, dots
 SAFE_FILENAME_RE = re.compile(r"^[a-zA-Z0-9_\-][a-zA-Z0-9_\-\.]*$")
 
@@ -144,10 +159,25 @@ def get_safe_filename(filename: str) -> str:
     return f"{safe_name}.{ext}" if ext else safe_name
 
 
+def _has_traversal_path_segment(filename: str) -> bool:
+    """Return True if `filename` contains a `..` PATH SEGMENT, or is an absolute path.
+
+    A `..` substring elsewhere in the name (e.g. a trailing double dot before the
+    extension, as in "report..pdf") is NOT traversal — only a full `..` segment
+    between path separators, or a leading absolute-path slash, counts. Backslashes
+    are normalized to forward slashes first so Windows-style paths (`..\\..\\x`)
+    are caught too.
+    """
+    normalized = filename.replace("\\", "/")
+    if normalized.startswith("/"):
+        return True
+    return any(segment == ".." for segment in normalized.split("/"))
+
+
 def validate_file_extension(filename: str) -> bool:
     """Check if filename has an allowed extension. Sanitizes first so display names with spaces are accepted."""
     # Reject path traversal attempts before sanitizing
-    if ".." in filename or filename.startswith("/"):
+    if _has_traversal_path_segment(filename):
         return False
     # Use the sanitized form for extension check — original names with spaces/accents are fine
     safe = sanitize_filename(filename)
@@ -278,7 +308,7 @@ def validate_evidence_file(filename: str, size: int, content_type: str, content:
     if size > MAX_EVIDENCE_FILE_SIZE_BYTES:
         max_mb = MAX_EVIDENCE_FILE_SIZE_BYTES // (1024 * 1024)
         raise ValidationError(f"Archivo demasiado grande ({size} bytes, máximo {max_mb}MB): {filename}")
-    if ".." in filename or filename.startswith("/"):
+    if _has_traversal_path_segment(filename):
         raise ValidationError(f"Nombre de archivo no permitido: {filename}")
 
     ext = _final_extension(filename)

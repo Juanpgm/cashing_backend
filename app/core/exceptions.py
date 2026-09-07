@@ -32,6 +32,11 @@ CUOTA_NUMERO_CONFLICT = "CUOTA_NUMERO_CONFLICT"
 # A cuenta de cobro already exists for the same (contrato, mes, anio) — lets the
 # frontend show a friendly Spanish message instead of the raw English `detail`.
 CUENTA_MES_DUPLICADA = "CUENTA_MES_DUPLICADA"
+# The document itself was persisted, but linking it to its checklist requisito
+# failed. Distinct from a plain upload failure: the client must not assume the
+# file is lost — re-uploading the same content repairs the link (see
+# document_service.upload_document's content-hash dedup fast path).
+CHECKLIST_LINK_FAILED = "CHECKLIST_LINK_FAILED"
 
 
 class DomainError(Exception):
@@ -110,6 +115,52 @@ class ExternalServiceError(DomainError):
         super().__init__(f"{service}: {detail}", code=code)
 
 
+class ChecklistLinkError(DomainError):
+    """The document was uploaded and persisted, but linking it to a checklist
+    requisito failed. Re-uploading the same file content re-attempts the link
+    (see the content-hash dedup fast path in document_service.upload_document)."""
+
+    def __init__(self, requisito_codigo: str, reason: str, archivos: list[str] | None = None) -> None:
+        if archivos:
+            # Batch flavour: name the affected files so the client knows exactly
+            # which ones need a retry (the others in the batch are fine).
+            nombres = ", ".join(f"'{a}'" for a in archivos)
+            sujeto = "Los archivos" if len(archivos) > 1 else "El archivo"
+            verbo = "se guardaron" if len(archivos) > 1 else "se guardó"
+            pudieron = "pudieron" if len(archivos) > 1 else "pudo"
+            detail = (
+                f"{sujeto} {nombres} {verbo} correctamente pero no {pudieron} vincularse al requisito "
+                f"'{requisito_codigo}': {reason}. Volvé a subir el mismo archivo para reintentar la vinculación."
+            )
+        else:
+            detail = (
+                f"El archivo se guardó correctamente pero no pudo vincularse al requisito "
+                f"'{requisito_codigo}': {reason}. Volvé a subir el mismo archivo para reintentar la vinculación."
+            )
+        super().__init__(detail, code=CHECKLIST_LINK_FAILED)
+
+
+_ATRIBUTO_DOCUMENTO_PERSISTIDO = "_documento_persistido"
+
+
+def marcar_documento_persistido(exc: DomainError) -> None:
+    """Flag a `DomainError` raised AFTER the document was already committed.
+
+    `document_service.upload_document` commits the document and only then
+    attempts the checklist link, so a `DomainError` escaping that block (a
+    `ChecklistLinkError` or any other, e.g. a `ValidationError` from
+    `vincular_documento_fuente`) belongs to a file that IS saved. Batch callers
+    must classify it as unlinked, never as "no se guardó" — the difference
+    decides whether the user retries the upload or only the link.
+    """
+    setattr(exc, _ATRIBUTO_DOCUMENTO_PERSISTIDO, True)
+
+
+def documento_fue_persistido(exc: BaseException) -> bool:
+    """Whether `exc` was flagged by `marcar_documento_persistido`."""
+    return bool(getattr(exc, _ATRIBUTO_DOCUMENTO_PERSISTIDO, False))
+
+
 # --- HTTP Exception mapping ---
 
 EXCEPTION_STATUS_MAP: dict[type[DomainError], int] = {
@@ -122,6 +173,7 @@ EXCEPTION_STATUS_MAP: dict[type[DomainError], int] = {
     RateLimitExceededError: status.HTTP_429_TOO_MANY_REQUESTS,
     ExternalServiceError: status.HTTP_502_BAD_GATEWAY,
     InviteRequiredError: status.HTTP_403_FORBIDDEN,
+    ChecklistLinkError: status.HTTP_502_BAD_GATEWAY,
 }
 
 
