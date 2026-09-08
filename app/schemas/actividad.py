@@ -7,17 +7,26 @@ from datetime import date, datetime
 
 from pydantic import BaseModel, Field
 
-
 # ── Evidencia (nested inside actividad responses) ────────────────────────────
 
 
 class EvidenciaResponse(BaseModel):
+    """Read schema for an evidencia nested inside an actividad response — either an
+    uploaded file or an external link (Gmail/Drive/Calendar discovery).
+
+    Mirrors `app.schemas.evidencia.EvidenciaResponse`: uploaded files populate
+    storage_key/tipo_archivo/tamano_bytes; link evidence populates fuente/url
+    instead, leaving the file fields NULL (see `app.models.evidencia.Evidencia`).
+    """
+
     id: uuid.UUID
     actividad_id: uuid.UUID
-    storage_key: str
+    storage_key: str | None = None
     nombre_archivo: str
-    tipo_archivo: str
-    tamano_bytes: int
+    tipo_archivo: str | None = None
+    tamano_bytes: int | None = None
+    fuente: str | None = None
+    url: str | None = None
     created_at: datetime
 
     model_config = {"from_attributes": True}

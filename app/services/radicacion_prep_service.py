@@ -76,7 +76,7 @@ async def preparar_radicacion(
     payload = await checklist_service.construir_checklist_completo(db, cuenta)
     resumen = payload["resumen"]
     if not resumen["radicacion_lista"]:
-        pendientes_desc = ", ".join(resumen["lista_pendientes"]) or "requisitos pendientes por definir"
+        pendientes_desc = ", ".join(resumen["lista_pendientes_desc"]) or "requisitos pendientes por definir"
         raise ValidationError(
             f"No se puede preparar la radicación: faltan requisitos del checklist. Pendientes: {pendientes_desc}.",
             code=CHECKLIST_INCOMPLETE,

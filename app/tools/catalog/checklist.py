@@ -50,6 +50,7 @@ async def resumen_checklist(ctx: ToolContext, params: ResumenChecklistInput) -> 
                 "cumplidos": 0,
                 "pendientes": 0,
                 "lista_pendientes": [],
+                "lista_pendientes_desc": [],
                 "radicacion_lista": False,
             },
             arbol_evidencias=[],

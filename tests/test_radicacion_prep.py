@@ -286,6 +286,49 @@ async def test_preparar_radicacion_raises_checklist_incomplete_when_pending(
     assert excinfo.value.code == "CHECKLIST_INCOMPLETE"
 
 
+async def test_preparar_radicacion_checklist_incompleto_message_names_etiqueta_not_uuid(
+    db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
+) -> None:
+    """End-to-end message content (BUG A): the CHECKLIST_INCOMPLETE message from
+    `preparar_radicacion` must name the pending CUSTOM requisito's etiqueta,
+    never its bare requisito_cuenta_id UUID."""
+    from app.models.requisito_cuenta import RequisitoCuenta
+
+    cuenta = CuentaCobro(
+        contrato_id=contrato.id,
+        mes=9,
+        anio=2024,
+        estado=EstadoCuentaCobro.BORRADOR,
+        valor=1_000_000,
+        requisitos_modo="augment",
+    )
+    db.add(cuenta)
+    await db.commit()
+    await db.refresh(cuenta)
+
+    rc = RequisitoCuenta(
+        cuenta_cobro_id=cuenta.id,
+        codigo="POLIZA_CUMPLIMIENTO",
+        etiqueta="Póliza de cumplimiento",
+        obligatorio=True,
+        keywords_deteccion=[],
+        orden=500,
+        origen="inferido",
+        activo=True,
+    )
+    db.add(rc)
+    await db.commit()
+    await db.refresh(rc)
+
+    with pytest.raises(ValidationError) as excinfo:
+        await radicacion_prep_service.preparar_radicacion(db, test_user["user"].id, cuenta.id)
+
+    assert excinfo.value.code == "CHECKLIST_INCOMPLETE"
+    mensaje = excinfo.value.detail
+    assert str(rc.id) not in mensaje
+    assert "Póliza de cumplimiento" in mensaje
+
+
 # ── 7.8-7.9 — HARD coherence finding halts BEFORE packaging ─────────────────
 
 

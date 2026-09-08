@@ -127,14 +127,26 @@ class ChecklistResumen(BaseModel):
     cumplidos: int
     pendientes: int
     lista_pendientes: list[str] = Field(default_factory=list)
+    # Human-readable "{codigo} — {etiqueta}" label per pendiente, index-aligned
+    # with `lista_pendientes`. `lista_pendientes` itself stays the load-bearing
+    # ref (codigo | str(uuid), matched by `_get_fila`/PATCH) — never a bare UUID
+    # in this one, which is what user-facing messages should join instead.
+    lista_pendientes_desc: list[str] = Field(default_factory=list)
     radicacion_lista: bool
 
 
 class ArbolEvidenciaItem(BaseModel):
     id: uuid.UUID
     nombre_archivo: str
-    tipo_archivo: str
-    tamano_bytes: int
+    # Nullable: link-only evidencia (Gmail/Drive/Calendar via
+    # evidence_persist_service) has no stored file — mirrors
+    # app.models.evidencia.Evidencia, where both are nullable.
+    tipo_archivo: str | None = None
+    tamano_bytes: int | None = None
+    # 'fuente'/'url' identify link evidence (see EvidenciaResponse); without
+    # them a link-evidencia is unopenable/unidentifiable in the tree.
+    fuente: str | None = None
+    url: str | None = None
 
 
 class ArbolActividadItem(BaseModel):
