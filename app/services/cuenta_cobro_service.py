@@ -1074,7 +1074,7 @@ async def radicar_cuenta(
     payload = await checklist_service.construir_checklist_completo(db, cuenta)
     resumen = payload["resumen"]
     if not resumen["radicacion_lista"]:
-        pendientes = ", ".join(resumen["lista_pendientes"]) or "requisitos pendientes por definir"
+        pendientes = ", ".join(resumen["lista_pendientes_desc"]) or "requisitos pendientes por definir"
         raise ValidationError(
             f"No se puede radicar: faltan requisitos del checklist. Pendientes: {pendientes}.",
             code=CHECKLIST_INCOMPLETE,

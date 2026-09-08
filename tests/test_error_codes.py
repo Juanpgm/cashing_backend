@@ -120,6 +120,51 @@ async def test_radicar_checklist_incompleto_returns_checklist_incomplete_code(
     assert body["code"] == "CHECKLIST_INCOMPLETE"
 
 
+async def test_radicar_checklist_incompleto_message_names_etiqueta_not_uuid(
+    client: AsyncClient, db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
+) -> None:
+    """End-to-end message content (BUG A): `radicar_cuenta`'s CHECKLIST_INCOMPLETE
+    message must name the pending CUSTOM requisito's etiqueta, never its bare
+    requisito_cuenta_id UUID."""
+    from app.models.requisito_cuenta import RequisitoCuenta
+
+    cuenta = CuentaCobro(
+        contrato_id=contrato.id,
+        mes=8,
+        anio=2024,
+        estado=EstadoCuentaCobro.BORRADOR,
+        valor=1_000_000,
+        requisitos_modo="augment",
+    )
+    db.add(cuenta)
+    await db.commit()
+    await db.refresh(cuenta)
+
+    rc = RequisitoCuenta(
+        cuenta_cobro_id=cuenta.id,
+        codigo="POLIZA_CUMPLIMIENTO",
+        etiqueta="Póliza de cumplimiento",
+        obligatorio=True,
+        keywords_deteccion=[],
+        orden=500,
+        origen="inferido",
+        activo=True,
+    )
+    db.add(rc)
+    await db.commit()
+    await db.refresh(rc)
+
+    resp = await client.post(
+        f"/api/v1/cuentas-cobro/{cuenta.id}/radicar",
+        headers=test_user["headers"],
+    )
+    assert resp.status_code in (400, 422), resp.text
+    body = resp.json()
+    assert body["code"] == "CHECKLIST_INCOMPLETE"
+    assert str(rc.id) not in body["detail"]
+    assert "Póliza de cumplimiento" in body["detail"]
+
+
 async def test_evidencias_descubrir_no_provider_connected_returns_code(
     client: AsyncClient, test_user: dict[str, Any]
 ) -> None:

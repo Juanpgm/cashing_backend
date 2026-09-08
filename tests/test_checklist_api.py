@@ -7,9 +7,12 @@ from datetime import date
 from typing import Any
 
 import pytest
+from app.models.actividad import Actividad
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
 from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
+from app.models.evidencia import Evidencia
+from app.models.obligacion import Obligacion, TipoObligacion
 from app.models.secop import SecopDocumento
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -88,6 +91,82 @@ async def test_get_checklist_seeds_and_returns_items(
     assert "CONTRATO" in codigos
     assert "RPC" in codigos
     assert body["resumen"]["radicacion_lista"] is False
+
+
+# ── link-only evidencia does not 500 (BUG B) ─────────────────────────────────
+# ArbolEvidenciaItem.tipo_archivo/tamano_bytes were required (non-nullable) but
+# Evidencia.tipo_archivo/tamano_bytes are nullable — a Gmail/Drive/Calendar
+# link-evidencia (evidence_persist_service) leaves both NULL, which used to
+# raise a pydantic ValidationError -> 500 on GET /checklist.
+
+
+async def test_get_checklist_with_link_evidencia_returns_200_with_fuente_y_url(
+    client: AsyncClient, test_user: dict[str, Any], db: AsyncSession, contrato: Contrato, cuenta: CuentaCobro
+) -> None:
+    ob = Obligacion(contrato_id=contrato.id, descripcion="Obligación de prueba", tipo=TipoObligacion.GENERAL, orden=0)
+    db.add(ob)
+    await db.commit()
+    await db.refresh(ob)
+
+    act = Actividad(cuenta_cobro_id=cuenta.id, obligacion_id=ob.id, descripcion="Actividad con enlace")
+    db.add(act)
+    await db.commit()
+    await db.refresh(act)
+
+    ev = Evidencia(
+        actividad_id=act.id,
+        nombre_archivo="Correo soporte",
+        fuente="gmail",
+        url="https://mail.example.com/x",
+        # tipo_archivo / tamano_bytes intentionally left NULL — legacy/link evidence.
+    )
+    db.add(ev)
+    await db.commit()
+
+    r = await client.get(
+        f"/api/v1/cuentas-cobro/{cuenta.id}/checklist",
+        headers=test_user["headers"],
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    evidencias = [e for obl in body["arbol_evidencias"] for a in obl["actividades"] for e in a["evidencias"]]
+    assert len(evidencias) == 1
+    ev_out = evidencias[0]
+    assert ev_out["tipo_archivo"] is None
+    assert ev_out["tamano_bytes"] is None
+    assert ev_out["fuente"] == "gmail"
+    assert ev_out["url"] == "https://mail.example.com/x"
+
+
+async def test_get_checklist_with_link_evidencia_on_non_borrador_cuenta_returns_200(
+    client: AsyncClient, test_user: dict[str, Any], db: AsyncSession, contrato: Contrato, cuenta: CuentaCobro
+) -> None:
+    """State-machine: a cuenta already past BORRADOR (e.g. ENVIADA) with legacy
+    link-evidencia must still return 200, not 500."""
+    ob = Obligacion(contrato_id=contrato.id, descripcion="Obligación de prueba", tipo=TipoObligacion.GENERAL, orden=0)
+    db.add(ob)
+    await db.commit()
+    await db.refresh(ob)
+
+    act = Actividad(cuenta_cobro_id=cuenta.id, obligacion_id=ob.id, descripcion="Actividad con enlace")
+    db.add(act)
+    await db.commit()
+    await db.refresh(act)
+
+    ev = Evidencia(
+        actividad_id=act.id, nombre_archivo="Correo soporte", fuente="gmail", url="https://mail.example.com/y"
+    )
+    db.add(ev)
+    await db.commit()
+
+    cuenta.estado = EstadoCuentaCobro.ENVIADA
+    await db.commit()
+
+    r = await client.get(
+        f"/api/v1/cuentas-cobro/{cuenta.id}/checklist",
+        headers=test_user["headers"],
+    )
+    assert r.status_code == 200, r.text
 
 
 async def test_patch_no_aplica(client: AsyncClient, test_user: dict[str, Any], cuenta: CuentaCobro) -> None:

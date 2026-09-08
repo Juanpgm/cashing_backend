@@ -2429,6 +2429,8 @@ async def listar_arbol_evidencias(db: AsyncSession, cuenta: CuentaCobro) -> list
                                 "nombre_archivo": e.nombre_archivo,
                                 "tipo_archivo": e.tipo_archivo,
                                 "tamano_bytes": e.tamano_bytes,
+                                "fuente": e.fuente,
+                                "url": e.url,
                             }
                             for e in a.evidencias
                         ],
@@ -2447,19 +2449,33 @@ def _fila_obligatorio_y_ref(
     fila: DocumentoCuentaCobro,
     cat_by_codigo: dict[str, RequisitoDocumento],
     custom_by_id: dict[uuid.UUID, RequisitoCuenta],
-) -> tuple[bool, str] | None:
-    """Return (obligatorio, public_ref) for a checklist row, or None if its
-    definition cannot be resolved (e.g. an orphaned/custom-disabled row)."""
+) -> tuple[bool, str, str] | None:
+    """Return (obligatorio, public_ref, human_desc) for a checklist row, or None
+    if its definition cannot be resolved (e.g. an orphaned/custom-disabled row).
+
+    `public_ref` is the load-bearing identifier used to address the row elsewhere
+    (catalog `codigo`, or `str(requisito_cuenta_id)` for custom rows) — NEVER
+    change its format, `_get_fila` and other consumers match on it verbatim.
+
+    `human_desc` is a "{codigo} — {etiqueta}" label safe for user-facing
+    messages (falls back to the bare codigo when etiqueta is blank/whitespace);
+    for custom rows it is built from the item's own `codigo`, never from
+    `public_ref`, so it never leaks the raw requisito_cuenta_id UUID.
+    """
     if fila.requisito_codigo is not None:
         req = cat_by_codigo.get(fila.requisito_codigo)
         if req is None:
             return None
-        return req.obligatorio, fila.requisito_codigo
+        etiqueta = (req.etiqueta or "").strip()
+        desc = f"{req.codigo} — {etiqueta}" if etiqueta else req.codigo
+        return req.obligatorio, fila.requisito_codigo, desc
     if fila.requisito_cuenta_id is not None:
         item = custom_by_id.get(fila.requisito_cuenta_id)
         if item is None:
             return None
-        return item.obligatorio, str(fila.requisito_cuenta_id)
+        etiqueta = (item.etiqueta or "").strip()
+        desc = f"{item.codigo} — {etiqueta}" if etiqueta else item.codigo
+        return item.obligatorio, str(fila.requisito_cuenta_id), desc
     return None
 
 
@@ -2477,11 +2493,12 @@ def computar_resumen(
     total = 0
     cumplidos = 0
     pendientes: list[str] = []
+    pendientes_desc: list[str] = []
     for fila in filas:
         meta = _fila_obligatorio_y_ref(fila, cat_by_codigo, custom_by_id)
         if meta is None:
             continue
-        obligatorio, ref = meta
+        obligatorio, ref, desc = meta
         if not obligatorio:
             continue
         estado = estado_overrides.get(fila.requisito_codigo or "", fila.estado)
@@ -2496,11 +2513,13 @@ def computar_resumen(
             cumplidos += 1
         else:
             pendientes.append(ref)
+            pendientes_desc.append(desc)
     return {
         "total": total,
         "cumplidos": cumplidos,
         "pendientes": len(pendientes),
         "lista_pendientes": pendientes,
+        "lista_pendientes_desc": pendientes_desc,
         "radicacion_lista": len(pendientes) == 0 and total > 0,
     }
 

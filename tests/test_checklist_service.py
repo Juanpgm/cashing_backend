@@ -19,6 +19,7 @@ from app.models.documento_cuenta_cobro import (
 from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
 from app.models.evidencia import Evidencia
 from app.models.obligacion import Obligacion, TipoObligacion
+from app.models.requisito_cuenta import RequisitoCuenta
 from app.models.secop import SecopDocumento
 from app.services import checklist_service
 from sqlalchemy import select
@@ -432,6 +433,207 @@ async def test_computar_resumen_radicacion_no_lista_si_falta(db: AsyncSession, c
     assert resumen["radicacion_lista"] is False
 
 
+# ── lista_pendientes_desc (BUG A: bare UUID in CHECKLIST_INCOMPLETE message) ─
+# billing-resilience-templates prodfix: `lista_pendientes` stays the load-bearing
+# ref (codigo | str(uuid) — see `_get_fila`), but a NEW `lista_pendientes_desc`
+# carries a human-readable "{codigo} — {etiqueta}" label, index-aligned with
+# `lista_pendientes`, so user-facing messages never leak a bare UUID.
+
+
+async def _make_cuenta_custom(db: AsyncSession, contrato: Contrato, mes: int, anio: int = 2024) -> CuentaCobro:
+    """A cuenta in 'augment' mode so custom RequisitoCuenta rows materialize."""
+    cc = CuentaCobro(
+        contrato_id=contrato.id,
+        mes=mes,
+        anio=anio,
+        estado=EstadoCuentaCobro.BORRADOR,
+        valor=1_000_000,
+        requisitos_modo="augment",
+    )
+    db.add(cc)
+    await db.commit()
+    await db.refresh(cc)
+    return cc
+
+
+async def _make_requisito_custom(
+    db: AsyncSession,
+    cuenta: CuentaCobro,
+    codigo: str,
+    etiqueta: str,
+    *,
+    activo: bool = True,
+    obligatorio: bool = True,
+) -> RequisitoCuenta:
+    rc = RequisitoCuenta(
+        cuenta_cobro_id=cuenta.id,
+        codigo=codigo,
+        etiqueta=etiqueta,
+        obligatorio=obligatorio,
+        keywords_deteccion=[],
+        orden=500,
+        origen="inferido",
+        activo=activo,
+    )
+    db.add(rc)
+    await db.commit()
+    await db.refresh(rc)
+    return rc
+
+
+async def _completar_menos(
+    db: AsyncSession, filas: list[DocumentoCuentaCobro], catalogo: list, codigo_dejar_pendiente: str | None
+) -> None:
+    """Mark every obligatorio row cumplido_manual/no_aplica EXCEPT one left pendiente."""
+    cat_by_codigo = {c.codigo: c for c in catalogo}
+    for fila in filas:
+        if fila.requisito_codigo == codigo_dejar_pendiente:
+            continue
+        if fila.requisito_codigo is not None:
+            req = cat_by_codigo.get(fila.requisito_codigo)
+            if req is None:
+                continue
+            fila.estado = EstadoRequisito.CUMPLIDO_MANUAL if req.obligatorio else EstadoRequisito.NO_APLICA
+        # custom rows left as-is by this helper — callers set them explicitly.
+    await db.commit()
+
+
+async def test_computar_resumen_lista_pendientes_desc_zero_pendientes(db: AsyncSession, contrato: Contrato) -> None:
+    """Boundary: 0 pendientes → both lists empty."""
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    filas = await checklist_service.asegurar_checklist(db, cuenta)
+    await db.commit()
+    catalogo = await checklist_service.listar_catalogo(db)
+    await _completar_menos(db, filas, catalogo, codigo_dejar_pendiente=None)
+
+    resumen = checklist_service.computar_resumen(filas, catalogo)
+    assert resumen["lista_pendientes"] == []
+    assert resumen["lista_pendientes_desc"] == []
+
+
+async def test_computar_resumen_lista_pendientes_desc_only_catalog_pendiente(
+    db: AsyncSession, contrato: Contrato
+) -> None:
+    """Boundary: only a catalog requisito pending → desc uses '{codigo} — {etiqueta}'."""
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    filas = await checklist_service.asegurar_checklist(db, cuenta)
+    await db.commit()
+    catalogo = await checklist_service.listar_catalogo(db)
+    await _completar_menos(db, filas, catalogo, codigo_dejar_pendiente="RPC")
+
+    resumen = checklist_service.computar_resumen(filas, catalogo)
+    req_rpc = next(c for c in catalogo if c.codigo == "RPC")
+    assert resumen["lista_pendientes"] == ["RPC"]
+    assert resumen["lista_pendientes_desc"] == [f"RPC — {req_rpc.etiqueta}"]
+
+
+async def test_computar_resumen_lista_pendientes_desc_only_custom_pendiente(
+    db: AsyncSession, contrato: Contrato
+) -> None:
+    """Boundary + regression for BUG A: only a CUSTOM requisito pending → desc
+    must carry its codigo/etiqueta, never the bare requisito_cuenta_id UUID."""
+    cuenta = await _make_cuenta_custom(db, contrato, mes=1)
+    rc = await _make_requisito_custom(db, cuenta, "POLIZA_CUMPLIMIENTO", "Póliza de cumplimiento")
+    filas = await checklist_service.asegurar_checklist(db, cuenta)
+    await db.commit()
+    catalogo = await checklist_service.listar_catalogo(db)
+    await _completar_menos(db, filas, catalogo, codigo_dejar_pendiente=None)
+    # The custom row is left PENDIENTE (default) — every catalog row above is
+    # now resolved by `_completar_menos`.
+
+    resumen = checklist_service.computar_resumen(filas, catalogo, custom_by_id={rc.id: rc})
+    assert resumen["lista_pendientes"] == [str(rc.id)]
+    assert resumen["lista_pendientes_desc"] == ["POLIZA_CUMPLIMIENTO — Póliza de cumplimiento"]
+    # The raw UUID must never leak into the human-readable list.
+    assert str(rc.id) not in resumen["lista_pendientes_desc"][0]
+
+
+async def test_computar_resumen_lista_pendientes_desc_mixed_index_aligned(db: AsyncSession, contrato: Contrato) -> None:
+    """Boundary: mixed catalog + custom pendientes stay index-aligned between
+    `lista_pendientes` and `lista_pendientes_desc`."""
+    cuenta = await _make_cuenta_custom(db, contrato, mes=1)
+    rc = await _make_requisito_custom(db, cuenta, "POLIZA_CUMPLIMIENTO", "Póliza de cumplimiento")
+    filas = await checklist_service.asegurar_checklist(db, cuenta)
+    await db.commit()
+    catalogo = await checklist_service.listar_catalogo(db)
+    # Leave RPC (catalog) and the custom row both pendiente; complete the rest.
+    await _completar_menos(db, filas, catalogo, codigo_dejar_pendiente="RPC")
+
+    resumen = checklist_service.computar_resumen(filas, catalogo, custom_by_id={rc.id: rc})
+    req_rpc = next(c for c in catalogo if c.codigo == "RPC")
+    assert len(resumen["lista_pendientes"]) == len(resumen["lista_pendientes_desc"]) == 2
+    for ref, desc in zip(resumen["lista_pendientes"], resumen["lista_pendientes_desc"], strict=True):
+        if ref == "RPC":
+            assert desc == f"RPC — {req_rpc.etiqueta}"
+        elif ref == str(rc.id):
+            assert desc == "POLIZA_CUMPLIMIENTO — Póliza de cumplimiento"
+        else:
+            pytest.fail(f"unexpected ref in lista_pendientes: {ref}")
+
+
+async def test_computar_resumen_only_no_aplica_radicacion_no_vacuously_lista(
+    db: AsyncSession, contrato: Contrato
+) -> None:
+    """Boundary: only NO_APLICA obligatorio items (no cumplidos, no pendientes)
+    must NOT vacuously report radicacion_lista=True."""
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    filas = await checklist_service.asegurar_checklist(db, cuenta)
+    await db.commit()
+    catalogo = await checklist_service.listar_catalogo(db)
+    cat_by_codigo = {c.codigo: c for c in catalogo}
+    for fila in filas:
+        if fila.requisito_codigo is None:
+            continue
+        req = cat_by_codigo.get(fila.requisito_codigo)
+        if req is None:
+            continue
+        fila.estado = EstadoRequisito.NO_APLICA
+    await db.commit()
+
+    resumen = checklist_service.computar_resumen(filas, catalogo)
+    assert resumen["pendientes"] == 0
+    assert resumen["total"] == 0
+    assert resumen["radicacion_lista"] is False
+    assert resumen["lista_pendientes"] == []
+    assert resumen["lista_pendientes_desc"] == []
+
+
+async def test_computar_resumen_orphaned_custom_requisito_skipped_from_both_lists(
+    db: AsyncSession, contrato: Contrato
+) -> None:
+    """Empty/null: a custom row whose RequisitoCuenta was deactivated (not in
+    custom_by_id) must be skipped from BOTH lists without raising."""
+    cuenta = await _make_cuenta_custom(db, contrato, mes=1)
+    rc = await _make_requisito_custom(db, cuenta, "POLIZA_CUMPLIMIENTO", "Póliza de cumplimiento")
+    filas = await checklist_service.asegurar_checklist(db, cuenta)
+    await db.commit()
+    catalogo = await checklist_service.listar_catalogo(db)
+    await _completar_menos(db, filas, catalogo, codigo_dejar_pendiente=None)
+
+    # custom_by_id does NOT contain rc.id — simulates a deactivated/orphaned row
+    # (`listar_requisitos_cuenta` only returns activo=True rows).
+    resumen = checklist_service.computar_resumen(filas, catalogo, custom_by_id={})
+
+    assert str(rc.id) not in resumen["lista_pendientes"]
+    assert resumen["lista_pendientes_desc"] == []
+
+
+async def test_computar_resumen_custom_etiqueta_blank_falls_back_to_bare_codigo(
+    db: AsyncSession, contrato: Contrato
+) -> None:
+    """Empty/null: a custom requisito with a blank/whitespace etiqueta falls
+    back to its bare codigo in the human-readable desc (never the UUID)."""
+    cuenta = await _make_cuenta_custom(db, contrato, mes=1)
+    rc = await _make_requisito_custom(db, cuenta, "CUSTOM_SIN_ETIQUETA", "   ")
+    filas = await checklist_service.asegurar_checklist(db, cuenta)
+    await db.commit()
+    catalogo = await checklist_service.listar_catalogo(db)
+    await _completar_menos(db, filas, catalogo, codigo_dejar_pendiente=None)
+
+    resumen = checklist_service.computar_resumen(filas, catalogo, custom_by_id={rc.id: rc})
+    assert resumen["lista_pendientes_desc"] == ["CUSTOM_SIN_ETIQUETA"]
+
+
 # ── 1:N document links per requisito ────────────────────────────────────────
 
 
@@ -722,6 +924,34 @@ async def test_evidencias_solo_enlace_cuenta_como_cobertura(db: AsyncSession, co
     item = next(i for i in payload["items"] if i["requisito"]["codigo"] == "EVIDENCIAS")
     assert item["estado"] == EstadoRequisito.CARGADO
     assert "EVIDENCIAS" not in payload["resumen"]["lista_pendientes"]
+
+
+# ── arbol_evidencias: link-evidencia null file fields (BUG B) ───────────────
+# app/models/evidencia.py's tipo_archivo/tamano_bytes are nullable (link-only
+# evidencias created by evidence_persist_service leave both NULL) but
+# ArbolEvidenciaItem required them non-nullable → GET /checklist 500s on any
+# cuenta with legacy/link evidencia. Also asserts fuente/url are surfaced —
+# without them a link-evidencia is unopenable/unidentifiable in the tree.
+
+
+async def test_listar_arbol_evidencias_link_only_passes_fuente_y_url(db: AsyncSession, contrato: Contrato) -> None:
+    """Empty/null: an all-null-file link-evidencia must not blow up building the
+    tree, and its `fuente`/`url` must be passed through in the resulting dict."""
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    await checklist_service.asegurar_checklist(db, cuenta)
+    ob1 = await _make_obligacion(db, contrato, 1)
+    await _make_actividad_con_evidencia(db, cuenta, ob1, solo_enlace=True)
+    await db.commit()
+
+    arbol = await checklist_service.listar_arbol_evidencias(db, cuenta)
+
+    evidencias = [e for obl in arbol for act in obl["actividades"] for e in act["evidencias"]]
+    assert len(evidencias) == 1
+    ev = evidencias[0]
+    assert ev["tipo_archivo"] is None
+    assert ev["tamano_bytes"] is None
+    assert ev["fuente"] == "gmail"
+    assert ev["url"] == "https://mail.example.com/x"
 
 
 async def test_evidencias_cumplido_manual_se_preserva(db: AsyncSession, contrato: Contrato) -> None:
