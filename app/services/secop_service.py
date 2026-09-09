@@ -1180,23 +1180,70 @@ def _calcular_valor_mensual(valor_total: Decimal, fecha_inicio: date, fecha_fin:
         return valor_total
 
 
+def _warn_if_replacement_char(field: str, value: str | None, row: dict[str, Any]) -> None:
+    """Log a structured warning when a raw SECOP field carries U+FFFD.
+
+    What this function knows: a U+FFFD in the value means *some* decoder, somewhere
+    upstream of this line, already replaced a byte it could not decode. The original
+    character is gone by the time we see it, so the value is passed through verbatim
+    — guessing it back would be lossy and could make it worse.
+
+    What this function does NOT know, and must not claim: WHERE that decode happened.
+    An earlier revision of this code asserted the damage was baked into SECOP's own
+    Socrata dataset. That claim does not survive checking. A direct, unmediated
+    ``httpx.get()`` against ``datos.gov.co/resource/jbjy-vk9h.json`` for the record
+    it named (NIT 890399011) returns the entity name CORRECTLY accented: the raw
+    response bytes read ``SECRETAR\xc3\x8dA DE GESTI\xc3\x93N``
+    (proper UTF-8 for Í and Ó), and the byte sequence ``ef bf bd`` appears nowhere in
+    the payload. Exhaustively, not by sampling: grouping that NIT's full population by
+    entity name yields 28 distinct values across all 217,544 rows, and none of them
+    contains U+FFFD. That probe is checked in as
+    ``test_live_secop_returns_accented_entity_name`` in
+    tests/test_secop_service_mapear.py and runs under ``-m live``, so the claim is
+    falsifiable from this repo instead of asserted in prose.
+
+    The likely origin of a U+FFFD seen in this data is therefore NOT the government's
+    database but something inside our own boundary — a console/stdout re-encode while
+    inspecting a value (Windows terminals mangle Í/Ó exactly this way), or a lossy
+    ``decode(..., errors="replace")`` on some ingest path.
+    ``gmail_adapter._decode_part_body`` was one such site and has since been fixed.
+    So treat a firing of this warning as "find out who replaced it", not as "SECOP is
+    broken, nothing we can do".
+    """
+    if value and "\ufffd" in value:
+        log.warning(
+            "secop_field_replacement_char",
+            field=field,
+            numero_contrato=(str(row.get("numero_contrato") or row.get("referencia_del_contrato") or "").strip()[:100])
+            or None,
+            nit_entidad=row.get("nit_entidad"),
+            value_preview=value[:120],
+        )
+
+
 def _mapear_a_contrato_create(row: dict[str, Any]) -> ContratoCreate | None:
     """Map a raw SECOP row to ContratoCreate. Returns None if data is insufficient."""
     # --- numero_contrato ---
-    numero = (
+    # Detection runs on the RAW value, before the length cap: a replacement char past
+    # the cutoff is still corruption, and slicing first would hide it from the warning.
+    numero_raw = (
         str(row.get("numero_contrato") or "").strip()
         or str(row.get("referencia_del_contrato") or "").strip()
         or str(row.get("id_contrato") or "").strip()
-    )[:100]
+    )
+    numero = numero_raw[:100]
     if not numero:
         return None
+    _warn_if_replacement_char("numero_contrato", numero_raw, row)
 
     # --- objeto ---
-    objeto = (
+    objeto_raw = (
         str(row.get("objeto_del_contrato") or "").strip() or str(row.get("descripcion_del_proceso") or "").strip()
-    )[:2000]
+    )
+    objeto = objeto_raw[:2000]
     if len(objeto) < 10:
         return None
+    _warn_if_replacement_char("objeto_del_contrato", objeto_raw, row)
 
     # --- valor_total (base + adición acumulada) ---
     try:
@@ -1225,13 +1272,15 @@ def _mapear_a_contrato_create(row: dict[str, Any]) -> ContratoCreate | None:
     valor_mensual = _calcular_valor_mensual(valor_total, fecha_inicio, fecha_fin)
 
     # --- campos opcionales ---
-    supervisor = str(row.get("nombre_supervisor") or "").strip() or None
-    if supervisor:
-        supervisor = supervisor[:255]
+    supervisor_raw = str(row.get("nombre_supervisor") or "").strip() or None
+    supervisor = supervisor_raw[:255] if supervisor_raw else None
+    if supervisor_raw:
+        _warn_if_replacement_char("nombre_supervisor", supervisor_raw, row)
 
-    entidad = str(row.get("nombre_entidad") or "").strip() or None
-    if entidad:
-        entidad = entidad[:255]
+    entidad_raw = str(row.get("nombre_entidad") or "").strip() or None
+    entidad = entidad_raw[:255] if entidad_raw else None
+    if entidad_raw:
+        _warn_if_replacement_char("nombre_entidad", entidad_raw, row)
 
     # Best-effort, deterministic first pass: SECOP's "objeto" is usually a short
     # paragraph with no enumerated obligations section, so this normally yields
