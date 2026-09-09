@@ -32,9 +32,7 @@ class _CountingLLM:
 async def test_matcher_batches_one_call_per_obligation() -> None:
     fake = _CountingLLM("[1]")  # only the first (highest-score) candidate is relevant
     state = {
-        "obligaciones_extraidas": [
-            {"id": "ob1", "descripcion": "realizar informes tecnicos mensuales consultoria"}
-        ],
+        "obligaciones_extraidas": [{"id": "ob1", "descripcion": "realizar informes tecnicos mensuales consultoria"}],
         "evidence_raw": [
             {"id": "a", "content": "informes tecnicos mensuales realizados consultoria"},
             {"id": "b", "content": "informes administrativos presupuesto reunion"},

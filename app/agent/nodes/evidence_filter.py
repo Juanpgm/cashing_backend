@@ -45,7 +45,9 @@ async def _llm_classify_batch(items: list[dict], llm) -> list[bool]:  # True = T
     if not items:
         return []
 
-    indexed = [{"idx": i, "source": it["source"], "title": it["title"], "content": it["content"]} for i, it in enumerate(items)]
+    indexed = [
+        {"idx": i, "source": it["source"], "title": it["title"], "content": it["content"]} for i, it in enumerate(items)
+    ]
     prompt = build_work_noise_prompt(indexed)
 
     try:

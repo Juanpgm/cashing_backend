@@ -267,10 +267,12 @@ async def test_cruzar_zero_obligaciones_creates_no_actividades(db: AsyncSession)
 
     mock_llm = AsyncMock()
 
-    with patch("app.services.cruzar_service.get_llm", return_value=mock_llm):
-        with patch("app.services.cruzar_service.quality_gate_node", new_callable=AsyncMock) as mock_gate:
-            mock_gate.return_value = {"quality_gate_passed": True, "quality_issues": []}
-            result = await cruzar_service.cruzar_documentos(db, user.id, cuenta.id)
+    with (
+        patch("app.services.cruzar_service.get_llm", return_value=mock_llm),
+        patch("app.services.cruzar_service.quality_gate_node", new_callable=AsyncMock) as mock_gate,
+    ):
+        mock_gate.return_value = {"quality_gate_passed": True, "quality_issues": []}
+        result = await cruzar_service.cruzar_documentos(db, user.id, cuenta.id)
 
     acts_result = await db.execute(select(Actividad).where(Actividad.cuenta_cobro_id == cuenta.id))
     assert list(acts_result.scalars().all()) == []
@@ -295,10 +297,12 @@ async def test_cruzar_constructs_relevance_llm_against_live_groq_model(db: Async
     mock_llm = AsyncMock()
     mock_llm.complete = AsyncMock(return_value=_make_llm_response("[]"))  # nothing relevant → no further LLM calls
 
-    with patch("app.services.cruzar_service.get_llm", return_value=mock_llm) as mock_get_llm:
-        with patch("app.services.cruzar_service.quality_gate_node", new_callable=AsyncMock) as mock_gate:
-            mock_gate.return_value = {"quality_gate_passed": True, "quality_issues": []}
-            await cruzar_service.cruzar_documentos(db, user.id, cuenta.id)
+    with (
+        patch("app.services.cruzar_service.get_llm", return_value=mock_llm) as mock_get_llm,
+        patch("app.services.cruzar_service.quality_gate_node", new_callable=AsyncMock) as mock_gate,
+    ):
+        mock_gate.return_value = {"quality_gate_passed": True, "quality_issues": []}
+        await cruzar_service.cruzar_documentos(db, user.id, cuenta.id)
 
     called_models = [c.kwargs["model"] for c in mock_get_llm.call_args_list]
     assert "groq/openai/gpt-oss-20b" in called_models
@@ -340,10 +344,12 @@ async def test_cruzar_creates_actividades_for_relevant_docs(db: AsyncSession) ->
     mock_llm = AsyncMock()
     mock_llm.complete = AsyncMock(side_effect=[mock_relevance_resp, mock_actividad_resp, mock_justification_resp])
 
-    with patch("app.services.cruzar_service.get_llm", return_value=mock_llm):
-        with patch("app.services.cruzar_service.quality_gate_node", new_callable=AsyncMock) as mock_gate:
-            mock_gate.return_value = {"quality_gate_passed": True, "quality_issues": []}
-            result = await cruzar_service.cruzar_documentos(db, user.id, cuenta.id)
+    with (
+        patch("app.services.cruzar_service.get_llm", return_value=mock_llm),
+        patch("app.services.cruzar_service.quality_gate_node", new_callable=AsyncMock) as mock_gate,
+    ):
+        mock_gate.return_value = {"quality_gate_passed": True, "quality_issues": []}
+        result = await cruzar_service.cruzar_documentos(db, user.id, cuenta.id)
 
     # Should have created at least one Actividad
     acts_result = await db.execute(select(Actividad).where(Actividad.cuenta_cobro_id == cuenta.id))
@@ -392,10 +398,12 @@ async def test_cruzar_actividad_falls_back_deterministically_on_llm_error(db: As
     mock_llm = AsyncMock()
     mock_llm.complete = AsyncMock(side_effect=[mock_relevance_resp, RuntimeError("llm down"), RuntimeError("llm down")])
 
-    with patch("app.services.cruzar_service.get_llm", return_value=mock_llm):
-        with patch("app.services.cruzar_service.quality_gate_node", new_callable=AsyncMock) as mock_gate:
-            mock_gate.return_value = {"quality_gate_passed": True, "quality_issues": []}
-            await cruzar_service.cruzar_documentos(db, user.id, cuenta.id)
+    with (
+        patch("app.services.cruzar_service.get_llm", return_value=mock_llm),
+        patch("app.services.cruzar_service.quality_gate_node", new_callable=AsyncMock) as mock_gate,
+    ):
+        mock_gate.return_value = {"quality_gate_passed": True, "quality_issues": []}
+        await cruzar_service.cruzar_documentos(db, user.id, cuenta.id)
 
     acts_result = await db.execute(select(Actividad).where(Actividad.cuenta_cobro_id == cuenta.id))
     actividades = list(acts_result.scalars().all())
@@ -430,10 +438,12 @@ async def test_cruzar_skips_obligacion_with_no_keyword_match(db: AsyncSession) -
     mock_llm = AsyncMock()
     mock_llm.complete = AsyncMock()  # Should never be called
 
-    with patch("app.services.cruzar_service.get_llm", return_value=mock_llm):
-        with patch("app.services.cruzar_service.quality_gate_node", new_callable=AsyncMock) as mock_gate:
-            mock_gate.return_value = {"quality_gate_passed": True, "quality_issues": []}
-            result = await cruzar_service.cruzar_documentos(db, user.id, cuenta.id)
+    with (
+        patch("app.services.cruzar_service.get_llm", return_value=mock_llm),
+        patch("app.services.cruzar_service.quality_gate_node", new_callable=AsyncMock) as mock_gate,
+    ):
+        mock_gate.return_value = {"quality_gate_passed": True, "quality_issues": []}
+        result = await cruzar_service.cruzar_documentos(db, user.id, cuenta.id)
 
     # LLM must NOT have been called (keyword filter handled it)
     mock_llm.complete.assert_not_called()
@@ -471,10 +481,12 @@ async def test_cruzar_clears_existing_actividades_before_run(db: AsyncSession) -
     mock_llm = AsyncMock()
     mock_llm.complete = AsyncMock(return_value=_make_llm_response("[]"))
 
-    with patch("app.services.cruzar_service.get_llm", return_value=mock_llm):
-        with patch("app.services.cruzar_service.quality_gate_node", new_callable=AsyncMock) as mock_gate:
-            mock_gate.return_value = {"quality_gate_passed": True, "quality_issues": []}
-            await cruzar_service.cruzar_documentos(db, user.id, cuenta.id)
+    with (
+        patch("app.services.cruzar_service.get_llm", return_value=mock_llm),
+        patch("app.services.cruzar_service.quality_gate_node", new_callable=AsyncMock) as mock_gate,
+    ):
+        mock_gate.return_value = {"quality_gate_passed": True, "quality_issues": []}
+        await cruzar_service.cruzar_documentos(db, user.id, cuenta.id)
 
     # After running, old activity must be gone (even if no new ones were created)
     after_result = await db.execute(select(Actividad).where(Actividad.cuenta_cobro_id == cuenta.id))
@@ -649,10 +661,12 @@ async def test_cruzar_reuses_actividad_stub_with_evidencia_instead_of_deleting_i
         ]
     )
 
-    with patch("app.services.cruzar_service.get_llm", return_value=mock_llm):
-        with patch("app.services.cruzar_service.quality_gate_node", new_callable=AsyncMock) as mock_gate:
-            mock_gate.return_value = {"quality_gate_passed": True, "quality_issues": []}
-            await cruzar_service.cruzar_documentos(db, user.id, cuenta.id)
+    with (
+        patch("app.services.cruzar_service.get_llm", return_value=mock_llm),
+        patch("app.services.cruzar_service.quality_gate_node", new_callable=AsyncMock) as mock_gate,
+    ):
+        mock_gate.return_value = {"quality_gate_passed": True, "quality_issues": []}
+        await cruzar_service.cruzar_documentos(db, user.id, cuenta.id)
 
     result = await db.execute(select(Actividad).where(Actividad.cuenta_cobro_id == cuenta.id))
     actividades = list(result.scalars().all())
