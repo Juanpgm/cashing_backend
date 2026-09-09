@@ -76,6 +76,10 @@ dev = [
     # Testing
     "pytest>=8,<9",
     "pytest-asyncio>=0.25,<1",
+    # On-demand hang diagnosis. Deliberately NOT enabled globally (see the note in
+    # [tool.pytest.ini_options]): run it by hand against a suspect file with
+    # `--timeout=60 --timeout-method=thread` to get a stack dump of every thread.
+    "pytest-timeout>=2.3,<3",
     "coverage[toml]>=7,<8",
     "moto[s3]>=5,<6",
     "factory-boy>=3,<4",
@@ -163,6 +167,13 @@ markers = [
     "live: hits a real external network API (opt-in: -m live), e.g. datos.gov.co Socrata",
 ]
 addopts = "-m \"not live_llm and not live\""
+# NOTE: no global `timeout`/`timeout_method` here, on purpose. `pytest-timeout`'s
+# only Windows-capable method is `thread`, and when it fires it dumps every
+# thread's stack and then KILLS THE WHOLE PYTEST PROCESS — it does not fail the
+# one slow test and carry on. A blanket policy would therefore turn any single
+# legitimately-slow test into a full-run abort. It is a diagnostic tool, not a
+# standing policy: to chase a future hang, run it by hand on the suspect file:
+#     uv run python -m pytest path/to/test.py --timeout=60 --timeout-method=thread
 
 [tool.coverage.run]
 source = ["app"]
