@@ -8,6 +8,7 @@ import pytest
 
 # ── Helpers de construcción de items de evidence_raw ─────────────────────────
 
+
 def _email_item(
     title: str,
     sender: str = "",
@@ -38,38 +39,45 @@ def _drive_item(title: str, mime: str = "application/pdf") -> dict:
 
 # ── Heurísticas deterministas ────────────────────────────────────────────────
 
+
 def test_heuristic_drops_noreply_sender():
     from app.agent.nodes.evidence_filter import _heuristic_is_noise
+
     item = _email_item("Informe mensual", sender="no-reply@promo.com")
     assert _heuristic_is_noise(item) is True
 
 
 def test_heuristic_drops_promo_sender():
     from app.agent.nodes.evidence_filter import _heuristic_is_noise
+
     item = _email_item("Entrega de documentos", sender="promo@deals.io")
     assert _heuristic_is_noise(item) is True
 
 
 def test_heuristic_drops_promotion_gmail_label():
     from app.agent.nodes.evidence_filter import _heuristic_is_noise
+
     item = _email_item("Oferta especial", sender="info@tienda.com", labels=["CATEGORY_PROMOTIONS"])
     assert _heuristic_is_noise(item) is True
 
 
 def test_heuristic_drops_noise_subject():
     from app.agent.nodes.evidence_filter import _heuristic_is_noise
+
     item = _email_item("Factura #12345", sender="cobros@plataforma.com")
     assert _heuristic_is_noise(item) is True
 
 
 def test_heuristic_keeps_supervisor_email():
     from app.agent.nodes.evidence_filter import _heuristic_is_noise
+
     item = _email_item("Informe mensual de actividades", sender="supervisor@entidad.gov.co")
     assert _heuristic_is_noise(item) is False
 
 
 def test_heuristic_drops_declined_calendar_event():
     from app.agent.nodes.evidence_filter import _heuristic_is_noise
+
     attendees = [{"self": True, "responseStatus": "declined"}, {"self": False, "responseStatus": "accepted"}]
     item = _calendar_item("Reunión de seguimiento", attendees=attendees)
     assert _heuristic_is_noise(item) is True
@@ -77,12 +85,14 @@ def test_heuristic_drops_declined_calendar_event():
 
 def test_heuristic_drops_allday_event_no_external_attendees():
     from app.agent.nodes.evidence_filter import _heuristic_is_noise
+
     item = _calendar_item("Bloqueo de agenda", is_all_day=True, attendees=[{"self": True}])
     assert _heuristic_is_noise(item) is True
 
 
 def test_heuristic_keeps_allday_event_with_external_attendees():
     from app.agent.nodes.evidence_filter import _heuristic_is_noise
+
     attendees = [{"self": True, "responseStatus": "accepted"}, {"self": False, "email": "colega@entidad.gov.co"}]
     item = _calendar_item("Jornada de trabajo conjunta", is_all_day=True, attendees=attendees)
     assert _heuristic_is_noise(item) is False
@@ -90,12 +100,14 @@ def test_heuristic_keeps_allday_event_with_external_attendees():
 
 def test_heuristic_drops_festivo_calendar():
     from app.agent.nodes.evidence_filter import _heuristic_is_noise
+
     item = _calendar_item("Día festivo")
     assert _heuristic_is_noise(item) is True
 
 
 def test_heuristic_keeps_work_meeting():
     from app.agent.nodes.evidence_filter import _heuristic_is_noise
+
     attendees = [{"self": True, "responseStatus": "accepted"}, {"self": False}]
     item = _calendar_item("Reunión de seguimiento contractual", attendees=attendees)
     assert _heuristic_is_noise(item) is False
@@ -103,17 +115,20 @@ def test_heuristic_keeps_work_meeting():
 
 def test_heuristic_drops_drive_folder():
     from app.agent.nodes.evidence_filter import _heuristic_is_noise
+
     item = _drive_item("Carpeta de evidencias", mime="application/vnd.google-apps.folder")
     assert _heuristic_is_noise(item) is True
 
 
 def test_heuristic_keeps_drive_pdf():
     from app.agent.nodes.evidence_filter import _heuristic_is_noise
+
     item = _drive_item("Informe de actividades.pdf", mime="application/pdf")
     assert _heuristic_is_noise(item) is False
 
 
 # ── Gate LLM ─────────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_llm_gate_keeps_trabajo():
@@ -220,6 +235,7 @@ async def test_evidence_filter_node_constructs_llm_against_live_groq_model():
 
 # ── Nodo completo ─────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_evidence_filter_node_drops_heuristic_noise_without_llm():
     """Un email de noreply es descartado por heurística sin hacer llamada LLM."""
@@ -259,6 +275,7 @@ async def test_evidence_filter_node_empty_state_returns_zero():
 
 
 # ── score_non_personal_email — sistema de scoring por headers ─────────────────
+
 
 def test_score_list_unsubscribe_header_returns_5():
     from app.agent.prompts.evidence_filter import score_non_personal_email
@@ -432,6 +449,7 @@ def test_heuristic_personal_with_headers_not_filtered():
 
 # ── Whitelist — personal providers and institutional domains ──────────────────
 
+
 def test_score_gmail_sender_never_filtered():
     """Emails from gmail.com must always pass through regardless of subject signals."""
     from app.agent.prompts.evidence_filter import score_non_personal_email
@@ -470,6 +488,7 @@ def test_score_outlook_sender_never_filtered():
 
 
 # ── Bank / financial-institution notification senders ─────────────────────────
+
 
 def test_score_davibank_sender_filtered():
     """Bank notification senders like DAVIbankInforma@davibank.com must be filtered."""
