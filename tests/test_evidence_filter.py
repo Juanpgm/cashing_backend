@@ -165,6 +165,59 @@ async def test_llm_gate_keeps_on_invalid_json():
     assert result == [True]
 
 
+@pytest.mark.asyncio
+async def test_llm_gate_keeps_on_empty_content():
+    """Reproduces the too-small-max_tokens failure mode for a reasoning model:
+    litellm can return 200 with EMPTY content (finish_reason=length) instead of
+    raising — no exception for the adapter's fallback-on-exception to catch.
+    Must degrade to the safe default (keep everything), not crash."""
+    from app.agent.nodes.evidence_filter import _llm_classify_batch
+
+    llm = AsyncMock()
+    llm.complete = AsyncMock(return_value=MagicMock(content=""))
+
+    items = [_email_item("Informe mensual"), _calendar_item("Reunión X")]
+    result = await _llm_classify_batch(items, llm)
+    assert result == [True, True]
+
+
+# ── groq/llama-3.1-8b-instant decommissioning fix ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_llm_classify_batch_sends_reasoning_effort():
+    """The new model (groq/openai/gpt-oss-20b) is a reasoning model — reasoning_effort
+    must be forwarded on every call."""
+    from app.agent.nodes.evidence_filter import _llm_classify_batch
+
+    llm = AsyncMock()
+    llm.complete = AsyncMock(return_value=MagicMock(content='[{"idx": 0, "verdict": "TRABAJO"}]'))
+
+    items = [_email_item("Acta de reunión", sender="coord@entidad.gov.co")]
+    await _llm_classify_batch(items, llm)
+
+    kwargs = llm.complete.call_args.kwargs
+    assert kwargs["reasoning_effort"] == "low"
+    assert kwargs["max_tokens"] == 256
+
+
+@pytest.mark.asyncio
+async def test_evidence_filter_node_constructs_llm_against_live_groq_model():
+    """groq/llama-3.1-8b-instant was decommissioned by Groq — evidence_filter_node
+    must build its LLM client against the current model."""
+    from app.agent.nodes import evidence_filter as mod
+
+    llm = AsyncMock()
+    llm.complete = AsyncMock(return_value=MagicMock(content="[]"))
+
+    state = {"evidence_raw": [_email_item("Informe mensual", sender="supervisor@entidad.gov.co")]}
+
+    with patch.object(mod, "get_llm", return_value=llm) as mock_get_llm:
+        await mod.evidence_filter_node(state)
+
+    mock_get_llm.assert_called_once_with(model="groq/openai/gpt-oss-20b")
+
+
 # ── Nodo completo ─────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio

@@ -70,7 +70,12 @@ async def _clasificar_via_llm(
                 LLMMessage(role="user", content=prompt),
             ],
             temperature=0.0,
-            max_tokens=8,
+            # groq/openai/gpt-oss-20b is a reasoning model: reasoning_tokens count
+            # against max_tokens before any visible output. 8 empirically returned
+            # EMPTY content (finish_reason=length) even with reasoning_effort="low" —
+            # 40 gives real headroom above the single-digit answer this prompt asks for.
+            max_tokens=40,
+            reasoning_effort="low",
         )
         match = _NUMBER_RE.search(resp.content)
         if not match:
@@ -194,7 +199,12 @@ async def _llm_relevance_batch(
                 LLMMessage(role="user", content=prompt),
             ],
             temperature=0.0,
-            max_tokens=64,
+            # groq/openai/gpt-oss-20b is a reasoning model — reasoning_tokens count
+            # against max_tokens before the visible JSON array output; 120 gives
+            # real headroom above the verified-working 64 (see evidence_matcher.py
+            # module docstring / groq-fallback-model-decommissioned fix).
+            max_tokens=120,
+            reasoning_effort="low",
         )
         match = _JSON_RE.search(resp.content)
         if not match:
@@ -230,7 +240,7 @@ async def clasificar_evidencia(texto_evidencia: str, obligaciones: list[Obligaci
     candidates = [(ob, score) for ob, score in scored if score >= _KEYWORD_THRESHOLD]
 
     if llm is None:
-        llm = get_llm(model="groq/llama-3.1-8b-instant")
+        llm = get_llm(model="groq/openai/gpt-oss-20b")
 
     if not candidates:
         return await _clasificar_via_llm(texto_evidencia, obligaciones, llm, fallback=None)
@@ -259,7 +269,7 @@ async def evidence_matcher_node(state: AgentState) -> AgentState:
             "current_phase": "evidence_matcher",
         }
 
-    llm = get_llm(model="groq/llama-3.1-8b-instant")
+    llm = get_llm(model="groq/openai/gpt-oss-20b")
     matched: dict[str, list[dict]] = {}
     matched_scores: dict[str, dict[str, float]] = {}
 

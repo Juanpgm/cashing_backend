@@ -637,7 +637,7 @@ async def subir_evidencias_cuenta(
 
     # ONE cached LLM instance for the whole batch — `clasificar_evidencia` only
     # calls it when a file has 2+ keyword-candidate obligaciones.
-    llm = get_llm(model="groq/llama-3.1-8b-instant") if obligaciones else None
+    llm = get_llm(model="groq/openai/gpt-oss-20b") if obligaciones else None
 
     # Cache found/created Actividad stubs within this batch call, keyed by
     # obligacion_id (None = unclassified sentinel) — avoids duplicate rows/queries

@@ -55,6 +55,7 @@ async def _llm_classify_batch(items: list[dict], llm) -> list[bool]:  # True = T
             ],
             temperature=0.0,
             max_tokens=256,
+            reasoning_effort="low",
         )
         raw = resp.content or ""
         m = _JSON_RE.search(raw)
@@ -142,7 +143,7 @@ async def evidence_filter_node(state: AgentState) -> AgentState:
     clasificables = [it for it in after_heuristics if it.get("source") != "local_file"]
 
     # Capa 2: clasificador LLM batch
-    llm = get_llm(model="groq/llama-3.1-8b-instant")
+    llm = get_llm(model="groq/openai/gpt-oss-20b")
     llm_dropped = 0
 
     for batch_start in range(0, len(clasificables), _LLM_BATCH_SIZE):

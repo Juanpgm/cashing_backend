@@ -22,8 +22,9 @@ class _CountingLLM:
         self.content = content
         self.calls = 0
 
-    async def complete(self, messages, temperature=0.0, max_tokens=64) -> _FakeResp:
+    async def complete(self, messages, temperature=0.0, max_tokens=64, **kwargs) -> _FakeResp:
         self.calls += 1
+        self.last_kwargs = {"max_tokens": max_tokens, **kwargs}
         return _FakeResp(self.content)
 
 
@@ -141,6 +142,75 @@ async def test_matcher_garbage_llm_output_does_not_accept_low_score_candidates()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# groq/llama-3.1-8b-instant decommissioning fix: new model + reasoning_effort +
+# larger max_tokens headroom (see evidence_matcher.py module changes).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_evidence_matcher_node_constructs_llm_against_live_groq_model() -> None:
+    """groq/llama-3.1-8b-instant was decommissioned by Groq — evidence_matcher_node
+    must build its LLM client against the current model."""
+    fake = _CountingLLM("[1]")
+    state = {
+        "obligaciones_extraidas": [{"id": "ob1", "descripcion": "realizar informes tecnicos mensuales consultoria"}],
+        "evidence_raw": [{"id": "a", "content": "informes tecnicos mensuales realizados consultoria"}],
+    }
+
+    with patch.object(evidence_matcher, "get_llm", return_value=fake) as mock_get_llm:
+        await evidence_matcher.evidence_matcher_node(state)
+
+    mock_get_llm.assert_called_once_with(model="groq/openai/gpt-oss-20b")
+
+
+@pytest.mark.asyncio
+async def test_llm_relevance_batch_sends_reasoning_effort_and_safe_max_tokens() -> None:
+    """The new model (groq/openai/gpt-oss-20b) is a reasoning model — reasoning_effort
+    must be forwarded and max_tokens must have real headroom above the verified-
+    minimum-working budget (64), not just the bare minimum."""
+    fake = _CountingLLM("[1]")
+    state = {
+        "obligaciones_extraidas": [{"id": "ob1", "descripcion": "realizar informes tecnicos mensuales consultoria"}],
+        "evidence_raw": [{"id": "a", "content": "informes tecnicos mensuales realizados consultoria"}],
+    }
+
+    with patch.object(evidence_matcher, "get_llm", return_value=fake):
+        await evidence_matcher.evidence_matcher_node(state)
+
+    assert fake.last_kwargs["reasoning_effort"] == "low"
+    assert fake.last_kwargs["max_tokens"] >= 120
+
+
+@pytest.mark.asyncio
+async def test_llm_relevance_batch_empty_content_falls_back_not_crashes() -> None:
+    """Reproduces the too-small-max_tokens failure mode at the batch-relevance call
+    site: litellm can return 200 with EMPTY content (finish_reason=length) instead
+    of raising — no exception for the adapter's fallback-on-exception to catch.
+    Must degrade to the deterministic keyword-score fallback, not crash."""
+
+    class _EmptyContentLLM:
+        async def complete(self, *args, **kwargs) -> _FakeResp:
+            return _FakeResp("")
+
+    # High overlap (>= 0.30) — accepted by the deterministic fallback bar.
+    ob_text = "elaborar informes tecnicos mensuales consultoria asesoria"
+    state = {
+        "obligaciones_extraidas": [{"id": "ob1", "descripcion": ob_text}],
+        "evidence_raw": [
+            {"id": "strong", "content": "informes tecnicos mensuales consultoria asesoria elaborados"},
+            {"id": "weak", "content": "informes generales sin relacion directa con nada mas del contrato"},
+        ],
+    }
+
+    with patch.object(evidence_matcher, "get_llm", return_value=_EmptyContentLLM()):
+        result = await evidence_matcher.evidence_matcher_node(state)
+
+    matched_ids = [e["id"] for e in result["matched_evidence"]["ob1"]]
+    assert "strong" in matched_ids
+    assert "weak" not in matched_ids
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Local-upload wiring (evidencia_service._clasificar_y_enlazar_lote) reuses the
 # SAME batched matcher — many files, few obligaciones must still cost at most
 # one LLM call per obligación (evidence-classification-pipeline: Batched-per-
@@ -227,3 +297,74 @@ async def test_subir_evidencias_cuenta_local_upload_batches_one_llm_call_per_obl
     links_result = await db.execute(select(EvidenciaObligacion).where(EvidenciaObligacion.obligacion_id == ob.id))
     links = links_result.scalars().all()
     assert len(links) == 5  # every uploaded evidencia resolved to a link for this obligación
+
+
+@pytest.mark.asyncio
+async def test_subir_evidencias_cuenta_constructs_llm_against_live_groq_model(db) -> None:
+    """evidencia_service.subir_evidencias_cuenta's `clasificar_evidencia` client must
+    also target the live (non-decommissioned) Groq model — groq/llama-3.1-8b-instant
+    no longer exists in Groq's catalog."""
+    from datetime import date
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from uuid import uuid4
+
+    from app.models.contrato import Contrato
+    from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
+    from app.models.obligacion import Obligacion, TipoObligacion
+    from app.models.usuario import Usuario
+    from app.services import evidencia_service
+
+    user = Usuario(
+        email=f"model-{uuid4()}@test.com",
+        nombre="Model User",
+        cedula="555000222",
+        password_hash="hashed",
+        rol="contratista",
+        activo=True,
+        creditos_disponibles=100,
+    )
+    db.add(user)
+    await db.flush()
+    contrato = Contrato(
+        usuario_id=user.id,
+        numero_contrato="CTR-MODEL-001",
+        objeto="Consultoría",
+        valor_total=36_000_000,
+        valor_mensual=3_000_000,
+        fecha_inicio=date(2024, 1, 1),
+        fecha_fin=date(2024, 12, 31),
+    )
+    db.add(contrato)
+    await db.flush()
+    ob = Obligacion(
+        contrato_id=contrato.id,
+        descripcion="Elaborar informes tecnicos mensuales de consultoria y asesoria",
+        tipo=TipoObligacion.ESPECIFICA,
+        orden=1,
+    )
+    db.add(ob)
+    cuenta = CuentaCobro(contrato_id=contrato.id, mes=3, anio=2024, estado=EstadoCuentaCobro.BORRADOR, valor=1)
+    db.add(cuenta)
+    await db.commit()
+    await db.refresh(ob)
+    await db.refresh(cuenta)
+    await db.refresh(contrato, attribute_names=["obligaciones"])
+
+    storage = AsyncMock()
+    storage.upload.return_value = "key"
+    storage.presigned_url.return_value = "https://s3.example.com/presigned"
+
+    fake = AsyncMock()
+    fake.complete = AsyncMock(return_value=MagicMock(content="1"))
+
+    archivos = [("informe.txt", "text/plain", b"Informe tecnico mensual de consultoria y asesoria.")]
+
+    with (
+        patch.object(evidencia_service, "get_llm", return_value=fake) as mock_get_llm,
+        patch("app.agent.nodes.evidence_matcher.get_llm", return_value=fake),
+    ):
+        await evidencia_service.subir_evidencias_cuenta(
+            db=db, storage=storage, usuario_id=user.id, cuenta_id=cuenta.id, archivos=archivos
+        )
+
+    mock_get_llm.assert_called_once_with(model="groq/openai/gpt-oss-20b")
