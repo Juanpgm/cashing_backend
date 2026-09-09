@@ -8,6 +8,7 @@ HTTP 429 "Too many concurrent requests for user".
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import uuid
 from typing import Any
@@ -145,9 +146,7 @@ class TestSearchMessagesConcurrency:
         adapter.get_credentials = AsyncMock(return_value=MagicMock())
 
         service = MagicMock()
-        service.users().messages().list().execute.return_value = {
-            "messages": [{"id": "a"}, {"id": "b"}, {"id": "c"}]
-        }
+        service.users().messages().list().execute.return_value = {"messages": [{"id": "a"}, {"id": "b"}, {"id": "c"}]}
         adapter._build_service = MagicMock(return_value=service)
         adapter._fetch_message = AsyncMock(return_value=MagicMock())
 
@@ -163,9 +162,7 @@ class TestSearchMessagesConcurrency:
         adapter.get_credentials = AsyncMock(return_value=MagicMock())
 
         service = MagicMock()
-        service.users().messages().list().execute.return_value = {
-            "messages": [{"id": "a"}, {"id": "b"}, {"id": "c"}]
-        }
+        service.users().messages().list().execute.return_value = {"messages": [{"id": "a"}, {"id": "b"}, {"id": "c"}]}
         # Each get(...).execute() returns a minimal raw message that _parse_message handles.
         service.users().messages().get().execute.return_value = {
             "id": "x",
@@ -304,3 +301,129 @@ class TestGetCredentialsAgainstRealIntegracionRow:
         creds = await adapter.get_credentials(user.id)
 
         assert creds.token == "access-token"
+
+
+# Spanish sample carrying the accented characters that break under a blind utf-8 decode.
+# The replacement character is spelled as an escape, never as a raw glyph: in a test
+# whose whole subject is encoding damage, a bad re-encode of this very file must not be
+# able to silently turn the thing being detected into something else.
+_SPANISH = "Informe de GESTI\u00d3N - Secretar\u00eda de Gesti\u00f3n del Riesgo, Se\u00f1or Mu\u00f1oz"
+_REPLACEMENT_CHAR = "\ufffd"
+
+
+def _text_part(raw: bytes, *, charset: str | None = None, mime: str = "text/plain") -> dict[str, Any]:
+    """Build a Gmail API MessagePart carrying `raw` as its base64url body.
+
+    Mirrors the real `users.messages.get(format="full")` shape: `body.data` is the
+    base64url-encoded part payload and `headers` carries the part's own
+    `Content-Type` (with its charset parameter) alongside it.
+    """
+    content_type = mime if charset is None else f'{mime}; charset="{charset}"'
+    return {
+        "mimeType": mime,
+        "headers": [{"name": "Content-Type", "value": content_type}],
+        "body": {"data": base64.urlsafe_b64encode(raw).decode()},
+        "parts": [],
+    }
+
+
+class TestExtractBodyDecoding:
+    """`_extract_body` must never manufacture U+FFFD out of non-utf-8 body bytes.
+
+    What is proven here: the decoder's own contract, exercised over byte payloads
+    built in-test. What is NOT proven here (and is not asserted anywhere in this
+    repo): whether Gmail's `format="full"` responses ever actually carry non-utf-8
+    `body.data`. Reports differ and Google's reference does not state it either way,
+    so the decoder is written to be correct under both readings — utf-8 is always
+    tried first (so an already-normalized body is never re-decoded through a stale
+    declared charset), and the declared charset only gets a turn when utf-8 fails.
+    """
+
+    def test_cp1252_body_is_decoded_via_declared_charset(self) -> None:
+        adapter = _make_adapter()
+        part = _text_part(_SPANISH.encode("cp1252"), charset="windows-1252")
+
+        plain, _html = adapter._extract_body(part)
+
+        assert plain == _SPANISH
+        assert _REPLACEMENT_CHAR not in plain
+
+    def test_latin1_body_without_declared_charset_is_recovered(self) -> None:
+        """No charset parameter at all — the cp1252/latin-1 ladder still recovers it."""
+        adapter = _make_adapter()
+        part = _text_part(_SPANISH.encode("latin-1"), charset=None)
+
+        plain, _html = adapter._extract_body(part)
+
+        assert plain == _SPANISH
+        assert _REPLACEMENT_CHAR not in plain
+
+    def test_utf8_body_wins_over_a_wrong_declared_charset(self) -> None:
+        """Guards the 'Gmail normalized the payload but kept the original header'
+        reading: valid utf-8 bytes must never be re-decoded through the declared
+        legacy charset, which would mojibake every accent into two characters."""
+        adapter = _make_adapter()
+        part = _text_part(_SPANISH.encode("utf-8"), charset="ISO-8859-1")
+
+        plain, _html = adapter._extract_body(part)
+
+        assert plain == _SPANISH
+
+    def test_unknown_declared_charset_falls_through_the_ladder(self) -> None:
+        """A charset Python has no codec for must not raise — it is skipped."""
+        adapter = _make_adapter()
+        part = _text_part(_SPANISH.encode("cp1252"), charset="x-not-a-real-charset")
+
+        plain, _html = adapter._extract_body(part)
+
+        assert plain == _SPANISH
+
+    def test_empty_body_is_not_decoded(self) -> None:
+        adapter = _make_adapter()
+        part = {"mimeType": "text/plain", "headers": [], "body": {}, "parts": []}
+
+        plain, html = adapter._extract_body(part)
+
+        assert plain == ""
+        assert html is None
+
+    def test_upstream_replacement_char_is_preserved_verbatim(self) -> None:
+        """Already-destroyed characters stay destroyed — we never guess a value back."""
+        adapter = _make_adapter()
+        corrupted = f"Secretar{_REPLACEMENT_CHAR}a de Gesti{_REPLACEMENT_CHAR}n"
+        part = _text_part(corrupted.encode("utf-8"), charset="utf-8")
+
+        plain, _html = adapter._extract_body(part)
+
+        assert plain == corrupted
+
+    def test_html_part_uses_the_same_decoder(self) -> None:
+        adapter = _make_adapter()
+        html_body = f"<p>{_SPANISH}</p>"
+        part = {
+            "mimeType": "multipart/alternative",
+            "headers": [],
+            "body": {},
+            "parts": [_text_part(html_body.encode("cp1252"), charset="windows-1252", mime="text/html")],
+        }
+
+        _plain, html = adapter._extract_body(part)
+
+        assert html == html_body
+
+    def test_multipart_picks_plain_and_html_independently(self) -> None:
+        adapter = _make_adapter()
+        part = {
+            "mimeType": "multipart/alternative",
+            "headers": [],
+            "body": {},
+            "parts": [
+                _text_part(_SPANISH.encode("cp1252"), charset="windows-1252"),
+                _text_part(f"<p>{_SPANISH}</p>".encode(), charset="utf-8", mime="text/html"),
+            ],
+        }
+
+        plain, html = adapter._extract_body(part)
+
+        assert plain == _SPANISH
+        assert html == f"<p>{_SPANISH}</p>"

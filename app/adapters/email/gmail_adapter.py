@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import email as email_lib
+import re
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -39,6 +40,61 @@ _T = TypeVar("_T")
 _GMAIL_MAX_CONCURRENCY = 5
 _GMAIL_MAX_RETRIES = 4
 _GMAIL_RETRY_BASE_DELAY = 0.5  # seconds; doubles each attempt (0.5, 1, 2, ...)
+
+
+# Decode ladder for message-part payloads. utf-8 goes FIRST, ahead of whatever the
+# part declares, because reports disagree on whether Gmail re-encodes `body.data` to
+# utf-8 while leaving the original Content-Type header untouched; trying utf-8 first
+# is correct either way, and real cp1252/latin-1 Spanish text is essentially never
+# valid utf-8, so the guard does not steal the legacy charset's turn.
+# cp1252 sits ahead of latin-1 for the same reason document_parser.parse_text orders
+# them that way: for bytes 0x80-0x9F cp1252 yields real punctuation (em-dash, curly
+# quotes) where latin-1 yields C1 control characters.
+_BODY_DECODE_FALLBACKS = ("cp1252", "latin-1")
+
+_CHARSET_RE = re.compile(r'charset\s*=\s*"?([\w.:+-]+)"?', re.IGNORECASE)
+
+
+def _charset_from_part(part: dict) -> str | None:  # type: ignore[type-arg]
+    """Charset declared in this MessagePart's own Content-Type header, if any."""
+    for header in part.get("headers") or []:
+        if str(header.get("name", "")).lower() == "content-type":
+            match = _CHARSET_RE.search(str(header.get("value", "")))
+            if match:
+                return match.group(1)
+    return None
+
+
+def _decode_part_body(raw: bytes, declared_charset: str | None) -> str:
+    """Decode a message-part payload without ever manufacturing U+FFFD.
+
+    The previous implementation was a bare ``decode("utf-8", errors="replace")``,
+    which silently turns every byte that is not valid utf-8 into U+FFFD. For an
+    accented Spanish body that is total, unrecoverable loss, and it lands in the DB:
+    an evidence body reaches ``Actividad.descripcion`` / ``Actividad.justificacion``
+    through evidence_discovery_service and evidence_persist_service. That damage
+    would be *ours*, introduced at this line, not something inherited from a sender
+    or an API — which is exactly the kind of thing that gets misfiled as "the source
+    data was already broken".
+
+    latin-1 decodes any byte sequence, so the ladder always terminates and the
+    ``errors="replace"`` branch below is unreachable defense-in-depth. A U+FFFD
+    that survives this function therefore came in as a literal U+FFFD in the
+    sender's own bytes, and is preserved verbatim rather than guessed at.
+    """
+    candidates = ["utf-8"]
+    if declared_charset and declared_charset.strip().lower().replace("_", "-") not in ("utf-8", "utf8"):
+        candidates.append(declared_charset.strip())
+    candidates.extend(_BODY_DECODE_FALLBACKS)
+
+    for encoding in candidates:
+        try:
+            return raw.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+
+    logger.warning("gmail_body_decode_fell_back_to_replacement", charset=declared_charset)
+    return raw.decode("utf-8", errors="replace")
 
 
 def _is_rate_limit_error(exc: GoogleHttpError) -> bool:
@@ -317,7 +373,7 @@ class GmailAdapter:
             mime = part.get("mimeType", "")
             data = part.get("body", {}).get("data", "")
             if data:
-                decoded = base64.urlsafe_b64decode(data + "==").decode("utf-8", errors="replace")
+                decoded = _decode_part_body(base64.urlsafe_b64decode(data + "=="), _charset_from_part(part))
                 if mime == "text/plain" and not plain:
                     plain = decoded
                 elif mime == "text/html" and not html:

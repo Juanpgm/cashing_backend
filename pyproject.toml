@@ -125,6 +125,10 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101", "S106"]
 "app/api/v1/debug.py" = ["E501"]  # HTML/JS/CSS embedded strings legitimately exceed line length
+# structlog is the standard for app/ — but scripts/ are operator-facing CLI tools whose
+# output IS stdout, and print() there is long-established practice (25+ scripts, hundreds
+# of calls, predating this rule). Codifying the exception rather than pretending it away.
+"scripts/**" = ["T201"]
 
 [tool.mypy]
 python_version = "3.12"
