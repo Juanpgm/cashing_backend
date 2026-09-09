@@ -44,6 +44,7 @@ FRICTION FOUND (partially mitigated, bug #6):
 from __future__ import annotations
 
 import io
+import re
 import uuid
 import zipfile
 from datetime import UTC, datetime
@@ -54,7 +55,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from app.adapters.email.port import EmailAttachment, EmailMessage
 from app.models.secop import SecopDocumento
-from app.schemas.agent import LLMResponse
+from app.schemas.agent import LLMMessage, LLMResponse
 from app.services import evidence_discovery_service as eds
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -129,6 +130,52 @@ def _patch_actividades_llm(monkeypatch: pytest.MonkeyPatch, content: str) -> Non
             return LLMResponse(content=content, model="fake", prompt_tokens=1, completion_tokens=1, total_tokens=2)
 
     monkeypatch.setattr(llm_pkg, "get_llm", lambda model=None: _FakeLLM(), raising=True)
+
+
+#: Prefix the fake supervision LLM prepends to every rewritten text. Its presence in the
+#: supervision DOCX (and absence from the actividades DOCX) is what proves the third-person
+#: conversion actually ran instead of failing open.
+_MARCA_TERCERA_PERSONA = "El contratista reporta que"
+
+_RENGLON_PROMPT_RE = re.compile(r"^\d+\)\s*(.+)$")
+
+
+def _patch_informe_llm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Patch the `get_llm` bound INSIDE `informe_service`, which nothing else reaches.
+
+    `informe_service` does a module-level `from app.adapters.llm import get_llm`, so it
+    holds its OWN binding: the `patch("app.adapters.llm.get_llm")` used earlier in this
+    journey does not touch it. Left unpatched, `_convertir_actividades_tercera_persona`
+    fails OPEN and the supervision report silently renders the contractor's original
+    first-person text — the journey would then only ever exercise the fallback branch,
+    never a successful LLM conversion.
+
+    The fake answers in the real `N| texto` contract from
+    `app.agent.prompts.supervision_tercera_persona`, so the production prompt builder and
+    parser both run for real; only the network hop is replaced.
+    """
+    from app.services import informe_service as _svc
+
+    class _FakeLLM:
+        async def complete(self, messages: list[LLMMessage], **_kwargs: Any) -> LLMResponse:
+            prompt = messages[-1].content
+            lineas = prompt.splitlines() if isinstance(prompt, str) else []
+            textos = [m.group(1) for line in lineas if (m := _RENGLON_PROMPT_RE.match(line))]
+            content = "\n".join(f"{i + 1}| {_MARCA_TERCERA_PERSONA} {t}" for i, t in enumerate(textos))
+            return LLMResponse(content=content, model="fake", prompt_tokens=1, completion_tokens=1, total_tokens=2)
+
+    monkeypatch.setattr(_svc, "get_llm", lambda model=None: _FakeLLM(), raising=True)
+
+
+def _texto_docx(contenido: bytes) -> str:
+    """Flatten every paragraph and table cell of a DOCX into one searchable string."""
+    from docx import Document as _Document
+
+    doc = _Document(io.BytesIO(contenido))
+    partes = [p.text for p in doc.paragraphs]
+    for tabla in doc.tables:
+        partes += [celda.text for fila in tabla.rows for celda in fila.cells]
+    return "\n".join(partes)
 
 
 def _fake_storage() -> AsyncMock:
@@ -466,6 +513,10 @@ async def test_full_radicacion_journey(
     assert cobertura["resumen"]["sin_evidencia"] == 0, cobertura
 
     # ── 9. Autogen the two mandatory informes ───────────────────────────────
+    # Mock `informe_service`'s OWN `get_llm` binding (see `_patch_informe_llm`) so the
+    # supervision report exercises a successful third-person conversion instead of the
+    # fail-open fallback. Stays active through paso 11, which regenerates both informes.
+    _patch_informe_llm(monkeypatch)
     with patch(_PATCH_S3, return_value=_fake_storage()):
         r = await client.post(
             f"/api/v1/cuentas-cobro/{cuenta_id}/checklist/INFORME_ACTIVIDADES/generar",
@@ -552,6 +603,22 @@ async def test_full_radicacion_journey(
     # Los informes DOCX generados viajan en la raíz del paquete.
     docs_raiz = [n for n in nombres if n.endswith(".docx") and "/" not in n]
     assert docs_raiz, f"esperaba informes DOCX en la raíz, obtuve: {nombres}"
+    # El informe de SUPERVISIÓN debe traer las actividades reescritas en tercera
+    # persona por `informe_service._convertir_actividades_tercera_persona` (seam
+    # mockeado en `_patch_informe_llm`). Sin ese mock la conversión falla OPEN y el
+    # documento sale con el texto original en primera persona — este par de asserts
+    # es lo que distingue "el LLM respondió" de "el fallback se tragó el error".
+    supervision_docx = next(n for n in docs_raiz if "SUPERVISION" in n.upper())
+    texto_supervision = _texto_docx(zf.read(supervision_docx))
+    assert _MARCA_TERCERA_PERSONA in texto_supervision, (
+        f"el informe de supervisión ({supervision_docx}) no aplicó la conversión a tercera "
+        f"persona — el seam LLM de informe_service falló open. Texto: {texto_supervision[:400]}"
+    )
+    # El informe de ACTIVIDADES, en cambio, conserva la primera persona del contratista.
+    actividades_docx = next(n for n in docs_raiz if "ACTIVIDADES" in n.upper())
+    assert _MARCA_TERCERA_PERSONA not in _texto_docx(zf.read(actividades_docx)), (
+        f"el informe de actividades ({actividades_docx}) debe conservar la primera persona"
+    )
     ledger.auto(
         "paquete de radicación generado y validado (zip íntegro, carpeta por obligación con archivos reales, informes)"
     )

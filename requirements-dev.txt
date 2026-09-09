@@ -205,12 +205,12 @@ googleapis-common-protos==1.75.0
     #   grpcio-status
 greenlet==3.5.4
     # via sqlalchemy
-grpcio==1.81.1 ; platform_python_implementation != 'PyPy'
+grpcio==1.81.1
     # via
     #   google-api-core
     #   google-cloud-firestore
     #   grpcio-status
-grpcio-status==1.81.1 ; platform_python_implementation != 'PyPy'
+grpcio-status==1.81.1
     # via google-api-core
 h11==0.16.0
     # via
@@ -467,8 +467,11 @@ pyphen==0.17.2
 pytesseract==0.3.13
     # via cashin-backend
 pytest==8.4.2
-    # via pytest-asyncio
+    # via
+    #   pytest-asyncio
+    #   pytest-timeout
 pytest-asyncio==0.26.0
+pytest-timeout==2.4.0
 python-dateutil==2.9.0.post0
     # via botocore
 python-discovery==1.5.0

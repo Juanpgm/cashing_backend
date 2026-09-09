@@ -49,6 +49,56 @@ def storage_local_por_defecto(tmp_path_factory: pytest.TempPathFactory) -> Gener
         settings.LOCAL_STORAGE_PATH = _LOCAL_STORAGE_PATH_ORIGINAL
 
 
+_LLM_NETWORK_HINT = (
+    "A test reached the real LLM network through {call}. Tests must mock their LLM seam "
+    "(patch `get_llm` in the module under test, or `app.adapters.llm.get_llm`). "
+    "Without this guard the call goes out to Gemini/Groq/Ollama with a 120s per-model "
+    "timeout across a 3-model fallback chain, so an unmocked call stalls the suite for "
+    "minutes instead of failing. Opt out only with @pytest.mark.live_llm / @pytest.mark.live."
+)
+
+
+@pytest.fixture(autouse=True)
+def bloquear_red_llm(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail fast instead of hanging when a test forgets to mock its LLM seam.
+
+    `LiteLLMAdapter` walks a 3-model fallback chain (Gemini -> Groq -> Ollama) with a
+    120s timeout each, and most callers `except Exception` and fail OPEN. An unmocked
+    call therefore never *fails* — it silently burns up to ~6 minutes of real network
+    waiting and then returns the fallback value, which is exactly what made the full
+    suite look like it was hanging. Raising here keeps the fail-open semantics (the
+    caller still gets its fallback) while removing the network wait.
+
+    Only the default (non-live) run is blocked: `tests/live/` opts back in via the
+    `live_llm` / `live` markers, which `addopts` deselects by default anyway.
+    """
+    if request.node.get_closest_marker("live_llm") or request.node.get_closest_marker("live"):
+        return
+
+    import litellm
+
+    def _bloqueado(nombre: str) -> Any:
+        def _sync(*_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError(_LLM_NETWORK_HINT.format(call=f"litellm.{nombre}"))
+
+        return _sync
+
+    def _bloqueado_async(nombre: str) -> Any:
+        async def _async(*_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError(_LLM_NETWORK_HINT.format(call=f"litellm.{nombre}"))
+
+        return _async
+
+    # `raising=True` is load-bearing: with `raising=False` a renamed litellm entrypoint
+    # would make monkeypatch CREATE a dead attribute instead of failing, leaving a guard
+    # that looks installed while real calls sail past it to the network. A rename must
+    # break the suite loudly (AttributeError) so the guard gets updated.
+    for nombre in ("completion", "embedding"):
+        monkeypatch.setattr(litellm, nombre, _bloqueado(nombre), raising=True)
+    for nombre in ("acompletion", "aembedding"):
+        monkeypatch.setattr(litellm, nombre, _bloqueado_async(nombre), raising=True)
+
+
 # In-memory SQLite for tests by default; override with TEST_DATABASE_URL to run
 # the suite against Postgres (e.g. postgresql+asyncpg://cashin:cashin_local@localhost:5432/cashin).
 TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
