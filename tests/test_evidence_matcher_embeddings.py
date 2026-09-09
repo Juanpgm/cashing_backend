@@ -37,7 +37,7 @@ class _FakeEmbedLLM:
         self.embed_calls: list[list[str]] = []
         self.complete_calls = 0
 
-    async def complete(self, messages, temperature=0.0, max_tokens=64) -> _FakeResp:
+    async def complete(self, messages, temperature=0.0, max_tokens=64, **kwargs) -> _FakeResp:
         self.complete_calls += 1
         return _FakeResp(self.relevance_content)
 
@@ -135,7 +135,7 @@ async def test_embed_failure_falls_back_to_keyword_only_ranking() -> None:
         def __init__(self) -> None:
             self.complete_calls = 0
 
-        async def complete(self, messages, temperature=0.0, max_tokens=64) -> _FakeResp:
+        async def complete(self, messages, temperature=0.0, max_tokens=64, **kwargs) -> _FakeResp:
             self.complete_calls += 1
             return _FakeResp("[1]")
 

@@ -166,6 +166,52 @@ async def test_llm_relevance_batch_fails_closed_on_garbage() -> None:
 
 
 @pytest.mark.asyncio
+async def test_llm_relevance_batch_fails_closed_on_empty_content() -> None:
+    """Reproduces the too-small-max_tokens failure mode for a reasoning model:
+    litellm can return 200 with EMPTY content (finish_reason=length) instead of
+    raising — no exception for the adapter's fallback-on-exception to catch.
+    Must fail closed (all False), same as garbage/error, not crash."""
+    candidates = [{"content": "x", "source": "a.pdf"}, {"content": "y", "source": "b.pdf"}]
+    mock_llm = AsyncMock()
+    mock_llm.complete = AsyncMock(return_value=_make_llm_response(""))
+
+    flags = await cruzar_service._llm_relevance_batch("obligación X", candidates, mock_llm)
+
+    assert flags == [False, False]
+
+
+@pytest.mark.asyncio
+async def test_llm_relevance_batch_zero_candidates_returns_empty_without_llm_call() -> None:
+    """Zero obligación-scoring candidates must short-circuit to [] with no LLM call
+    at all — the obligation-scoring edge case of nothing to classify."""
+    mock_llm = AsyncMock()
+
+    flags = await cruzar_service._llm_relevance_batch("obligación X", [], mock_llm)
+
+    assert flags == []
+    mock_llm.complete.assert_not_called()
+
+
+# ── groq/llama-3.1-8b-instant decommissioning fix ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_llm_relevance_batch_sends_reasoning_effort_and_safe_max_tokens() -> None:
+    """The new model (groq/openai/gpt-oss-20b) is a reasoning model — reasoning_effort
+    must be forwarded and max_tokens must have real headroom above the verified-
+    minimum-working budget (64), not just the bare minimum."""
+    candidates = [{"content": "x", "source": "a.pdf"}]
+    mock_llm = AsyncMock()
+    mock_llm.complete = AsyncMock(return_value=_make_llm_response("[1]"))
+
+    await cruzar_service._llm_relevance_batch("obligación X", candidates, mock_llm)
+
+    kwargs = mock_llm.complete.call_args.kwargs
+    assert kwargs["reasoning_effort"] == "low"
+    assert kwargs["max_tokens"] >= 120
+
+
+@pytest.mark.asyncio
 async def test_cruzar_raises_not_found_for_unknown_cuenta(db: AsyncSession) -> None:
     """Non-existent cuenta_id must raise NotFoundError, not crash."""
     user = await _make_user(db)
@@ -205,6 +251,58 @@ async def test_cruzar_returns_cobertura_response_when_no_docs(db: AsyncSession) 
     assert result.resumen.total == 1
     assert result.resumen.sin_evidencia == 1
     assert result.listo_para_generar is False
+
+
+@pytest.mark.asyncio
+async def test_cruzar_zero_obligaciones_creates_no_actividades(db: AsyncSession) -> None:
+    """Obligation-scoring edge case: a contrato with ZERO obligaciones but with a
+    matchable document must not crash — the `for ob in obligaciones` loop simply
+    never runs, so no relevance LLM call happens and no Actividad is created."""
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+    # No _make_obligacion call — contrato has zero obligaciones.
+    cuenta = await _make_cuenta(db, contrato.id)
+    await _make_documento(db, user.id, contrato.id, texto_extraido="Informe técnico mensual de consultoría.")
+    await db.commit()
+
+    mock_llm = AsyncMock()
+
+    with patch("app.services.cruzar_service.get_llm", return_value=mock_llm):
+        with patch("app.services.cruzar_service.quality_gate_node", new_callable=AsyncMock) as mock_gate:
+            mock_gate.return_value = {"quality_gate_passed": True, "quality_issues": []}
+            result = await cruzar_service.cruzar_documentos(db, user.id, cuenta.id)
+
+    acts_result = await db.execute(select(Actividad).where(Actividad.cuenta_cobro_id == cuenta.id))
+    assert list(acts_result.scalars().all()) == []
+    assert result.resumen.total == 0
+    mock_llm.complete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cruzar_constructs_relevance_llm_against_live_groq_model(db: AsyncSession) -> None:
+    """groq/llama-3.1-8b-instant was decommissioned by Groq — the relevance LLM
+    client must target the live model, distinct from the untouched justification
+    LLM (gemini/gemini-2.5-flash)."""
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+    await _make_obligacion(
+        db, contrato.id, 1, descripcion="Elaborar informes técnicos mensuales de consultoría y asesoría"
+    )
+    cuenta = await _make_cuenta(db, contrato.id)
+    await _make_documento(db, user.id, contrato.id, texto_extraido="Informe técnico mensual de consultoría y asesoría.")
+    await db.commit()
+
+    mock_llm = AsyncMock()
+    mock_llm.complete = AsyncMock(return_value=_make_llm_response("[]"))  # nothing relevant → no further LLM calls
+
+    with patch("app.services.cruzar_service.get_llm", return_value=mock_llm) as mock_get_llm:
+        with patch("app.services.cruzar_service.quality_gate_node", new_callable=AsyncMock) as mock_gate:
+            mock_gate.return_value = {"quality_gate_passed": True, "quality_issues": []}
+            await cruzar_service.cruzar_documentos(db, user.id, cuenta.id)
+
+    called_models = [c.kwargs["model"] for c in mock_get_llm.call_args_list]
+    assert "groq/openai/gpt-oss-20b" in called_models
+    assert "gemini/gemini-2.5-flash" in called_models
 
 
 @pytest.mark.asyncio

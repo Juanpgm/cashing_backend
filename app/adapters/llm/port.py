@@ -20,6 +20,7 @@ class LLMPort(Protocol):
         response_format: type[BaseModel] | dict[str, Any] | None = None,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
+        reasoning_effort: str | None = None,
     ) -> LLMResponse:
         """Send messages and return a completion.
 
@@ -28,6 +29,12 @@ class LLMPort(Protocol):
         forwarded to the underlying provider when set; the returned
         ``LLMResponse.tool_calls`` is populated when the model requests one
         or more tool invocations instead of (or alongside) plain content.
+
+        ``reasoning_effort`` (``"low"``/``"medium"``/``"high"``) is a Groq-specific
+        extra param for reasoning models — implementations forward it only when
+        the model actually called is a Groq model; other providers never receive
+        it. An unrecognized value should raise ``ValueError`` before any network
+        call.
         """
         ...
 

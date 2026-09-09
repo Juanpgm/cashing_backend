@@ -19,6 +19,7 @@ from app.adapters.storage.port import StoragePort
 from app.agent.nodes.evidence_matcher import clasificar_evidencia, confidence_bucket, evidence_matcher_node
 from app.agent.state import AgentState
 from app.agent.tools import document_parser
+from app.core.config import settings
 from app.core.exceptions import ExternalServiceError, NotFoundError, ValidationError
 from app.core.file_validation import (
     JUNK_PATH_SEGMENTS,
@@ -637,7 +638,7 @@ async def subir_evidencias_cuenta(
 
     # ONE cached LLM instance for the whole batch — `clasificar_evidencia` only
     # calls it when a file has 2+ keyword-candidate obligaciones.
-    llm = get_llm(model="groq/llama-3.1-8b-instant") if obligaciones else None
+    llm = get_llm(model=settings.LLM_EVIDENCE_CLASSIFIER_MODEL) if obligaciones else None
 
     # Cache found/created Actividad stubs within this batch call, keyed by
     # obligacion_id (None = unclassified sentinel) — avoids duplicate rows/queries

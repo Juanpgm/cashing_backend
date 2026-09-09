@@ -77,6 +77,13 @@ class Settings(BaseSettings):
     LLM_DEFAULT_MODEL: str = "ollama/llama3.1:8b"
     LLM_FALLBACK_MODEL: str = "ollama/llama3.1:8b"
     LLM_LOCAL_MODEL: str = "ollama/llama3.1:8b"
+    # LLM_EVIDENCE_CLASSIFIER_MODEL: dedicated reasoning model for the evidence
+    # work/noise filter, obligation matching, and cruzar/upload relevance
+    # classification (evidence_filter.py, evidence_matcher.py, cruzar_service.py,
+    # evidencia_service.py). Single source of truth so a future Groq decommission
+    # is a one-line/one-env-var change instead of a find-and-replace across 5
+    # call sites (groq-fallback-model-decommissioned fix).
+    LLM_EVIDENCE_CLASSIFIER_MODEL: str = "groq/openai/gpt-oss-20b"
     # LLM_EXTRACTION_MODEL: dedicated model for document/obligation extraction.
     # Default is gemini-2.5-flash: flash-lite returns 404 for API keys created
     # after mid-2026, so the cheaper tier is opt-in via .env only.

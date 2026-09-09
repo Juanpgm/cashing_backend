@@ -32,6 +32,7 @@ from app.agent.prompts.cruzar import (
     CRUZAR_JUSTIFICATION_USER,
     CRUZAR_RELEVANCE_BATCH_SYSTEM,
 )
+from app.core.config import settings
 from app.core.exceptions import ForbiddenError, NotFoundError
 from app.models.actividad import Actividad, JustificacionOrigen
 from app.models.contrato import Contrato
@@ -93,7 +94,11 @@ async def _llm_relevance_batch(obligation_text: str, candidates: list[dict], llm
                 LLMMessage(role="user", content=user_content),
             ],
             temperature=0.0,
-            max_tokens=64,
+            # groq/openai/gpt-oss-20b is a reasoning model — reasoning_tokens count
+            # against max_tokens before the visible JSON array output; 120 gives
+            # real headroom above the verified-working 64.
+            max_tokens=120,
+            reasoning_effort="low",
         )
         match = _RELEVANCE_JSON_RE.search(resp.content)
         if not match:
@@ -336,7 +341,7 @@ async def cruzar_documentos(
     contexto_contrato = _contexto_contrato_bloque(contexto_docs)
 
     # LLM clients (reused across all obligations for connection efficiency)
-    llm_relevance = get_llm(model="groq/llama-3.1-8b-instant")
+    llm_relevance = get_llm(model=settings.LLM_EVIDENCE_CLASSIFIER_MODEL)
     llm_justification = get_llm(model="gemini/gemini-2.5-flash")
 
     # Compute last day of the billing month for fecha_realizacion

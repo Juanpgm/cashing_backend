@@ -15,6 +15,8 @@ from app.schemas.agent import LLMMessage, LLMResponse, LLMToolCall
 
 logger = structlog.get_logger("llm")
 
+_VALID_REASONING_EFFORTS = {"low", "medium", "high"}
+
 
 class LiteLLMAdapter:
     """Wraps LiteLLM for async completions with automatic fallback."""
@@ -113,6 +115,7 @@ class LiteLLMAdapter:
         response_format: type[BaseModel] | dict[str, Any] | None = None,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
+        reasoning_effort: str | None = None,
     ) -> LLMResponse:
         import litellm
 
@@ -131,6 +134,12 @@ class LiteLLMAdapter:
             kwargs["tools"] = tools
             if tool_choice is not None:
                 kwargs["tool_choice"] = tool_choice
+        # Groq-specific extra param (litellm passthrough) — only Groq models support
+        # it; other providers (Gemini, Ollama, OpenAI) don't, so it must never be
+        # sent to them. Decided per-attempted-model, not once at `complete()`, so a
+        # fallback to a non-Groq model in the chain never carries it either.
+        if reasoning_effort is not None and model.startswith("groq/"):
+            kwargs["reasoning_effort"] = reasoning_effort
         api_base = self._api_base_for(model)
         if api_base:
             kwargs["api_base"] = api_base
@@ -192,6 +201,7 @@ class LiteLLMAdapter:
         response_format: type[BaseModel] | dict[str, Any] | None = None,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
+        reasoning_effort: str | None = None,
         fallback: bool = True,
     ) -> LLMResponse:
         """Complete with automatic fallback through model chain.
@@ -206,20 +216,48 @@ class LiteLLMAdapter:
         more invocations. See ``_rewrite_model_for_tools`` for the Ollama
         provider caveat.
 
+        ``reasoning_effort`` (``"low"``/``"medium"``/``"high"``) is a Groq-specific
+        extra param forwarded to reasoning models (e.g. ``groq/openai/gpt-oss-20b``)
+        — it is only ever sent when the model actually being called is a Groq
+        model (see ``_call_model``); other providers never receive it. Any other
+        value raises ``ValueError`` immediately, before any network call.
+
         Set ``fallback=False`` to try only the requested model — used for vision
         calls, where the text-only fallback models cannot read image parts and
         would just produce a misleading error.
         """
+        if reasoning_effort is not None and reasoning_effort not in _VALID_REASONING_EFFORTS:
+            raise ValueError(
+                f"Invalid reasoning_effort={reasoning_effort!r}; must be one of {sorted(_VALID_REASONING_EFFORTS)}"
+            )
+
         litellm_msgs = self._to_litellm_messages(messages)
         models = self._get_model_chain(model) if fallback else [model or self._default_model]
         last_error: Exception | None = None
 
-        for m in models:
+        for idx, m in enumerate(models):
             try:
                 called_model = self._rewrite_model_for_tools(m, tools)
                 await logger.ainfo("llm_request", model=called_model, msg_count=len(messages))
+                # reasoning_effort is tuned for the SPECIFIC model the caller asked
+                # for (models[0], the primary) — never forwarded on a fallback
+                # attempt, regardless of what provider/model it happens to be.
+                # A Groq-model-level allowlist ("which Groq models support
+                # reasoning_effort") would be more fragile than this: scoping by
+                # loop position is simpler and correctly reflects that the caller
+                # never tuned this param for whatever model ends up being tried
+                # after the primary fails. `_call_model`'s own
+                # `model.startswith("groq/")` gate stays as a secondary safety net.
+                attempt_reasoning_effort = reasoning_effort if idx == 0 else None
                 result = await self._call_model(
-                    m, litellm_msgs, temperature, max_tokens, response_format, tools, tool_choice
+                    m,
+                    litellm_msgs,
+                    temperature,
+                    max_tokens,
+                    response_format,
+                    tools,
+                    tool_choice,
+                    attempt_reasoning_effort,
                 )
                 await logger.ainfo(
                     "llm_response",
