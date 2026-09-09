@@ -9,6 +9,17 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _log = structlog.get_logger("core.config")
 
+# Single in-code source of truth for the running app version, referenced by both
+# `app.main`'s FastAPI(version=...) (OpenAPI metadata) and
+# `app.schemas.common.HealthResponse.version` (what GET /health actually returns).
+# Not a Settings field on purpose — it identifies the deployed BUILD, not something
+# an operator should override via env var. Still hand-kept in sync with
+# pyproject.toml's [project].version: this app has no [build-system] section, so
+# it is never installed as a distributable package and `importlib.metadata.version()`
+# cannot resolve it. Previously drifted 3 ways (pyproject.toml, main.py, common.py)
+# after a version bump silently didn't reach /health — see PR #63.
+APP_VERSION = "0.2.1"
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
