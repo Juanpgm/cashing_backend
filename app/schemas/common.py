@@ -4,6 +4,8 @@ from typing import TypeVar
 
 from pydantic import BaseModel
 
+from app.core.config import APP_VERSION
+
 T = TypeVar("T")
 
 
@@ -23,7 +25,11 @@ class PaginatedResponse[T](BaseModel):
 class HealthResponse(BaseModel):
     status: str = "ok"
     environment: str
-    version: str = "0.2.0"
+    # Default kept only as a safety net for a caller that forgets to pass it
+    # explicitly — app.main's /health route always does. See APP_VERSION's
+    # docstring in app.core.config for why this can't resolve from package
+    # metadata.
+    version: str = APP_VERSION
 
 
 class LLMModelStatus(BaseModel):

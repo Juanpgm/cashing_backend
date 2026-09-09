@@ -14,7 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from app.api.router import api_v1_router
 from app.core.audit import AuditMiddleware
 from app.core.client_ip import TrustedProxyClientMiddleware
-from app.core.config import settings
+from app.core.config import APP_VERSION, settings
 from app.core.error_response import internal_error_response
 from app.core.exceptions import DomainError, domain_to_http
 from app.core.rate_limit import limiter
@@ -188,15 +188,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
 
 
-# NOTE: keep this in sync with `[project].version` in pyproject.toml by hand — this
-# app is not installed as a distributable package (no [build-system] section), so
-# `importlib.metadata.version()` cannot resolve it, and reading pyproject.toml at
-# import time would add a runtime file-path dependency for a cosmetic string. A
-# mismatch here silently breaks /health as a way to confirm which build is live.
 app = FastAPI(
     title="CashIn Backend",
     description="AI Agent-first backend for Colombian contractor billing automation",
-    version="0.2.1",
+    version=APP_VERSION,
     lifespan=lifespan,
 )
 
@@ -308,7 +303,7 @@ app.include_router(api_v1_router)
 
 @app.get("/health", response_model=HealthResponse, tags=["health"])
 async def health() -> HealthResponse:
-    return HealthResponse(environment=settings.ENVIRONMENT)
+    return HealthResponse(environment=settings.ENVIRONMENT, version=APP_VERSION)
 
 
 # Developer Test UI (static file served at /test-ui)
