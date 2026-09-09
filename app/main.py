@@ -188,10 +188,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
 
 
+# NOTE: keep this in sync with `[project].version` in pyproject.toml by hand — this
+# app is not installed as a distributable package (no [build-system] section), so
+# `importlib.metadata.version()` cannot resolve it, and reading pyproject.toml at
+# import time would add a runtime file-path dependency for a cosmetic string. A
+# mismatch here silently breaks /health as a way to confirm which build is live.
 app = FastAPI(
     title="CashIn Backend",
     description="AI Agent-first backend for Colombian contractor billing automation",
-    version="0.2.0",
+    version="0.2.1",
     lifespan=lifespan,
 )
 
