@@ -27,6 +27,7 @@ from app.agent.prompts.evidence_filter import (
     score_non_personal_ms_email,
 )
 from app.agent.state import AgentState
+from app.core.config import settings
 from app.schemas.agent import LLMMessage
 
 logger = structlog.get_logger("agent.nodes.evidence_filter")
@@ -54,7 +55,20 @@ async def _llm_classify_batch(items: list[dict], llm) -> list[bool]:  # True = T
                 LLMMessage(role="user", content=prompt),
             ],
             temperature=0.0,
-            max_tokens=256,
+            # groq/openai/gpt-oss-20b is a reasoning model: reasoning_tokens count
+            # against max_tokens before any visible output. This is the tightest
+            # budget of the 4 sites tuned in the groq-fallback-model-decommissioned
+            # fix -- _LLM_BATCH_SIZE=15 means the visible output is a JSON array of
+            # up to 15 `{"idx": N, "verdict": "TRABAJO"}` objects. Worst case:
+            # ~18-20 tokens/object (2-digit idx, "TRABAJO", braces/commas) x 15
+            # items ~= 270-300 tokens of visible content alone, before any hidden
+            # reasoning tokens. The other 3 sites (single-number and small
+            # JSON-array answers) needed roughly 1.9x-5x headroom above their
+            # verified-working baseline to absorb reasoning_effort="low"
+            # overhead; 256 was never empirically verified here and can be
+            # smaller than the worst-case visible content by itself. 700 =
+            # ~300 worst-case content + ~400 headroom for reasoning + margin.
+            max_tokens=700,
             reasoning_effort="low",
         )
         raw = resp.content or ""
@@ -143,7 +157,7 @@ async def evidence_filter_node(state: AgentState) -> AgentState:
     clasificables = [it for it in after_heuristics if it.get("source") != "local_file"]
 
     # Capa 2: clasificador LLM batch
-    llm = get_llm(model="groq/openai/gpt-oss-20b")
+    llm = get_llm(model=settings.LLM_EVIDENCE_CLASSIFIER_MODEL)
     llm_dropped = 0
 
     for batch_start in range(0, len(clasificables), _LLM_BATCH_SIZE):

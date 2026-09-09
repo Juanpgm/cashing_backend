@@ -193,3 +193,36 @@ class TestReasoningEffortPassthrough:
         assert mock_call.call_args_list[1].kwargs["reasoning_effort"] == "low"
         assert mock_call.call_args_list[2].kwargs["model"] == "gemini/gemini-2.5-flash"
         assert "reasoning_effort" not in mock_call.call_args_list[2].kwargs
+
+    @pytest.mark.asyncio
+    async def test_fallback_to_different_groq_model_does_not_forward_reasoning_effort(self, monkeypatch) -> None:
+        """`reasoning_effort` must be scoped to the PRIMARY model the caller actually
+        requested (models[0]), never to "any Groq model that happens to be in the
+        fallback chain". The `_call_model`-internal `model.startswith("groq/")` gate
+        is provider-level, not model-level — it alone would still forward
+        reasoning_effort to a different Groq fallback model (e.g. a non-reasoning
+        one), which Groq's API can reject with a 400. `LLM_FALLBACK_MODEL` is forced
+        to a DIFFERENT Groq model here so the only thing that can save the fallback
+        attempt from carrying reasoning_effort is the loop-position (index) check in
+        `complete()`, not the provider-prefix check.
+        """
+        monkeypatch.setattr(settings, "LLM_FALLBACK_MODEL", "groq/llama-3.3-70b-versatile")
+        adapter = LiteLLMAdapter(default_model="groq/openai/gpt-oss-20b")
+        fake_response = _fake_completion_response()
+
+        with patch(
+            "litellm.acompletion",
+            new=AsyncMock(side_effect=[RuntimeError("groq down"), RuntimeError("groq down"), fake_response]),
+        ) as mock_call:
+            result = await adapter.complete(
+                [LLMMessage(role="user", content="hola")],
+                reasoning_effort="low",
+            )
+
+        assert result.content == "ok"
+        assert mock_call.call_count == 3
+        assert mock_call.call_args_list[0].kwargs["model"] == "groq/openai/gpt-oss-20b"
+        assert mock_call.call_args_list[0].kwargs["reasoning_effort"] == "low"
+        assert mock_call.call_args_list[1].kwargs["reasoning_effort"] == "low"
+        assert mock_call.call_args_list[2].kwargs["model"] == "groq/llama-3.3-70b-versatile"
+        assert "reasoning_effort" not in mock_call.call_args_list[2].kwargs

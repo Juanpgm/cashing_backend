@@ -235,10 +235,20 @@ class LiteLLMAdapter:
         models = self._get_model_chain(model) if fallback else [model or self._default_model]
         last_error: Exception | None = None
 
-        for m in models:
+        for idx, m in enumerate(models):
             try:
                 called_model = self._rewrite_model_for_tools(m, tools)
                 await logger.ainfo("llm_request", model=called_model, msg_count=len(messages))
+                # reasoning_effort is tuned for the SPECIFIC model the caller asked
+                # for (models[0], the primary) — never forwarded on a fallback
+                # attempt, regardless of what provider/model it happens to be.
+                # A Groq-model-level allowlist ("which Groq models support
+                # reasoning_effort") would be more fragile than this: scoping by
+                # loop position is simpler and correctly reflects that the caller
+                # never tuned this param for whatever model ends up being tried
+                # after the primary fails. `_call_model`'s own
+                # `model.startswith("groq/")` gate stays as a secondary safety net.
+                attempt_reasoning_effort = reasoning_effort if idx == 0 else None
                 result = await self._call_model(
                     m,
                     litellm_msgs,
@@ -247,7 +257,7 @@ class LiteLLMAdapter:
                     response_format,
                     tools,
                     tool_choice,
-                    reasoning_effort,
+                    attempt_reasoning_effort,
                 )
                 await logger.ainfo(
                     "llm_response",

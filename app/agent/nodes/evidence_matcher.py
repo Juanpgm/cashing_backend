@@ -201,8 +201,10 @@ async def _llm_relevance_batch(
             temperature=0.0,
             # groq/openai/gpt-oss-20b is a reasoning model — reasoning_tokens count
             # against max_tokens before the visible JSON array output; 120 gives
-            # real headroom above the verified-working 64 (see evidence_matcher.py
-            # module docstring / groq-fallback-model-decommissioned fix).
+            # real headroom above the verified-working 64, per the empirical
+            # investigation in the groq-fallback-model-decommissioned fix (see
+            # this commit and the sibling `max_tokens` tuning in
+            # `evidence_filter.py`/`cruzar_service.py` from the same fix).
             max_tokens=120,
             reasoning_effort="low",
         )
@@ -240,7 +242,7 @@ async def clasificar_evidencia(texto_evidencia: str, obligaciones: list[Obligaci
     candidates = [(ob, score) for ob, score in scored if score >= _KEYWORD_THRESHOLD]
 
     if llm is None:
-        llm = get_llm(model="groq/openai/gpt-oss-20b")
+        llm = get_llm(model=settings.LLM_EVIDENCE_CLASSIFIER_MODEL)
 
     if not candidates:
         return await _clasificar_via_llm(texto_evidencia, obligaciones, llm, fallback=None)
@@ -269,7 +271,7 @@ async def evidence_matcher_node(state: AgentState) -> AgentState:
             "current_phase": "evidence_matcher",
         }
 
-    llm = get_llm(model="groq/openai/gpt-oss-20b")
+    llm = get_llm(model=settings.LLM_EVIDENCE_CLASSIFIER_MODEL)
     matched: dict[str, list[dict]] = {}
     matched_scores: dict[str, dict[str, float]] = {}
 

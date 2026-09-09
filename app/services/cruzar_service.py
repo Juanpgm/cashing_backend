@@ -32,6 +32,7 @@ from app.agent.prompts.cruzar import (
     CRUZAR_JUSTIFICATION_USER,
     CRUZAR_RELEVANCE_BATCH_SYSTEM,
 )
+from app.core.config import settings
 from app.core.exceptions import ForbiddenError, NotFoundError
 from app.models.actividad import Actividad, JustificacionOrigen
 from app.models.contrato import Contrato
@@ -340,7 +341,7 @@ async def cruzar_documentos(
     contexto_contrato = _contexto_contrato_bloque(contexto_docs)
 
     # LLM clients (reused across all obligations for connection efficiency)
-    llm_relevance = get_llm(model="groq/openai/gpt-oss-20b")
+    llm_relevance = get_llm(model=settings.LLM_EVIDENCE_CLASSIFIER_MODEL)
     llm_justification = get_llm(model="gemini/gemini-2.5-flash")
 
     # Compute last day of the billing month for fecha_realizacion

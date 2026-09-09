@@ -198,7 +198,7 @@ async def test_llm_classify_batch_sends_reasoning_effort():
 
     kwargs = llm.complete.call_args.kwargs
     assert kwargs["reasoning_effort"] == "low"
-    assert kwargs["max_tokens"] == 256
+    assert kwargs["max_tokens"] == 700
 
 
 @pytest.mark.asyncio
