@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import re
+import time
 import uuid
 from collections.abc import Callable
 from datetime import date
@@ -38,6 +39,7 @@ from app.agent.tools.document_parser import (
 )
 from app.core.exceptions import DomainError
 from app.core.file_validation import _EXT_TO_MIME
+from app.core.observability import elapsed_ms
 from app.models.conversacion import Conversacion
 from app.models.usuario import Usuario
 from app.schemas.agent import (
@@ -927,6 +929,33 @@ async def chat_with_tools(
     # the loop triggers `db.rollback()`, which would otherwise silently discard a
     # brand-new Conversacion row that was only flushed, never committed.
     await db.commit()
+
+    # Bound for the lifetime of this turn so every log line emitted below — by this
+    # function, by `LiteLLMAdapter`, by a tool handler — carries `session_id` without
+    # threading it through every call site. Contextvars are asyncio-task-local: two
+    # concurrent turns on different sessions (different asyncio Tasks) never see each
+    # other's bound value, and the `finally` below guarantees this task's binding
+    # never survives past its own turn.
+    turn_start = time.perf_counter()
+    structlog.contextvars.bind_contextvars(session_id=str(convo.id))
+    try:
+        return await _run_chat_turn(db, usuario, message, attachments, contrato_id, convo, turn_start)
+    finally:
+        structlog.contextvars.unbind_contextvars("session_id")
+
+
+async def _run_chat_turn(
+    db: AsyncSession,
+    usuario: Usuario,
+    message: str,
+    attachments: dict[str, ToolAttachment],
+    contrato_id: str | None,
+    convo: Conversacion,
+    turn_start: float,
+) -> AgentChatResult:
+    """Body of `chat_with_tools`, split out so the outer function can bind/unbind
+    the `session_id` structlog contextvar around it (including on exception) via
+    try/finally without indenting this entire body under it."""
     history = [LLMMessage(**m) for m in convo.mensajes_json]
 
     documentos: list[DocumentoAdjuntoResumen] = []
@@ -964,8 +993,11 @@ async def chat_with_tools(
     call_results: list[tuple[str, str, dict[str, Any] | None]] = []
     tokens_used = 0
     final_content = ""
+    iterations_run = 0
 
-    for _ in range(MAX_TOOL_ITERATIONS):
+    for iteration in range(MAX_TOOL_ITERATIONS):
+        iterations_run = iteration + 1
+        llm_start = time.perf_counter()
         try:
             response = await llm.complete(messages, tools=tools, temperature=0.2, max_tokens=1024)
         except Exception as exc:
@@ -987,6 +1019,15 @@ async def chat_with_tools(
             messages.append(LLMMessage(role="assistant", content=final_content))
             break
         tokens_used += response.total_tokens
+        await logger.ainfo(
+            "agent_chat_llm_turn",
+            iteration=iteration,
+            model=response.model,
+            fallback_depth=response.fallback_depth,
+            duration_ms=round(elapsed_ms(llm_start), 2),
+            prompt_tokens=response.prompt_tokens,
+            completion_tokens=response.completion_tokens,
+        )
 
         calls = response.tool_calls
         recovered_from_content = False
@@ -1033,6 +1074,7 @@ async def chat_with_tools(
                 result_payload: Any = {"error": llm_detail}
                 call_results.append((call.name, "error", None))
             else:
+                tool_start = time.perf_counter()
                 try:
                     output = await invoke_tool(call.name, tool_ctx, _normalize_tool_args(call.arguments))
                     if "write" in spec.tags:
@@ -1040,7 +1082,14 @@ async def chat_with_tools(
                     output_model = output
                     dumped = output.model_dump(mode="json")
                     result_payload = dumped
-                    tool_events.append(ToolEvent(tool=call.name, status="ok", resumen=_summarize_tool_result(dumped)))
+                    tool_events.append(
+                        ToolEvent(
+                            tool=call.name,
+                            status="ok",
+                            resumen=_summarize_tool_result(dumped),
+                            duration_ms=round(elapsed_ms(tool_start), 2),
+                        )
+                    )
                     call_results.append((call.name, "ok", dumped))
                     action = _run_ui_action_builder(call.name, output)
                     if action is not None:
@@ -1054,6 +1103,7 @@ async def chat_with_tools(
                     # desync those committed side effects from a never-persisted conversation
                     # history. BaseException (KeyboardInterrupt/SystemExit/CancelledError) is
                     # intentionally NOT caught here.
+                    tool_duration_ms = round(elapsed_ms(tool_start), 2)
                     await db.rollback()
                     # rollback() expires every object in the session (regardless of
                     # expire_on_commit) — refresh the two long-lived objects the rest
@@ -1064,9 +1114,13 @@ async def chat_with_tools(
                     await db.refresh(convo)
                     user_resumen, llm_detail = _format_tool_error(exc, call.name)
                     result_payload = {"error": llm_detail}
-                    tool_events.append(ToolEvent(tool=call.name, status="error", resumen=user_resumen))
+                    tool_events.append(
+                        ToolEvent(tool=call.name, status="error", resumen=user_resumen, duration_ms=tool_duration_ms)
+                    )
                     call_results.append((call.name, "error", None))
-                    await logger.awarning("agent_chat_tool_error", tool=call.name, error=str(exc))
+                    await logger.awarning(
+                        "agent_chat_tool_error", tool=call.name, error=str(exc), duration_ms=tool_duration_ms
+                    )
 
             messages.append(
                 LLMMessage(
@@ -1111,6 +1165,8 @@ async def chat_with_tools(
         user_id=str(usuario.id),
         tool_calls=len(tool_events),
         tokens_used=tokens_used,
+        iterations_run=iterations_run,
+        turn_duration_ms=round(elapsed_ms(turn_start), 2),
     )
 
     return AgentChatResult(
