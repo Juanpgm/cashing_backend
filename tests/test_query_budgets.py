@@ -9,9 +9,18 @@ load). If a future change genuinely needs more queries, re-measure and bump
 the budget deliberately in the same PR, with a comment explaining why.
 
 Fixtures build a realistic, non-degenerate scenario per the audit: 1 contrato,
-1 obligación, 1 cuenta_cobro with a fully-completed checklist (mandatory
-requisitos marked cumplido_manual, same pattern as `test_radicar.py`), 1
+1 obligación, 1 cuenta_cobro with a fully-completed checklist (RPC satisfied by
+a real uploaded `DocumentoFuente`, the remaining mandatory requisitos marked
+cumplido_manual — a mixed shape, since a real production cuenta always has at
+least one uploaded document and `construir_checklist_completo` only issues its
+`documento_fuente` selectin lookup when at least one row has a non-NULL FK), 1
 actividad, 1 evidencia.
+
+Skipped on Postgres (`TEST_DATABASE_URL` set): these counts were measured on
+SQLite and are not guaranteed byte-for-byte on Postgres (different pooling /
+statement chatter, see `QueryCounter`'s docstring in conftest.py) — asserting
+them there would produce a misleading "budget exceeded" failure instead of an
+honest skip.
 """
 
 from __future__ import annotations
@@ -29,9 +38,20 @@ from app.models.obligacion import Obligacion, TipoObligacion
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tests.conftest import QueryCounter
+from tests.conftest import _IS_PG, QueryCounter
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [
+    pytest.mark.asyncio,
+    pytest.mark.skipif(
+        _IS_PG,
+        reason="query-count budgets measured on SQLite only, see module docstring",
+    ),
+]
+
+# A minimal valid PDF header — enough for the upload endpoint's magic-byte
+# MIME sniff (core/file_validation.py), same fixture content style as
+# test_checklist_api.py's RPC upload test.
+_PDF_MAGIC = b"%PDF-1.4 sample pdf content here"
 
 # Mandatory (obligatorio=True) codes in the standard catalog seed — same list
 # `test_radicar.py` uses to satisfy `computar_resumen`'s radicacion_lista gate.
@@ -46,6 +66,11 @@ _CODIGOS_OBLIGATORIOS = [
     "RUT",
     "ACTA_INICIO",
 ]
+
+# RPC is satisfied by a real upload (below) instead of cumplido_manual, so the
+# fixture exercises the `documento_fuente` selectin lookup that a checklist
+# with zero uploaded documents never triggers.
+_CODIGOS_MANUALES = [c for c in _CODIGOS_OBLIGATORIOS if c != "RPC"]
 
 
 @pytest.fixture
@@ -129,12 +154,22 @@ async def actividad_con_evidencia(db: AsyncSession, cuenta: CuentaCobro, obligac
 
 
 async def _completar_checklist(client: AsyncClient, headers: dict[str, str], cuenta_id: uuid.UUID) -> None:
-    """Seed the checklist rows and mark every mandatory requisito as cumplido_manual
-    — same pattern as `test_radicar.py`'s helper of the same name."""
+    """Seed the checklist rows, satisfy RPC with a real uploaded document, and
+    mark every other mandatory requisito as cumplido_manual — a mixed shape
+    matching real production data (see module docstring), not the all-manual
+    pattern `test_radicar.py`'s helper of the same name uses."""
     r = await client.get(f"/api/v1/cuentas-cobro/{cuenta_id}/checklist", headers=headers)
     assert r.status_code == 200, r.text
 
-    for codigo in _CODIGOS_OBLIGATORIOS:
+    up = await client.post(
+        "/api/v1/documentos/upload",
+        headers=headers,
+        params={"tipo": "rpc", "cuenta_cobro_id": str(cuenta_id), "requisito_codigo": "RPC"},
+        files={"file": ("rpc.pdf", _PDF_MAGIC, "application/pdf")},
+    )
+    assert up.status_code == 201, up.text
+
+    for codigo in _CODIGOS_MANUALES:
         p = await client.patch(
             f"/api/v1/cuentas-cobro/{cuenta_id}/checklist/{codigo}",
             headers=headers,
@@ -205,11 +240,19 @@ async def test_query_budget_checklist(
     client: AsyncClient, escenario_completo: dict[str, Any], query_counter: QueryCounter
 ) -> None:
     """GET /api/v1/cuentas-cobro/{id}/checklist — audit estimate ~36-40.
-    Measured baseline: 44 (slightly above the audit's upper bound — the fixture's
-    fully-completed checklist plus a real actividad+evidencia+obligacion graph
-    exercises more of `construir_checklist_completo` than the audit's assumed
-    scenario, e.g. the `evidencia_obligacion` join and per-requisito documento
-    lookups). Pinned to the real number, not the estimate."""
+    Measured baseline: 47 (above the estimate's upper bound — the fixture's
+    fully-completed checklist plus a real actividad+evidencia+obligacion graph,
+    AND a real uploaded RPC document (via the actual `/documentos/upload`
+    endpoint, not a raw ORM insert), exercises more of
+    `construir_checklist_completo` than the audit's assumed scenario: the
+    `evidencia_obligacion` join, PLUS the `documento_fuente` selectin lookup
+    and its own candidate/confianza resolution, which only fire once at least
+    one requisito row has a real linked document. A checklist with zero
+    uploaded documents (every requisito cumplido_manual, no real upload)
+    measures 44 instead — 47 is pinned here because that mixed shape is what
+    real production data actually looks like. Re-measured directly against
+    this test (not extrapolated) after a prior estimate of 45 turned out
+    wrong by 2 — see the adversarial review this fixture went through."""
     cuenta = escenario_completo["cuenta"]
     headers = escenario_completo["headers"]
     query_counter.reset()
@@ -217,16 +260,16 @@ async def test_query_budget_checklist(
     resp = await client.get(f"/api/v1/cuentas-cobro/{cuenta.id}/checklist", headers=headers)
 
     assert resp.status_code == 200, resp.text
-    query_counter.assert_budget(44, label="GET /cuentas-cobro/{id}/checklist")
+    query_counter.assert_budget(47, label="GET /cuentas-cobro/{id}/checklist")
 
 
 async def test_query_budget_radicar(
     client: AsyncClient, escenario_completo: dict[str, Any], query_counter: QueryCounter
 ) -> None:
     """POST /api/v1/cuentas-cobro/{id}/radicar — audit estimate ~60-80.
-    Measured baseline: 77 (radicar rebuilds the full checklist to re-validate
+    Measured baseline: 80 (radicar rebuilds the full checklist to re-validate
     the radicacion_lista gate before flipping estado, so it pays the same cost
-    as the checklist GET above plus the state-machine transition)."""
+    as the checklist GET above, 47, plus the state-machine transition)."""
     cuenta = escenario_completo["cuenta"]
     headers = escenario_completo["headers"]
     query_counter.reset()
@@ -234,7 +277,7 @@ async def test_query_budget_radicar(
     resp = await client.post(f"/api/v1/cuentas-cobro/{cuenta.id}/radicar", headers=headers)
 
     assert resp.status_code == 200, resp.text
-    query_counter.assert_budget(77, label="POST /cuentas-cobro/{id}/radicar")
+    query_counter.assert_budget(80, label="POST /cuentas-cobro/{id}/radicar")
 
 
 async def test_query_budget_stepper_state(
