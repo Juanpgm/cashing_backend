@@ -1,5 +1,6 @@
 """LLM port (interface) for language model interactions."""
 
+from collections.abc import AsyncIterator
 from typing import Any, Protocol
 
 from pydantic import BaseModel
@@ -45,9 +46,15 @@ class LLMPort(Protocol):
         model: str | None = None,
         temperature: float = 0.3,
         max_tokens: int = 2048,
-    ) -> "AsyncIterator[str]":  # noqa: F821
+    ) -> AsyncIterator[str]:
         """Stream completion tokens one by one."""
-        ...
+        # Protocol stub body — never actually executed. The `yield` (instead of a
+        # bare `...`) is load-bearing for mypy: without it this reads as a plain
+        # coroutine returning `AsyncIterator[str]`, which does NOT structurally
+        # match `LiteLLMAdapter.stream`/`FakeLLMPort.stream` (real async
+        # generators, callable without `await` to get the iterator).
+        if False:
+            yield ""
 
     async def embed(self, texts: list[str], *, model: str | None = None) -> list[list[float]]:
         """Return one embedding vector per input text.

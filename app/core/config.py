@@ -1,7 +1,7 @@
 """Application configuration via Pydantic Settings."""
 
 import os
-from typing import Any
+from typing import Any, Literal
 
 import structlog
 from pydantic import field_validator
@@ -81,6 +81,21 @@ class Settings(BaseSettings):
     S3_BUCKET_DOCUMENTOS: str = "cashin-documentos"
     S3_BUCKET_PDFS: str = "cashin-pdfs"
     S3_BUCKET_AVATARS: str = "cashin-avatars"
+
+    # LLM_PROVIDER: "litellm" (default, real Gemini/Groq/Ollama chain via LiteLLMAdapter)
+    # | "fake" (FakeLLMPort — deterministic, no network, no litellm import; see
+    # app/adapters/llm/fake_adapter.py). Lets the RUNNING APP (not just pytest, which
+    # already has its own ScriptedLLM/bloquear_red_llm test-only seam) boot and complete
+    # chat turns without hitting a real model — local dev without API keys, future
+    # Playwright E2E runs. The `_normalize_llm_provider` validator below folds any value
+    # other than exactly "fake" (unset, typo, invalid) to "litellm" so a bad env var
+    # falls back to the real provider instead of crashing Settings load.
+    LLM_PROVIDER: Literal["litellm", "fake"] = "litellm"
+
+    @field_validator("LLM_PROVIDER", mode="before")
+    @classmethod
+    def _normalize_llm_provider(cls, v: Any) -> Any:
+        return v if v == "fake" else "litellm"
 
     # LLM — Groq for fast chat/routing; Gemini 2.5 Flash for document extraction (generous free tier)
     # Gemini free tier: 1,000,000 TPM/day vs Groq 8b: ~20,000 TPM/day
