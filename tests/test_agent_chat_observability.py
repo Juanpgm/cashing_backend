@@ -87,8 +87,6 @@ def _capture_logs_with_contextvars() -> Generator[list[dict[str, Any]], None, No
         structlog.configure(processors=processors)
 
 
-
-
 async def _make_user_with_contrato(db: AsyncSession, suffix: str) -> tuple[Usuario, Contrato]:
     user = Usuario(
         email=f"obs_{suffix}@example.com",
@@ -308,9 +306,7 @@ class TestIterationCapFinalSummary:
 
         user, contrato = await _make_user_with_contrato(db, "cap01")
         ctx = ToolContext(db=db, usuario=user)
-        cuenta = await invoke_tool(
-            "crear_cuenta_cobro", ctx, {"contrato_id": str(contrato.id), "mes": 9, "anio": 2026}
-        )
+        cuenta = await invoke_tool("crear_cuenta_cobro", ctx, {"contrato_id": str(contrato.id), "mes": 9, "anio": 2026})
         await db.commit()
 
         responses = [

@@ -254,7 +254,11 @@ async def _resolve_contrato_context(db: AsyncSession, usuario: Usuario, contrato
         # not-owned contrato_id, but this helper must never let ANY failure here (a bad
         # id is just an untrusted hint from the client) escalate into a 4xx/5xx for the
         # whole chat request.
-        await logger.adebug("agent_chat_contrato_context_not_resolved", contrato_id=contrato_id, error=str(exc))
+        # warning, not debug: this marks a graceful-degradation branch (the agent
+        # proceeds without contract context). If this fires systematically it
+        # degrades every answer and must stay visible past the production
+        # log-level gate (app/main.py, radicacion-sin-friccion 0.3).
+        await logger.awarning("agent_chat_contrato_context_not_resolved", contrato_id=contrato_id, error=str(exc))
         return None
 
     objeto = contrato.objeto[:_MAX_OBJETO_CONTEXT_CHARS] if contrato.objeto else ""
