@@ -8,27 +8,52 @@
 from __future__ import annotations
 
 import pytest
-import structlog
 
 
+# NOT `structlog.testing.capture_logs()`: that relies on the global processors
+# list being mutated in place and every module's `structlog.get_logger(...)`
+# proxy resolving against it -- true in isolation, but `app.core.config._log`
+# is a MODULE-LEVEL proxy shared by every `Settings()` construction in the
+# WHOLE suite (2000+ tests), some of which log through it before this test
+# ever runs (structlog's `cache_logger_on_first_use=True`, app/main.py,
+# caches the bound logger on whichever call happens first -- see
+# gotcha/structlog-cache-logger-processors in project memory, 2 prior
+# occurrences). `capture_logs()` worked for a single-session concurrency test
+# (radicacion-sin-friccion 0.3) but is provably order-dependent across the
+# full suite (radicacion-sin-friccion 0.4: passes in isolation or paired with
+# one other file, fails in the full 2450-test run). Monkeypatching the
+# module's own `_log` object sidesteps global structlog state entirely --
+# this test no longer cares what any other test in the suite logged first.
 class TestSecopTokenWarning:
-    def test_empty_token_does_not_raise_and_logs_warning(self) -> None:
-        from app.core.config import Settings
+    def test_empty_token_does_not_raise_and_logs_warning(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import app.core.config as config_module
 
-        with structlog.testing.capture_logs() as captured:
-            s = Settings(SECOP_APP_TOKEN="")
+        captured: list[tuple[str, dict[str, object]]] = []
+        monkeypatch.setattr(
+            config_module._log,
+            "warning",
+            lambda event, **kw: captured.append((event, kw)),
+        )
+
+        s = config_module.Settings(SECOP_APP_TOKEN="")
 
         assert s.SECOP_APP_TOKEN == ""
-        warn_events = [e for e in captured if e.get("event") == "secop_app_token_missing"]
+        warn_events = [event for event, _ in captured if event == "secop_app_token_missing"]
         assert warn_events, "expected a queryable warning log when SECOP_APP_TOKEN is empty"
 
-    def test_configured_token_does_not_warn(self) -> None:
-        from app.core.config import Settings
+    def test_configured_token_does_not_warn(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import app.core.config as config_module
 
-        with structlog.testing.capture_logs() as captured:
-            Settings(SECOP_APP_TOKEN="a-real-token-value")
+        captured: list[tuple[str, dict[str, object]]] = []
+        monkeypatch.setattr(
+            config_module._log,
+            "warning",
+            lambda event, **kw: captured.append((event, kw)),
+        )
 
-        warn_events = [e for e in captured if e.get("event") == "secop_app_token_missing"]
+        config_module.Settings(SECOP_APP_TOKEN="a-real-token-value")
+
+        warn_events = [event for event, _ in captured if event == "secop_app_token_missing"]
         assert not warn_events
 
 
