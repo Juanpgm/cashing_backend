@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  schedule:
+    # Nightly real-Postgres run. Enum label casing, VARCHAR length limits, and
+    # NULL/enum constraints are all silently ignored by the SQLite suite that
+    # runs on every push/PR — this is the net that catches a Postgres-only
+    # regression within 24h even on a day nobody opens a PR.
+    - cron: "17 6 * * *" # 06:17 UTC daily, off-peak
+
+concurrency:
+  group: ci-backend-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pytest (SQLite, coverage >= 70%)
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      # HARD convention: never bare `uv run pytest` (segfaults on python-magic on
+      # Windows dev machines). CI runs on Linux, but the invocation stays
+      # identical to the local one on purpose, so local and CI are never
+      # different commands.
+      - name: Run test suite with coverage
+        run: uv run python -m pytest --cov=app --cov-report=term-missing --cov-report=xml
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-coverage
+          path: coverage.xml
+          retention-days: 14
+
+  lint:
+    name: ruff + mypy
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    # Repo baseline is currently red (~970 ruff, ~320 mypy findings) per the
+    # 2026-09-08 close-out session — non-blocking until that debt is paid down
+    # as its own change. Flip to blocking once the baseline is clean.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+          enable-cache: true
+      - run: uv python install 3.12
+      - run: uv sync --frozen
+      - run: uv run ruff check .
+      - run: uv run mypy app
+
+  test-postgres-nightly:
+    name: pytest (real PostgreSQL, nightly)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: cashin
+          POSTGRES_PASSWORD: cashin
+          POSTGRES_DB: cashin_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+          enable-cache: true
+      - run: uv python install 3.12
+      - run: uv sync --frozen
+      - name: Run suite against real Postgres
+        env:
+          TEST_DATABASE_URL: postgresql+asyncpg://cashin:cashin@localhost:5432/cashin_test
+        run: uv run python -m pytest
