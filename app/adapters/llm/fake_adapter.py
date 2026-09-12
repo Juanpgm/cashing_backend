@@ -5,10 +5,20 @@ network call. It implements the same surface the rest of the app calls through
 `LLMPort` (`complete` / `stream` / `embed`) so the RUNNING APP — not just pytest,
 which already has its own test-only seam (`tests/conftest.py::bloquear_red_llm` +
 the `ScriptedLLM` pattern in `tests/test_agent_chat_service_iterations.py`) — can
-complete a full tool-calling chat turn deterministically. Swapped in via
-`LLM_PROVIDER=fake` (see `app.core.config.Settings` and
-`app.adapters.llm.litellm_adapter.get_llm`). Intended for local dev without API
-keys and for future Playwright E2E runs where the whole app boots for real.
+complete a full tool-calling chat turn. Swapped in via `LLM_PROVIDER=fake` (see
+`app.core.config.Settings` and `app.adapters.llm.litellm_adapter.get_llm`).
+Intended for local dev without API keys and for future Playwright E2E runs
+where the whole app boots for real.
+
+Determinism, precisely stated (do not assume more than this): the SEQUENCE of
+tool NAMES produced across a chat turn is deterministic — it is a pure
+function of `HAPPY_PATH_SEQUENCE` and the last tool name seen in `messages`
+(see `_last_tool_called`). The synthesized argument VALUES inside each tool
+call are NOT deterministic — `synthesize_tool_arguments` calls `uuid.uuid4()`
+for UUID fields and `datetime.date.today()` for date fields, so two runs of
+the identical scripted sequence produce different argument payloads (and,
+against a real DB, different domain outcomes per call — see
+`tests/test_fake_llm_adapter.py::test_fake_llm_completes_the_full_tool_sequence_even_when_synthesized_ids_dont_resolve`).
 
 Design: `complete()` is a PURE function of the `messages` history it receives —
 no mutable instance state — so two concurrent chat sessions sharing (or each
@@ -25,7 +35,7 @@ from decimal import Decimal
 from typing import Any, get_args, get_origin
 
 import structlog
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from app.schemas.agent import LLMMessage, LLMResponse, LLMToolCall
 from app.tools.registry import TOOL_REGISTRY
@@ -223,7 +233,15 @@ class FakeLLMPort:
             return LLMResponse(content=_DONE_TEXT_RESPONSE, model=used_model)
 
         if tools is not None:
-            offered = {t.get("function", {}).get("name") for t in tools}
+            offered: set[str | None] = set()
+            for t in tools:
+                function = t.get("function")
+                # A hand-built or third-party `tools` entry could have a
+                # non-dict `function` value (mirrors the malformed
+                # `tool_calls[*].function` shape already guarded for below) —
+                # skip it instead of an `AttributeError` on `.get("name")`.
+                if isinstance(function, dict):
+                    offered.add(function.get("name"))
             if next_tool not in offered:
                 # The caller didn't advertise the scripted tool this turn — never
                 # request a tool call the caller can't actually dispatch.
@@ -237,7 +255,17 @@ class FakeLLMPort:
             return LLMResponse(content=_DEFAULT_TEXT_RESPONSE, model=used_model)
 
         call_id = f"fake_call_{len(messages)}_{next_tool}"
-        tool_call = build_tool_call(next_tool, spec.input_model, call_id=call_id)
+        try:
+            tool_call = build_tool_call(next_tool, spec.input_model, call_id=call_id)
+        except ValidationError:
+            # The synthesizer produced a value the tool's own schema rejects
+            # (e.g. a constraint shape `_synthesize_field_value` doesn't know
+            # about yet) — degrade to a safe plain-text reply instead of
+            # letting a `ValidationError` propagate up into `complete()`'s
+            # caller, where it would be misdiagnosed as an LLM-network failure
+            # rather than a fake-adapter synthesis gap.
+            await logger.awarning("fake_llm_synthesized_arguments_invalid", tool=next_tool)
+            return LLMResponse(content=_DEFAULT_TEXT_RESPONSE, model=used_model)
         return LLMResponse(content="", model=used_model, tool_calls=[tool_call])
 
     async def stream(

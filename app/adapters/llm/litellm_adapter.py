@@ -356,8 +356,10 @@ def get_llm(model: str | None = None) -> LLMPort:
 
     `settings.LLM_PROVIDER` selects the implementation: "litellm" (default) wires
     the real Gemini -> Groq -> Ollama fallback chain via `LiteLLMAdapter`; "fake"
-    returns `FakeLLMPort` (see `app.adapters.llm.fake_adapter`) — a deterministic,
-    network-free implementation for local dev/E2E runs. The import is local to
+    returns `FakeLLMPort` (see `app.adapters.llm.fake_adapter`) — a network-free
+    implementation for local dev/E2E runs whose tool-NAME sequence is
+    deterministic but whose synthesized argument VALUES are not (see that
+    module's docstring for the precise distinction). The import is local to
     avoid paying `app.tools.registry`'s import cost (pulled in by `fake_adapter`)
     on the default "litellm" path, which every request already takes.
     """

@@ -66,6 +66,32 @@ def test_llm_provider_fake_is_accepted() -> None:
     assert s.LLM_PROVIDER == "fake"
 
 
+@pytest.mark.parametrize("raw_value", ["FAKE", "Fake", " fake", "fake ", " FaKe "])
+def test_llm_provider_fake_is_case_and_whitespace_insensitive(raw_value: str) -> None:
+    """A typo'd casing/whitespace variant of "fake" must still route to the
+    fake provider — otherwise it silently falls through to "litellm" (the
+    REAL, network-calling provider), a real risk for a CI/E2E env that
+    intended to stay network-free."""
+    s = Settings(LLM_PROVIDER=raw_value, SECOP_APP_TOKEN=_NON_EMPTY_SECOP_TOKEN)  # type: ignore[call-arg]
+    assert s.LLM_PROVIDER == "fake"
+
+
+def test_llm_provider_invalid_value_logs_a_warning(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unrecognized value doesn't just silently fold to "litellm" — it logs
+    a warning naming the invalid value received, so a misconfigured env var
+    is discoverable instead of silently swallowed."""
+    import app.core.config as config_module
+
+    warnings: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        config_module._log,
+        "warning",
+        lambda event, **kwargs: warnings.append((event, kwargs)),
+    )
+    Settings(LLM_PROVIDER="banana", SECOP_APP_TOKEN=_NON_EMPTY_SECOP_TOKEN)  # type: ignore[call-arg]
+    assert any(event == "llm_provider_invalid_value_fallback_to_litellm" for event, _ in warnings)
+
+
 def test_get_llm_returns_litellm_adapter_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "LLM_PROVIDER", "litellm")
     assert isinstance(get_llm(), LiteLLMAdapter)
@@ -148,6 +174,61 @@ async def test_complete_does_not_request_a_tool_the_caller_did_not_offer() -> No
     fake = FakeLLMPort()
     response = await fake.complete([], tools=[{"type": "function", "function": {"name": "otra_herramienta"}}])
     assert response.tool_calls is None
+
+
+async def test_complete_with_malformed_tools_list_entry_returns_safe_default() -> None:
+    """A `tools=[...]` entry whose `function` value isn't a dict (the sibling
+    malformed shape to `test_complete_with_malformed_tool_call_shape_returns_safe_default`,
+    but on the OFFERED-tools list rather than a prior `tool_calls` message) must
+    degrade to a plain text reply too, not raise `AttributeError` from
+    `.get("name")` on a non-dict."""
+    fake = FakeLLMPort()
+    response = await fake.complete([], tools=[{"function": "not-a-dict"}])
+    assert response.tool_calls is None
+    assert response.content
+
+
+async def test_complete_degrades_safely_when_synthesized_arguments_fail_validation() -> None:
+    """If `synthesize_tool_arguments` can't fill a required field shape (e.g. a
+    hypothetical strict-schema tool with a type this synthesizer doesn't know
+    how to fill), `build_tool_call`'s own `model_validate` raises
+    `ValidationError` — `complete()` must catch it and degrade to a safe
+    plain-text reply, not let it propagate up where the caller
+    (`agent_chat_service.chat_with_tools`) would misdiagnose it as an
+    LLM-network failure rather than a fake-adapter synthesis gap."""
+    from app.tools.registry import ToolSpec
+    from pydantic import BaseModel
+
+    class _UnsynthesizableInput(BaseModel):
+        # `bytes` isn't one of the shapes `_synthesize_field_value` knows how to
+        # fill — it falls back to `None`, which this required field rejects.
+        payload: bytes
+
+    class _DummyOutput(BaseModel):
+        ok: bool = True
+
+    async def _unused_handler(_ctx: object, _args: object) -> _DummyOutput:
+        raise AssertionError("handler should never be invoked in this test")
+
+    hypothetical_spec = ToolSpec(
+        name="listar_contratos",
+        description="test-only strict-schema stand-in",
+        input_model=_UnsynthesizableInput,
+        output_model=_DummyOutput,
+        handler=_unused_handler,  # type: ignore[arg-type]
+    )
+
+    original_spec = TOOL_REGISTRY["listar_contratos"]
+    TOOL_REGISTRY["listar_contratos"] = hypothetical_spec
+    try:
+        fake = FakeLLMPort()
+        tools = [{"type": "function", "function": {"name": "listar_contratos"}}]
+        response = await fake.complete([LLMMessage(role="user", content="hola")], tools=tools)
+    finally:
+        TOOL_REGISTRY["listar_contratos"] = original_spec
+
+    assert response.tool_calls is None
+    assert response.content
 
 
 # --- Happy-path script produces schema-valid, JSON-serializable calls -------
@@ -302,20 +383,50 @@ async def _make_user_with_contrato(db: AsyncSession) -> tuple[Usuario, Contrato]
     return user, contrato
 
 
-async def test_chat_with_tools_completes_a_full_turn_with_llm_provider_fake(
+async def test_fake_llm_completes_the_full_tool_sequence_even_when_synthesized_ids_dont_resolve(
     db: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """RED->GREEN target test: boots the REAL agent loop with LLM_PROVIDER=fake and
-    asserts the turn completes end-to-end — no `bloquear_red_llm` opt-out needed
-    (FakeLLMPort never imports litellm), no `ScriptedLLM` monkeypatch of `get_llm`
-    (the real factory routes to the fake via the setting alone)."""
+    """Boots the REAL agent loop with LLM_PROVIDER=fake and asserts the turn
+    completes the whole scripted tool NAME sequence end-to-end — no
+    `bloquear_red_llm` opt-out needed (FakeLLMPort never imports litellm), no
+    `ScriptedLLM` monkeypatch of `get_llm` (the real factory routes to the fake
+    via the setting alone).
+
+    IMPORTANT: this does NOT assert a fully successful radicación chain. Only
+    `listar_contratos` (the sole zero-required-argument tool in the sequence)
+    actually succeeds. Every other tool call is built with `synthesize_tool_arguments`
+    (see fake_adapter.py), which fills required fields with schema-valid but
+    RANDOM placeholder values (e.g. `uuid.uuid4()` for foreign keys) — it does
+    NOT thread real IDs from prior tool results (`crear_cuenta_cobro`'s real
+    `contrato.id`, etc.). So the remaining 5 calls in this script correctly
+    fail with domain "not found" errors against a real DB. This is a KNOWN,
+    TRACKED limitation of the Phase 0 fake-adapter seam (cross-turn ID
+    threading is future work, not part of this slice) — it is not a bug to fix
+    here. The point of this test is that the fake adapter still drives the
+    agent loop through the ENTIRE scripted tool-name sequence without crashing
+    or stalling, regardless of each call's individual domain outcome.
+    """
     monkeypatch.setattr(settings, "LLM_PROVIDER", "fake")
     user, _contrato = await _make_user_with_contrato(db)
 
     result = await agent_chat_service.chat_with_tools(db, user, "Radicá mi cuenta de este mes", None, {})
 
+    # Real observed outcome (verified by running this test): only the first
+    # call (`listar_contratos`, the only tool with no required arguments) can
+    # succeed against a real DB with synthesized/random arguments — the other
+    # 5 calls fail with domain "not found" errors because their synthesized
+    # foreign-key IDs are random UUIDs, not IDs threaded from prior results.
+    expected_events = [
+        ("listar_contratos", "ok"),
+        ("crear_cuenta_cobro", "error"),
+        ("definir_requisitos_checklist", "error"),
+        ("importar_documento", "error"),
+        ("resumen_checklist", "error"),
+        ("radicar_cuenta", "error"),
+    ]
     expected_sequence = [name for name in HAPPY_PATH_SEQUENCE.values() if name is not None]
-    assert [event.tool for event in result.tool_events] == expected_sequence
+    assert expected_sequence == [tool for tool, _status in expected_events]
+    assert [(event.tool, event.status) for event in result.tool_events] == expected_events
     assert result.content
     assert result.session_id
 

@@ -87,15 +87,24 @@ class Settings(BaseSettings):
     # app/adapters/llm/fake_adapter.py). Lets the RUNNING APP (not just pytest, which
     # already has its own ScriptedLLM/bloquear_red_llm test-only seam) boot and complete
     # chat turns without hitting a real model — local dev without API keys, future
-    # Playwright E2E runs. The `_normalize_llm_provider` validator below folds any value
-    # other than exactly "fake" (unset, typo, invalid) to "litellm" so a bad env var
-    # falls back to the real provider instead of crashing Settings load.
+    # Playwright E2E runs. The `_normalize_llm_provider` validator below case- and
+    # whitespace-normalizes the raw value and folds anything other than "fake"
+    # (unset, typo, invalid) to "litellm" so a bad env var falls back to the real
+    # provider instead of crashing Settings load. Normalization matters here
+    # specifically: without it, a typo'd casing like "FAKE" or "Fake " would
+    # silently fall through to "litellm" — the REAL, network-calling provider —
+    # a genuine risk in CI/E2E environments that intend to run network-free.
     LLM_PROVIDER: Literal["litellm", "fake"] = "litellm"
 
     @field_validator("LLM_PROVIDER", mode="before")
     @classmethod
     def _normalize_llm_provider(cls, v: Any) -> Any:
-        return v if v == "fake" else "litellm"
+        normalized = str(v).strip().lower()
+        if normalized == "fake":
+            return "fake"
+        if normalized != "litellm":
+            _log.warning("llm_provider_invalid_value_fallback_to_litellm", received=v)
+        return "litellm"
 
     # LLM — Groq for fast chat/routing; Gemini 2.5 Flash for document extraction (generous free tier)
     # Gemini free tier: 1,000,000 TPM/day vs Groq 8b: ~20,000 TPM/day
