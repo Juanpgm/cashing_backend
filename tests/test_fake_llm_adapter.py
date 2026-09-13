@@ -799,6 +799,46 @@ async def test_concurrent_calls_do_not_leak_state_between_sessions() -> None:
     assert all(r.tool_calls is not None and r.tool_calls[0].name == "crear_cuenta_cobro" for r in b_results)
 
 
+async def test_concurrent_calls_do_not_leak_known_ids_between_sessions() -> None:
+    """Sibling of the routing-leak test above, but for `known` IDS specifically
+    (the new slice 0.6 feature) — two sessions concurrently at the SAME routing
+    position (`crear_cuenta_cobro` next) but with DIFFERENT real `contrato_id`
+    values in their own history must each synthesize THEIR OWN id, never the
+    other session's — proving `_known_ids`/`synthesize_tool_arguments(known=)`
+    introduced no module-level mutable state either."""
+    fake = FakeLLMPort()
+    tools = [{"type": "function", "function": {"name": "crear_cuenta_cobro"}}]
+
+    contrato_id_a = str(uuid.uuid4())
+    contrato_id_b = str(uuid.uuid4())
+
+    def _messages_for(contrato_id: str) -> list[LLMMessage]:
+        return [
+            _assistant_call("1", "listar_contratos"),
+            LLMMessage(
+                role="tool",
+                tool_call_id="1",
+                content=json.dumps({"contratos": [{"id": contrato_id}]}),
+            ),
+        ]
+
+    session_a_messages = _messages_for(contrato_id_a)
+    session_b_messages = _messages_for(contrato_id_b)
+
+    results = await asyncio.gather(
+        *[fake.complete(session_a_messages, tools=tools) for _ in range(5)],
+        *[fake.complete(session_b_messages, tools=tools) for _ in range(5)],
+    )
+    a_results, b_results = results[:5], results[5:]
+
+    assert all(
+        r.tool_calls is not None and r.tool_calls[0].arguments["contrato_id"] == contrato_id_a for r in a_results
+    )
+    assert all(
+        r.tool_calls is not None and r.tool_calls[0].arguments["contrato_id"] == contrato_id_b for r in b_results
+    )
+
+
 # --- Full catalog schema validity (all 32 tools, not just the playbook) -----
 
 
