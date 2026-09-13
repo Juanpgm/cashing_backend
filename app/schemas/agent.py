@@ -49,6 +49,11 @@ class LLMResponse(BaseModel):
     completion_tokens: int = 0
     total_tokens: int = 0
     tool_calls: list[LLMToolCall] | None = None
+    # How many models in the fallback chain were tried before this one answered
+    # (0 = the primary/requested model succeeded on the first attempt). Populated
+    # by `LiteLLMAdapter.complete()` — see `app.services.agent_chat_service`'s
+    # per-turn `agent_chat_llm_turn` log, which surfaces this to observability.
+    fallback_depth: int = 0
 
 
 # --- Chat schemas ---
@@ -252,6 +257,10 @@ class ToolEvent(BaseModel):
     tool: str
     status: Literal["ok", "error"]
     resumen: str
+    # Wall-clock time the tool handler took to run (ms), populated by
+    # `agent_chat_service.chat_with_tools` for BOTH "ok" and "error" outcomes.
+    # `None` only for the "unknown tool" branch, where nothing was ever invoked.
+    duration_ms: float | None = None
 
 
 class UiAction(BaseModel):

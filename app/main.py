@@ -1,5 +1,6 @@
 """FastAPI application entry point."""
 
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -21,6 +22,20 @@ from app.core.rate_limit import limiter
 from app.core.security_headers import SecurityHeadersMiddleware
 from app.schemas.common import HealthResponse
 
+
+def _wrapper_log_level() -> int:
+    """DEBUG in development, INFO in production.
+
+    `make_filtering_bound_logger(0)` (NOTSET) used to emit DEBUG-level logs
+    unconditionally, including in production — noisy (e.g. every
+    `agent_chat_llm_turn`/`llm_request` call) and a needless verbose-log-volume
+    cost on a paid log sink. Kept as a standalone function (not inlined into
+    `structlog.configure` below) so it's unit-testable without re-triggering
+    the module-level `configure()` call, which is process-global.
+    """
+    return logging.DEBUG if settings.is_development else logging.INFO
+
+
 structlog.configure(
     processors=[
         structlog.contextvars.merge_contextvars,
@@ -28,7 +43,7 @@ structlog.configure(
         structlog.processors.TimeStamper(fmt="iso"),
         structlog.dev.ConsoleRenderer() if settings.is_development else structlog.processors.JSONRenderer(),
     ],
-    wrapper_class=structlog.make_filtering_bound_logger(0),
+    wrapper_class=structlog.make_filtering_bound_logger(_wrapper_log_level()),
     context_class=dict,
     logger_factory=structlog.PrintLoggerFactory(),
     cache_logger_on_first_use=True,
