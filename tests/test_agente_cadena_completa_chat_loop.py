@@ -61,6 +61,7 @@ from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
 from app.models.documento_fuente import DocumentoFuente
 from app.models.evidencia import Evidencia
 from app.models.obligacion import Obligacion, TipoObligacion
+from app.models.usuario import Usuario
 from app.services import agent_chat_service
 from app.tools.context import ToolAttachment
 from sqlalchemy import select
@@ -99,11 +100,18 @@ def _fake_storage() -> AsyncMock:
     return storage
 
 
-async def _seed_contratista(db: AsyncSession) -> tuple[object, object]:
+async def _seed_contratista(db: AsyncSession) -> tuple[Usuario, object]:
     """Seeds a real usuario/contrato via the shared factories (radicacion-sin-
     friccion 4.1, `tests/factories.py`) — `Obligacion` has no factory yet (not
     one of the five core models that module covers), so its rows are added
     directly, mirroring `test_agente_cadena_completa.py::_sembrar_contratista`.
+
+    Fetches `usuario` via an explicit `select` (not the lazy `contrato.usuario`
+    relationship attribute) — under certain pytest `-k` subset selections the
+    lazy-load attribute access intermittently raised `MissingGreenlet`
+    (asyncio/SQLAlchemy greenlet-context timing, reproducible only with
+    specific `-k` test subsets, never in a full-file or full-suite run); an
+    explicit awaited query has no such failure mode.
     """
     contrato = await ContratoFactory.create_async(db)
     for i, descripcion in enumerate(_OBLIGACIONES_REALISTAS):
@@ -118,8 +126,7 @@ async def _seed_contratista(db: AsyncSession) -> tuple[object, object]:
         )
     await db.commit()
     await db.refresh(contrato)
-    usuario = contrato.usuario
-    await db.refresh(usuario)
+    usuario = (await db.execute(select(Usuario).where(Usuario.id == contrato.usuario_id))).scalar_one()
     return usuario, contrato
 
 
@@ -357,3 +364,105 @@ async def test_iteration_cap_hit_mid_upload_loop_survives_and_resumes_correctly(
     # rows) and no gap (a skip would produce fewer than 6 distinct tipos).
     assert {d.tipo.value for d in documentos_despues} == {tipo for tipo, _filename in _SOPORTES}
     assert len(documentos_despues) == len(_SOPORTES)
+
+
+@pytest.mark.asyncio
+async def test_malformed_tool_args_surface_as_validation_error_not_network_failure(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`FAKE_LLM_SCRIPT=malformed` (slice 0.6) corrupts `crear_cuenta_cobro`'s
+    arguments (`mes=13`, violating `Field(ge=1, le=12)`) at the SAME point in
+    the real playbook chain this slice drives end to end — reused here (per
+    the 1.9 edge-case list), not re-invented, so the existing per-tool proof
+    (`test_chat_with_tools_malformed_script_surfaces_a_validation_error_not_a_network_failure`,
+    test_fake_llm_adapter.py) is also exercised inside a full contratista
+    playbook run. The resulting error must be the REAL pydantic
+    ValidationError shape (naming the bad field), never the generic 'No pude
+    contactar al modelo de IA' LLM-network-failure message — that
+    misdiagnosis is exactly what slice 0.4/0.6 fixed and pinned regression
+    tests for."""
+    monkeypatch.setattr(settings, "LLM_PROVIDER", "fake")
+    monkeypatch.setattr(settings, "FAKE_LLM_SCRIPT", "malformed")
+    usuario, contrato = await _seed_contratista(db)
+
+    result = await agent_chat_service.chat_with_tools(db, usuario, "Radicá mi cuenta de cobro de este mes.", None, {})
+
+    crear_events = [e for e in result.tool_events if e.tool == "crear_cuenta_cobro"]
+    assert len(crear_events) == 2, [(e.tool, e.status, e.resumen) for e in result.tool_events]
+    assert all(e.status == "error" for e in crear_events)
+    assert all("mes" in e.resumen for e in crear_events)
+    assert "No pude contactar al modelo" not in result.content
+
+    # crear_cuenta_cobro never actually succeeded — no orphan CuentaCobro row.
+    await db.refresh(contrato)
+    cuentas = (await db.execute(select(CuentaCobro).where(CuentaCobro.contrato_id == contrato.id))).scalars().all()
+    assert cuentas == []
+
+
+@pytest.mark.asyncio
+async def test_failed_upload_on_the_fourth_of_six_leaves_no_orphan_rows(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failure partway through the 6 mandatory uploads (radicacion-sin-
+    friccion 1.9 edge case) — the 4th file (RUT) is corrupted (>10MB,
+    `validate_file_size`'s real `MAX_FILE_SIZE_BYTES` cap) — must leave the 3
+    earlier SUCCESSFUL imports (CONTRATO, RPC, CEDULA) committed and intact,
+    produce NO DocumentoFuente row for the failed RUT upload, and leave NO
+    orphan Actividad/Evidencia rows for this cuenta — those tables are only
+    ever touched by LATER playbook steps (crear_actividades_desde_obligaciones,
+    subir_evidencias_desde_chat), which this chain never reaches because the
+    fake's outcome-aware retry (slice 0.6) fails RUT twice and gives up — so a
+    non-zero count in either table would mean something leaked across steps
+    that never ran."""
+    monkeypatch.setattr(settings, "LLM_PROVIDER", "fake")
+    usuario, contrato = await _seed_contratista(db)
+
+    attachments = _attachments([name for _tipo, name in _SOPORTES])
+    # Corrupt exactly the RUT attachment (4th of 6, _SOPORTES[3]) — oversized,
+    # so `importar_documento`'s own validate_file_size check rejects it before
+    # any storage/DB write, independent of content-sniffing heuristics.
+    corrupt_name = _SOPORTES[3][1]
+    attachments[corrupt_name] = ToolAttachment(
+        filename=corrupt_name,
+        content_type="text/plain",
+        data=b"x" * (11 * 1024 * 1024),
+    )
+
+    with patch(_PATCH_DOC_S3, return_value=_fake_storage()):
+        result = await agent_chat_service.chat_with_tools(
+            db, usuario, "Radicá mi cuenta, te adjunto los soportes.", None, attachments
+        )
+
+    assert [e.tool for e in result.tool_events] == [
+        "listar_contratos",
+        "crear_cuenta_cobro",
+        "definir_requisitos_checklist",
+        "importar_documento",
+        "importar_documento",
+        "importar_documento",
+        "importar_documento",
+        "importar_documento",
+    ]
+    statuses = [e.status for e in result.tool_events]
+    assert statuses[:6] == ["ok"] * 6, [(e.tool, e.status, e.resumen) for e in result.tool_events]
+    assert statuses[6:] == ["error", "error"]
+    assert all("File exceeds maximum size" in e.resumen for e in result.tool_events[6:])
+
+    await db.refresh(contrato)
+    cuenta = (await db.execute(select(CuentaCobro).where(CuentaCobro.contrato_id == contrato.id))).scalar_one()
+
+    documentos = (
+        (await db.execute(select(DocumentoFuente).where(DocumentoFuente.contrato_id == contrato.id))).scalars().all()
+    )
+    # The 3 earlier successful uploads (contrato, rpc, cedula) remain; RUT (the
+    # failed one) produced no row at all — not a partial/corrupt one.
+    assert {d.tipo.value for d in documentos} == {"contrato", "rpc", "cedula"}
+
+    actividades = (await db.execute(select(Actividad).where(Actividad.cuenta_cobro_id == cuenta.id))).scalars().all()
+    assert actividades == []
+    evidencias = (
+        (await db.execute(select(Evidencia).join(Actividad).where(Actividad.cuenta_cobro_id == cuenta.id)))
+        .scalars()
+        .all()
+    )
+    assert evidencias == []
