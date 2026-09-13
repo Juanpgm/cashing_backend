@@ -276,3 +276,84 @@ async def test_full_playbook_via_chat_loop_reaches_preparar_radicacion_and_radic
     assert persistida is not None
     assert persistida.estado == EstadoCuentaCobro.ENVIADA
     assert persistida.fecha_envio is not None
+
+
+@pytest.mark.asyncio
+async def test_iteration_cap_hit_mid_upload_loop_survives_and_resumes_correctly(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MAX_TOOL_ITERATIONS hits mid-way through the 6-call importar_documento
+    loop (radicacion-sin-friccion 1.9 edge case). Two things must both hold:
+    (1) whatever committed before the cap (the cuenta, the checklist
+    definition, the 1 document already imported) survives intact; (2) a
+    follow-up turn actually CONTINUES the loop from the 2nd override entry
+    (rpc.txt) — not a duplicate re-upload of contrato.txt (queue restarted)
+    and not a silent skip straight to auto_vincular_documentos (the bug fixed
+    by `_count_recap_ok_entries`, see that commit).
+
+    Capped after exactly ONE importar_documento call, not several: the
+    cross-turn recap is deliberately bounded to `_RECAP_MAX_CHARS=240`
+    (agent_chat_service, "a handful of tool:status id=value entries, never
+    enough to meaningfully eat into the model's context budget") — an
+    `importar_documento:ok` line carries TWO real UUIDs (documento_id,
+    contrato_id), ~115 chars each, so only the SINGLE newest one reliably
+    survives truncation once earlier entries (listar_contratos,
+    crear_cuenta_cobro, definir_requisitos_checklist) compete for the same
+    budget. `_count_recap_ok_entries` correctly counts however many entries
+    the recap actually kept — it fixes the routing bug (resume position was
+    ALWAYS wrong before), but resuming after MORE than ~1-2 interrupted
+    importar_documento calls is bounded by the recap's own budget, a
+    separate, pre-existing constraint this slice did not redesign. Flagged
+    as a follow-up in the apply report, not silently glossed over here."""
+    monkeypatch.setattr(settings, "LLM_PROVIDER", "fake")
+    monkeypatch.setattr(agent_chat_service, "MAX_TOOL_ITERATIONS", 4)
+    usuario, contrato = await _seed_contratista(db)
+
+    turn1_attachments = _attachments([name for _tipo, name in _SOPORTES])
+    with patch(_PATCH_DOC_S3, return_value=_fake_storage()):
+        turn1 = await agent_chat_service.chat_with_tools(
+            db, usuario, "Radicá mi cuenta, te adjunto los soportes.", None, turn1_attachments
+        )
+
+    assert [e.tool for e in turn1.tool_events] == [
+        "listar_contratos",
+        "crear_cuenta_cobro",
+        "definir_requisitos_checklist",
+        "importar_documento",
+    ]
+    assert all(e.status == "ok" for e in turn1.tool_events), [(e.tool, e.status, e.resumen) for e in turn1.tool_events]
+    assert turn1.content == (
+        "Alcancé el límite de pasos automáticos para esta solicitud. "
+        "¿Quieres que continúe con la tarea o prefieres darme más detalles?"
+    )
+
+    # --- What committed before the cap survives intact ----------------------
+    await db.refresh(contrato)
+    cuenta = (await db.execute(select(CuentaCobro).where(CuentaCobro.contrato_id == contrato.id))).scalar_one()
+    assert cuenta.requisitos_modo is not None
+    documentos_antes = (
+        (await db.execute(select(DocumentoFuente).where(DocumentoFuente.contrato_id == contrato.id))).scalars().all()
+    )
+    assert {d.tipo.value for d in documentos_antes} == {"contrato"}
+
+    # --- Follow-up turn continues from the 2nd override entry, not a restart
+    monkeypatch.setattr(agent_chat_service, "MAX_TOOL_ITERATIONS", 20)
+    remaining_soportes = _SOPORTES[1:]
+    turn2_attachments = _attachments([name for _tipo, name in remaining_soportes])
+    with patch(_PATCH_DOC_S3, return_value=_fake_storage()):
+        turn2 = await agent_chat_service.chat_with_tools(
+            db, usuario, "Seguí, acá van los demás soportes.", turn1.session_id, turn2_attachments
+        )
+
+    resumed_imports = [e for e in turn2.tool_events if e.tool == "importar_documento"]
+    assert len(resumed_imports) == len(remaining_soportes), [(e.tool, e.status, e.resumen) for e in turn2.tool_events]
+    assert all(e.status == "ok" for e in resumed_imports), [(e.status, e.resumen) for e in resumed_imports]
+
+    await db.refresh(contrato)
+    documentos_despues = (
+        (await db.execute(select(DocumentoFuente).where(DocumentoFuente.contrato_id == contrato.id))).scalars().all()
+    )
+    # Exactly 6 documents total — no duplicate (a restart would produce 2 "contrato"
+    # rows) and no gap (a skip would produce fewer than 6 distinct tipos).
+    assert {d.tipo.value for d in documentos_despues} == {tipo for tipo, _filename in _SOPORTES}
+    assert len(documentos_despues) == len(_SOPORTES)

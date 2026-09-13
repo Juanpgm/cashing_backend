@@ -1079,6 +1079,52 @@ async def test_importar_documento_resumes_mid_loop_from_recap_after_a_turn_bound
     )
 
 
+async def test_recap_known_ids_survive_a_second_live_call_in_the_same_resumed_turn() -> None:
+    """`known` ids from the cross-turn recap (e.g. `cuenta_id` from a prior
+    `definir_requisitos_checklist:ok`) must be threaded into EVERY live call of
+    a resumed turn, not just the FIRST one — `_known_ids(messages)` alone only
+    ever sees THIS turn's own live tool results, so once a SECOND scripted
+    call happens (e.g. the 2nd of importar_documento's repeat-loop calls), the
+    recap-only cuenta id would otherwise vanish the moment `known` is
+    recomputed purely from live history (`ImportarDocumentoOutput` doesn't
+    itself carry a `cuenta_cobro_id`/`cuenta_id` field to re-supply it)."""
+    cuenta_id = str(uuid.uuid4())
+    recap_content = agent_chat_service._build_tool_context_recap(
+        [("definir_requisitos_checklist", "ok", {"cuenta_cobro_id": cuenta_id})]
+    )
+    assert recap_content is not None
+    fake = FakeLLMPort()
+    tools = [{"type": "function", "function": {"name": name}} for name in TOOL_REGISTRY]
+    messages: list[LLMMessage] = [
+        LLMMessage(role="system", content=recap_content),
+        LLMMessage(role="user", content="seguí subiendo documentos"),
+    ]
+
+    first = await fake.complete(messages, tools=tools)
+    assert first.tool_calls is not None
+    assert first.tool_calls[0].name == "importar_documento"
+    assert first.tool_calls[0].arguments["cuenta_cobro_id"] == cuenta_id
+
+    call = first.tool_calls[0]
+    messages.append(
+        LLMMessage(
+            role="assistant",
+            content="",
+            tool_calls=[{"id": call.id, "type": "function", "function": {"name": call.name, "arguments": "{}"}}],
+        )
+    )
+    messages.append(
+        LLMMessage(role="tool", tool_call_id=call.id, content=json.dumps({"documento_id": str(uuid.uuid4())}))
+    )
+
+    second = await fake.complete(messages, tools=tools)
+    assert second.tool_calls is not None
+    assert second.tool_calls[0].name == "importar_documento"
+    assert second.tool_calls[0].arguments["cuenta_cobro_id"] == cuenta_id, (
+        "recap-derived cuenta_id was lost on the SECOND live call of the resumed turn"
+    )
+
+
 async def test_preparar_radicacion_result_aliases_cuenta_cobro_id_into_radicar_cuenta() -> None:
     """`preparar_radicacion` dumps `cuenta_cobro_id` (`PreparaRadicacionResponse`),
     never a bare `cuenta_id` — without an alias, `radicar_cuenta`'s next scripted

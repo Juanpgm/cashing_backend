@@ -700,7 +700,18 @@ def _resolve_next_tool(messages: list[LLMMessage]) -> tuple[str | None, str, dic
         next_tool, reason = _advance(recap_tool)
         return next_tool, reason, recap_known
 
+    # `_known_ids(messages)` alone only ever sees THIS turn's own LIVE tool
+    # results — on a resumed turn, once a SECOND scripted call happens (e.g.
+    # the 2nd call of importar_documento's repeat loop), an id that was ONLY
+    # ever recap-derived (e.g. cuenta_id from an earlier turn's
+    # definir_requisitos_checklist, never re-produced by anything called live
+    # THIS turn) would otherwise silently vanish. Merge the recap's ids in
+    # UNDER the live ones (live always wins on a key clash — it's fresher)
+    # rather than replacing this turn's own findings.
     known = _known_ids(messages)
+    _, recap_known = _resume_from_recap(messages)
+    if recap_known:
+        known = {**recap_known, **known}
 
     if last_tool not in HAPPY_PATH_SEQUENCE:
         # Unscripted tool (not a key in HAPPY_PATH_SEQUENCE at all) — the
