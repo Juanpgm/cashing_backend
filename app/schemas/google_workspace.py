@@ -275,6 +275,18 @@ class EvidenceDiscoveryResponse(BaseModel):
         default_factory=dict,
         description="Conteo de evidencias por fuente: email/drive/calendar",
     )
+    handle_id: str = Field(
+        default="",
+        description=(
+            "Opaque short-lived handle (radicacion-sin-friccion 1.7) that redeems this exact "
+            "obligaciones/evidencias payload via persistir_evidencias(cuenta_id, handle_id), "
+            "without re-sending the payload itself. Populated only by the shared "
+            "`descubrir_evidencias` tool wrapper (app/tools/catalog/evidencias.py) — empty when "
+            "`evidence_discovery_service.descubrir_evidencias` is called directly (e.g. from "
+            "`evidence_auto_service`), since those callers already hold the obligaciones list "
+            "in-process and have no need for a handle."
+        ),
+    )
 
 
 class EvidencePersistRequest(BaseModel):

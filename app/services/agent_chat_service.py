@@ -580,6 +580,32 @@ def _compact_resumen_checklist(output: BaseModel) -> str:
     return "\n".join(lines)
 
 
+def _compact_descubrir_evidencias(output: BaseModel) -> str:
+    """Summary + handle_id ONLY — deliberately drops the full `obligaciones`
+    list (justificación text, evidence links) from what the LLM reads.
+
+    radicacion-sin-friccion 1.7: `descubrir_evidencias` can return up to dozens
+    of obligaciones x evidence links (10 obligaciones x 4 links = 40 full JSON
+    objects is the documented worst case). Without this compact form the model
+    would both (a) burn a large chunk of its context reading the full dump and
+    (b) be tempted to re-type that same payload as `persistir_evidencias`
+    arguments — the exact problem the handle exists to avoid. The handle_id
+    alone is enough: `persistir_evidencias(cuenta_id, handle_id)` redeems the
+    real payload server-side (see `app.services.evidence_handle_cache`).
+    """
+    resumen = output.resumen  # type: ignore[attr-defined]
+    total_obligaciones = len(output.obligaciones)  # type: ignore[attr-defined]
+    total_evidencias = output.total_evidencias  # type: ignore[attr-defined]
+    fuentes = output.fuentes  # type: ignore[attr-defined]
+    handle_id = output.handle_id  # type: ignore[attr-defined]
+    return (
+        f"handle_id={handle_id} resumen={resumen!r} total_obligaciones={total_obligaciones} "
+        f"total_evidencias={total_evidencias} fuentes={fuentes}\n"
+        f"Llama a persistir_evidencias(cuenta_id, handle_id={handle_id!r}) para guardar este "
+        "resultado — NO reescribas las obligaciones ni las evidencias, solo pasa este handle_id."
+    )
+
+
 # Per-tool compact serializer, consulted by `_serialize_tool_result` BEFORE the
 # generic `model_dump` + truncate path. Only for the chattiest list-shaped read
 # tools, where truncating the generic JSON dump can cut off real data the LLM
@@ -589,6 +615,7 @@ def _compact_resumen_checklist(output: BaseModel) -> str:
 _COMPACT_SERIALIZERS: dict[str, Callable[[BaseModel], str]] = {
     "listar_contratos": _compact_listar_contratos,
     "resumen_checklist": _compact_resumen_checklist,
+    "descubrir_evidencias": _compact_descubrir_evidencias,
 }
 
 

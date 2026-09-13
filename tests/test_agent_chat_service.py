@@ -677,6 +677,56 @@ def test_compact_resumen_checklist_includes_every_item_codigo() -> None:
     assert "cumplidos=6" in text
 
 
+def test_compact_descubrir_evidencias_carries_handle_id_and_summary_not_the_payload() -> None:
+    """The whole point of the handle (radicacion-sin-friccion 1.7): the LLM-facing
+    text must carry `handle_id` + a compact summary, and must NOT include the
+    full obligaciones/evidencias JSON the model would otherwise have to re-emit
+    to call persistir_evidencias."""
+    obligaciones = [
+        ObligacionJustificada(
+            obligacion_id=str(uuid.uuid4()),
+            descripcion=f"Obligación {i}",
+            justificacion=f"Justificación larga y detallada número {i} " * 5,
+        )
+        for i in range(10)
+    ]
+    output = EvidenceDiscoveryResponse(
+        obligaciones=obligaciones,
+        resumen="Se encontraron 12 evidencias en Gmail y Drive.",
+        total_evidencias=12,
+        fuentes={"email": 8, "drive": 4},
+        handle_id="a1b2c3d4-0000-0000-0000-000000000000",
+    )
+
+    text = agent_chat_service._compact_descubrir_evidencias(output)
+
+    assert "a1b2c3d4-0000-0000-0000-000000000000" in text
+    assert "persistir_evidencias" in text
+    assert "total_obligaciones=10" in text
+    assert "total_evidencias=12" in text
+    for obligacion in obligaciones:
+        assert obligacion.justificacion not in text
+        assert obligacion.obligacion_id not in text
+
+
+def test_serialize_tool_result_uses_compact_serializer_for_descubrir_evidencias() -> None:
+    output = EvidenceDiscoveryResponse(
+        obligaciones=[
+            ObligacionJustificada(obligacion_id=str(uuid.uuid4()), descripcion="Obligación", justificacion="Texto")
+        ],
+        resumen="resumen",
+        total_evidencias=1,
+        fuentes={"email": 1},
+        handle_id="handle-123",
+    )
+    dumped = output.model_dump(mode="json")
+
+    result = agent_chat_service._serialize_tool_result(dumped, "descubrir_evidencias", output)
+
+    assert result == agent_chat_service._compact_descubrir_evidencias(output)
+    assert "handle-123" in result
+
+
 def test_serialize_tool_result_uses_compact_serializer_when_registered() -> None:
     contratos = [_make_contrato_resumen(f"AC-000{i}") for i in range(9)]
     output = ListarContratosOutput(contratos=contratos)

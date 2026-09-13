@@ -37,6 +37,10 @@ CUENTA_MES_DUPLICADA = "CUENTA_MES_DUPLICADA"
 # file is lost — re-uploading the same content repairs the link (see
 # document_service.upload_document's content-hash dedup fast path).
 CHECKLIST_LINK_FAILED = "CHECKLIST_LINK_FAILED"
+# `persistir_evidencias` (agent tool) was called with a `handle_id` that is
+# unknown, expired, or does not match the caller/cuenta_id it was issued for
+# (radicacion-sin-friccion 1.7 — see `app.services.evidence_handle_cache`).
+EVIDENCE_HANDLE_NOT_FOUND = "EVIDENCE_HANDLE_NOT_FOUND"
 
 
 class DomainError(Exception):
@@ -56,6 +60,33 @@ class NotFoundError(DomainError):
         if identifier:
             detail = f"{resource} '{identifier}' not found"
         super().__init__(detail)
+
+
+class EvidenceHandleNotFoundError(NotFoundError):
+    """`persistir_evidencias` was called with a discovery handle that can't be redeemed.
+
+    Deliberately ONE outcome/message for four distinct causes — unknown handle,
+    expired handle, handle owned by a different user, and handle scoped to a
+    different `cuenta_id` — same never-leak-existence rationale documented on
+    `evidence_persist_service._verify_cuenta_owned` and
+    `app/tools/catalog/importar_documento.py`: telling the caller WHICH of those
+    it hit would leak information about a handle they don't own. The message is
+    still actionable (unlike a bare 404) because every cause has the exact same
+    fix — call `descubrir_evidencias` again for a fresh handle — so collapsing
+    the cases costs nothing.
+
+    Maps to HTTP 404 via `NotFoundError`'s entry in `EXCEPTION_STATUS_MAP`
+    (MRO-based lookup, see `domain_to_http`) — no separate registration needed.
+    """
+
+    def __init__(self) -> None:
+        DomainError.__init__(
+            self,
+            "El handle de descubrimiento de evidencias no existe, expiró o no corresponde a "
+            "esta cuenta. Volvé a llamar a descubrir_evidencias para generar uno nuevo antes "
+            "de persistir.",
+            code=EVIDENCE_HANDLE_NOT_FOUND,
+        )
 
 
 class AlreadyExistsError(DomainError):
