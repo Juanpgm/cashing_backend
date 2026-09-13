@@ -1,4 +1,8 @@
 name: CI
+#
+# Local pre-merge gate mirroring this file's pytest+coverage and lint steps:
+# scripts/pre-merge.ps1 (see CLAUDE.md's "Before merging" note). Keep both in
+# sync when changing the commands below.
 
 on:
   push:
