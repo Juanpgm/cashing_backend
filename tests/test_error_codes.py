@@ -120,6 +120,70 @@ async def test_radicar_checklist_incompleto_returns_checklist_incomplete_code(
     assert body["code"] == "CHECKLIST_INCOMPLETE"
 
 
+async def test_radicar_on_undefined_requisitos_modo_matches_estandar_behaviour(
+    db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
+) -> None:
+    """Adversarial-review WARNING: `cuenta_cobro_service.radicar_cuenta` calls
+    `construir_checklist_completo` without checking `requisitos_modo is None`
+    first (app/services/cuenta_cobro_service.py). Confirmed harmless rather than
+    gated: `checklist_service.modo_efectivo` collapses `None` to the same
+    "estandar" default an EXPLICIT `requisitos_modo="estandar"` cuenta gets, so
+    the materialized standard `requisito_codigo` set is identical either way —
+    same CHECKLIST_INCOMPLETE outcome, same rows created.
+
+    Calls the service directly (not through `client`/the API) so the rows
+    `asegurar_checklist` flushes are actually observable in this test's `db`
+    session before comparison — through the real HTTP path, `_override_get_db`
+    (tests/conftest.py) rolls back the WHOLE request session on any raised
+    exception, so a failed `POST .../radicar` never leaves stray checklist rows
+    behind regardless of requisitos_modo; this direct-call test instead proves
+    the stronger claim that even the in-transaction row set itself never
+    diverges between NULL and "estandar"."""
+    from app.models.documento_cuenta_cobro import DocumentoCuentaCobro
+    from app.services import cuenta_cobro_service
+    from sqlalchemy import select
+
+    cuenta_null = CuentaCobro(
+        contrato_id=contrato.id,
+        mes=11,
+        anio=2024,
+        estado=EstadoCuentaCobro.BORRADOR,
+        valor=1_000_000,
+        # requisitos_modo intentionally left unset (None) — gate never resolved.
+    )
+    cuenta_estandar = CuentaCobro(
+        contrato_id=contrato.id,
+        mes=12,
+        anio=2024,
+        estado=EstadoCuentaCobro.BORRADOR,
+        valor=1_000_000,
+        requisitos_modo="estandar",
+    )
+    db.add_all([cuenta_null, cuenta_estandar])
+    await db.commit()
+    await db.refresh(cuenta_null)
+    await db.refresh(cuenta_estandar)
+    assert cuenta_null.requisitos_modo is None
+
+    async def _codigos(cuenta_id: Any) -> set[str]:
+        with pytest.raises(ValidationError) as excinfo:
+            await cuenta_cobro_service.radicar_cuenta(db, test_user["user"].id, cuenta_id)
+        assert excinfo.value.code == "CHECKLIST_INCOMPLETE"
+        filas = await db.execute(
+            select(DocumentoCuentaCobro.requisito_codigo).where(
+                DocumentoCuentaCobro.cuenta_cobro_id == cuenta_id,
+                DocumentoCuentaCobro.requisito_codigo.is_not(None),
+            )
+        )
+        return {c for (c,) in filas.all()}
+
+    codigos_null = await _codigos(cuenta_null.id)
+    codigos_estandar = await _codigos(cuenta_estandar.id)
+
+    assert codigos_null, "expected the standard catalog to materialize checklist rows"
+    assert codigos_null == codigos_estandar
+
+
 async def test_radicar_checklist_incompleto_message_names_etiqueta_not_uuid(
     client: AsyncClient, db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
 ) -> None:

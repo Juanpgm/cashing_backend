@@ -244,6 +244,11 @@ async def _reload_cuenta_response(db: AsyncSession, cuenta_id: uuid.UUID) -> Cue
     ENVIADA via `_leer_estado_bajo_lock`. `populate_existing` forces every matching row to
     overwrite the cached instance's attributes, which is exactly this function's documented
     contract ("fresh from the DB").
+
+    `populate_existing=True` is safe here only because the session runs with
+    `autoflush=True` (the default): any pending in-session changes on the cuenta are
+    flushed to the DB before this `select()` executes, so the reload never loses an
+    uncommitted write from earlier in the same request.
     """
     result = await db.execute(
         select(CuentaCobro)
@@ -1228,6 +1233,15 @@ async def radicar_cuenta(
                 advertencias=len(findings),
             )
 
+    # No `requisitos_modo is None` gate here (unlike the agent tools in
+    # app/tools/catalog/checklist.py / app/api/v1/checklist.py): confirmed
+    # harmless (adversarial-review WARNING, see
+    # tests/test_radicacion_prep.py::
+    # test_preparar_radicacion_on_undefined_requisitos_modo_materializes_estandar_set,
+    # which covers this same construir_checklist_completo codepath). `modo_efectivo`
+    # collapses `None` to the same "estandar" default an EXPLICIT
+    # `requisitos_modo="estandar"` cuenta gets, so the materialized row set never
+    # differs from what the user would get by choosing "estandar" later.
     payload = await checklist_service.construir_checklist_completo(db, cuenta)
     resumen = payload["resumen"]
     if not resumen["radicacion_lista"]:

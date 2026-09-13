@@ -28,6 +28,30 @@ router = APIRouter(
 )
 
 
+def _checklist_no_definido(cuenta_id: uuid.UUID) -> ChecklistResponse:
+    """Gate response shared by every checklist endpoint: when the post-creation
+    gate has not been resolved yet (`cuenta.requisitos_modo is None`), NONE of
+    them may materialise or scan the checklist — they must all report the same
+    `requisitos_definidos=false` / empty-items view of the cuenta so the
+    frontend consistently shows the definition step regardless of which
+    endpoint it happened to call first.
+    """
+    return ChecklistResponse(
+        cuenta_cobro_id=cuenta_id,
+        requisitos_definidos=False,
+        items=[],
+        resumen=ChecklistResumen(
+            total=0,
+            cumplidos=0,
+            pendientes=0,
+            lista_pendientes=[],
+            lista_pendientes_desc=[],
+            radicacion_lista=False,
+        ),
+        arbol_evidencias=[],
+    )
+
+
 @router.get("", response_model=ChecklistResponse)
 async def obtener_checklist(
     cuenta_id: uuid.UUID,
@@ -52,20 +76,7 @@ async def obtener_checklist(
     cuenta = await cuenta_cobro_service._get_cuenta_con_ownership(db, user.id, cuenta_id)
 
     if cuenta.requisitos_modo is None:
-        return ChecklistResponse(
-            cuenta_cobro_id=cuenta.id,
-            requisitos_definidos=False,
-            items=[],
-            resumen=ChecklistResumen(
-                total=0,
-                cumplidos=0,
-                pendientes=0,
-                lista_pendientes=[],
-                lista_pendientes_desc=[],
-                radicacion_lista=False,
-            ),
-            arbol_evidencias=[],
-        )
+        return _checklist_no_definido(cuenta.id)
 
     payload = await checklist_service.construir_checklist_completo(db, cuenta)
     await db.commit()
@@ -101,8 +112,16 @@ async def refrescar_secop(
 
     Útil cuando se han importado nuevos documentos SECOP después de crear la cuenta.
     No sobreescribe documentos cargados manualmente (estado=cargado).
+
+    Si la cuenta aún no resolvió el gate de definición (`requisitos_modo` es NULL),
+    no hay nada que escanear todavía: devuelve el mismo `requisitos_definidos=false`
+    que `GET /checklist`, sin materializar filas (bug fix — antes llamaba
+    `asegurar_checklist` incondicionalmente, lo que creaba el checklist ESTÁNDAR
+    por default aunque el usuario nunca eligió un modo).
     """
     cuenta = await cuenta_cobro_service._get_cuenta_con_ownership(db, user.id, cuenta_id)
+    if cuenta.requisitos_modo is None:
+        return _checklist_no_definido(cuenta.id)
     user_id = user.id  # captured before any rollback expires the session-bound `user`
     await checklist_service.asegurar_checklist(db, cuenta)
     try:
@@ -134,8 +153,15 @@ async def auto_vincular_documentos(
 
     Solo toca filas PENDIENTE — nunca sobreescribe vínculos ya establecidos.
     Retorna el checklist actualizado más `auto_vinculados: int`.
+
+    Si la cuenta aún no resolvió el gate de definición (`requisitos_modo` es NULL),
+    no hay filas de checklist a las que vincular nada todavía: devuelve el mismo
+    `requisitos_definidos=false` que `GET /checklist` (más `auto_vinculados: 0`),
+    sin materializar filas (mismo bug fix que `POST /refresh-secop`).
     """
     cuenta = await cuenta_cobro_service._get_cuenta_con_ownership(db, user.id, cuenta_id)
+    if cuenta.requisitos_modo is None:
+        return {**_checklist_no_definido(cuenta.id).model_dump(), "auto_vinculados": 0}
     await checklist_service.asegurar_checklist(db, cuenta)
     vinculados = await checklist_service.auto_vincular_documentos_fuente(db, cuenta)
     # auto_vincular=False: the linking was already done above, no need to run it again.

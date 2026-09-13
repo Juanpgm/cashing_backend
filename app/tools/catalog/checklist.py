@@ -73,6 +73,15 @@ class DetectarDesdeSecopOutput(BaseModel):
     candidatos_por_requisito: dict[str, list[CandidatoDetectado]] = Field(
         description="Top-N SECOP document candidates found per requisito code (or custom requisito UUID)."
     )
+    requisitos_definidos: bool = Field(
+        default=True,
+        description=(
+            "False when the cuenta has not resolved the post-creation checklist gate yet "
+            "(requisitos_modo is NULL) — same signal resumen_checklist reports. When False, "
+            "candidatos_por_requisito is always empty and nothing was scanned or materialized; "
+            "the agent should prompt the user to call definir_requisitos_checklist first."
+        ),
+    )
 
 
 @tool(
@@ -81,8 +90,10 @@ class DetectarDesdeSecopOutput(BaseModel):
         "Re-scan the cached SECOP documents for this cuenta's contract and (re)score candidates "
         "per checklist requisito. Auto-links the best match when its confidence score clears the "
         "auto-link threshold and the requisito is still pendiente — never overwrites a document "
-        "already linked manually. Args: cuenta_id (UUID of the cuenta de cobro; must belong to "
-        "the authenticated user)."
+        "already linked manually. If the cuenta has not resolved the requisitos gate yet "
+        "(requisitos_modo unset), does nothing and returns requisitos_definidos=false with an "
+        "empty candidatos_por_requisito instead of materializing the standard checklist. Args: "
+        "cuenta_id (UUID of the cuenta de cobro; must belong to the authenticated user)."
     ),
     input_model=DetectarDesdeSecopInput,
     output_model=DetectarDesdeSecopOutput,
@@ -90,6 +101,13 @@ class DetectarDesdeSecopOutput(BaseModel):
 )
 async def detectar_desde_secop(ctx: ToolContext, params: DetectarDesdeSecopInput) -> DetectarDesdeSecopOutput:
     cuenta = await cuenta_cobro_service._get_cuenta_con_ownership(ctx.db, ctx.usuario_id, params.cuenta_id)
+
+    # Mirrors resumen_checklist's early return (and app/api/v1/checklist.py's
+    # `_checklist_no_definido`): never materialize the standard checklist just
+    # because it was scanned before the user chose a requisitos_modo.
+    if cuenta.requisitos_modo is None:
+        return DetectarDesdeSecopOutput(candidatos_por_requisito={}, requisitos_definidos=False)
+
     await checklist_service.asegurar_checklist(ctx.db, cuenta)
     resultado = await checklist_service.detectar_desde_secop(ctx.db, cuenta)
     return DetectarDesdeSecopOutput(
@@ -106,6 +124,15 @@ class AutoVincularDocumentosInput(BaseModel):
 
 class AutoVincularDocumentosOutput(BaseModel):
     vinculados: int = Field(description="Number of checklist rows newly linked to an uploaded document.")
+    requisitos_definidos: bool = Field(
+        default=True,
+        description=(
+            "False when the cuenta has not resolved the post-creation checklist gate yet "
+            "(requisitos_modo is NULL) — same signal resumen_checklist reports. When False, "
+            "vinculados is always 0 and nothing was linked or materialized; the agent should "
+            "prompt the user to call definir_requisitos_checklist first."
+        ),
+    )
 
 
 @tool(
@@ -113,8 +140,11 @@ class AutoVincularDocumentosOutput(BaseModel):
     description=(
         "Auto-link already-uploaded documents (DocumentoFuente) to pendiente checklist rows for "
         "this cuenta, using category/type matching. Only touches pendiente rows — manual or "
-        "SECOP-detected links are never overwritten. Args: cuenta_id (UUID of the cuenta de cobro; "
-        "must belong to the authenticated user)."
+        "SECOP-detected links are never overwritten. If the cuenta has not resolved the "
+        "requisitos gate yet (requisitos_modo unset), does nothing and returns "
+        "requisitos_definidos=false with vinculados=0 instead of materializing the standard "
+        "checklist. Args: cuenta_id (UUID of the cuenta de cobro; must belong to the "
+        "authenticated user)."
     ),
     input_model=AutoVincularDocumentosInput,
     output_model=AutoVincularDocumentosOutput,
@@ -124,6 +154,13 @@ async def auto_vincular_documentos(
     ctx: ToolContext, params: AutoVincularDocumentosInput
 ) -> AutoVincularDocumentosOutput:
     cuenta = await cuenta_cobro_service._get_cuenta_con_ownership(ctx.db, ctx.usuario_id, params.cuenta_id)
+
+    # Mirrors resumen_checklist's early return (and app/api/v1/checklist.py's
+    # `_checklist_no_definido`): never materialize the standard checklist just
+    # because auto-link was requested before the user chose a requisitos_modo.
+    if cuenta.requisitos_modo is None:
+        return AutoVincularDocumentosOutput(vinculados=0, requisitos_definidos=False)
+
     await checklist_service.asegurar_checklist(ctx.db, cuenta)
     vinculados = await checklist_service.auto_vincular_documentos_fuente(ctx.db, cuenta)
     return AutoVincularDocumentosOutput(vinculados=vinculados)

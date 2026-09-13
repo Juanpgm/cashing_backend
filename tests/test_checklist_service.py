@@ -122,6 +122,22 @@ async def test_asegurar_checklist_is_idempotent(db: AsyncSession, contrato: Cont
     assert len(codigos) == len(set(codigos))
 
 
+# ── modo_efectivo ────────────────────────────────────────────────────────────
+# Pure function — no DB fixtures needed, `CuentaCobro()` here is a plain
+# in-memory object never added to a session.
+
+
+def test_modo_efectivo_defaults_null_to_estandar() -> None:
+    cuenta = CuentaCobro(requisitos_modo=None)
+    assert checklist_service.modo_efectivo(cuenta) == "estandar"
+
+
+@pytest.mark.parametrize("modo", ["estandar", "augment", "reemplazar"])
+def test_modo_efectivo_never_overwrites_an_explicit_choice(modo: str) -> None:
+    cuenta = CuentaCobro(requisitos_modo=modo)
+    assert checklist_service.modo_efectivo(cuenta) == modo
+
+
 async def test_previsualizar_checklist_reflects_structured_requisitos_without_persisting(
     db: AsyncSession, contrato: Contrato
 ) -> None:

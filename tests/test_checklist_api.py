@@ -10,6 +10,7 @@ import pytest
 from app.models.actividad import Actividad
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
+from app.models.documento_cuenta_cobro import DocumentoCuentaCobro
 from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
 from app.models.evidencia import Evidencia
 from app.models.obligacion import Obligacion, TipoObligacion
@@ -325,6 +326,66 @@ async def test_refresh_secop_runs(
     contrato_item = next(i for i in body["items"] if i["requisito"]["codigo"] == "CONTRATO")
     assert contrato_item["estado"] in ("detectado", "cargado")
     assert contrato_item.get("secop_documento") is not None or contrato_item.get("documento_fuente") is not None
+
+
+# ── mode gate must be consistent across every checklist-mutating endpoint ──
+# `GET /checklist` and `POST /{codigo}/generar` already refused to act on a
+# cuenta whose `requisitos_modo` is still NULL (the post-creation gate has not
+# been resolved). `POST /refresh-secop` and `POST /auto-vincular-documentos`
+# did NOT check the gate before calling `asegurar_checklist`, which silently
+# materialises the STANDARD checklist (service-layer default via
+# `checklist_service.modo_efectivo`) even though the user never chose a mode —
+# `GET /checklist` would still report `requisitos_definidos=False` right after,
+# an inconsistent view of the same cuenta from two endpoints. These two tests
+# pin the fix: both endpoints must now short-circuit exactly like `GET
+# /checklist` and must not create any DocumentoCuentaCobro row.
+
+
+async def test_refresh_secop_gate_when_undefined(
+    client: AsyncClient,
+    test_user: dict[str, Any],
+    db: AsyncSession,
+    cuenta_sin_definir: CuentaCobro,
+) -> None:
+    r = await client.post(
+        f"/api/v1/cuentas-cobro/{cuenta_sin_definir.id}/checklist/refresh-secop",
+        headers=test_user["headers"],
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["requisitos_definidos"] is False
+    assert body["items"] == []
+
+    from sqlalchemy import select
+
+    res = await db.execute(
+        select(DocumentoCuentaCobro).where(DocumentoCuentaCobro.cuenta_cobro_id == cuenta_sin_definir.id)
+    )
+    assert res.scalars().all() == []
+
+
+async def test_auto_vincular_documentos_gate_when_undefined(
+    client: AsyncClient,
+    test_user: dict[str, Any],
+    db: AsyncSession,
+    cuenta_sin_definir: CuentaCobro,
+) -> None:
+    r = await client.post(
+        f"/api/v1/cuentas-cobro/{cuenta_sin_definir.id}/checklist/auto-vincular-documentos",
+        headers=test_user["headers"],
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["requisitos_definidos"] is False
+    assert body["items"] == []
+    assert body["auto_vinculados"] == 0
+
+    from sqlalchemy import select
+
+    res = await db.execute(
+        select(DocumentoCuentaCobro).where(DocumentoCuentaCobro.cuenta_cobro_id == cuenta_sin_definir.id)
+    )
+    assert res.scalars().all() == []
 
 
 # ── 1:N document links per requisito (PATCH) ────────────────────────────────

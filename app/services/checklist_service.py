@@ -309,6 +309,23 @@ async def listar_catalogo(db: AsyncSession) -> list[RequisitoDocumento]:
 _MODO_DEFAULT = "estandar"
 
 
+def modo_efectivo(cuenta: CuentaCobro) -> str:
+    """Effective checklist build mode for content-deciding readers.
+
+    `CuentaCobro.requisitos_modo` is a tri-state: `None` means "the user has
+    not resolved the post-creation gate yet" (see the model docstring). Readers
+    that report WHETHER the gate has been resolved (`requisitos_definidos`,
+    the API-layer gate, `stepper_state_service`) must keep checking
+    `requisitos_modo is None` directly — collapsing that to a string here
+    would hide the tri-state from them. Readers that instead decide checklist
+    CONTENT/behaviour (which rows to materialise, which catalog to select)
+    should go through this helper instead of repeating the `... or _MODO_DEFAULT`
+    fallback inline. An explicit non-default mode (`augment`, `reemplazar`) is
+    always returned as-is — this never overwrites the user's choice.
+    """
+    return cuenta.requisitos_modo or _MODO_DEFAULT
+
+
 async def listar_requisitos_cuenta(db: AsyncSession, cuenta_id: uuid.UUID) -> list[RequisitoCuenta]:
     """Return the ACTIVE custom requirements defined for a cuenta, ordered."""
     res = await db.execute(
@@ -381,7 +398,7 @@ async def asegurar_checklist(db: AsyncSession, cuenta: CuentaCobro) -> list[Docu
 
     New rows always start PENDIENTE — links are never copied from a previous
     cuenta. Returns the full list of rows (existing + newly created)."""
-    modo = cuenta.requisitos_modo or _MODO_DEFAULT
+    modo = modo_efectivo(cuenta)
     catalogo = await listar_catalogo(db)
     custom = await listar_requisitos_cuenta(db, cuenta.id)
 
