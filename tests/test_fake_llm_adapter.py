@@ -59,7 +59,13 @@ _NON_EMPTY_SECOP_TOKEN = "test-token-does-not-trigger-the-missing-token-warning"
 
 
 def test_llm_provider_defaults_to_litellm() -> None:
-    assert Settings(SECOP_APP_TOKEN=_NON_EMPTY_SECOP_TOKEN).LLM_PROVIDER == "litellm"  # type: ignore[call-arg]
+    # `_env_file=None` skips loading `.env.example`/`.env`/`secrets/.env.local` for
+    # this instance, so a developer's local `LLM_PROVIDER=fake` override (the
+    # sanctioned local-dev workflow) can never leak into this default-value assertion.
+    assert (
+        Settings(_env_file=None, SECOP_APP_TOKEN=_NON_EMPTY_SECOP_TOKEN).LLM_PROVIDER  # type: ignore[call-arg]
+        == "litellm"
+    )
 
 
 def test_llm_provider_invalid_value_falls_back_to_litellm() -> None:

@@ -61,7 +61,7 @@ def test_entrypoints_sincronos_estan_bloqueados() -> None:
 _LIMITE_SEGUNDOS = 6.0
 
 
-async def test_el_adaptador_real_falla_rapido_en_vez_de_colgarse() -> None:
+async def test_el_adaptador_real_falla_rapido_en_vez_de_colgarse(monkeypatch: pytest.MonkeyPatch) -> None:
     """End-to-end: the production adapter, unmocked, must fail immediately.
 
     This is the shape the hanging tests had — a real `get_llm()` call with no patch.
@@ -71,7 +71,15 @@ async def test_el_adaptador_real_falla_rapido_en_vez_de_colgarse() -> None:
     import time
 
     from app.adapters.llm import get_llm
+    from app.core.config import settings
     from app.schemas.agent import LLMMessage
+
+    # `get_llm()` reads the process-wide `settings` singleton, not a fresh `Settings()`
+    # instance — force the real `LiteLLMAdapter` path regardless of a developer's local
+    # `LLM_PROVIDER=fake` override (see `secrets/.env.local`, the sanctioned local-dev
+    # workflow), otherwise this "network guard" test would silently exercise the
+    # network-free `FakeLLMPort` instead and never hit the guard it exists to verify.
+    monkeypatch.setattr(settings, "LLM_PROVIDER", "litellm")
 
     llm = get_llm()
     inicio = time.monotonic()
