@@ -16,6 +16,7 @@ from datetime import date
 
 import app.tools.catalog  # noqa: F401 — registers every catalog tool
 import pytest
+import structlog
 from app.adapters.llm import get_llm
 from app.adapters.llm.fake_adapter import (
     HAPPY_PATH_SEQUENCE,
@@ -38,14 +39,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 
 # `SECOP_APP_TOKEN` always passed non-empty below: an empty value trips
-# `Settings._warn_if_secop_token_missing`'s `_log.warning(...)`, and
-# `app.main`'s `structlog.configure(..., cache_logger_on_first_use=True)` caches
-# that "core.config" logger's processor chain on its FIRST-ever call — if that
-# first call happens here (outside of `structlog.testing.capture_logs()`), it
-# poisons `tests/test_secop_configuracion.py::TestSecopTokenWarning`, which
-# asserts on `capture_logs()` intercepting that exact warning. Keeping these
-# `Settings(...)` constructions free of that side effect avoids the whole class
-# of test-order-dependent flake.
+# `Settings._warn_if_secop_token_missing`'s `_log.warning(...)`, which is
+# irrelevant noise for these LLM_PROVIDER-focused tests. This alone does NOT
+# fully prevent test-order-dependent flakes on `app.core.config`'s shared
+# module-level logger proxy (`_log`) — see the docstring on
+# `test_llm_provider_invalid_value_logs_a_warning` below for the mechanism
+# that actually matters: never `monkeypatch.setattr()` a method directly onto
+# a structlog lazy-proxy object, only ever use `structlog.testing.capture_logs()`.
 _NON_EMPTY_SECOP_TOKEN = "test-token-does-not-trigger-the-missing-token-warning"
 
 
@@ -76,20 +76,28 @@ def test_llm_provider_fake_is_case_and_whitespace_insensitive(raw_value: str) ->
     assert s.LLM_PROVIDER == "fake"
 
 
-def test_llm_provider_invalid_value_logs_a_warning(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_llm_provider_invalid_value_logs_a_warning() -> None:
     """An unrecognized value doesn't just silently fold to "litellm" — it logs
     a warning naming the invalid value received, so a misconfigured env var
-    is discoverable instead of silently swallowed."""
-    import app.core.config as config_module
+    is discoverable instead of silently swallowed.
 
-    warnings: list[tuple[str, dict[str, object]]] = []
-    monkeypatch.setattr(
-        config_module._log,
-        "warning",
-        lambda event, **kwargs: warnings.append((event, kwargs)),
-    )
-    Settings(LLM_PROVIDER="banana", SECOP_APP_TOKEN=_NON_EMPTY_SECOP_TOKEN)  # type: ignore[call-arg]
-    assert any(event == "llm_provider_invalid_value_fallback_to_litellm" for event, _ in warnings)
+    Uses `structlog.testing.capture_logs()`, NOT `monkeypatch.setattr` on
+    `app.core.config._log` directly: `_log` is a `structlog` lazy logger proxy
+    that synthesizes attributes via `__getattr__` rather than storing them as
+    real instance attributes, so `monkeypatch`'s teardown (which reads the "old"
+    value via `getattr` to restore it later) ends up INSTALLING a permanently
+    frozen bound method on `_log.warning` instead of removing the patch --
+    verified: this poisoned `tests/test_secop_configuracion.py`'s
+    `capture_logs()`-based assertions for every test file that runs
+    alphabetically after this one, in the full suite (radicacion-sin-friccion
+    0.4, third occurrence of this order-dependency class). `capture_logs()`
+    mutates the shared processors list in place and cleans up correctly on
+    exit -- no leak."""
+    with structlog.testing.capture_logs() as captured:
+        Settings(LLM_PROVIDER="banana", SECOP_APP_TOKEN=_NON_EMPTY_SECOP_TOKEN)  # type: ignore[call-arg]
+
+    warn_events = [e for e in captured if e.get("event") == "llm_provider_invalid_value_fallback_to_litellm"]
+    assert warn_events, "expected a queryable warning log for an unrecognized LLM_PROVIDER value"
 
 
 def test_get_llm_returns_litellm_adapter_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
