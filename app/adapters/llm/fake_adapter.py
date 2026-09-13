@@ -567,16 +567,48 @@ def _resume_from_recap(messages: list[LLMMessage]) -> tuple[str | None, dict[str
     return resume_tool, known
 
 
+def _count_recap_ok_entries(recap_text: str | None, tool_name: str) -> int:
+    """How many `{tool_name}:ok` lines appear in the cross-turn recap text —
+    the resume-side counterpart to the LIVE count below. Needed because a
+    REPEATING scripted tool (`_ARGUMENT_OVERRIDES`) interrupted mid-loop by a
+    turn boundary (MAX_TOOL_ITERATIONS, a turn-budget timeout, anything that
+    ends the turn before the queue is exhausted) must resume the NEXT turn
+    from where it left off — the queue's occurrence index — not restart from 0
+    (a duplicate call) nor skip straight past the whole tool (treating even
+    ONE recap `ok` entry as "done", which `_advance` alone would do since it
+    has no concept of a queue). The recap carries ONE line PER CALL, no
+    per-tool-name dedup (`agent_chat_service._build_tool_context_recap`), so
+    counting matching lines is the correct occurrence count."""
+    if not recap_text:
+        return 0
+    body = recap_text[len(AGENT_RECAP_MARKER) :].strip()
+    if not body:
+        return 0
+    count = 0
+    for raw_entry in body.split(" | "):
+        parsed = _parse_recap_entry(raw_entry)
+        if parsed is None:
+            continue
+        name, status, _ids = parsed
+        if name == tool_name and status == "ok":
+            count += 1
+    return count
+
+
 def _count_successful_calls(messages: list[LLMMessage], tool_name: str) -> int:
-    """How many times `tool_name` already succeeded (paired, non-error result)
-    anywhere in `messages` — the occurrence index used both to decide whether a
-    tool in `_ARGUMENT_OVERRIDES` should REPEAT (index still within its queue)
-    and, in `complete()`, which override entry to use next (see
-    `_next_argument_override`). Both call sites share this exact helper so they
-    can never drift out of sync with each other."""
-    return sum(
+    """How many times `tool_name` already succeeded — LIVE calls THIS turn
+    (paired, non-error result, anywhere in `messages`) PLUS any prior turn's
+    successes still visible in the cross-turn recap (`_count_recap_ok_entries`
+    — a fresh turn's `messages` has zero live tool_calls, so without this the
+    count would always restart at 0). The occurrence index used both to decide
+    whether a tool in `_ARGUMENT_OVERRIDES` should REPEAT (index still within
+    its queue) and, in `complete()`, which override entry to use next (see
+    `_next_argument_override`). Every call site shares this exact helper so
+    they can never drift out of sync with each other."""
+    live = sum(
         1 for _call_id, name, result in _tool_results(messages) if name == tool_name and not _is_error_result(result)
     )
+    return live + _count_recap_ok_entries(_find_recap_content(messages), tool_name)
 
 
 def _next_argument_override(
@@ -655,6 +687,16 @@ def _resolve_next_tool(messages: list[LLMMessage]) -> tuple[str | None, str, dic
 
     if last_tool is None:
         recap_tool, recap_known = _resume_from_recap(messages)
+        # Same repeat-loop check as the live-turn branch below — a turn
+        # boundary (MAX_TOOL_ITERATIONS, a budget timeout, anything else that
+        # ends a turn) can interrupt a repeating scripted tool
+        # (`_ARGUMENT_OVERRIDES`) mid-queue just as easily as a same-turn
+        # failure can. Without this, resuming from the recap would either
+        # restart the queue at index 0 (a duplicate call) or skip straight to
+        # `HAPPY_PATH_SEQUENCE[recap_tool]`, silently dropping every
+        # not-yet-made call in the queue.
+        if recap_tool is not None and _next_argument_override(recap_tool, messages, recap_known) is not None:
+            return recap_tool, "call", recap_known
         next_tool, reason = _advance(recap_tool)
         return next_tool, reason, recap_known
 

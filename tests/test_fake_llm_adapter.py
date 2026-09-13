@@ -1043,6 +1043,42 @@ async def test_importar_documento_repeats_with_six_distinct_overrides_then_advan
     )
 
 
+async def test_importar_documento_resumes_mid_loop_from_recap_after_a_turn_boundary() -> None:
+    """A turn interrupted mid-loop (e.g. MAX_TOOL_ITERATIONS hit after only 2 of
+    the 6 scripted importar_documento calls) must resume from the NEXT
+    unconsumed override on the FOLLOWING turn, not restart the queue from index
+    0 (a duplicate re-upload of contrato.txt) nor skip straight to
+    auto_vincular_documentos (silently dropping the other 4 mandatory
+    uploads) — the recap carries ONE `importar_documento:ok` line per call
+    (see `agent_chat_service._build_tool_context_recap`, no per-tool-name
+    dedup), so the resume position must be counted from THOSE lines, not just
+    from this turn's own (empty, on a fresh turn) live history."""
+    cuenta_id = str(uuid.uuid4())
+    recap_content = agent_chat_service._build_tool_context_recap(
+        [
+            ("crear_cuenta_cobro", "ok", {"id": cuenta_id, "contrato_id": str(uuid.uuid4())}),
+            ("importar_documento", "ok", {"documento_id": str(uuid.uuid4())}),
+            ("importar_documento", "ok", {"documento_id": str(uuid.uuid4())}),
+        ]
+    )
+    assert recap_content is not None
+    fake = FakeLLMPort()
+    tools = [{"type": "function", "function": {"name": name}} for name in TOOL_REGISTRY]
+    messages = [
+        LLMMessage(role="system", content=recap_content),
+        LLMMessage(role="user", content="seguí subiendo los documentos"),
+    ]
+    response = await fake.complete(messages, tools=tools)
+    assert response.tool_calls is not None
+    call = response.tool_calls[0]
+    assert call.name == "importar_documento", (
+        f"expected the loop to resume with 4 more importar_documento calls, got {call.name}"
+    )
+    assert call.arguments["filename"] == _IMPORTAR_DOCUMENTO_OVERRIDES[2]["filename"], (
+        "expected the 3rd override entry (2 already consumed per the recap), not a restart"
+    )
+
+
 async def test_preparar_radicacion_result_aliases_cuenta_cobro_id_into_radicar_cuenta() -> None:
     """`preparar_radicacion` dumps `cuenta_cobro_id` (`PreparaRadicacionResponse`),
     never a bare `cuenta_id` — without an alias, `radicar_cuenta`'s next scripted
