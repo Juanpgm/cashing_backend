@@ -1532,6 +1532,22 @@ async def _run_chat_turn(
             # path, is accepted as final immediately — this loop only runs at all when
             # both an approval_gate is wired up AND the failing tool is a write tool.
             while outcome.status == "error" and is_write and approval_gate is not None:
+                # WARNING fix (phase3-agent-sse-approval-gate adversarial review,
+                # follow-up to the write-tool approval fix above): commit and
+                # release the connection BEFORE parking on
+                # `request_retry_decision` below — that call carries the IDENTICAL
+                # pool-exhaustion risk as `request_approval` above (same ~120s TTL,
+                # see `ToolCallGate._await_decision`), and can be hit up to
+                # `MAX_RETRY_ATTEMPTS` (3) times per failing write-tool call.
+                # Committed HERE — before the `tool_call_awaiting_retry` sink event
+                # below — and not between that event and `request_retry_decision`,
+                # for the exact same reason as the approval fix above: the sink
+                # event and the gate's own `store` bookkeeping must stay
+                # back-to-back with no real `await` between them, or a client
+                # reacting to the SSE event could race ahead of the gate being
+                # ready for it — the `PendingToolCallNotFoundError` regression the
+                # approval fix hit when first placed between the two.
+                await db.commit()
                 if tool_event_sink is not None:
                     await tool_event_sink(
                         {"type": "tool_call_awaiting_retry", "call_id": call.id, "tool": call.name, "attempt": attempt}

@@ -800,3 +800,99 @@ async def test_background_session_releases_connection_while_parked_on_approval(
         convo = await fresh_db.get(Conversacion, convo_id)
         assert convo is not None
         assert any(m.get("content") == "Listo, la creé." for m in convo.mensajes_json)
+
+
+async def test_background_session_releases_connection_while_parked_on_retry_decision(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WARNING fix (phase3-agent-sse-approval-gate adversarial review, follow-up to
+    the write-tool approval fix above): the background turn's OWN session (`bg_db`)
+    must not hold an open transaction while parked on
+    `approval_gate.request_retry_decision` either — this second wait point carries
+    the IDENTICAL pool-exhaustion risk as the approval wait fixed above: up to the
+    ~120s decision TTL, repeatable up to `MAX_RETRY_ATTEMPTS` (3) times per failing
+    write-tool call. Under real Postgres (`pool_size=10, max_overflow=5`, see
+    `database.py`), a handful of concurrent parked retries would exhaust the pool
+    and block ALL other traffic — invisible on this suite's SQLite backend, which
+    has no such limit, so this test targets the session's own `in_transaction()`
+    state directly rather than pool exhaustion.
+
+    Uses `_FlakyInvoke` (see `test_retry_after_failure_re_executes_and_keeps_both_
+    events` above) to force the write tool to fail on its first attempt so the turn
+    actually reaches the retry-decision wait.
+    """
+    from app.core import database
+
+    from tests.conftest import async_session_test
+
+    captured_sessions: list[AsyncSession] = []
+    original_factory = database.async_session_factory
+
+    def _spy_factory() -> AsyncSession:
+        session = original_factory()
+        captured_sessions.append(session)
+        return session
+
+    monkeypatch.setattr(database, "async_session_factory", _spy_factory)
+
+    user, contrato = await _make_user_with_contrato(db, "0151")
+    flaky = _FlakyInvoke("crear_cuenta_cobro")
+    monkeypatch.setattr(agent_chat_service, "invoke_tool", flaky)
+
+    tool_call = LLMToolCall(
+        id="call_1", name="crear_cuenta_cobro", arguments={"contrato_id": str(contrato.id), "mes": 9, "anio": 2026}
+    )
+    scripted = ScriptedLLM(
+        [
+            LLMResponse(content="", model="fake", tool_calls=[tool_call], total_tokens=5),
+            LLMResponse(content="Listo, la creé tras reintentar.", model="fake", total_tokens=8),
+        ]
+    )
+    _patch_llm(monkeypatch, scripted)
+
+    session_id: str | None = None
+    call_id: str | None = None
+    async for event in agent_chat_service.stream_chat_with_tools(db, user, "Crea mi cuenta de septiembre", None, {}):
+        if event["type"] == "connected":
+            session_id = event["session_id"]
+        if event["type"] == "tool_call_awaiting_approval":
+            assert session_id is not None
+            agent_tool_approval.resolve(session_id, event["call_id"], user.id, "approve")
+        if event["type"] == "tool_call_awaiting_retry":
+            call_id = event["call_id"]
+            break  # the failed write tool is now parked on the gate, waiting for a retry decision
+    assert session_id is not None
+    assert call_id is not None
+    assert len(captured_sessions) == 1, "the background task must open exactly one bg_db session"
+    bg_db = captured_sessions[0]
+
+    # Give the event loop a few turns so the fix's `await db.commit()` (real async
+    # I/O, even against aiosqlite) has a chance to fully finish before we inspect
+    # `bg_db` — otherwise we could observe it mid-commit rather than truly parked.
+    for _ in range(5):
+        await asyncio.sleep(0)
+    await asyncio.sleep(0.05)
+
+    assert bg_db.in_transaction() is False, (
+        "the background session must commit and release its connection BEFORE "
+        "parking on approval_gate.request_retry_decision — holding it open for "
+        "the whole TTL, up to MAX_RETRY_ATTEMPTS times, exhausts the Postgres "
+        "pool under concurrent retries"
+    )
+
+    # The turn must still complete and persist correctly after the retry decision
+    # resolves — this fix must not regress the retry-after-failure behaviour
+    # (`test_retry_after_failure_re_executes_and_keeps_both_events`).
+    agent_tool_approval.resolve(session_id, call_id, user.id, "retry")
+    await _drain_background_tasks()
+
+    async with async_session_test() as fresh_db:
+        rows = await fresh_db.execute(select(CuentaCobro).where(CuentaCobro.contrato_id == contrato.id))
+        assert len(rows.scalars().all()) == 1
+
+        convo_id = uuid.UUID(session_id)
+        from app.models.conversacion import Conversacion
+
+        convo = await fresh_db.get(Conversacion, convo_id)
+        assert convo is not None
+        assert any(m.get("content") == "Listo, la creé tras reintentar." for m in convo.mensajes_json)
