@@ -14,6 +14,7 @@ here would duplicate that logic and risk drifting out of sync with it.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import mimetypes
 import re
@@ -52,6 +53,7 @@ from app.schemas.agent import (
     UiAction,
 )
 from app.services import contrato_service
+from app.tools import phase_gating
 from app.tools.context import ToolAttachment, ToolContext
 from app.tools.invoke import invoke_tool
 from app.tools.llm_schema import to_openai_tools
@@ -67,6 +69,49 @@ logger = structlog.get_logger("services.agent_chat")
 # a conversation that (before the recap below existed) had no memory of what
 # already ran. Raised with headroom for a retry or two along the way.
 MAX_TOOL_ITERATIONS = 20
+
+# Per-model-attempt wall-clock budget for THIS interactive loop's llm.complete()
+# calls only — forwarded as `LiteLLMAdapter.complete`'s `timeout_seconds` kwarg
+# (default 120s, unchanged for every OTHER caller: batch/pipeline extraction,
+# document generation, etc. — see that kwarg's docstring). Chosen so a full
+# fallback-chain exhaustion stays comfortably under the 2-minute target: with
+# the real configured chain (`gemini` -> `groq` -> `ollama`, 3 models) and
+# tenacity's 2 attempts per model (`LiteLLMAdapter._call_model`'s
+# `@retry(stop_after_attempt(2))`), a full exhaustion now bounds at roughly
+# 3 models * 2 attempts * 15s = 90s (+ a few seconds of exponential backoff
+# between attempts, `wait_exponential(min=1, max=4)`) — see
+# `tests/test_litellm_adapter.py::TestTimeoutSeconds` for the exact math,
+# instead of the OLD 120s-per-call value's worst case of
+# 3 models * 2 attempts * 120s = 720s (~12 minutes).
+_INTERACTIVE_LLM_TIMEOUT_SECONDS = 15
+
+# Cumulative wall-clock ceiling on time spent AWAITING llm.complete() across
+# every iteration of ONE turn — deliberately excludes tool execution time. A
+# write tool (e.g. generar_informe_actividades, preparar_radicacion) can
+# legitimately run long and may already have committed a DB write by the time
+# it finishes; cutting it off mid-flight would desync stored side effects from
+# a never-persisted conversation history (see the broad `except Exception`
+# around the tool-call block below for the existing precedent of never
+# interrupting a mid-flight write). The ~12-minute hang this slice fixes only
+# ever happened in LLM round trips, never in tool execution, so the budget is
+# scoped there on purpose — see `_INTERACTIVE_LLM_TIMEOUT_SECONDS` above.
+# Set below MAX_TOOL_ITERATIONS * _INTERACTIVE_LLM_TIMEOUT_SECONDS (20 * 15 =
+# 300s) so a genuinely long multi-iteration chain still gets cut off well
+# before a user would call the request "hung", while comfortably exceeding
+# the single-full-fallback-exhaustion cost (~90-102s) computed above so ONE
+# outage-triggered retry never eats the whole budget by itself.
+_TURN_LLM_BUDGET_SECONDS = 100
+
+# User-facing message on ANY LLM-side turn timeout — either the whole model
+# fallback chain failing (`RuntimeError` from `LiteLLMAdapter.complete`) or
+# this turn's cumulative LLM budget running out before the next call. Kept as
+# ONE shared string (not two near-duplicate messages) so the app's register
+# stays consistent regardless of which of the two timeout paths fired.
+_LLM_TIMEOUT_MESSAGE = (
+    "No pude contactar al modelo de IA en este momento. Lo que ya se alcanzó a "
+    "completar en esta solicitud quedó guardado — escribime de nuevo en un momento "
+    "para continuar."
+)
 
 # Tool results fed back to the LLM are truncated so a single verbose tool output
 # (e.g. a full checklist dump) doesn't blow past the model's context window. Live
@@ -1012,8 +1057,23 @@ async def _run_chat_turn(
     ]
 
     llm = get_llm()
-    tools = to_openai_tools()
+    # Full catalog computed once — the per-iteration OFFERED subset is derived
+    # from this via `phase_gating.filter_openai_tools` below (see that call
+    # site's comment for why the filter must be recomputed every iteration,
+    # not once per turn).
+    all_tools = to_openai_tools()
     tool_ctx = ToolContext(db=db, usuario=usuario, attachments=expanded_attachments)
+
+    # Phase-gating (radicacion-sin-friccion 1.8): seed this turn's gate state
+    # from the cross-turn recap (the newest recap message in `history`, if
+    # any) — see `app.tools.phase_gating` module docstring for the full
+    # rationale and safety argument.
+    _recap_for_gating = next(
+        (str(m.content) for m in reversed(history) if _is_recap_message(m.model_dump())),
+        None,
+    )
+    cuenta_known_this_turn = phase_gating.cuenta_known_from_recap(_recap_for_gating)
+    called_tool_names_this_turn: set[str] = set(phase_gating.called_tool_names_from_recap(_recap_for_gating))
 
     tool_events: list[ToolEvent] = []
     ui_actions: list[UiAction] = []
@@ -1025,30 +1085,68 @@ async def _run_chat_turn(
     tokens_used = 0
     final_content = ""
     iterations_run = 0
+    # Cumulative seconds already spent AWAITING llm.complete() this turn — see
+    # `_TURN_LLM_BUDGET_SECONDS` for what this bounds and why tool execution
+    # time is deliberately excluded.
+    llm_elapsed_seconds = 0.0
 
     for iteration in range(MAX_TOOL_ITERATIONS):
         iterations_run = iteration + 1
+
+        remaining_budget = _TURN_LLM_BUDGET_SECONDS - llm_elapsed_seconds
+        if remaining_budget <= 0:
+            await logger.awarning("agent_chat_llm_turn_budget_exhausted", elapsed_seconds=round(llm_elapsed_seconds, 2))
+            final_content = _LLM_TIMEOUT_MESSAGE
+            messages.append(LLMMessage(role="assistant", content=final_content))
+            break
+
+        # Recomputed EVERY iteration (not once per turn): a tool that becomes
+        # relevant mid-turn — e.g. definir_requisitos_checklist right after
+        # crear_cuenta_cobro succeeds two lines below — must be visible to the
+        # very next llm.complete() call, or the autonomous within-turn chain
+        # the canonical playbook depends on breaks (see phase_gating module
+        # docstring).
+        hidden_tools = phase_gating.hidden_tool_names(
+            message=message,
+            cuenta_known=cuenta_known_this_turn,
+            called_tool_names=frozenset(called_tool_names_this_turn),
+        )
+        tools = phase_gating.filter_openai_tools(all_tools, hidden_tools)
         llm_start = time.perf_counter()
         try:
-            response = await llm.complete(messages, tools=tools, temperature=0.2, max_tokens=1024)
+            # `asyncio.timeout` is defense-in-depth ON TOP OF `timeout_seconds`
+            # (litellm's own per-attempt timeout kwarg, forwarded to the
+            # provider SDK): a hard OS-level cutoff that fires regardless of
+            # whether litellm/httpx/the provider client actually honors its
+            # own timeout internally (e.g. a hang before the HTTP request is
+            # even sent). Bounded by whatever's LEFT of this turn's budget so
+            # the last iteration before exhaustion can't overrun it either.
+            async with asyncio.timeout(remaining_budget):
+                response = await llm.complete(
+                    messages,
+                    tools=tools,
+                    temperature=0.2,
+                    max_tokens=1024,
+                    timeout_seconds=max(1, min(_INTERACTIVE_LLM_TIMEOUT_SECONDS, int(remaining_budget))),
+                )
         except Exception as exc:
             # Broad by design, mirroring the per-tool-call exception boundary below:
             # `LiteLLMAdapter.complete` raises `RuntimeError` when its ENTIRE model
-            # fallback chain fails, but a provider SDK could raise anything network-
-            # shaped. Letting this escape `chat_with_tools` used to 500 the whole
-            # request AND skip the final `db.commit()` below — losing the user
-            # message, the assistant reply, and the recap of tool calls that
-            # already succeeded and committed in an EARLIER iteration this same
-            # turn. BaseException (KeyboardInterrupt/SystemExit/CancelledError) is
-            # intentionally NOT caught here.
+            # fallback chain fails, and `asyncio.timeout` raises `TimeoutError` when
+            # this turn's cumulative LLM budget runs out mid-call — but a provider
+            # SDK could raise anything network-shaped too. Letting any of these
+            # escape `chat_with_tools` used to 500 the whole request AND skip the
+            # final `db.commit()` below — losing the user message, the assistant
+            # reply, and the recap of tool calls that already succeeded and
+            # committed in an EARLIER iteration this same turn. BaseException
+            # (KeyboardInterrupt/SystemExit/CancelledError) is intentionally NOT
+            # caught here.
             await logger.awarning("agent_chat_llm_unreachable", error=str(exc))
-            final_content = (
-                "No pude contactar al modelo de IA en este momento. Lo que ya se alcanzó a "
-                "completar en esta solicitud quedó guardado — escribime de nuevo en un momento "
-                "para continuar."
-            )
+            final_content = _LLM_TIMEOUT_MESSAGE
             messages.append(LLMMessage(role="assistant", content=final_content))
             break
+        finally:
+            llm_elapsed_seconds += elapsed_ms(llm_start) / 1000
         tokens_used += response.total_tokens
         await logger.ainfo(
             "agent_chat_llm_turn",
@@ -1125,6 +1223,16 @@ async def _run_chat_turn(
                     action = _run_ui_action_builder(call.name, output)
                     if action is not None:
                         _record_ui_action(ui_actions, action)
+                    # Phase-gating state for the NEXT iteration (see the
+                    # `hidden_tool_names` call above the loop): a successful
+                    # crear_cuenta_cobro (or any already-visible cuenta-scoped
+                    # tool) proves a cuenta now exists; any orthogonal-gated
+                    # tool that just succeeded stays visible for the rest of
+                    # this turn even without repeating its trigger keyword.
+                    if call.name == "crear_cuenta_cobro" or call.name in phase_gating.cuenta_scoped_tool_names():
+                        cuenta_known_this_turn = True
+                    if call.name in phase_gating.ORTHOGONAL_TOOL_KEYWORDS:
+                        called_tool_names_this_turn.add(call.name)
                 except Exception as exc:
                     # Broad by design: a tool doing real I/O can raise anything (DomainError,
                     # pydantic ValidationError, KeyError/ValueError/TypeError from bad

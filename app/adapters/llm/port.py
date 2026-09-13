@@ -22,6 +22,7 @@ class LLMPort(Protocol):
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         reasoning_effort: str | None = None,
+        timeout_seconds: int = 120,
     ) -> LLMResponse:
         """Send messages and return a completion.
 
@@ -36,6 +37,10 @@ class LLMPort(Protocol):
         the model actually called is a Groq model; other providers never receive
         it. An unrecognized value should raise ``ValueError`` before any network
         call.
+
+        ``timeout_seconds`` is a per-attempt wall-clock budget forwarded to the
+        underlying provider call for every model in the fallback chain; see
+        ``LiteLLMAdapter.complete``'s docstring for the default and rationale.
         """
         ...
 

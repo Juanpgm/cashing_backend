@@ -322,3 +322,69 @@ class TestLangfuseTracing:
             await adapter.complete([LLMMessage(role="user", content="hola")], fallback=False)
 
         assert not [e for e in captured if e.get("event") == "langfuse_trace_failed"]
+
+
+class TestTimeoutSeconds:
+    """`timeout_seconds` (radicacion-sin-friccion 1.8) — per-call wall-clock
+    budget forwarded to litellm's own `timeout` kwarg. Defaults to the
+    historical 120s so every EXISTING caller (batch/pipeline LLM calls with no
+    opinion on this) keeps its current behavior unchanged; only
+    `agent_chat_service`'s interactive loop passes a smaller value.
+    """
+
+    @pytest.mark.asyncio
+    async def test_default_timeout_seconds_is_120_for_backward_compatibility(self) -> None:
+        adapter = LiteLLMAdapter(default_model="gemini/gemini-2.5-flash")
+        fake_response = _fake_completion_response()
+
+        with patch("litellm.acompletion", new=AsyncMock(return_value=fake_response)) as mock_call:
+            await adapter.complete([LLMMessage(role="user", content="hola")], fallback=False)
+
+        assert mock_call.call_args.kwargs["timeout"] == 120
+
+    @pytest.mark.asyncio
+    async def test_custom_timeout_seconds_is_forwarded_to_litellm(self) -> None:
+        adapter = LiteLLMAdapter(default_model="gemini/gemini-2.5-flash")
+        fake_response = _fake_completion_response()
+
+        with patch("litellm.acompletion", new=AsyncMock(return_value=fake_response)) as mock_call:
+            await adapter.complete([LLMMessage(role="user", content="hola")], fallback=False, timeout_seconds=15)
+
+        assert mock_call.call_args.kwargs["timeout"] == 15
+
+    @pytest.mark.asyncio
+    async def test_custom_timeout_seconds_applies_to_every_model_in_the_fallback_chain(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        adapter = LiteLLMAdapter(default_model="gemini/gemini-2.5-flash")
+        monkeypatch.setattr("app.adapters.llm.litellm_adapter.settings.LLM_FALLBACK_MODEL", "groq/openai/gpt-oss-20b")
+        fake_response = _fake_completion_response()
+
+        with patch(
+            "litellm.acompletion",
+            new=AsyncMock(
+                side_effect=[RuntimeError("primary down"), RuntimeError("primary retry down"), fake_response]
+            ),
+        ) as mock_call:
+            await adapter.complete([LLMMessage(role="user", content="hola")], timeout_seconds=15)
+
+        assert mock_call.call_count == 3
+        assert all(c.kwargs["timeout"] == 15 for c in mock_call.call_args_list)
+
+    def test_fallback_chain_length_times_new_interactive_timeout_stays_under_two_minutes(self) -> None:
+        """The explicit math backing `agent_chat_service._INTERACTIVE_LLM_TIMEOUT_SECONDS`:
+        chain_length * attempts_per_model * per_call_timeout (+ small tenacity
+        backoff) must stay comfortably under 120s — see that constant's
+        docstring for the full derivation of the old ~12-minute worst case."""
+        from app.services.agent_chat_service import _INTERACTIVE_LLM_TIMEOUT_SECONDS
+
+        adapter = LiteLLMAdapter(default_model="gemini/gemini-2.5-flash")
+        chain_length = len(adapter._get_model_chain(None))
+        attempts_per_model = 2  # `_call_model`'s `@retry(stop_after_attempt(2))`
+        max_backoff_per_model = 4  # `wait_exponential(min=1, max=4)`, one wait per model
+
+        worst_case_seconds = chain_length * attempts_per_model * _INTERACTIVE_LLM_TIMEOUT_SECONDS
+        worst_case_seconds += chain_length * max_backoff_per_model
+
+        assert chain_length == 3, "this test's headline claim assumes the documented 3-model chain"
+        assert worst_case_seconds < 120, f"worst case {worst_case_seconds}s exceeds the 2-minute target"

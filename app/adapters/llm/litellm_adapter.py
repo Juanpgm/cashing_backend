@@ -120,6 +120,7 @@ class LiteLLMAdapter:
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         reasoning_effort: str | None = None,
+        timeout_seconds: int = 120,
     ) -> LLMResponse:
         import litellm
 
@@ -130,7 +131,7 @@ class LiteLLMAdapter:
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
-            "timeout": 120,
+            "timeout": timeout_seconds,
         }
         if response_format is not None:
             kwargs["response_format"] = response_format
@@ -207,6 +208,7 @@ class LiteLLMAdapter:
         tool_choice: str | dict[str, Any] | None = None,
         reasoning_effort: str | None = None,
         fallback: bool = True,
+        timeout_seconds: int = 120,
     ) -> LLMResponse:
         """Complete with automatic fallback through model chain.
 
@@ -229,6 +231,15 @@ class LiteLLMAdapter:
         Set ``fallback=False`` to try only the requested model — used for vision
         calls, where the text-only fallback models cannot read image parts and
         would just produce a misleading error.
+
+        ``timeout_seconds`` (default 120, matching the historical hardcoded
+        value) is litellm's own per-attempt wall-clock budget, applied to
+        EVERY model in the fallback chain and EVERY tenacity retry of
+        ``_call_model``. Callers with tighter latency tolerance than the
+        120s default — currently only the interactive chat loop,
+        ``app.services.agent_chat_service`` — should pass a smaller value;
+        every other caller (batch/pipeline extraction, document generation)
+        keeps the default unless it opts in explicitly.
         """
         if reasoning_effort is not None and reasoning_effort not in _VALID_REASONING_EFFORTS:
             raise ValueError(
@@ -263,6 +274,7 @@ class LiteLLMAdapter:
                     tools,
                     tool_choice,
                     attempt_reasoning_effort,
+                    timeout_seconds,
                 )
                 duration_ms = elapsed_ms(start)
                 # `idx` IS the fallback depth: 0 means the primary/requested model
