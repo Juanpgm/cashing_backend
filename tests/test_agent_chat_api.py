@@ -68,9 +68,44 @@ async def test_chat_without_files_matches_contract(client: AsyncClient, test_use
     assert body["documentos"] == []
 
 
+def test_max_chat_files_covers_six_mandatory_uploads() -> None:
+    """6 mandatory, upload-only (non-autogen) requisitos exist in the standard
+    checklist catalog — CONTRATO, RPC, SEGURIDAD_SOCIAL, CEDULA, RUT, ACTA_INICIO
+    (see `checklist_service._CATALOGO_SEED`; INFORME_ACTIVIDADES/INFORME_SUPERVISION
+    are also obligatorio=True but permite_autogen=True, never uploaded; EVIDENCIAS is
+    obligatorio=True but satisfied via `subir_evidencias_desde_chat`/`persistir_evidencias`,
+    not `importar_documento`). A user attaching every mandatory support in one message
+    must never be rejected purely on file count."""
+    assert agent_chat_module.MAX_CHAT_FILES >= 6
+
+
 @pytest.mark.asyncio
-async def test_more_than_five_files_rejected(client: AsyncClient, test_user: dict[str, Any]) -> None:
-    files = [("files", (f"doc_{i}.pdf", _PDF_MAGIC, "application/pdf")) for i in range(6)]
+async def test_exactly_max_chat_files_accepted(client: AsyncClient, test_user: dict[str, Any]) -> None:
+    """MAX_CHAT_FILES must cover the 6 mandatory upload-based checklist requisitos
+    (CONTRATO, RPC, SEGURIDAD_SOCIAL, CEDULA, RUT, ACTA_INICIO — see
+    `checklist_service._CATALOGO_SEED`) in a SINGLE message, so a user attaching every
+    mandatory support at once is never rejected purely on file count."""
+    fake_llm = _ScriptedLLM([LLMResponse(content="Recibí todos tus archivos.", model="fake", total_tokens=5)])
+    files = [
+        ("files", (f"doc_{i}.pdf", _PDF_MAGIC, "application/pdf")) for i in range(agent_chat_module.MAX_CHAT_FILES)
+    ]
+
+    with patch("app.services.agent_chat_service.get_llm", return_value=fake_llm):
+        response = await client.post(
+            "/api/v1/agent/chat",
+            headers=test_user["headers"],
+            data={"message": "Aquí van todos mis soportes"},
+            files=files,
+        )
+
+    assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_more_than_max_files_rejected(client: AsyncClient, test_user: dict[str, Any]) -> None:
+    files = [
+        ("files", (f"doc_{i}.pdf", _PDF_MAGIC, "application/pdf")) for i in range(agent_chat_module.MAX_CHAT_FILES + 1)
+    ]
 
     response = await client.post(
         "/api/v1/agent/chat",

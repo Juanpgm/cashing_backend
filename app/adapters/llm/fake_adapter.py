@@ -63,9 +63,52 @@ HAPPY_PATH_SEQUENCE: dict[str | None, str | None] = {
     "listar_contratos": "crear_cuenta_cobro",
     "crear_cuenta_cobro": "definir_requisitos_checklist",
     "definir_requisitos_checklist": "importar_documento",
-    "importar_documento": "resumen_checklist",
-    "resumen_checklist": "radicar_cuenta",
+    # `importar_documento` maps to itself here — see `_ARGUMENT_OVERRIDES` /
+    # `_next_tool_repeats` below for how the chain actually loops it 6 times
+    # (once per `_IMPORTAR_DOCUMENTO_OVERRIDES` entry) before falling through to
+    # this same-name entry's real meaning once the queue is exhausted: "stay on
+    # this step". The dict alone can't express "repeat N times with different
+    # arguments then advance" — only the outcome-aware routing below can.
+    "importar_documento": "auto_vincular_documentos",
+    "auto_vincular_documentos": "crear_actividades_desde_obligaciones",
+    "crear_actividades_desde_obligaciones": "subir_evidencias_desde_chat",
+    "subir_evidencias_desde_chat": "generar_informe_actividades",
+    "generar_informe_actividades": "generar_informe_supervision",
+    "generar_informe_supervision": "resumen_checklist",
+    "resumen_checklist": "preparar_radicacion",
+    "preparar_radicacion": "radicar_cuenta",
     "radicar_cuenta": None,
+}
+
+# Extends HAPPY_PATH_SEQUENCE (radicacion-sin-friccion 1.9): a per-tool QUEUE of
+# argument overrides, consumed one entry per SUCCESSFUL prior call of that tool
+# name (see `_next_argument_override`) — merged over whatever
+# `synthesize_tool_arguments` would otherwise produce (random `str` fields,
+# empty lists for required `list[...]` fields). Two real needs the generic
+# synthesizer can never satisfy on its own:
+#   1. `importar_documento` must be called 6 times in a row — once per mandatory
+#      upload-only checklist requisito (CONTRATO, RPC, CEDULA, RUT, ACTA_INICIO,
+#      SEGURIDAD_SOCIAL; see `checklist_service._CATALOGO_SEED`) — each with a
+#      DIFFERENT `filename`/`tipo`. A bare random string always synthesizes to
+#      the literal `"fake"`, which can only ever match ONE attachment.
+#      Filenames mirror `tests/test_agente_cadena_completa.py`'s `_SOPORTES`
+#      fixture convention so a caller seeding `ToolContext.attachments` with
+#      those exact names gets a real (not "Attachment not found") result.
+#   2. `subir_evidencias_desde_chat.filenames` is a REQUIRED `list[str]` field —
+#      `_synthesize_field_value` fills any required `list[...]` with `[]`,
+#      which is schema-valid but uploads nothing.
+_IMPORTAR_DOCUMENTO_OVERRIDES: list[dict[str, Any]] = [
+    {"filename": "contrato.txt", "tipo": "contrato"},
+    {"filename": "rpc.txt", "tipo": "rpc"},
+    {"filename": "cedula.txt", "tipo": "cedula"},
+    {"filename": "rut.txt", "tipo": "rut"},
+    {"filename": "acta_inicio.txt", "tipo": "acta_inicio"},
+    {"filename": "planilla_pila.txt", "tipo": "seguridad_social"},
+]
+
+_ARGUMENT_OVERRIDES: dict[str, list[dict[str, Any]]] = {
+    "importar_documento": _IMPORTAR_DOCUMENTO_OVERRIDES,
+    "subir_evidencias_desde_chat": [{"filenames": ["evidencia_1.txt", "evidencia_2.txt", "evidencia_3.txt"]}],
 }
 
 _DONE_TEXT_RESPONSE = "Listo, terminé la cadena de radicación."
@@ -227,6 +270,28 @@ _ID_ALIASES: dict[str, dict[str, str]] = {
     "crear_cuenta_cobro": {"id": "cuenta_id"},
     "definir_requisitos_checklist": {"cuenta_cobro_id": "cuenta_id"},
     "resumen_checklist": {"cuenta_cobro_id": "cuenta_id"},
+    # `PreparaRadicacionResponse.cuenta_cobro_id` (radicacion-sin-friccion 1.9) —
+    # without this, `radicar_cuenta` (the very next HAPPY_PATH_SEQUENCE step)
+    # synthesizes a RANDOM uuid4() instead of the real cuenta id and fails with
+    # "CuentaCobro not found" immediately after a successful preparar_radicacion.
+    # Found by the full-playbook chat-loop E2E test — every other alias in this
+    # dict was added deliberately when its producing tool was scripted, but this
+    # one was missed when `preparar_radicacion` was added to the chain.
+    #
+    # SCOPE (adversarial review follow-up): this whole `_ID_ALIASES` dict, like
+    # `_resolve_next_tool`/`_next_argument_override`/`_count_recap_ok_entries`
+    # below, is internal to THIS fake adapter's own deterministic argument
+    # synthesis — a real LLM never calls through here, it reads the id straight
+    # out of the tool result text. Missing this entry only ever made
+    # `FakeLLMPort` itself synthesize a wrong id for its next scripted call
+    # (confirmed by reverting this line: 0 test failures anywhere outside this
+    # file's own suite). It was never a production bug in `agent_chat_service`
+    # or `radicacion_prep_service` — both already resolve either `cuenta_id` or
+    # `cuenta_cobro_id` spelling correctly today (see
+    # `app.tools.phase_gating._CUENTA_ID_IN_TEXT_RE` and
+    # `agent_chat_service._extract_recap_ids`). Do not read this as "fixed a
+    # user-facing reliability bug" — it fixed a test-harness-only gap.
+    "preparar_radicacion": {"cuenta_cobro_id": "cuenta_id"},
 }
 
 
@@ -385,16 +450,26 @@ def synthesize_tool_arguments(input_model: type[BaseModel], known: dict[str, str
 
 
 def build_tool_call(
-    tool_name: str, input_model: type[BaseModel], call_id: str, known: dict[str, str] | None = None
+    tool_name: str,
+    input_model: type[BaseModel],
+    call_id: str,
+    known: dict[str, str] | None = None,
+    overrides: dict[str, Any] | None = None,
 ) -> LLMToolCall:
     """Build a schema-valid `LLMToolCall` for `tool_name`, validated against its
     own `input_model` before being handed back (fails loudly, at fake-adapter
     build time, if a future catalog tool needs a shape this synthesizer can't
     fill — never silently emits a call the real tool invoker would reject).
 
-    See `synthesize_tool_arguments` for `known`.
+    See `synthesize_tool_arguments` for `known`. `overrides` (radicacion-sin-
+    friccion 1.9, see `_ARGUMENT_OVERRIDES`) is applied AFTER synthesis — it
+    replaces whatever the generic synthesizer produced for those specific field
+    names (e.g. a real `filename` instead of the literal string `"fake"`) —
+    every other field is untouched.
     """
     arguments = synthesize_tool_arguments(input_model, known=known)
+    if overrides:
+        arguments.update(overrides)
     input_model.model_validate(arguments)
     return LLMToolCall(id=call_id, name=tool_name, arguments=arguments)
 
@@ -506,6 +581,82 @@ def _resume_from_recap(messages: list[LLMMessage]) -> tuple[str | None, dict[str
     return resume_tool, known
 
 
+def _count_recap_ok_entries(recap_text: str | None, tool_name: str) -> int:
+    """How many `{tool_name}:ok` lines appear in the cross-turn recap text —
+    the resume-side counterpart to the LIVE count below. Needed because a
+    REPEATING scripted tool (`_ARGUMENT_OVERRIDES`) interrupted mid-loop by a
+    turn boundary (MAX_TOOL_ITERATIONS, a turn-budget timeout, anything that
+    ends the turn before the queue is exhausted) must resume the NEXT turn
+    from where it left off — the queue's occurrence index — not restart from 0
+    (a duplicate call) nor skip straight past the whole tool (treating even
+    ONE recap `ok` entry as "done", which `_advance` alone would do since it
+    has no concept of a queue). The recap carries ONE line PER CALL, no
+    per-tool-name dedup (`agent_chat_service._build_tool_context_recap`), so
+    counting matching lines is the correct occurrence count."""
+    if not recap_text:
+        return 0
+    body = recap_text[len(AGENT_RECAP_MARKER) :].strip()
+    if not body:
+        return 0
+    count = 0
+    for raw_entry in body.split(" | "):
+        parsed = _parse_recap_entry(raw_entry)
+        if parsed is None:
+            continue
+        name, status, _ids = parsed
+        if name == tool_name and status == "ok":
+            count += 1
+    return count
+
+
+def _count_successful_calls(messages: list[LLMMessage], tool_name: str) -> int:
+    """How many times `tool_name` already succeeded — LIVE calls THIS turn
+    (paired, non-error result, anywhere in `messages`) PLUS any prior turn's
+    successes still visible in the cross-turn recap (`_count_recap_ok_entries`
+    — a fresh turn's `messages` has zero live tool_calls, so without this the
+    count would always restart at 0). The occurrence index used both to decide
+    whether a tool in `_ARGUMENT_OVERRIDES` should REPEAT (index still within
+    its queue) and, in `complete()`, which override entry to use next (see
+    `_next_argument_override`). Every call site shares this exact helper so
+    they can never drift out of sync with each other."""
+    live = sum(
+        1 for _call_id, name, result in _tool_results(messages) if name == tool_name and not _is_error_result(result)
+    )
+    return live + _count_recap_ok_entries(_find_recap_content(messages), tool_name)
+
+
+def _next_argument_override(
+    tool_name: str, messages: list[LLMMessage], known: dict[str, str] | None = None
+) -> dict[str, Any] | None:
+    """The next unconsumed `_ARGUMENT_OVERRIDES[tool_name]` entry, or `None` when
+    `tool_name` has no override queue at all, or its queue is already exhausted
+    (every entry already consumed by a prior successful call — the generic
+    synthesizer takes over from there, same as any other unscripted field).
+
+    `importar_documento.cuenta_cobro_id` is a special case: it's an OPTIONAL
+    field (`ImportarDocumentoInput.cuenta_cobro_id: uuid.UUID | None = None`),
+    so `synthesize_tool_arguments` — which only fills REQUIRED fields — never
+    supplies it, even when a real cuenta id is already `known`. Without it,
+    EVERY `importar_documento` call (contract-level tipos included —
+    `_resolver_scope` resolves `contrato_id` FROM `cuenta_cobro_id` when the
+    latter is given) would fail with "necesitás pasar contrato_id, o
+    cuenta_cobro_id" the instant no contrato_id happens to be known either.
+    Threading it here (from the SAME `known` pool every other required-UUID
+    field already uses) mirrors that existing convention instead of inventing
+    a parallel one just for this optional field.
+    """
+    queue = _ARGUMENT_OVERRIDES.get(tool_name)
+    if not queue:
+        return None
+    index = _count_successful_calls(messages, tool_name)
+    if index >= len(queue):
+        return None
+    override = dict(queue[index])
+    if tool_name == "importar_documento" and known and "cuenta_id" in known:
+        override.setdefault("cuenta_cobro_id", known["cuenta_id"])
+    return override
+
+
 def _advance(last_tool: str | None) -> tuple[str | None, str]:
     """Look up the next scripted tool for `last_tool` in `HAPPY_PATH_SEQUENCE`.
 
@@ -550,10 +701,43 @@ def _resolve_next_tool(messages: list[LLMMessage]) -> tuple[str | None, str, dic
 
     if last_tool is None:
         recap_tool, recap_known = _resume_from_recap(messages)
+        # Same repeat-loop check as the live-turn branch below — a turn
+        # boundary (MAX_TOOL_ITERATIONS, a budget timeout, anything else that
+        # ends a turn) can interrupt a repeating scripted tool
+        # (`_ARGUMENT_OVERRIDES`) mid-queue just as easily as a same-turn
+        # failure can. Without this, resuming from the recap would either
+        # restart the queue at index 0 (a duplicate call) or skip straight to
+        # `HAPPY_PATH_SEQUENCE[recap_tool]`, silently dropping every
+        # not-yet-made call in the queue.
+        #
+        # SCOPE (adversarial review follow-up): both this check and the
+        # `known` merge just below fix how THIS deterministic fake decides
+        # its own next scripted call and synthesizes its own arguments — a
+        # real reasoning model resuming a turn reads the recap text itself
+        # and reasons about it directly, it never goes through
+        # `HAPPY_PATH_SEQUENCE`/`_ARGUMENT_OVERRIDES` at all. Reverting either
+        # fix in isolation produces 0 failures anywhere outside this file's
+        # own suite (`fake_adapter.py` / `test_fake_llm_adapter.py`) —
+        # confirmed by the adversarial review. Read these as FakeLLMPort
+        # test-harness fixes (they make the local E2E fixture behave
+        # correctly), not as production reliability fixes.
+        if recap_tool is not None and _next_argument_override(recap_tool, messages, recap_known) is not None:
+            return recap_tool, "call", recap_known
         next_tool, reason = _advance(recap_tool)
         return next_tool, reason, recap_known
 
+    # `_known_ids(messages)` alone only ever sees THIS turn's own LIVE tool
+    # results — on a resumed turn, once a SECOND scripted call happens (e.g.
+    # the 2nd call of importar_documento's repeat loop), an id that was ONLY
+    # ever recap-derived (e.g. cuenta_id from an earlier turn's
+    # definir_requisitos_checklist, never re-produced by anything called live
+    # THIS turn) would otherwise silently vanish. Merge the recap's ids in
+    # UNDER the live ones (live always wins on a key clash — it's fresher)
+    # rather than replacing this turn's own findings.
     known = _known_ids(messages)
+    _, recap_known = _resume_from_recap(messages)
+    if recap_known:
+        known = {**recap_known, **known}
 
     if last_tool not in HAPPY_PATH_SEQUENCE:
         # Unscripted tool (not a key in HAPPY_PATH_SEQUENCE at all) — the
@@ -572,6 +756,16 @@ def _resolve_next_tool(messages: list[LLMMessage]) -> tuple[str | None, str, dic
             break
 
     if not _is_error_result(last_result):
+        # Repeat-with-different-arguments loop (radicacion-sin-friccion 1.9):
+        # `HAPPY_PATH_SEQUENCE[last_tool]` alone can't express "call this same
+        # tool N more times, each with different arguments, THEN advance" — only
+        # `_ARGUMENT_OVERRIDES` (a queue, not a single dict) can. While the
+        # queue still has an unconsumed entry for `last_tool`, stay on it
+        # instead of advancing to `HAPPY_PATH_SEQUENCE[last_tool]`; once
+        # exhausted, `_next_argument_override` returns `None` and normal
+        # single-step advancement resumes exactly as before this slice.
+        if _next_argument_override(last_tool, messages, known) is not None:
+            return last_tool, "call", known
         next_tool, reason = _advance(last_tool)
         return next_tool, reason, known
 
@@ -692,8 +886,9 @@ class FakeLLMPort:
             tool_call = LLMToolCall(id=call_id, name=next_tool, arguments=malformed_args)
             return LLMResponse(content="", model=used_model, tool_calls=[tool_call])
 
+        override = _next_argument_override(next_tool, messages, known)
         try:
-            tool_call = build_tool_call(next_tool, spec.input_model, call_id=call_id, known=known)
+            tool_call = build_tool_call(next_tool, spec.input_model, call_id=call_id, known=known, overrides=override)
         except ValidationError:
             # The synthesizer produced a value the tool's own schema rejects
             # (e.g. a constraint shape `_synthesize_field_value` doesn't know
