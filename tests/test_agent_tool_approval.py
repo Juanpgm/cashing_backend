@@ -8,6 +8,7 @@ without the `db` fixture.
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from typing import Any
@@ -100,6 +101,63 @@ async def test_sweep_never_evicts_a_live_pending_entry_even_past_its_ttl() -> No
     agent_tool_approval.register(session_id, "call-trigger-sweep", usuario_id, "crear_cuenta_cobro", {})
 
     assert agent_tool_approval._store.get(agent_tool_approval._key(session_id, "call-live")) is not None
+
+
+# ---------------------------------------------------------------------------
+# WARNING (phase3-agent-sse-approval-gate adversarial review): resolve() race —
+# the allowed-status check now lives INSIDE resolve(), atomically.
+# ---------------------------------------------------------------------------
+
+
+async def test_concurrent_approve_and_reject_exactly_one_wins() -> None:
+    """Mirrors the reviewer's own probe (`asyncio.gather(approve(X), reject(X))`),
+    run at the SERVICE layer, not just HTTP. Before this fix, the allowed-status
+    check lived in the CALLER (the 4 control endpoints), not in `resolve()` itself
+    — two statements that only happened to be race-free because `resolve()` had no
+    `await` inside it, not because the pair was designed to be atomic together."""
+    usuario_id = uuid.uuid4()
+    session_id = "session-race"
+    agent_tool_approval.register(session_id, "call-race", usuario_id, "crear_cuenta_cobro", {})
+
+    async def _approve() -> tuple[bool, agent_tool_approval.PendingToolCall]:
+        return agent_tool_approval.resolve(
+            session_id, "call-race", usuario_id, "approve", expected=("pending_approval",)
+        )
+
+    async def _reject() -> tuple[bool, agent_tool_approval.PendingToolCall]:
+        return agent_tool_approval.resolve(
+            session_id, "call-race", usuario_id, "reject", expected=("pending_approval",)
+        )
+
+    approve_result, reject_result = await asyncio.gather(_approve(), _reject())
+    outcomes = [approve_result[0], reject_result[0]]
+
+    assert outcomes.count(True) == 1, "exactly one decision must win"
+    assert outcomes.count(False) == 1, "the other must be a no-op"
+
+    final_entry = agent_tool_approval._store[agent_tool_approval._key(session_id, "call-race")]
+    assert final_entry.status in ("approved", "rejected")
+    # The winner's OWN returned entry must match the store's final state — the
+    # no-op side must never have mutated it after the winner already resolved.
+    winner = approve_result if approve_result[0] else reject_result
+    assert winner[1].status == final_entry.status
+
+
+async def test_resolve_without_expected_keeps_unconditional_overwrite_default() -> None:
+    """Callers that don't pass `expected=` (mostly tests exercising the gate/store
+    directly) keep the OLD unconditional-overwrite behavior — this default must not
+    silently change under them."""
+    usuario_id = uuid.uuid4()
+    session_id = "session-no-guard"
+    agent_tool_approval.register(session_id, "call-no-guard", usuario_id, "crear_cuenta_cobro", {})
+
+    changed_first, entry = agent_tool_approval.resolve(session_id, "call-no-guard", usuario_id, "approve")
+    assert changed_first
+    assert entry.status == "approved"
+
+    changed_second, entry = agent_tool_approval.resolve(session_id, "call-no-guard", usuario_id, "cancel")
+    assert changed_second
+    assert entry.status == "cancelled"
 
 
 async def test_sweep_never_evicts_a_terminal_entry_still_within_its_ttl_grace_window() -> None:

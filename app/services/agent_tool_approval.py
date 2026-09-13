@@ -205,15 +205,45 @@ _DECISION_STATUS: dict[Decision, ToolCallStatus] = {
 }
 
 
-def resolve(session_id: str, call_id: str, usuario_id: uuid.UUID, decision: Decision) -> PendingToolCall:
+def resolve(
+    session_id: str,
+    call_id: str,
+    usuario_id: uuid.UUID,
+    decision: Decision,
+    *,
+    expected: tuple[ToolCallStatus, ...] | None = None,
+) -> tuple[bool, PendingToolCall]:
     """Record the user's decision, set the status it implies, and wake up whichever
     `ToolCallGate` coroutine is awaiting this entry's event. Ownership-checked the
-    same way as `get_owned`."""
+    same way as `get_owned`.
+
+    WARNING fix (phase3-agent-sse-approval-gate adversarial review): the
+    allowed-status CHECK used to live in each of the 4 control endpoints (`if
+    entry.status != "pending_approval": ... else: resolve(...)`) — two separate
+    statements that happened to be race-free today only because `resolve()` itself
+    has no `await` inside it (the GIL makes each of the two calls individually
+    atomic), not because the pair of them was designed to be atomic together. A
+    service-layer `asyncio.gather(approve(X), reject(X))` proved this: without a
+    single atomic check-and-set, "last writer wins" (both mutate) instead of
+    exactly one decision winning.
+
+    Pass `expected` — the tuple of statuses this decision is only valid to apply
+    FROM — and this function makes the check-and-set ONE synchronous unit: when
+    `entry.status` is not in `expected`, it returns `(False, entry)` WITHOUT
+    mutating anything, so a caller that only acts on `changed=True` can never
+    observe a state that changed out from under it between checking and acting.
+    `expected=None` (the default) skips the check entirely — unconditional
+    overwrite, the exact behavior this function had before this fix — for callers
+    (mostly tests exercising the gate/store directly) that intentionally don't
+    gate on a prior status.
+    """
     entry = get_owned(session_id, call_id, usuario_id)
+    if expected is not None and entry.status not in expected:
+        return False, entry
     entry.decision = decision
     entry.status = _DECISION_STATUS[decision]
     entry.event.set()
-    return entry
+    return True, entry
 
 
 def discard(session_id: str, call_id: str) -> None:

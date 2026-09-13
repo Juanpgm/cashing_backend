@@ -397,7 +397,8 @@ async def test_cross_user_cannot_resolve_another_users_pending_call(db: AsyncSes
     # User B's failed attempt must not corrupt the entry — the real owner can still
     # resolve it normally afterward.
     assert entry.status == "pending_approval"
-    resolved = agent_tool_approval.resolve("session-a", "call-a", user_a.id, "approve")
+    changed, resolved = agent_tool_approval.resolve("session-a", "call-a", user_a.id, "approve")
+    assert changed
     assert resolved.status == "approved"
 
 
@@ -521,11 +522,13 @@ async def test_cancel_after_already_resolved_is_noop_not_a_crash(db: AsyncSessio
     # Cancelling something already past the pending/awaiting-retry window does not
     # raise and does not silently pretend to cancel it — callers (the API layer)
     # decide the exact no-op response; here we assert the store itself never
-    # corrupts an already-resolved decision.
-    second = agent_tool_approval.resolve("session-x", "call-x", user.id, "cancel")
-    assert second.status == "cancelled"  # store itself is a plain overwrite;
-    # the API layer (tested in test_agent_chat_stream_api.py) is what actually
-    # enforces "already resolved -> no_op" for a human clicking twice.
+    # corrupts an already-resolved decision. No `expected=` passed here — that is
+    # the API layer's job (tested in test_agent_chat_stream_api.py AND in
+    # test_agent_tool_approval.py's race test) — so `resolve()` keeps its
+    # unconditional-overwrite default for this direct, store-level check.
+    changed, second = agent_tool_approval.resolve("session-x", "call-x", user.id, "cancel")
+    assert changed
+    assert second.status == "cancelled"
 
 
 # ---------------------------------------------------------------------------

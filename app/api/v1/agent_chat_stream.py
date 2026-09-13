@@ -134,11 +134,12 @@ async def approve_tool_call(session_id: str, call_id: str, user: CurrentUser) ->
     or a `call_id` that belongs to a DIFFERENT user's session — approving/rejecting/
     cancelling/retrying another user's pending tool call is never possible.
     """
-    entry = agent_tool_approval.get_owned(session_id, call_id, user.id)
-    if entry.status != "pending_approval":
+    changed, entry = agent_tool_approval.resolve(
+        session_id, call_id, user.id, "approve", expected=("pending_approval",)
+    )
+    if not changed:
         message = f"Esta acción ya no está pendiente de aprobación (estado: {entry.status})."
         return _control_response(entry, "no_op", message)
-    agent_tool_approval.resolve(session_id, call_id, user.id, "approve")
     return _control_response(entry, "approved", "Aprobado.")
 
 
@@ -146,11 +147,10 @@ async def approve_tool_call(session_id: str, call_id: str, user: CurrentUser) ->
 async def reject_tool_call(session_id: str, call_id: str, user: CurrentUser) -> ToolCallControlResponse:
     """Reject a pending WRITE tool call — it will NOT execute. See `approve_tool_call`
     for the ownership/404 contract, identical here."""
-    entry = agent_tool_approval.get_owned(session_id, call_id, user.id)
-    if entry.status != "pending_approval":
+    changed, entry = agent_tool_approval.resolve(session_id, call_id, user.id, "reject", expected=("pending_approval",))
+    if not changed:
         message = f"Esta acción ya no está pendiente de aprobación (estado: {entry.status})."
         return _control_response(entry, "no_op", message)
-    agent_tool_approval.resolve(session_id, call_id, user.id, "reject")
     return _control_response(entry, "rejected", "Rechazado.")
 
 
@@ -161,11 +161,12 @@ async def cancel_tool_call(session_id: str, call_id: str, user: CurrentUser) -> 
     this codebase does not preemptively interrupt an in-flight handler coroutine) or
     already in a terminal state (`success`/`error`/`rejected`/`cancelled`/`expired`)
     returns a clear no-op instead of an error or a double-execution."""
-    entry = agent_tool_approval.get_owned(session_id, call_id, user.id)
-    if entry.status not in ("pending_approval", "awaiting_retry_decision"):
+    changed, entry = agent_tool_approval.resolve(
+        session_id, call_id, user.id, "cancel", expected=("pending_approval", "awaiting_retry_decision")
+    )
+    if not changed:
         message = f"Esta acción ya no se puede cancelar (estado: {entry.status})."
         return _control_response(entry, "no_op", message)
-    agent_tool_approval.resolve(session_id, call_id, user.id, "cancel")
     return _control_response(entry, "cancelled", "Cancelado.")
 
 
@@ -175,9 +176,10 @@ async def retry_tool_call(session_id: str, call_id: str, user: CurrentUser) -> T
     decision. Any other status (still awaiting approval, already succeeded, already
     terminal) returns a clear no-op — retry is only meaningful after a genuine
     failure, never a way to re-run a call that hasn't failed."""
-    entry = agent_tool_approval.get_owned(session_id, call_id, user.id)
-    if entry.status != "awaiting_retry_decision":
+    changed, entry = agent_tool_approval.resolve(
+        session_id, call_id, user.id, "retry", expected=("awaiting_retry_decision",)
+    )
+    if not changed:
         message = f"Esta acción no está esperando una decisión de reintento (estado: {entry.status})."
         return _control_response(entry, "no_op", message)
-    agent_tool_approval.resolve(session_id, call_id, user.id, "retry")
     return _control_response(entry, "retry_requested", "Reintento solicitado.")
