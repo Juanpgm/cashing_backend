@@ -173,6 +173,11 @@ async def test_refresh_secop_endpoint_returns_200_and_rolls_back_on_pass_level_e
     from sqlalchemy import select
 
     cuenta = await _make_cuenta(db, contrato)
+    # Gate already resolved (radicacion-sin-friccion slice 1.3): `/refresh-secop`
+    # now short-circuits on `requisitos_modo is None` like `GET /checklist` does,
+    # so this rollback scenario needs a cuenta whose checklist mode was chosen.
+    cuenta.requisitos_modo = "estandar"
+    await db.flush()
     await checklist_service.asegurar_checklist(db, cuenta)
     await db.commit()
     fila = await checklist_service._get_fila(db, cuenta.id, "CONTRATO")

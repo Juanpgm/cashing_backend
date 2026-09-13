@@ -47,6 +47,14 @@ class CuentaCobro(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
     # How the document checklist is built for this cuenta. NULL = not defined yet
     # (the post-creation gate must be resolved first). Once chosen: 'estandar',
     # 'augment' (standard + inferred) or 'reemplazar' (inferred + EVIDENCIAS only).
+    #
+    # Tri-state contract (radicacion-sin-friccion slice 1.3): NULL is a MEANING,
+    # not a missing value — the frontend gate (`DefinirChecklistGate`) and
+    # `stepper_state_service` key off `requisitos_modo is None` to decide whether
+    # the user has resolved the post-creation choice yet, so it must NEVER be
+    # materialised to 'estandar' at creation time nor backfilled by a migration.
+    # Readers that instead decide checklist CONTENT (which rows to build) treat
+    # NULL as an effective 'estandar' via `checklist_service.modo_efectivo()`.
     requisitos_modo: Mapped[str | None] = mapped_column(String(20), nullable=True)
 
     # Cuota position model (billing-resilience-templates, slice #3, migration 025).
