@@ -125,8 +125,21 @@ def _control_response(entry: agent_tool_approval.PendingToolCall, action: str, m
     )
 
 
+# WARNING fix (phase3-agent-sse-approval-gate adversarial review): the 4 control
+# endpoints below had NO `@limiter.limit(...)` — unlike `/chat/stream` itself
+# (`5/minute`) — a call-id brute-force surface. `10/minute` matches this
+# codebase's existing "moderate action" tier already used for document uploads
+# (`documentos.py`) and auth actions (`auth.py`): generous enough that a single
+# busy radicación turn's several approve/cancel/retry clicks are never
+# throttled, while still bounding an unauthenticated-call_id-guessing loop.
+_CONTROL_ENDPOINT_RATE_LIMIT = "10/minute"
+
+
 @router.post("/chat/stream/{session_id}/tool-calls/{call_id}/approve", response_model=ToolCallControlResponse)
-async def approve_tool_call(session_id: str, call_id: str, user: CurrentUser) -> ToolCallControlResponse:
+@limiter.limit(_CONTROL_ENDPOINT_RATE_LIMIT)
+async def approve_tool_call(
+    request: Request, session_id: str, call_id: str, user: CurrentUser
+) -> ToolCallControlResponse:
     """Approve a pending WRITE tool call so the stream can execute it.
 
     404s (`PendingToolCallNotFoundError`, never a leak — see that exception's
@@ -144,7 +157,10 @@ async def approve_tool_call(session_id: str, call_id: str, user: CurrentUser) ->
 
 
 @router.post("/chat/stream/{session_id}/tool-calls/{call_id}/reject", response_model=ToolCallControlResponse)
-async def reject_tool_call(session_id: str, call_id: str, user: CurrentUser) -> ToolCallControlResponse:
+@limiter.limit(_CONTROL_ENDPOINT_RATE_LIMIT)
+async def reject_tool_call(
+    request: Request, session_id: str, call_id: str, user: CurrentUser
+) -> ToolCallControlResponse:
     """Reject a pending WRITE tool call — it will NOT execute. See `approve_tool_call`
     for the ownership/404 contract, identical here."""
     changed, entry = agent_tool_approval.resolve(session_id, call_id, user.id, "reject", expected=("pending_approval",))
@@ -155,7 +171,10 @@ async def reject_tool_call(session_id: str, call_id: str, user: CurrentUser) -> 
 
 
 @router.post("/chat/stream/{session_id}/tool-calls/{call_id}/cancel", response_model=ToolCallControlResponse)
-async def cancel_tool_call(session_id: str, call_id: str, user: CurrentUser) -> ToolCallControlResponse:
+@limiter.limit(_CONTROL_ENDPOINT_RATE_LIMIT)
+async def cancel_tool_call(
+    request: Request, session_id: str, call_id: str, user: CurrentUser
+) -> ToolCallControlResponse:
     """Cancel a pending WRITE tool call (before execution) or give up on retrying one
     that already failed. A call that is already `running` (best-effort marker only —
     this codebase does not preemptively interrupt an in-flight handler coroutine) or
@@ -171,15 +190,33 @@ async def cancel_tool_call(session_id: str, call_id: str, user: CurrentUser) -> 
 
 
 @router.post("/chat/stream/{session_id}/tool-calls/{call_id}/retry", response_model=ToolCallControlResponse)
-async def retry_tool_call(session_id: str, call_id: str, user: CurrentUser) -> ToolCallControlResponse:
+@limiter.limit(_CONTROL_ENDPOINT_RATE_LIMIT)
+async def retry_tool_call(
+    request: Request, session_id: str, call_id: str, user: CurrentUser
+) -> ToolCallControlResponse:
     """Retry a WRITE tool call that just failed and is awaiting a retry-or-cancel
     decision. Any other status (still awaiting approval, already succeeded, already
     terminal) returns a clear no-op — retry is only meaningful after a genuine
-    failure, never a way to re-run a call that hasn't failed."""
+    failure, never a way to re-run a call that hasn't failed.
+
+    Also enforces `agent_tool_approval.MAX_RETRY_ATTEMPTS` (WARNING fix,
+    phase3-agent-sse-approval-gate adversarial review): once exhausted, `resolve()`
+    itself refuses the "retry" decision (folded into its own atomic check — see its
+    docstring), and this endpoint renders a clear give-up message instead of the
+    generic "not awaiting a retry decision" one — the entry IS still genuinely
+    awaiting a decision, just not this one; the user's only remaining option is to
+    cancel.
+    """
     changed, entry = agent_tool_approval.resolve(
         session_id, call_id, user.id, "retry", expected=("awaiting_retry_decision",)
     )
     if not changed:
-        message = f"Esta acción no está esperando una decisión de reintento (estado: {entry.status})."
+        if entry.status == "awaiting_retry_decision" and agent_tool_approval.retry_attempts_exhausted(entry):
+            message = (
+                f"Ya se reintentó {agent_tool_approval.MAX_RETRY_ATTEMPTS} veces sin éxito. "
+                "No se permiten más reintentos para esta acción — cancelala."
+            )
+        else:
+            message = f"Esta acción no está esperando una decisión de reintento (estado: {entry.status})."
         return _control_response(entry, "no_op", message)
     return _control_response(entry, "retry_requested", "Reintento solicitado.")

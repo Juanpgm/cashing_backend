@@ -58,6 +58,18 @@ ToolCallStatus = Literal[
 
 Decision = Literal["approve", "reject", "cancel", "retry"]
 
+# WARNING fix (phase3-agent-sse-approval-gate adversarial review): without a cap,
+# each "retry" decision resets the TTL to `AGENT_TOOL_APPROVAL_TTL_SECONDS` (120s
+# by default), letting a user pin the background chat turn task — and the DB
+# session it now owns (see `agent_chat_service.stream_chat_with_tools`'s BLOCKER 1
+# fix) — open indefinitely by retrying forever. 3 retries (4 total execution
+# attempts, since `PendingToolCall.attempt` starts at 1 for the initial attempt)
+# mirrors the "retry once then give up" spirit of the fake-LLM-adapter path this
+# codebase already uses for its automated retry logic, but gives a REAL user
+# clicking through a real UI more than one chance — enough to recover from a
+# flaky external dependency (SECOP, Google APIs) without an unbounded loop.
+MAX_RETRY_ATTEMPTS = 3
+
 
 @dataclass
 class PendingToolCall:
@@ -89,6 +101,15 @@ _TERMINAL_STATUSES: frozenset[ToolCallStatus] = frozenset({"success", "error", "
 
 def _key(session_id: str, call_id: str) -> str:
     return f"{session_id}:{call_id}"
+
+
+def retry_attempts_exhausted(entry: PendingToolCall) -> bool:
+    """True once `entry` has already used up its `MAX_RETRY_ATTEMPTS` retries.
+
+    `entry.attempt` counts the INITIAL execution as 1, so "3 retries used" means
+    `attempt == 4` — one past `MAX_RETRY_ATTEMPTS`.
+    """
+    return entry.attempt > MAX_RETRY_ATTEMPTS
 
 
 def _sweep_expired_terminal_entries() -> None:
@@ -236,9 +257,17 @@ def resolve(
     overwrite, the exact behavior this function had before this fix — for callers
     (mostly tests exercising the gate/store directly) that intentionally don't
     gate on a prior status.
+
+    A `"retry"` decision is ADDITIONALLY rejected (same `(False, entry)`, no
+    mutation) once `retry_attempts_exhausted(entry)` — see `MAX_RETRY_ATTEMPTS` —
+    folded into this same atomic check rather than a separate caller-side
+    pre-read, for the identical reason `expected` lives here and not in the
+    caller.
     """
     entry = get_owned(session_id, call_id, usuario_id)
     if expected is not None and entry.status not in expected:
+        return False, entry
+    if decision == "retry" and retry_attempts_exhausted(entry):
         return False, entry
     entry.decision = decision
     entry.status = _DECISION_STATUS[decision]

@@ -12,9 +12,11 @@ alone is enough to make status transitions deterministic without one).
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+import app.api.v1.agent_chat_stream as agent_chat_stream_module
 import pytest
 from app.core.security import create_access_token, hash_password
 from app.models.usuario import Usuario
@@ -184,3 +186,52 @@ async def test_retry_only_valid_while_awaiting_retry_decision(client: AsyncClien
     ok = await client.post("/api/v1/agent/chat/stream/session-v/tool-calls/call-v/retry", headers=test_user["headers"])
     assert ok.status_code == 200
     assert ok.json()["action"] == "retry_requested"
+
+
+# ---------------------------------------------------------------------------
+# WARNING (phase3-agent-sse-approval-gate adversarial review): no rate limit on
+# the 4 control endpoints; no cap on retry attempts.
+# ---------------------------------------------------------------------------
+
+
+async def test_control_endpoints_have_rate_limit_decorators() -> None:
+    """Confirm `@limiter.limit(...)` guards all 4 approve/reject/cancel/retry
+    endpoints, matching `/chat/stream`'s own rate-limiting convention and this
+    codebase's existing `10/minute` "moderate action" tier (documentos.py uploads,
+    auth.py) — mirrors `test_agent_chat_api.
+    test_chat_endpoint_has_rate_limit_decorator`'s source-text check."""
+    assert agent_chat_stream_module._CONTROL_ENDPOINT_RATE_LIMIT == "10/minute"
+    source = Path(agent_chat_stream_module.__file__).read_text(encoding="utf-8")
+    assert source.count("@limiter.limit(_CONTROL_ENDPOINT_RATE_LIMIT)") == 4
+
+
+async def test_retry_is_rejected_after_max_attempts_reached(client: AsyncClient, test_user: dict[str, Any]) -> None:
+    entry = agent_tool_approval.register("session-cap", "call-cap", test_user["user"].id, "crear_cuenta_cobro", {})
+    agent_tool_approval.reopen_for_retry_decision("session-cap", "call-cap")
+    entry.attempt = agent_tool_approval.MAX_RETRY_ATTEMPTS + 1  # 3 retries already used
+
+    response = await client.post(
+        "/api/v1/agent/chat/stream/session-cap/tool-calls/call-cap/retry", headers=test_user["headers"]
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["action"] == "no_op"
+    assert "reintento" in body["message"].lower()
+    # Must NOT have been advanced toward re-execution.
+    assert entry.status == "awaiting_retry_decision"
+
+
+async def test_retry_still_works_at_the_last_allowed_attempt(client: AsyncClient, test_user: dict[str, Any]) -> None:
+    entry = agent_tool_approval.register(
+        "session-under-cap", "call-under-cap", test_user["user"].id, "crear_cuenta_cobro", {}
+    )
+    agent_tool_approval.reopen_for_retry_decision("session-under-cap", "call-under-cap")
+    entry.attempt = agent_tool_approval.MAX_RETRY_ATTEMPTS  # the LAST retry still allowed
+
+    response = await client.post(
+        "/api/v1/agent/chat/stream/session-under-cap/tool-calls/call-under-cap/retry", headers=test_user["headers"]
+    )
+
+    assert response.status_code == 200
+    assert response.json()["action"] == "retry_requested"
