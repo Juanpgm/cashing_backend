@@ -36,6 +36,7 @@ from app.schemas.agent import LLMResponse, LLMToolCall
 from app.services import agent_chat_service, agent_tool_approval
 from app.tools.context import ToolContext
 from app.tools.invoke import invoke_tool
+from app.tools.registry import TOOL_REGISTRY
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -142,6 +143,105 @@ async def test_read_tool_streams_without_pause(db: AsyncSession, monkeypatch: py
     final_event = events[-1]
     assert final_event["type"] == "final"
     assert final_event["content"] == "Tenés 1 contrato activo."
+
+
+# ---------------------------------------------------------------------------
+# CRITICAL (phase3-agent-sse-approval-gate adversarial review): two tools that
+# actually mutate + commit were tagged ("read",) — they used to stream straight
+# through the approval gate with no pause, because the gate derives from the
+# pre-existing "write" tag. Retagged ("read", "write"); these tests prove the
+# pause now happens BEFORE the underlying side effect runs, not just that the
+# tag string changed.
+# ---------------------------------------------------------------------------
+
+
+async def test_buscar_secop_por_cedula_now_pauses_for_approval_before_querying_socrata(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import AsyncMock
+
+    user, _contrato = await _make_user_with_contrato(db, "0012")
+
+    socrata_mock = AsyncMock(return_value=[])
+    monkeypatch.setattr("app.services.secop_service._query_socrata", socrata_mock)
+
+    tool_call = LLMToolCall(id="call_1", name="buscar_secop_por_cedula", arguments={"cedula": "12345678"})
+    scripted = ScriptedLLM(
+        [
+            LLMResponse(content="", model="fake", tool_calls=[tool_call], total_tokens=5),
+            LLMResponse(content="Entendido, no consulté SECOP.", model="fake", total_tokens=8),
+        ]
+    )
+    _patch_llm(monkeypatch, scripted)
+
+    events: list[dict[str, Any]] = []
+    session_id: str | None = None
+    async for event in agent_chat_service.stream_chat_with_tools(db, user, "Buscá mis contratos en SECOP", None, {}):
+        events.append(event)
+        if event["type"] == "connected":
+            session_id = event["session_id"]
+        if event["type"] == "tool_call_awaiting_approval":
+            assert session_id is not None
+            agent_tool_approval.resolve(session_id, event["call_id"], user.id, "reject")
+
+    types = [e["type"] for e in events]
+    assert "tool_call_awaiting_approval" in types, "buscar_secop_por_cedula must pause for approval like a write tool"
+    assert "tool_call_rejected" in types
+
+    # The gate must have blocked the call BEFORE it reached the network/DB
+    # mutation — rejecting must mean `_query_socrata` (and therefore
+    # `_upsert_contrato` + `db.commit()`) never ran at all.
+    socrata_mock.assert_not_called()
+
+
+async def test_descubrir_evidencias_now_pauses_for_approval_before_writing_texto_extraido(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.services import evidence_discovery_service
+
+    user, _contrato = await _make_user_with_contrato(db, "0013")
+
+    async def _fail_if_called(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("descubrir_evidencias service must not run before approval")
+
+    monkeypatch.setattr(evidence_discovery_service, "descubrir_evidencias", _fail_if_called)
+
+    tool_call = LLMToolCall(id="call_1", name="descubrir_evidencias", arguments={})
+    scripted = ScriptedLLM(
+        [
+            LLMResponse(content="", model="fake", tool_calls=[tool_call], total_tokens=5),
+            LLMResponse(content="Entendido, no busqué evidencias.", model="fake", total_tokens=8),
+        ]
+    )
+    _patch_llm(monkeypatch, scripted)
+
+    events: list[dict[str, Any]] = []
+    session_id: str | None = None
+    async for event in agent_chat_service.stream_chat_with_tools(db, user, "Buscá evidencias", None, {}):
+        events.append(event)
+        if event["type"] == "connected":
+            session_id = event["session_id"]
+        if event["type"] == "tool_call_awaiting_approval":
+            assert session_id is not None
+            agent_tool_approval.resolve(session_id, event["call_id"], user.id, "reject")
+
+    types = [e["type"] for e in events]
+    assert "tool_call_awaiting_approval" in types, "descubrir_evidencias must pause for approval like a write tool"
+    assert "tool_call_rejected" in types
+    # `_fail_if_called` would have raised (surfacing as an "error" tool_call_result,
+    # not "rejected") had the gate let the call through before rejection.
+    result_event = next(e for e in events if e["type"] == "tool_call_result")
+    assert result_event["status"] == "error"
+    assert "rechazó" in result_event["resumen"]
+
+
+async def test_every_mutating_tool_is_tagged_write() -> None:
+    """Direct registry check for the two retagged tools, plus the exact
+    post-retag write-tool count the adversarial review report must cite."""
+    write_tools = {name for name, spec in TOOL_REGISTRY.items() if "write" in spec.tags}
+    assert "buscar_secop_por_cedula" in write_tools
+    assert "descubrir_evidencias" in write_tools
+    assert len(write_tools) == 25  # 23 pre-existing + 2 retagged
 
 
 # ---------------------------------------------------------------------------

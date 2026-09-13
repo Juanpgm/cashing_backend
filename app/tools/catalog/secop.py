@@ -40,15 +40,23 @@ class BuscarSecopPorCedulaOutput(BaseModel):
     name="buscar_secop_por_cedula",
     description=(
         "Search SECOP II (Colombia's public procurement portal) for prestación de servicios "
-        "contracts belonging to a given contractor cédula. Read-only: this only queries and "
-        "caches SECOP data locally, it never creates or modifies Contrato rows. "
+        "contracts belonging to a given contractor cédula. Never creates or modifies the "
+        "user's own Contrato rows, but DOES upsert and commit local SecopContrato cache rows "
+        "when the cache is stale — tagged as a write tool for that reason (it pauses for "
+        "approval in the streaming agent chat, same as any other mutating tool). "
         "Args: cedula (contractor's national ID, 5-15 digits); "
         "refresh (bool, default False — set True to force re-fetching from SECOP instead of "
         "using the local cache when it is still considered fresh)."
     ),
     input_model=BuscarSecopPorCedulaInput,
     output_model=BuscarSecopPorCedulaOutput,
-    tags=("read",),
+    # CRITICAL (phase3-agent-sse-approval-gate adversarial review): this used to be
+    # ("read",) — the streaming approval gate (app.services.agent_chat_service.
+    # _run_chat_turn) derives whether to pause for approval purely from `"write" in
+    # spec.tags`, so an untagged mutation streamed straight through with no pause.
+    # `buscar_contratos_cedula` (app.services.secop_service) upserts SecopContrato
+    # cache rows and commits when the cache is stale — a real DB mutation.
+    tags=("read", "write"),
 )
 async def buscar_secop_por_cedula(ctx: ToolContext, params: BuscarSecopPorCedulaInput) -> BuscarSecopPorCedulaOutput:
     contratos = await secop_service.buscar_contratos_cedula(ctx.db, params.cedula, refresh=params.refresh)

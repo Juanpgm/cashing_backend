@@ -53,8 +53,11 @@ from app.tools.registry import tool
     description=(
         "Explore Gmail, Drive, and Calendar for evidence supporting a set of contractual "
         "obligaciones (either sent directly or loaded from a contrato_id) and generate a "
-        "justificación per obligación with supporting links. Read-only against the DB — this "
-        "does not create Actividad/Evidencia rows, it only proposes them. The response's "
+        "justificación per obligación with supporting links. This does not create "
+        "Actividad/Evidencia rows, it only proposes them — but it DOES write and commit "
+        "extracted text (Evidencia.texto_extraido) for existing evidence rows while "
+        "backfilling, so it is tagged as a write tool (it pauses for approval in the "
+        "streaming agent chat, same as any other mutating tool). The response's "
         "handle_id lets you call persistir_evidencias(cuenta_id, handle_id) to write them "
         "WITHOUT re-sending the obligaciones/evidencias — never copy that payload into your "
         "persistir_evidencias call, just pass the handle_id back. Requires the user's Google "
@@ -63,7 +66,13 @@ from app.tools.registry import tool
     ),
     input_model=EvidenceDiscoveryRequest,
     output_model=EvidenceDiscoveryResponse,
-    tags=("read",),
+    # CRITICAL (phase3-agent-sse-approval-gate adversarial review): this used to be
+    # ("read",) — the streaming approval gate (app.services.agent_chat_service.
+    # _run_chat_turn) derives whether to pause for approval purely from `"write" in
+    # spec.tags`, so an untagged mutation streamed straight through with no pause.
+    # `evidence_discovery_service.descubrir_evidencias` backfills and commits
+    # `Evidencia.texto_extraido` for legacy rows — a real DB mutation.
+    tags=("read", "write"),
     consumes_credits=settings.CREDITS_PER_EVIDENCE_COLLECTION,
 )
 async def descubrir_evidencias(ctx: ToolContext, params: EvidenceDiscoveryRequest) -> EvidenceDiscoveryResponse:
