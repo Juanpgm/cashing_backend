@@ -20,6 +20,8 @@ from app.schemas.cuenta_cobro import CuentaCobroCreate, CuentaCobroUpdate
 from app.services import checklist_service, cuenta_cobro_service
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from tests.factories import ContratoFactory, UsuarioFactory
+
 
 def test_posicion_enum_column_labels_match_lowercase_values() -> None:
     """Regression for the Postgres enum-label mismatch (slice #3 verify C1):
@@ -120,8 +122,8 @@ def test_cuota_position_conflict_code_maps_to_http_422() -> None:
 
 
 async def test_crear_cuenta_cobro_duplicate_informe_final_raises_conflict(db: AsyncSession) -> None:
-    user = await _make_user(db)
-    contrato = await _make_contrato(db, user.id)
+    user = await UsuarioFactory.create_async(db)
+    contrato = await ContratoFactory.create_async(db, usuario=user)
     await db.commit()
 
     data1 = CuentaCobroCreate(

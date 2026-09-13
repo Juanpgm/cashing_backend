@@ -7,16 +7,16 @@ from datetime import date
 from typing import Any
 
 import pytest
-from app.core.security import hash_password
 from app.models.actividad import Actividad
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
 from app.models.evidencia import Evidencia
-from app.models.usuario import Usuario
 from app.schemas.actividad import ActividadCreate, ActividadResponse, ActividadUpdate
 from app.services import actividad_service
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from tests.factories import CuentaCobroFactory
 
 pytestmark = pytest.mark.asyncio
 
@@ -228,44 +228,7 @@ async def evidencia_enlace(db: AsyncSession, actividad: Actividad) -> Evidencia:
 async def otro_usuario_cuenta_cobro(db: AsyncSession) -> CuentaCobro:
     """A cuenta de cobro belonging to a DIFFERENT user (not `test_user`) — for
     cross-tenant ownership checks on the actividades endpoints."""
-    otro_user = Usuario(
-        email="otro-usuario-act@example.com",
-        nombre="Otro Usuario",
-        cedula="192837465",
-        telefono="+573001112233",
-        password_hash=hash_password("OtherPass123!"),
-        rol="contratista",
-        activo=True,
-        creditos_disponibles=100,
-    )
-    db.add(otro_user)
-    await db.commit()
-    await db.refresh(otro_user)
-
-    otro_contrato = Contrato(
-        usuario_id=otro_user.id,
-        numero_contrato="CTR-ACT-AJENO-001",
-        objeto="Servicios de consultoría ajenos",
-        valor_total=12_000_000,
-        valor_mensual=1_000_000,
-        fecha_inicio=date(2024, 1, 1),
-        fecha_fin=date(2024, 12, 31),
-        entidad="MinTIC",
-        dependencia="Sistemas",
-        supervisor_nombre="Otro Supervisor",
-    )
-    db.add(otro_contrato)
-    await db.commit()
-    await db.refresh(otro_contrato)
-
-    otro_cc = CuentaCobro(
-        contrato_id=otro_contrato.id,
-        mes=4,
-        anio=2024,
-        estado=EstadoCuentaCobro.BORRADOR,
-        valor=1_000_000,
-    )
-    db.add(otro_cc)
+    otro_cc = await CuentaCobroFactory.create_async(db, mes=4, anio=2024)
     await db.commit()
     await db.refresh(otro_cc)
     return otro_cc
