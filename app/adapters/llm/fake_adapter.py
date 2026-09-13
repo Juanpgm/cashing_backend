@@ -12,17 +12,24 @@ where the whole app boots for real.
 
 Determinism, precisely stated (do not assume more than this): the SEQUENCE of
 tool NAMES produced across a chat turn is deterministic — it is a pure
-function of `HAPPY_PATH_SEQUENCE` and the last tool name seen in `messages`
-(see `_last_tool_called`). The synthesized argument VALUES inside each tool
-call are NOT deterministic — `synthesize_tool_arguments` calls `uuid.uuid4()`
-for UUID fields and `datetime.date.today()` for date fields, so two runs of
-the identical scripted sequence produce different argument payloads (and,
-against a real DB, different domain outcomes per call — see
+function of `HAPPY_PATH_SEQUENCE`, the last tool called in `messages`, and
+(since slice 0.6) whether that last call's paired result SUCCEEDED or FAILED
+(see `_resolve_next_tool` — a failure retries the same tool once, then gives
+up, instead of blindly advancing). The synthesized argument VALUES inside each
+tool call are mostly NOT deterministic — `synthesize_tool_arguments` calls
+`uuid.uuid4()` for any UUID field NOT already present in `known` (see
+`_known_ids`, slice 0.6 — real ids threaded from earlier tool results in the
+SAME `messages` history ARE deterministic and reused) and
+`datetime.date.today()` for date fields, so two runs of the identical scripted
+sequence still produce different non-id argument payloads (and, against a real
+DB, different domain outcomes for those fields — see
 `tests/test_fake_llm_adapter.py::test_fake_llm_completes_the_full_tool_sequence_even_when_synthesized_ids_dont_resolve`).
 
-Design: `complete()` is a PURE function of the `messages` history it receives —
-no mutable instance state — so two concurrent chat sessions sharing (or each
-holding their own) `FakeLLMPort` never leak script position into each other.
+Design: `complete()` is a PURE function of `messages` PLUS the process-wide
+`settings.FAKE_LLM_SCRIPT` knob (slice 0.6 — see that method's own docstring
+for why this one exception is safe) — no INSTANCE/mutable module state, so two
+concurrent chat sessions sharing (or each holding their own) `FakeLLMPort`
+never leak script position OR known ids into each other.
 """
 
 from __future__ import annotations
