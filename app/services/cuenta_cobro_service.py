@@ -228,11 +228,28 @@ async def _get_cuenta_con_ownership(
 
 
 async def _reload_cuenta_response(db: AsyncSession, cuenta_id: uuid.UUID) -> CuentaCobroResponse:
-    """Re-query a CuentaCobro fresh from the DB with all eager-loaded relationships for serialization."""
+    """Re-query a CuentaCobro fresh from the DB with all eager-loaded relationships for serialization.
+
+    `populate_existing=True` is load-bearing, not cosmetic: SQLAlchemy's identity map
+    returns an already-loaded, non-expired object AS-IS for a plain `select()` — it does
+    NOT refresh its attributes from the new row. Every caller of this helper (radicar's
+    post-lock short-circuit, `cambiar_estado`'s CAS-loser fallback, etc.) may be reloading
+    a `CuentaCobro` that was loaded EARLIER in this same session (e.g. `radicar_cuenta`'s
+    top-of-function `_get_cuenta_con_ownership` read) and never explicitly expired before
+    this call. Without `populate_existing`, this function silently returns that stale
+    cached instance instead of the row's true current state — observed concretely under
+    Postgres: a concurrent request's committed ENVIADA transition (a DIFFERENT session,
+    so `db.expire()` in that other session's code path never touches THIS session's
+    identity map) was reported back as BORRADOR to the caller that only just observed
+    ENVIADA via `_leer_estado_bajo_lock`. `populate_existing` forces every matching row to
+    overwrite the cached instance's attributes, which is exactly this function's documented
+    contract ("fresh from the DB").
+    """
     result = await db.execute(
         select(CuentaCobro)
         .options(selectinload(CuentaCobro.actividades), selectinload(CuentaCobro.contrato))
         .where(CuentaCobro.id == cuenta_id)
+        .execution_options(populate_existing=True)
     )
     cuenta = result.scalar_one()
     return CuentaCobroResponse.model_validate(cuenta)
@@ -1095,7 +1112,7 @@ async def cambiar_estado(
     return await _reload_cuenta_response(db, cuenta_id)
 
 
-async def _leer_estado_bajo_lock(db: AsyncSession, cuenta_id: uuid.UUID) -> EstadoCuentaCobro:
+async def _leer_estado_bajo_lock(db: AsyncSession, cuenta_id: uuid.UUID, *, nowait: bool = False) -> EstadoCuentaCobro:
     """Minimal `SELECT ... FOR UPDATE` used ONLY to observe the current `estado`
     immediately before the ENVIADA transition (radicacion-sin-friccion slice 1.2,
     W2 fix). Deliberately selects just `estado` — no eager-loaded
@@ -1112,6 +1129,14 @@ async def _leer_estado_bajo_lock(db: AsyncSession, cuenta_id: uuid.UUID) -> Esta
     statement on the same row; SQLite (aiosqlite) silently ignores the clause
     (same idiom already used in `secop_service.py`'s reimport race guard).
 
+    `nowait` (keyword-only, default `False`) is a test-only knob: with `nowait=True`,
+    Postgres raises immediately (`55P03 lock_not_available`) instead of blocking when
+    the row is already locked by another transaction. Production `radicar_cuenta`
+    never passes it — it deliberately waits for the holder to commit/rollback so the
+    request can observe the outcome. Added so `tests/test_radicar_idempotente.py`'s
+    lock-blocking test can probe "is this row currently locked?" deterministically
+    without racing an `asyncio.wait_for` cancellation against an in-flight statement.
+
     Raises `NotFoundError` if the row is gone (hard-deleted or soft-deleted
     concurrently) — `radicar_cuenta` treats that as "nothing to transition"
     rather than silently proceeding on stale data.
@@ -1119,7 +1144,7 @@ async def _leer_estado_bajo_lock(db: AsyncSession, cuenta_id: uuid.UUID) -> Esta
     stmt = (
         select(CuentaCobro.estado)
         .where(CuentaCobro.id == cuenta_id, CuentaCobro.deleted_at.is_(None))
-        .with_for_update()
+        .with_for_update(nowait=nowait)
     )
     result = await db.execute(stmt)
     estado = result.scalar_one_or_none()
