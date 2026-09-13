@@ -345,6 +345,14 @@ class Settings(BaseSettings):
     # keyed by (usuario_id, cuenta_id, ventana). Default ~10 min.
     DISCOVERY_CACHE_TTL_SECONDS: int = 600
 
+    # Evidence-handle cache (radicacion-sin-friccion 1.7): in-process TTL cache
+    # keyed by an opaque handle_id, holding the full `ObligacionJustificada` list
+    # `descubrir_evidencias` produced so `persistir_evidencias` never needs the
+    # LLM to re-emit it. 20 min — long enough for the user/agent to review the
+    # discovery result and confirm persistence in the same chat session, short
+    # enough that a stale handle can't be replayed long after the fact.
+    EVIDENCE_HANDLE_TTL_SECONDS: int = 1200
+
     # Waitlist / invite-code gate: when True, account creation (email + first-time
     # Google sign-in) requires a valid, active, non-exhausted invite code.
     WAITLIST_ENABLED: bool = False
