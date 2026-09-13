@@ -1462,6 +1462,30 @@ async def _run_chat_turn(
             # tool always falls straight through to `_execute_tool_once` below with no
             # pause, gate or not.
             if is_write and approval_gate is not None:
+                # WARNING fix (phase3-agent-sse-approval-gate adversarial review,
+                # follow-up to BLOCKER 1): commit and release the connection BEFORE
+                # parking on `request_approval` below — that call can block for up to
+                # the approval TTL (~120s, see `ToolCallGate._await_decision`) waiting
+                # on a human. Holding `db`'s pooled connection checked out the whole
+                # time is invisible on this suite's SQLite backend but would exhaust a
+                # real Postgres pool (`pool_size=10, max_overflow=5`, see
+                # `database.py`) after ~15 concurrent parked approvals, blocking ALL
+                # other traffic. `expire_on_commit=False` (see `database.py`) keeps
+                # `usuario`/`convo`/every other already-loaded ORM object on this
+                # session usable after the commit with no lazy-load needed — the next
+                # statement (e.g. `_execute_tool_once` below) transparently re-acquires
+                # a connection from the pool, exactly as SQLAlchemy's autobegin design
+                # intends.
+                #
+                # Committed HERE — before the `tool_call_awaiting_approval` sink event
+                # below — and not right before `request_approval`, to preserve an
+                # existing invariant: emitting that event and `request_approval`'s own
+                # `store.register()` must stay back-to-back with no real `await` (i.e.
+                # no actual event-loop suspension) between them, so a client reacting
+                # to the SSE event can never race ahead of the entry existing in
+                # `agent_tool_approval`'s store. `db.commit()` performs real I/O and
+                # WOULD suspend if placed between them.
+                await db.commit()
                 if tool_event_sink is not None:
                     await tool_event_sink(
                         {"type": "tool_call_awaiting_approval", "call_id": call.id, "tool": call.name}

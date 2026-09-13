@@ -710,3 +710,93 @@ async def test_client_disconnect_mid_turn_does_not_lose_the_background_write(
         convo = await fresh_db.get(Conversacion, convo_id)
         assert convo is not None
         assert any(m.get("content") == "Listo, la creé." for m in convo.mensajes_json)
+
+
+async def test_background_session_releases_connection_while_parked_on_approval(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WARNING fix (phase3-agent-sse-approval-gate adversarial review, follow-up to
+    BLOCKER 1): the background turn's OWN session (`bg_db`, opened via
+    `database.async_session_factory()`) must not hold an open transaction — a
+    checked-out pooled connection — for the whole time a write-tool call is parked
+    waiting for human approval. Worst case per call: ~120s approval TTL (see
+    `agent_tool_gate.ToolCallGate._await_decision`) with the connection held the
+    entire wait. Under real Postgres (`pool_size=10, max_overflow=5`, see
+    `database.py`), 15 concurrent parked approvals would exhaust the pool and block
+    ALL other traffic — invisible on this suite's SQLite backend, which has no such
+    limit, so this test targets the session's own `in_transaction()` state directly
+    rather than pool exhaustion.
+
+    Spies on `database.async_session_factory` (already redirected to this suite's
+    test engine by the autouse `_redirect_ad_hoc_db_sessions_to_test_engine`
+    fixture) to capture the exact `bg_db` instance the background task opens, so it
+    can be inspected from here while the task is parked.
+    """
+    from app.core import database
+
+    from tests.conftest import async_session_test
+
+    captured_sessions: list[AsyncSession] = []
+    original_factory = database.async_session_factory
+
+    def _spy_factory() -> AsyncSession:
+        session = original_factory()
+        captured_sessions.append(session)
+        return session
+
+    monkeypatch.setattr(database, "async_session_factory", _spy_factory)
+
+    user, contrato = await _make_user_with_contrato(db, "0150")
+    tool_call = LLMToolCall(
+        id="call_1", name="crear_cuenta_cobro", arguments={"contrato_id": str(contrato.id), "mes": 9, "anio": 2026}
+    )
+    scripted = ScriptedLLM(
+        [
+            LLMResponse(content="", model="fake", tool_calls=[tool_call], total_tokens=5),
+            LLMResponse(content="Listo, la creé.", model="fake", total_tokens=8),
+        ]
+    )
+    _patch_llm(monkeypatch, scripted)
+
+    session_id: str | None = None
+    call_id: str | None = None
+    async for event in agent_chat_service.stream_chat_with_tools(db, user, "Crea mi cuenta de septiembre", None, {}):
+        if event["type"] == "connected":
+            session_id = event["session_id"]
+        if event["type"] == "tool_call_awaiting_approval":
+            call_id = event["call_id"]
+            break  # the write tool is now parked on the gate, waiting for approval
+    assert session_id is not None
+    assert call_id is not None
+    assert len(captured_sessions) == 1, "the background task must open exactly one bg_db session"
+    bg_db = captured_sessions[0]
+
+    # Give the event loop a few turns so the fix's `await db.commit()` (real async
+    # I/O, even against aiosqlite) has a chance to fully finish before we inspect
+    # `bg_db` — otherwise we could observe it mid-commit rather than truly parked.
+    for _ in range(5):
+        await asyncio.sleep(0)
+    await asyncio.sleep(0.05)
+
+    assert bg_db.in_transaction() is False, (
+        "the background session must commit and release its connection BEFORE "
+        "parking on approval_gate.request_approval — holding it open for the "
+        "whole TTL exhausts the Postgres pool under concurrent approvals"
+    )
+
+    # The turn must still complete and persist correctly after approval resolves —
+    # this fix must not regress BLOCKER 1 (background turn survives independently
+    # of the request-scoped session).
+    agent_tool_approval.resolve(session_id, call_id, user.id, "approve")
+    await _drain_background_tasks()
+
+    async with async_session_test() as fresh_db:
+        rows = await fresh_db.execute(select(CuentaCobro).where(CuentaCobro.contrato_id == contrato.id))
+        assert len(rows.scalars().all()) == 1
+
+        convo_id = uuid.UUID(session_id)
+        from app.models.conversacion import Conversacion
+
+        convo = await fresh_db.get(Conversacion, convo_id)
+        assert convo is not None
+        assert any(m.get("content") == "Listo, la creé." for m in convo.mensajes_json)
