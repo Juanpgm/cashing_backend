@@ -121,9 +121,12 @@ async def _tiene_progreso(db: AsyncSession, cuenta_id: uuid.UUID) -> bool:
         "autenticado); modo ('estandar' = default correcto si el usuario NO dio un documento de "
         "requisitos de la entidad; 'augment' = estándar + 'requisitos' custom; 'reemplazar' = "
         "solo 'requisitos' custom); requisitos (custom, solo para 'augment'/'reemplazar'). "
-        "LLAMALA UNA SOLA VEZ por cuenta: si ya tiene documentos vinculados en su checklist, es "
-        "un no-op seguro (devuelve el checklist actual sin tocarlo, para no perder lo ya "
-        "cargado)."
+        "LLAMALA UNA SOLA VEZ por cuenta, inmediatamente después de crearla. NUNCA la vuelvas a "
+        "llamar sobre una cuenta que ya tiene requisitos definidos — reemplaza el set completo y, "
+        "si ya hay documentos vinculados, arrastra en cascada el borrado de esos vínculos. Solo "
+        "cuando YA hay documentos vinculados la herramienta detecta el riesgo y no hace nada "
+        "(devuelve el checklist actual sin tocarlo); si el modo estándar ya quedó definido pero "
+        "todavía NADA está vinculado, un re-llamado SÍ reemplaza ese set en silencio."
     ),
     input_model=DefinirRequisitosChecklistInput,
     output_model=DefinirRequisitosChecklistOutput,
