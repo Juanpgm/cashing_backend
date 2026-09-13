@@ -21,7 +21,9 @@ from app.adapters.llm import get_llm
 from app.adapters.llm.fake_adapter import (
     HAPPY_PATH_SEQUENCE,
     FakeLLMPort,
+    _known_ids,
     _last_tool_called,
+    _tool_results,
     build_tool_call,
     synthesize_tool_arguments,
 )
@@ -172,6 +174,155 @@ def test_last_tool_called_reads_the_most_recent_assistant_tool_call() -> None:
         LLMMessage(role="tool", tool_call_id="1", content="{}"),
     ]
     assert _last_tool_called(messages) == "listar_contratos"
+
+
+# --- _tool_results / _known_ids: real cross-turn ID threading (Phase 0, 0.6) -
+
+
+def _assistant_call(call_id: str, name: str) -> LLMMessage:
+    return LLMMessage(
+        role="assistant",
+        content="",
+        tool_calls=[{"id": call_id, "type": "function", "function": {"name": name, "arguments": "{}"}}],
+    )
+
+
+def test_tool_results_pairs_each_assistant_call_with_its_later_tool_message() -> None:
+    messages = [
+        LLMMessage(role="user", content="hola"),
+        _assistant_call("1", "listar_contratos"),
+        LLMMessage(role="tool", tool_call_id="1", content='{"contratos": []}'),
+        _assistant_call("2", "crear_cuenta_cobro"),
+        LLMMessage(role="tool", tool_call_id="2", content='{"id": "not-checked-here"}'),
+    ]
+    results = _tool_results(messages)
+    assert results == [
+        ("1", "listar_contratos", {"contratos": []}),
+        ("2", "crear_cuenta_cobro", {"id": "not-checked-here"}),
+    ]
+
+
+def test_tool_results_unpaired_assistant_call_is_not_included() -> None:
+    """An assistant `tool_calls` message with no LATER `role=\"tool\"` message
+    carrying a matching `tool_call_id` produces no result entry — the call hasn't
+    resolved yet, so `_known_ids` has nothing to extract from it."""
+    messages = [_assistant_call("1", "listar_contratos")]
+    assert _tool_results(messages) == []
+
+
+def test_known_ids_aliases_listar_contratos_result_into_contrato_id() -> None:
+    real_id = str(uuid.uuid4())
+    messages = [
+        _assistant_call("1", "listar_contratos"),
+        LLMMessage(
+            role="tool",
+            tool_call_id="1",
+            content=json.dumps({"contratos": [{"id": real_id, "numero_contrato": "C-1"}]}),
+        ),
+    ]
+    assert _known_ids(messages) == {"id": real_id, "contrato_id": real_id}
+
+
+def test_known_ids_aliases_crear_cuenta_cobro_result_into_cuenta_id() -> None:
+    cuenta_id = str(uuid.uuid4())
+    contrato_id = str(uuid.uuid4())
+    messages = [
+        _assistant_call("1", "crear_cuenta_cobro"),
+        LLMMessage(
+            role="tool",
+            tool_call_id="1",
+            content=json.dumps({"id": cuenta_id, "contrato_id": contrato_id, "mes": 3}),
+        ),
+    ]
+    known = _known_ids(messages)
+    assert known["cuenta_id"] == cuenta_id
+    assert known["contrato_id"] == contrato_id
+    assert known["id"] == cuenta_id
+
+
+def test_known_ids_two_tools_alias_to_different_keys_without_cross_contamination() -> None:
+    """`listar_contratos` and `crear_cuenta_cobro` BOTH expose a generic top-level
+    `id` key — each must alias into the field name the NEXT tool actually expects
+    (`contrato_id` vs `cuenta_id`), never leak one tool's id under the other's
+    target key."""
+    contrato_id = str(uuid.uuid4())
+    cuenta_id = str(uuid.uuid4())
+    messages = [
+        _assistant_call("1", "listar_contratos"),
+        LLMMessage(role="tool", tool_call_id="1", content=json.dumps({"contratos": [{"id": contrato_id}]})),
+        _assistant_call("2", "crear_cuenta_cobro"),
+        LLMMessage(role="tool", tool_call_id="2", content=json.dumps({"id": cuenta_id, "contrato_id": contrato_id})),
+    ]
+    known = _known_ids(messages)
+    assert known["contrato_id"] == contrato_id
+    assert known["cuenta_id"] == cuenta_id
+    assert known["contrato_id"] != known["cuenta_id"]
+
+
+def test_known_ids_missing_id_key_does_not_crash_and_yields_no_entry() -> None:
+    messages = [
+        _assistant_call("1", "listar_contratos"),
+        LLMMessage(role="tool", tool_call_id="1", content=json.dumps({"contratos": []})),
+    ]
+    assert _known_ids(messages) == {}
+
+
+def test_known_ids_malformed_json_content_yields_empty_dict_no_exception() -> None:
+    messages = [
+        _assistant_call("1", "listar_contratos"),
+        LLMMessage(role="tool", tool_call_id="1", content="not json at all"),
+    ]
+    assert _known_ids(messages) == {}
+
+
+def test_known_ids_definir_requisitos_checklist_aliases_cuenta_cobro_id() -> None:
+    cuenta_id = str(uuid.uuid4())
+    messages = [
+        _assistant_call("1", "definir_requisitos_checklist"),
+        LLMMessage(
+            role="tool",
+            tool_call_id="1",
+            content=json.dumps({"cuenta_cobro_id": cuenta_id, "modo": "estandar", "requisitos_custom": 0}),
+        ),
+    ]
+    assert _known_ids(messages)["cuenta_id"] == cuenta_id
+
+
+def test_known_ids_resumen_checklist_aliases_cuenta_cobro_id() -> None:
+    cuenta_id = str(uuid.uuid4())
+    messages = [
+        _assistant_call("1", "resumen_checklist"),
+        LLMMessage(role="tool", tool_call_id="1", content=json.dumps({"cuenta_cobro_id": cuenta_id})),
+    ]
+    assert _known_ids(messages)["cuenta_id"] == cuenta_id
+
+
+def test_synthesize_tool_arguments_uses_known_id_for_matching_uuid_field() -> None:
+    from app.tools.catalog.cuentas import CrearCuentaCobroInput
+
+    real_contrato_id = str(uuid.uuid4())
+    args = synthesize_tool_arguments(CrearCuentaCobroInput, known={"contrato_id": real_contrato_id})
+    assert args["contrato_id"] == real_contrato_id
+
+
+def test_synthesize_tool_arguments_ignores_known_when_field_not_present() -> None:
+    from app.tools.catalog.cuentas import CrearCuentaCobroInput
+
+    args = synthesize_tool_arguments(CrearCuentaCobroInput, known={"cuenta_id": str(uuid.uuid4())})
+    assert "cuenta_id" not in args
+    # contrato_id still synthesized (falls back to a random UUID, today's behavior)
+    uuid.UUID(args["contrato_id"])
+
+
+def test_synthesize_tool_arguments_known_none_default_matches_pre_existing_behavior() -> None:
+    """Explicit regression proof for the `known: dict[str, str] | None = None`
+    default — every field must still be synthesized exactly like before this
+    slice when no `known` dict is passed at all."""
+    from app.tools.catalog.cuentas import CrearCuentaCobroInput
+
+    args = synthesize_tool_arguments(CrearCuentaCobroInput)
+    assert set(args) == {"contrato_id", "mes", "anio"}
+    uuid.UUID(args["contrato_id"])
 
 
 # --- Malformed / unrecognized input -> safe default, never a crash ----------

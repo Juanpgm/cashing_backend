@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import datetime
 import enum
+import json
 import uuid
 from collections.abc import AsyncIterator
 from decimal import Decimal
@@ -79,6 +80,129 @@ def _last_tool_called(messages: list[LLMMessage]) -> str | None:
             if isinstance(name, str):
                 return name
     return None
+
+
+def _safe_json_dict(content: Any) -> dict[str, Any] | None:
+    """`json.loads(content)` guarded: any parse failure, or a value that parses to
+    something other than a dict (e.g. a bare JSON list/number), returns `None`
+    instead of raising — a tool result's content is always attacker/model-adjacent
+    text as far as this adapter is concerned, never trusted to be well-formed."""
+    if not isinstance(content, str):
+        return None
+    try:
+        loaded = json.loads(content)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def _tool_results(messages: list[LLMMessage]) -> list[tuple[str, str, dict[str, Any] | None]]:
+    """Pair each assistant `tool_calls[0]` `(id, name)` with the `role="tool"`
+    message carrying a matching `tool_call_id` LATER in `messages` — mirrors how
+    `agent_chat_service.chat_with_tools` actually appends history (one assistant
+    tool_calls message immediately followed by its `role="tool"` result, repeated
+    per iteration). An assistant call with no later matching tool message yet
+    (still pending) is simply NOT included — there is nothing to judge its outcome
+    from yet, see `_last_result_for`.
+
+    Only looks at `tool_calls[0]` per assistant message, same single-call
+    convention as `_last_tool_called` (this fake only ever emits one).
+    """
+    pending: dict[str, str] = {}
+    results: list[tuple[str, str, dict[str, Any] | None]] = []
+    for message in messages:
+        if message.role == "assistant" and message.tool_calls:
+            fn = message.tool_calls[0].get("function") or {}
+            name = fn.get("name")
+            call_id = message.tool_calls[0].get("id")
+            if isinstance(name, str) and isinstance(call_id, str):
+                pending[call_id] = name
+        elif message.role == "tool" and message.tool_call_id in pending:
+            call_id = message.tool_call_id
+            name = pending.pop(call_id)
+            results.append((call_id, name, _safe_json_dict(message.content)))
+    return results
+
+
+def _is_uuid_shaped(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        uuid.UUID(value)
+    except (ValueError, AttributeError, TypeError):
+        return False
+    return True
+
+
+# Maps a producing tool's name -> {raw output field name: field name the NEXT tool
+# in HAPPY_PATH_SEQUENCE actually expects}. Derived from the REAL Pydantic models,
+# not guessed:
+#   - listar_contratos  -> ListarContratosOutput.contratos: list[ContratoResumen],
+#     each with `id` (app/tools/catalog/listar_contratos.py) -> the next tool,
+#     crear_cuenta_cobro, needs `contrato_id` (CrearCuentaCobroInput).
+#   - crear_cuenta_cobro -> CuentaCobroResponse.id (app/schemas/cuenta_cobro.py,
+#     the cuenta itself) -> every downstream tool that needs the cuenta needs
+#     `cuenta_id` (DefinirRequisitosChecklistInput, ResumenChecklistInput,
+#     RadicarCuentaInput). `CuentaCobroResponse.contrato_id` already matches its
+#     own field name, no alias needed for that one (generic passthrough covers it).
+#   - definir_requisitos_checklist -> DefinirRequisitosChecklistOutput.
+#     cuenta_cobro_id (app/tools/catalog/requisitos.py) -> `cuenta_id`.
+#   - resumen_checklist -> ChecklistResponse.cuenta_cobro_id
+#     (app/schemas/checklist.py, same field name as above) -> `cuenta_id`. This one
+#     is load-bearing for the happy path: radicar_cuenta (the step right after
+#     resumen_checklist) needs `cuenta_id`, and resumen_checklist's own result is
+#     the most recent id source at that point in the script.
+_ID_ALIASES: dict[str, dict[str, str]] = {
+    "listar_contratos": {"id": "contrato_id"},
+    "crear_cuenta_cobro": {"id": "cuenta_id"},
+    "definir_requisitos_checklist": {"cuenta_cobro_id": "cuenta_id"},
+    "resumen_checklist": {"cuenta_cobro_id": "cuenta_id"},
+}
+
+
+def _extract_id_fields(result: dict[str, Any]) -> dict[str, str]:
+    """Collect UUID-shaped `id`/`*_id` string values out of a tool's dumped JSON
+    result: top-level fields, PLUS one level into the first item of any top-level
+    list value (covers `ListarContratosOutput.contratos[0].id` — the only nested
+    shape the Phase 0 happy-path script's tools actually produce; deeper nesting
+    is out of scope for this slice). Same id/`*_id` + UUID-validate convention as
+    `agent_chat_service._extract_recap_ids` (same purpose, a dumped tool result) —
+    duplicated locally rather than imported: an adapter importing a service would
+    invert this codebase's hexagonal dependency direction (services depend on
+    adapters via ports, never the reverse — see CLAUDE.md's Anti-Patterns)."""
+    found: dict[str, str] = {}
+    for key, value in result.items():
+        if key == "id" or key.endswith("_id"):
+            if _is_uuid_shaped(value):
+                found[key] = value
+            continue
+        if isinstance(value, list) and value and isinstance(value[0], dict):
+            for nested_key, nested_value in value[0].items():
+                if (nested_key == "id" or nested_key.endswith("_id")) and _is_uuid_shaped(nested_value):
+                    found.setdefault(nested_key, nested_value)
+    return found
+
+
+def _known_ids(messages: list[LLMMessage]) -> dict[str, str]:
+    """Flat `{field_name: uuid_string}` pool built from every RESOLVED tool result
+    in `messages`, in call order (a later call's id for the same field name wins —
+    it's the freshest). Each raw id is registered under its OWN field name
+    (generic passthrough — e.g. `crear_cuenta_cobro`'s echoed `contrato_id`
+    already matches what `importar_documento` would want) AND, when the producing
+    tool has an entry in `_ID_ALIASES`, additionally under the alias target the
+    NEXT tool in the happy path actually expects."""
+    known: dict[str, str] = {}
+    for _call_id, tool_name, result in _tool_results(messages):
+        if not isinstance(result, dict):
+            continue
+        raw_ids = _extract_id_fields(result)
+        if not raw_ids:
+            continue
+        known.update(raw_ids)
+        for raw_key, target_key in _ID_ALIASES.get(tool_name, {}).items():
+            if raw_key in raw_ids:
+                known[target_key] = raw_ids[raw_key]
+    return known
 
 
 def _unwrap_optional(annotation: Any) -> Any:
@@ -163,26 +287,44 @@ def _synthesize_field_value(field_info: Any) -> Any:
     return None
 
 
-def synthesize_tool_arguments(input_model: type[BaseModel]) -> dict[str, Any]:
+def synthesize_tool_arguments(input_model: type[BaseModel], known: dict[str, str] | None = None) -> dict[str, Any]:
     """Build a minimal, schema-VALID argument dict for `input_model`.
 
     Fills only the fields Pydantic requires (no default/default_factory) and
     leaves every optional field to its own default — mirrors how a real model
     would call a tool when the user hasn't specified optional knobs.
+
+    `known`: optional `{field_name: uuid_string}` pool (see `_known_ids`) of REAL
+    ids threaded from earlier tool results in this same chat turn/session — when a
+    REQUIRED field's name is a key in `known` AND the field is UUID-shaped, its
+    real value is used instead of a fresh random `uuid.uuid4()`. Every other
+    synthesis rule (dates, enums, numeric bounds, non-UUID/non-matching fields)
+    is unchanged. `known=None` (the default) reproduces the exact pre-existing
+    behavior — always a fresh random value for every UUID field.
     """
+    known = known or {}
     values: dict[str, Any] = {}
     for name, field_info in input_model.model_fields.items():
-        if field_info.is_required():
-            values[name] = _synthesize_field_value(field_info)
+        if not field_info.is_required():
+            continue
+        if name in known and _unwrap_optional(field_info.annotation) is uuid.UUID:
+            values[name] = known[name]
+            continue
+        values[name] = _synthesize_field_value(field_info)
     return values
 
 
-def build_tool_call(tool_name: str, input_model: type[BaseModel], call_id: str) -> LLMToolCall:
+def build_tool_call(
+    tool_name: str, input_model: type[BaseModel], call_id: str, known: dict[str, str] | None = None
+) -> LLMToolCall:
     """Build a schema-valid `LLMToolCall` for `tool_name`, validated against its
     own `input_model` before being handed back (fails loudly, at fake-adapter
     build time, if a future catalog tool needs a shape this synthesizer can't
-    fill — never silently emits a call the real tool invoker would reject)."""
-    arguments = synthesize_tool_arguments(input_model)
+    fill — never silently emits a call the real tool invoker would reject).
+
+    See `synthesize_tool_arguments` for `known`.
+    """
+    arguments = synthesize_tool_arguments(input_model, known=known)
     input_model.model_validate(arguments)
     return LLMToolCall(id=call_id, name=tool_name, arguments=arguments)
 
