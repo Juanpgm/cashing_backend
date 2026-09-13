@@ -75,7 +75,11 @@ async def procesar_webhook_wompi(
 ) -> None:
     """Handle a verified Wompi webhook event and update Pago + Credito."""
     if evento.event != "transaction.updated":
-        logger.debug("webhook_ignorado", wompi_event=evento.event)
+        # info, not debug: this is the ONLY production record that a Wompi webhook
+        # was received and dropped — if Wompi renames/adds an event type, payments
+        # silently stop processing with zero evidence unless this survives the
+        # production log-level gate (app/main.py, radicacion-sin-friccion 0.3).
+        logger.info("webhook_ignorado", wompi_event=evento.event)
         return
 
     transaction = evento.data.get("transaction", {})
@@ -87,9 +91,7 @@ async def procesar_webhook_wompi(
         logger.warning("webhook_sin_referencia")
         return
 
-    result = await db.execute(
-        select(Pago).where(Pago.referencia_wompi == referencia)
-    )
+    result = await db.execute(select(Pago).where(Pago.referencia_wompi == referencia))
     pago = result.scalar_one_or_none()
     if pago is None:
         logger.warning("pago_no_encontrado", referencia=referencia)
@@ -130,9 +132,5 @@ async def listar_pagos(
     db: AsyncSession,
     usuario_id: uuid.UUID,
 ) -> list[PagoResponse]:
-    result = await db.execute(
-        select(Pago)
-        .where(Pago.usuario_id == usuario_id)
-        .order_by(Pago.created_at.desc())
-    )
+    result = await db.execute(select(Pago).where(Pago.usuario_id == usuario_id).order_by(Pago.created_at.desc()))
     return [PagoResponse.model_validate(p) for p in result.scalars().all()]

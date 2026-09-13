@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+import structlog
 from app.adapters.llm.litellm_adapter import LiteLLMAdapter
 from app.core.config import settings
 from app.schemas.agent import LLMMessage
@@ -226,3 +227,98 @@ class TestReasoningEffortPassthrough:
         assert mock_call.call_args_list[1].kwargs["reasoning_effort"] == "low"
         assert mock_call.call_args_list[2].kwargs["model"] == "groq/llama-3.3-70b-versatile"
         assert "reasoning_effort" not in mock_call.call_args_list[2].kwargs
+
+
+class TestFallbackDepthAndTiming:
+    """`LLMResponse.fallback_depth` and per-attempt timing/split-token logging —
+    Phase 0 observability slice (radicacion-sin-friccion)."""
+
+    @pytest.mark.asyncio
+    async def test_successful_primary_call_has_fallback_depth_zero(self) -> None:
+        adapter = LiteLLMAdapter(default_model="gemini/gemini-2.5-flash")
+        fake_response = _fake_completion_response()
+
+        with patch("litellm.acompletion", new=AsyncMock(return_value=fake_response)):
+            result = await adapter.complete([LLMMessage(role="user", content="hola")], fallback=False)
+
+        assert result.fallback_depth == 0
+
+    @pytest.mark.asyncio
+    async def test_fallback_success_records_nonzero_fallback_depth(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The primary model fails (both `_call_model`-internal tenacity attempts,
+        hence TWO RuntimeErrors — see `test_fallback_to_non_groq_model_...` above
+        for the same pattern) and the fallback model answers: `fallback_depth`
+        must reflect the fallback model's position in the chain (index 1), not 0.
+        """
+        monkeypatch.setattr(settings, "LLM_FALLBACK_MODEL", "gemini/gemini-2.5-flash")
+        adapter = LiteLLMAdapter(default_model="groq/openai/gpt-oss-20b")
+        fake_response = _fake_completion_response()
+
+        with patch(
+            "litellm.acompletion",
+            new=AsyncMock(side_effect=[RuntimeError("groq down"), RuntimeError("groq down"), fake_response]),
+        ):
+            result = await adapter.complete([LLMMessage(role="user", content="hola")])
+
+        assert result.fallback_depth == 1
+
+    @pytest.mark.asyncio
+    async def test_llm_response_log_carries_duration_and_split_tokens(self) -> None:
+        adapter = LiteLLMAdapter(default_model="gemini/gemini-2.5-flash")
+        fake_response = _fake_completion_response()
+
+        with (
+            patch("litellm.acompletion", new=AsyncMock(return_value=fake_response)),
+            structlog.testing.capture_logs() as captured,
+        ):
+            await adapter.complete([LLMMessage(role="user", content="hola")], fallback=False)
+
+        resp_events = [e for e in captured if e.get("event") == "llm_response"]
+        assert resp_events, "expected an llm_response log entry"
+        entry = resp_events[0]
+        assert entry["duration_ms"] >= 0
+        assert entry["prompt_tokens"] == 1
+        assert entry["completion_tokens"] == 1
+        assert entry["fallback_depth"] == 0
+
+
+class TestLangfuseTracing:
+    """Wiring the existing (previously dead-code) Langfuse tracer around
+    `_call_model` — must never abort a turn if Langfuse is misconfigured or
+    unreachable (see `app.core.langfuse_client`, `_NoopTracer` fallback)."""
+
+    @pytest.mark.asyncio
+    async def test_langfuse_failure_does_not_abort_the_completion(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        adapter = LiteLLMAdapter(default_model="gemini/gemini-2.5-flash")
+        fake_response = _fake_completion_response("respuesta ok")
+
+        def _raise(*args: object, **kwargs: object) -> None:
+            raise RuntimeError("langfuse unreachable")
+
+        monkeypatch.setattr("app.adapters.llm.litellm_adapter.tracer.generation", _raise)
+
+        with (
+            patch("litellm.acompletion", new=AsyncMock(return_value=fake_response)),
+            structlog.testing.capture_logs() as captured,
+        ):
+            result = await adapter.complete([LLMMessage(role="user", content="hola")], fallback=False)
+
+        assert result.content == "respuesta ok"
+        warn_events = [e for e in captured if e.get("event") == "langfuse_trace_failed"]
+        assert warn_events, "expected a warning log when Langfuse tracing raises, not a propagated exception"
+
+    @pytest.mark.asyncio
+    async def test_langfuse_success_path_does_not_warn(self) -> None:
+        """Sanity companion to the failure test above: the no-op tracer (no
+        `LANGFUSE_PUBLIC_KEY` configured in tests) must never itself trigger the
+        `langfuse_trace_failed` warning."""
+        adapter = LiteLLMAdapter(default_model="gemini/gemini-2.5-flash")
+        fake_response = _fake_completion_response()
+
+        with (
+            patch("litellm.acompletion", new=AsyncMock(return_value=fake_response)),
+            structlog.testing.capture_logs() as captured,
+        ):
+            await adapter.complete([LLMMessage(role="user", content="hola")], fallback=False)
+
+        assert not [e for e in captured if e.get("event") == "langfuse_trace_failed"]

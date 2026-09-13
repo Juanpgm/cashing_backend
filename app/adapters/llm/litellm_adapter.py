@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -12,6 +13,8 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 
 from app.adapters.llm.port import LLMPort
 from app.core.config import settings
+from app.core.langfuse_client import tracer
+from app.core.observability import elapsed_ms
 from app.schemas.agent import LLMMessage, LLMResponse, LLMToolCall
 
 logger = structlog.get_logger("llm")
@@ -250,6 +253,7 @@ class LiteLLMAdapter:
                 # after the primary fails. `_call_model`'s own
                 # `model.startswith("groq/")` gate stays as a secondary safety net.
                 attempt_reasoning_effort = reasoning_effort if idx == 0 else None
+                start = time.perf_counter()
                 result = await self._call_model(
                     m,
                     litellm_msgs,
@@ -260,10 +264,19 @@ class LiteLLMAdapter:
                     tool_choice,
                     attempt_reasoning_effort,
                 )
+                duration_ms = elapsed_ms(start)
+                # `idx` IS the fallback depth: 0 means the primary/requested model
+                # answered on the first attempt, 1 means one fallback was needed, etc.
+                result.fallback_depth = idx
+                self._trace_generation(called_model, result, duration_ms, idx)
                 await logger.ainfo(
                     "llm_response",
                     model=called_model,
                     tokens=result.total_tokens,
+                    prompt_tokens=result.prompt_tokens,
+                    completion_tokens=result.completion_tokens,
+                    duration_ms=round(duration_ms, 2),
+                    fallback_depth=idx,
                 )
                 return result
             except Exception as exc:
@@ -271,6 +284,32 @@ class LiteLLMAdapter:
                 await logger.awarning("llm_fallback", model=m, error=str(exc))
 
         raise RuntimeError(f"All LLM models failed. Last error: {last_error}")
+
+    @staticmethod
+    def _trace_generation(model: str, result: LLMResponse, duration_ms: float, fallback_depth: int) -> None:
+        """Best-effort Langfuse generation record for one successful model attempt.
+
+        Wrapped independently of the LLM call itself: Langfuse being unreachable,
+        misconfigured, or raising from a bad SDK response must NEVER surface as a
+        chat-turn failure — this is purely observability plumbing riding alongside
+        an already-successful completion. `tracer` itself no-ops when
+        `LANGFUSE_PUBLIC_KEY` isn't set (see `app.core.langfuse_client`); this
+        try/except additionally covers a *configured-but-broken* Langfuse (network
+        down, bad keys, SDK exception) so that failure mode degrades the same way.
+        """
+        try:
+            tracer.generation(
+                name="llm_complete",
+                model=model,
+                usage={
+                    "input": result.prompt_tokens,
+                    "output": result.completion_tokens,
+                    "total": result.total_tokens,
+                },
+                metadata={"fallback_depth": fallback_depth, "duration_ms": round(duration_ms, 2)},
+            )
+        except Exception as exc:
+            logger.warning("langfuse_trace_failed", error=str(exc))
 
     async def stream(
         self,
