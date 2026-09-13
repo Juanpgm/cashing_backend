@@ -11,6 +11,7 @@ import structlog
 from pydantic import BaseModel
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
+from app.adapters.llm.port import LLMPort
 from app.core.config import settings
 from app.core.langfuse_client import tracer
 from app.core.observability import elapsed_ms
@@ -389,6 +390,20 @@ class LiteLLMAdapter:
         raise RuntimeError(f"All embedding models failed. Last error: {last_error}")
 
 
-def get_llm(model: str | None = None) -> LiteLLMAdapter:
-    """Factory — returns the LLM adapter."""
+def get_llm(model: str | None = None) -> LLMPort:
+    """Factory — returns the configured `LLMPort` implementation.
+
+    `settings.LLM_PROVIDER` selects the implementation: "litellm" (default) wires
+    the real Gemini -> Groq -> Ollama fallback chain via `LiteLLMAdapter`; "fake"
+    returns `FakeLLMPort` (see `app.adapters.llm.fake_adapter`) — a network-free
+    implementation for local dev/E2E runs whose tool-NAME sequence is
+    deterministic but whose synthesized argument VALUES are not (see that
+    module's docstring for the precise distinction). The import is local to
+    avoid paying `app.tools.registry`'s import cost (pulled in by `fake_adapter`)
+    on the default "litellm" path, which every request already takes.
+    """
+    if settings.LLM_PROVIDER == "fake":
+        from app.adapters.llm.fake_adapter import FakeLLMPort
+
+        return FakeLLMPort(default_model=model)
     return LiteLLMAdapter(default_model=model)

@@ -1,6 +1,7 @@
 """FastAPI application entry point."""
 
 import logging
+import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -36,6 +37,18 @@ def _wrapper_log_level() -> int:
     return logging.DEBUG if settings.is_development else logging.INFO
 
 
+# cache_logger_on_first_use=True is a real production perf optimization (skips
+# re-resolving the processor chain on every log call) but has bitten this repo's
+# test suite three separate times (radicacion-sin-friccion 0.3's contextvars
+# concurrency test, 0.4's SECOP_APP_TOKEN warning test, and again after 0.4's own
+# fix-pass): whichever module-level `structlog.get_logger(name)` proxy gets its
+# FIRST real log call anywhere across the ~2450-test suite caches that binding for
+# the rest of the run, and a later `structlog.testing.capture_logs()` in an
+# unrelated test file can silently fail to intercept it depending on suite order.
+# `app` is never imported by production/Railway with pytest on sys.path, so this
+# is production-safe: the optimization stays on everywhere except under pytest.
+_RUNNING_UNDER_PYTEST = "pytest" in sys.modules
+
 structlog.configure(
     processors=[
         structlog.contextvars.merge_contextvars,
@@ -46,7 +59,7 @@ structlog.configure(
     wrapper_class=structlog.make_filtering_bound_logger(_wrapper_log_level()),
     context_class=dict,
     logger_factory=structlog.PrintLoggerFactory(),
-    cache_logger_on_first_use=True,
+    cache_logger_on_first_use=not _RUNNING_UNDER_PYTEST,
 )
 
 
@@ -124,10 +137,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     ).scalar()
                     if current_len is not None and current_len < 255:
                         await conn.execute(
-                            _text(
-                                "ALTER TABLE alembic_version "
-                                "ALTER COLUMN version_num TYPE VARCHAR(255)"
-                            )
+                            _text("ALTER TABLE alembic_version ALTER COLUMN version_num TYPE VARCHAR(255)")
                         )
         except Exception as exc:
             log.warning("alembic_version_prepare_failed", error=str(exc))
@@ -156,7 +166,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 is_versioned = await conn.run_sync(_is_versioned)
             action = "upgrade" if is_versioned else "stamp"
             proc = await asyncio.create_subprocess_exec(
-                "alembic", action, "head",
+                "alembic",
+                action,
+                "head",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -164,9 +176,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             if proc.returncode == 0:
                 await log.ainfo("alembic_ok", action=action, output=stdout.decode().strip())
             else:
-                await log.awarning(
-                    "alembic_failed", action=action, stderr=stderr.decode().strip()
-                )
+                await log.awarning("alembic_failed", action=action, stderr=stderr.decode().strip())
         except Exception as exc:
             log.warning("alembic_error", error=str(exc))
 

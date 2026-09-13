@@ -10,6 +10,17 @@ from __future__ import annotations
 import pytest
 import structlog
 
+# This pair used to be order-dependent on the FULL suite (passed in isolation,
+# passed paired with one other file, failed in the full ~2450-test run) because
+# `app/main.py` set `cache_logger_on_first_use=True` unconditionally: whichever
+# test first triggered a real call on `app.core.config`'s module-level logger
+# proxy cached that binding for the rest of the process, and this file's
+# `capture_logs()` could silently miss it depending on suite order. Root cause
+# fixed in `app/main.py` (cache disabled under pytest) rather than worked
+# around here -- this file is back to the plain, idiomatic form specifically
+# to prove that fix: if the root cause were still present, this would still be
+# flaky in full-suite order.
+
 
 class TestSecopTokenWarning:
     def test_empty_token_does_not_raise_and_logs_warning(self) -> None:
