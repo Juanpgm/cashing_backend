@@ -41,6 +41,11 @@ CHECKLIST_LINK_FAILED = "CHECKLIST_LINK_FAILED"
 # unknown, expired, or does not match the caller/cuenta_id it was issued for
 # (radicacion-sin-friccion 1.7 — see `app.services.evidence_handle_cache`).
 EVIDENCE_HANDLE_NOT_FOUND = "EVIDENCE_HANDLE_NOT_FOUND"
+# A write-tool approval/cancel/retry control endpoint (radicacion-sin-friccion 3.10,
+# `POST /api/v1/agent/chat/stream/{session_id}/tool-calls/{call_id}/...`) was called
+# with a `call_id` that is unknown, expired, or belongs to another user's session
+# (see `app.services.agent_tool_approval`).
+PENDING_TOOL_CALL_NOT_FOUND = "PENDING_TOOL_CALL_NOT_FOUND"
 
 
 class DomainError(Exception):
@@ -86,6 +91,28 @@ class EvidenceHandleNotFoundError(NotFoundError):
             "esta cuenta. Volvé a llamar a descubrir_evidencias para generar uno nuevo antes "
             "de persistir.",
             code=EVIDENCE_HANDLE_NOT_FOUND,
+        )
+
+
+class PendingToolCallNotFoundError(NotFoundError):
+    """A tool-call control action (approve/reject/cancel/retry) targeted a `call_id`
+    that can't be resolved for the calling user.
+
+    Deliberately ONE outcome/message for three distinct causes — unknown call_id,
+    expired pending entry, and a call_id that exists but belongs to a different
+    user's session — same never-leak-existence rationale as
+    `EvidenceHandleNotFoundError`: distinguishing "doesn't exist" from "exists but
+    isn't yours" would let user B probe for user A's session activity.
+
+    Maps to HTTP 404 via `NotFoundError`'s entry in `EXCEPTION_STATUS_MAP`
+    (MRO-based lookup, see `domain_to_http`) — no separate registration needed.
+    """
+
+    def __init__(self) -> None:
+        DomainError.__init__(
+            self,
+            "Esta acción sobre la herramienta no existe, expiró, o no corresponde a esta sesión de chat.",
+            code=PENDING_TOOL_CALL_NOT_FOUND,
         )
 
 

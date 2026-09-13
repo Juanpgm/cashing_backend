@@ -4,6 +4,7 @@ from fastapi import APIRouter
 
 from app.api.v1.actividades import router as actividades_router
 from app.api.v1.agent_chat import router as agent_chat_router
+from app.api.v1.agent_chat_stream import router as agent_chat_stream_router
 from app.api.v1.agent_sessions import router as agent_sessions_router
 from app.api.v1.auth import router as auth_router
 from app.api.v1.chat import router as chat_router
@@ -31,6 +32,7 @@ api_v1_router.include_router(auth_router)
 api_v1_router.include_router(chat_router)
 api_v1_router.include_router(agent_sessions_router)
 api_v1_router.include_router(agent_chat_router)
+api_v1_router.include_router(agent_chat_stream_router)
 api_v1_router.include_router(documentos_router)
 api_v1_router.include_router(contratos_router)
 api_v1_router.include_router(cuentas_cobro_router)

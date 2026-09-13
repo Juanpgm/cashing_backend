@@ -34,32 +34,11 @@ MAX_CHAT_FILES = 6
 MAX_TOTAL_ATTACHMENT_BYTES = 40 * 1024 * 1024
 
 
-@router.post("/chat", response_model=AgentChatResult, status_code=200)
-@limiter.limit("5/minute")
-async def chat(
-    request: Request,
-    user: CurrentUser,
-    message: str = Form(..., min_length=1, max_length=5000),
-    session_id: str | None = Form(None),
-    contrato_id: str | None = Form(None),
-    files: list[UploadFile] = File(default=[]),
-    db: AsyncSession = Depends(get_db),
-) -> AgentChatResult:
-    """Send a free-form message (optionally with file attachments) to the tool-calling agent.
-
-    Unlike `POST /chat/` (fixed router + pipeline graph), this endpoint lets the LLM
-    decide autonomously which registered tools to call — importing contracts,
-    creating cuentas de cobro, managing the checklist, generating informes, finding
-    evidence, etc. — in whatever order is needed to resolve the request.
-
-    Accepts up to 6 file attachments per message, any format except executables
-    (same allowlist as evidence uploads — see `validate_evidence_file`), with a
-    combined size cap of 40 MB across all attachments in the message.
-
-    `contrato_id` is an OPTIONAL contract context (e.g. the contract the user has
-    currently open in the UI) so the agent never has to ask the user for a raw UUID.
-    It is resolved defensively by the service — a missing, malformed, unknown, or
-    not-owned value is silently ignored (never a 4xx/5xx for this alone).
+async def parse_chat_attachments(files: list[UploadFile]) -> dict[str, ToolAttachment]:
+    """Validate and read `files` into the `{filename: ToolAttachment}` shape both
+    `POST /chat` and `POST /chat/stream` (radicacion-sin-friccion 3.10) pass to
+    `agent_chat_service`. Single source of truth for the file-count/size/type
+    limits described on `chat`'s own docstring below.
     """
     if len(files) > MAX_CHAT_FILES:
         raise ValidationError(f"Máximo {MAX_CHAT_FILES} archivos por mensaje.")
@@ -88,6 +67,41 @@ async def chat(
             content_type=upload.content_type or "application/octet-stream",
             data=content,
         )
+    return attachments
+
+
+@router.post("/chat", response_model=AgentChatResult, status_code=200)
+@limiter.limit("5/minute")
+async def chat(
+    request: Request,
+    user: CurrentUser,
+    message: str = Form(..., min_length=1, max_length=5000),
+    session_id: str | None = Form(None),
+    contrato_id: str | None = Form(None),
+    files: list[UploadFile] = File(default=[]),
+    db: AsyncSession = Depends(get_db),
+) -> AgentChatResult:
+    """Send a free-form message (optionally with file attachments) to the tool-calling agent.
+
+    Unlike `POST /chat/` (fixed router + pipeline graph), this endpoint lets the LLM
+    decide autonomously which registered tools to call — importing contracts,
+    creating cuentas de cobro, managing the checklist, generating informes, finding
+    evidence, etc. — in whatever order is needed to resolve the request.
+
+    Accepts up to 6 file attachments per message, any format except executables
+    (same allowlist as evidence uploads — see `validate_evidence_file`), with a
+    combined size cap of 40 MB across all attachments in the message.
+
+    `contrato_id` is an OPTIONAL contract context (e.g. the contract the user has
+    currently open in the UI) so the agent never has to ask the user for a raw UUID.
+    It is resolved defensively by the service — a missing, malformed, unknown, or
+    not-owned value is silently ignored (never a 4xx/5xx for this alone).
+
+    Runs synchronously with no live tool-call progress and no write-tool approval
+    gate — see `POST /chat/stream` (`app.api.v1.agent_chat_stream`) for the docked
+    wizard's interactive counterpart. Unaffected by that endpoint's existence.
+    """
+    attachments = await parse_chat_attachments(files)
 
     return await agent_chat_service.chat_with_tools(
         db=db,
