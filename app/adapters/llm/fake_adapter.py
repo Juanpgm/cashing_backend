@@ -393,12 +393,91 @@ def _is_error_result(result: dict[str, Any] | None) -> bool:
     return "error" in result or "detail" in result
 
 
+def _find_recap_content(messages: list[LLMMessage]) -> str | None:
+    """The most recent `role="system"` message whose content starts with
+    `AGENT_RECAP_MARKER` (`agent_chat_service._build_tool_context_recap`'s exact
+    prefix), or `None`. `agent_service.get_conversation_history` only ever keeps
+    ONE such message at a time (refreshed, not accumulated — see that module's
+    docstring), but scanning for the LAST match is a harmless, defensive choice
+    if a hand-built history ever carried more than one."""
+    recap: str | None = None
+    for message in messages:
+        if (
+            message.role == "system"
+            and isinstance(message.content, str)
+            and message.content.startswith(AGENT_RECAP_MARKER)
+        ):
+            recap = message.content
+    return recap
+
+
+def _parse_recap_entry(entry: str) -> tuple[str, str, dict[str, str]] | None:
+    """Parse ONE `tool_name:status[ k=v ...]` recap entry (see
+    `agent_chat_service._build_tool_context_recap`'s exact line format) into
+    `(tool_name, status, ids)`. Returns `None` for anything that doesn't match
+    that shape — never raises, the caller treats that as "skip this entry"."""
+    entry = entry.strip()
+    if not entry or ":" not in entry:
+        return None
+    tool_name, _, rest = entry.partition(":")
+    tool_name = tool_name.strip()
+    if not tool_name:
+        return None
+    status, _, id_part = rest.strip().partition(" ")
+    status = status.strip()
+    if not status:
+        return None
+    ids: dict[str, str] = {}
+    for token in id_part.split():
+        key, sep, value = token.partition("=")
+        if sep and key and _is_uuid_shaped(value):
+            ids[key] = value
+    return tool_name, status, ids
+
+
 def _resume_from_recap(messages: list[LLMMessage]) -> tuple[str | None, dict[str, str]]:
-    """Placeholder — replaced by the real cross-turn recap parser below (see
-    the "Cross-turn continuity" section further down this file). Always "no
-    recap" until then: `(None, {})`."""
-    del messages
-    return None, {}
+    """When `messages` carries no assistant `tool_calls` at all (a continuation
+    turn replaying ONLY the persisted user/assistant history — see
+    `agent_chat_service._build_tool_context_recap`'s docstring), derive:
+      1. which tool to resume `HAPPY_PATH_SEQUENCE` from — the NEWEST `ok` entry
+         in the recap (recap lines are newest-first: `_build_tool_context_recap`
+         builds from `reversed(call_results)`).
+      2. the `known` ids pool to seed — merged from EVERY `ok` entry (not just
+         the newest), aliased exactly like `_known_ids` aliases a live tool
+         result, newest value wins per field name.
+
+    Returns `(None, {})` for a missing/malformed/empty recap — the caller
+    (`_resolve_next_tool`) then starts the sequence fresh via `_advance(None)`,
+    identical to no history at all. Never raises.
+    """
+    recap = _find_recap_content(messages)
+    if recap is None:
+        return None, {}
+
+    body = recap[len(AGENT_RECAP_MARKER) :].strip()
+    if not body:
+        return None, {}
+
+    resume_tool: str | None = None
+    known: dict[str, str] = {}
+    for raw_entry in body.split(" | "):
+        parsed = _parse_recap_entry(raw_entry)
+        if parsed is None:
+            continue
+        tool_name, status, ids = parsed
+        if status != "ok":
+            continue
+        if resume_tool is None:
+            resume_tool = tool_name
+        # Newest-first iteration: setdefault so an OLDER entry never overwrites
+        # a field name a NEWER entry already supplied.
+        for key, value in ids.items():
+            known.setdefault(key, value)
+        for raw_key, target_key in _ID_ALIASES.get(tool_name, {}).items():
+            if raw_key in ids:
+                known.setdefault(target_key, ids[raw_key])
+
+    return resume_tool, known
 
 
 def _advance(last_tool: str | None) -> tuple[str | None, str]:
@@ -534,9 +613,7 @@ class FakeLLMPort:
             return LLMResponse(content=_DEFAULT_TEXT_RESPONSE, model=used_model)
 
         if next_tool is None:
-            text = {"done": _DONE_TEXT_RESPONSE, "gave_up": _GAVE_UP_TEXT_RESPONSE}.get(
-                reason, _DEFAULT_TEXT_RESPONSE
-            )
+            text = {"done": _DONE_TEXT_RESPONSE, "gave_up": _GAVE_UP_TEXT_RESPONSE}.get(reason, _DEFAULT_TEXT_RESPONSE)
             return LLMResponse(content=text, model=used_model)
 
         if tools is not None:

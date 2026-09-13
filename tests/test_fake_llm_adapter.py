@@ -19,9 +19,9 @@ import pytest
 import structlog
 from app.adapters.llm import get_llm
 from app.adapters.llm.fake_adapter import (
+    _GAVE_UP_TEXT_RESPONSE,
     HAPPY_PATH_SEQUENCE,
     FakeLLMPort,
-    _GAVE_UP_TEXT_RESPONSE,
     _known_ids,
     _last_tool_called,
     _tool_results,
@@ -407,6 +407,82 @@ async def test_complete_advances_normally_when_last_result_succeeded() -> None:
     response = await fake.complete(messages, tools=tools)
     assert response.tool_calls is not None
     assert response.tool_calls[0].name == "crear_cuenta_cobro"
+
+
+# --- Cross-turn recap resume (Phase 0, slice 0.6) ---------------------------
+
+
+async def test_complete_resumes_from_recap_when_no_tool_calls_in_history() -> None:
+    """A CONTINUATION turn on the same session_id replays history with the
+    cross-turn recap (`agent_chat_service._build_tool_context_recap`'s exact
+    format — role="system", `AGENT_RECAP_MARKER` prefix, `tool:status k=v`
+    entries) but NO assistant `tool_calls` at all (only the user + assistant
+    text from the persisted `Conversacion.mensajes_json`). The fake must
+    resume `HAPPY_PATH_SEQUENCE` from the recap's newest entry AND thread its
+    ids into the next call's arguments."""
+    from app.schemas.agent import AGENT_RECAP_MARKER
+
+    cuenta_id = str(uuid.uuid4())
+    contrato_id = str(uuid.uuid4())
+    fake = FakeLLMPort()
+    tools = [{"type": "function", "function": {"name": "definir_requisitos_checklist"}}]
+    messages = [
+        LLMMessage(
+            role="system",
+            content=f"{AGENT_RECAP_MARKER} crear_cuenta_cobro:ok id={cuenta_id} contrato_id={contrato_id}",
+        ),
+        LLMMessage(role="user", content="creá la cuenta"),
+        LLMMessage(role="assistant", content="Listo, la cuenta quedó creada."),
+        LLMMessage(role="user", content="seguí con el checklist"),
+    ]
+    response = await fake.complete(messages, tools=tools)
+    assert response.tool_calls is not None
+    assert response.tool_calls[0].name == "definir_requisitos_checklist"
+    assert response.tool_calls[0].arguments["cuenta_id"] == cuenta_id
+
+
+async def test_complete_falls_back_to_fresh_start_on_malformed_recap() -> None:
+    """A truncated/garbled recap line (never happens today — `_RECAP_MAX_CHARS`
+    truncates safely — but a hand-built or future history could still carry
+    one) must never raise, and must fall back to starting the sequence fresh,
+    same as no history/recap at all."""
+    from app.schemas.agent import AGENT_RECAP_MARKER
+
+    fake = FakeLLMPort()
+    tools = [{"type": "function", "function": {"name": "listar_contratos"}}]
+    messages = [
+        LLMMessage(role="system", content=f"{AGENT_RECAP_MARKER} garbled;;not-the-expected-format###"),
+        LLMMessage(role="user", content="seguí"),
+    ]
+    response = await fake.complete(messages, tools=tools)
+    assert response.tool_calls is not None
+    assert response.tool_calls[0].name == "listar_contratos"
+
+
+async def test_complete_recap_picks_the_newest_entry_when_multiple_lines_present() -> None:
+    """Recap lines are newest-first (`_build_tool_context_recap` builds from
+    `reversed(call_results)`) — the resume position must come from the FIRST
+    (most recent) `ok` entry, not an older one."""
+    from app.schemas.agent import AGENT_RECAP_MARKER
+
+    newer_cuenta_id = str(uuid.uuid4())
+    older_contrato_id = str(uuid.uuid4())
+    fake = FakeLLMPort()
+    tools = [{"type": "function", "function": {"name": "definir_requisitos_checklist"}}]
+    messages = [
+        LLMMessage(
+            role="system",
+            content=(
+                f"{AGENT_RECAP_MARKER} crear_cuenta_cobro:ok id={newer_cuenta_id} "
+                f"| listar_contratos:ok id={older_contrato_id}"
+            ),
+        ),
+        LLMMessage(role="user", content="seguí"),
+    ]
+    response = await fake.complete(messages, tools=tools)
+    assert response.tool_calls is not None
+    assert response.tool_calls[0].name == "definir_requisitos_checklist"
+    assert response.tool_calls[0].arguments["cuenta_id"] == newer_cuenta_id
 
 
 async def test_complete_with_malformed_tool_call_shape_returns_safe_default() -> None:
