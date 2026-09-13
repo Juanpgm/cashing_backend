@@ -10,13 +10,25 @@ from __future__ import annotations
 
 import uuid
 from decimal import Decimal
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from app.schemas.checklist import ChecklistResponse
+from app.core.exceptions import ValidationError
+from app.models.cuenta_cobro import EstadoCuentaCobro
+from app.schemas.checklist import ChecklistResponse, RequisitoChecklistItem
 from app.services import checklist_service, cuenta_cobro_service
 from app.tools.context import ToolContext
 from app.tools.registry import tool
+
+# Checklist rows may only be mutated while the cuenta is still editable —
+# mirrors the BORRADOR/RECHAZADA guard `cuenta_cobro_service` already enforces
+# for actividades/formato/etc. (e.g. `agregar_actividad`, `actualizar_cuenta_cobro`).
+# The legacy `PATCH /checklist/{codigo}` HTTP endpoint does NOT enforce this today
+# (confirmed by audit, radicacion-sin-friccion slice 1.6) — this guard is
+# deliberately stricter at the agent-tool layer, since an ENVIADA cuenta should
+# never have its checklist silently rewritten from a chat turn.
+_ESTADOS_CHECKLIST_EDITABLE = (EstadoCuentaCobro.BORRADOR, EstadoCuentaCobro.RECHAZADA)
 
 
 class ResumenChecklistInput(BaseModel):
@@ -164,3 +176,80 @@ async def auto_vincular_documentos(
     await checklist_service.asegurar_checklist(ctx.db, cuenta)
     vinculados = await checklist_service.auto_vincular_documentos_fuente(ctx.db, cuenta)
     return AutoVincularDocumentosOutput(vinculados=vinculados)
+
+
+class MarcarRequisitoInput(BaseModel):
+    cuenta_id: uuid.UUID = Field(description="CuentaCobro id owning the checklist row.")
+    codigo: str = Field(
+        description=(
+            "Requisito reference: a standard catalog code (e.g. 'RUT', 'DS_CONSECUTIVO') or the "
+            "requisito_cuenta_id UUID (as a string) for a custom requisito."
+        )
+    )
+    modo: Literal["no_aplica", "cumplido_manual", "desvincular"] = Field(
+        description=(
+            "no_aplica: marks the requisito as not applicable for this cuenta. cumplido_manual: "
+            "marks it fulfilled without an attached document. desvincular: removes ALL documents "
+            "linked to this row and resets it to pendiente. Exactly one per call — observaciones "
+            "is a separate optional field, NOT a fourth modo."
+        )
+    )
+    observaciones: str | None = Field(
+        default=None,
+        description="Optional free-text note to set/update on the row, combinable with any modo.",
+    )
+
+
+@tool(
+    name="marcar_requisito",
+    description=(
+        "Manually set the state of one checklist requisito for a cuenta de cobro — the agent-tool "
+        "twin of `PATCH /checklist/{codigo}`'s no_aplica/cumplido_manual/desvincular actions. Use "
+        "this when the user tells you a requisito doesn't apply, was already fulfilled without a "
+        "file, or should be unlinked from its current document(s). Only allowed while the cuenta "
+        "is BORRADOR or RECHAZADA — rejects with a validation error on any other estado (e.g. "
+        "ENVIADA), since the checklist must not change after submission. Args: cuenta_id (UUID of "
+        "the cuenta de cobro; must belong to the authenticated user); codigo (catalog code or "
+        "custom requisito_cuenta_id); modo ('no_aplica'/'cumplido_manual'/'desvincular', exactly "
+        "one per call); observaciones (optional free-text note, combinable with any modo — not a "
+        "fourth modo value)."
+    ),
+    input_model=MarcarRequisitoInput,
+    output_model=RequisitoChecklistItem,
+    tags=("write",),
+)
+async def marcar_requisito(ctx: ToolContext, params: MarcarRequisitoInput) -> RequisitoChecklistItem:
+    cuenta = await cuenta_cobro_service._get_cuenta_con_ownership(ctx.db, ctx.usuario_id, params.cuenta_id)
+
+    if cuenta.estado not in _ESTADOS_CHECKLIST_EDITABLE:
+        raise ValidationError(
+            f"No se puede modificar el checklist de una cuenta de cobro en estado '{cuenta.estado.value}'. "
+            "Solo se permite en borrador o rechazada."
+        )
+
+    if params.modo == "no_aplica":
+        await checklist_service.marcar_no_aplica(ctx.db, cuenta.id, params.codigo)
+    elif params.modo == "cumplido_manual":
+        await checklist_service.marcar_cumplido_manual(ctx.db, cuenta.id, params.codigo)
+    else:
+        await checklist_service.desvincular(ctx.db, cuenta.id, params.codigo)
+
+    if params.observaciones is not None:
+        await checklist_service.set_observaciones(ctx.db, cuenta.id, params.codigo, params.observaciones)
+
+    # Rebuild and return only this requisito's item — mirrors the HTTP endpoint's
+    # own response shaping (app/api/v1/checklist.py::actualizar_requisito).
+    # auto_vincular=False: the user just made an explicit choice; don't override it.
+    payload = await checklist_service.construir_checklist_completo(ctx.db, cuenta, auto_vincular=False)
+    item = next(
+        (
+            i
+            for i in payload["items"]
+            if i["requisito"]["codigo"] == params.codigo
+            or str(i["requisito"].get("requisito_cuenta_id")) == params.codigo
+        ),
+        None,
+    )
+    if item is None:
+        raise ValidationError(f"Requisito {params.codigo} not found in checklist.")
+    return RequisitoChecklistItem(**item)

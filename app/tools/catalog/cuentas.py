@@ -13,8 +13,9 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
+from app.adapters.storage import get_storage as _get_storage
 from app.core.config import settings
-from app.schemas.cuenta_cobro import CuentaCobroCreate, CuentaCobroResponse
+from app.schemas.cuenta_cobro import CuentaCobroCreate, CuentaCobroResponse, GenerarPDFResponse
 from app.services import cuenta_cobro_service
 from app.tools.context import ToolContext
 from app.tools.registry import tool
@@ -114,7 +115,7 @@ class CrearCuentaCobroInput(BaseModel):
         "the request. Args: contrato_id (UUID, from listar_contratos), mes (integer 1-12, OR a "
         "Spanish month name such as 'febrero'), anio (integer 2000-2099, e.g. 2026), valor "
         "(optional; defaults to the contrato's valor_mensual when omitted). Example call: "
-        "{\"contrato_id\": \"<uuid from listar_contratos>\", \"mes\": 7, \"anio\": 2026}."
+        '{"contrato_id": "<uuid from listar_contratos>", "mes": 7, "anio": 2026}.'
     ),
     input_model=CrearCuentaCobroInput,
     output_model=CuentaCobroResponse,
@@ -134,10 +135,20 @@ class RadicarCuentaInput(BaseModel):
     name="radicar_cuenta",
     description=(
         "Submit (radicar) a cuenta de cobro, transitioning it from BORRADOR/RECHAZADA to "
-        "ENVIADA. Gates the transition on checklist readiness: rebuilds the document checklist "
-        "and raises a ValidationError (code=CHECKLIST_INCOMPLETE) naming the pending requisitos "
-        "if it isn't complete yet. Args: cuenta_id (UUID of the cuenta de cobro; must belong to "
-        "the authenticated user)."
+        "ENVIADA. Runs TWO gates in order before the transition, in this order: (1) coherence — "
+        "the R1-R6 rule catalog (same one validar_coherencia_cuenta previews); any HARD finding "
+        "raises a validation error with code=COHERENCE_CHECK_FAILED, listing the failing rule(s) "
+        "and their messages (SOFT findings never block, only surface as advertencias_coherencia "
+        "on success); (2) checklist — rebuilds the document checklist and, if any obligatorio "
+        "requisito is still pending, raises a validation error with code=CHECKLIST_INCOMPLETE "
+        "naming the pending requisitos. How to react: on COHERENCE_CHECK_FAILED, call "
+        "validar_coherencia_cuenta to see the full finding list and tell the user what to fix "
+        "(e.g. stale cuota numbering, mismatched SS planilla, stale month names) — there is no "
+        "tool to silence a HARD finding, the underlying data must change. On CHECKLIST_INCOMPLETE, "
+        "call resumen_checklist (or obtener_estado_radicacion) to see exactly which requisitos are "
+        "pending, then resolve each one via marcar_requisito (no_aplica/cumplido_manual) or by "
+        "uploading/linking a document, and retry radicar_cuenta. Args: cuenta_id (UUID of the "
+        "cuenta de cobro; must belong to the authenticated user)."
     ),
     input_model=RadicarCuentaInput,
     output_model=CuentaCobroResponse,
@@ -145,3 +156,26 @@ class RadicarCuentaInput(BaseModel):
 )
 async def radicar_cuenta(ctx: ToolContext, params: RadicarCuentaInput) -> CuentaCobroResponse:
     return await cuenta_cobro_service.radicar_cuenta(ctx.db, ctx.usuario_id, params.cuenta_id)
+
+
+class GenerarCuentaCobroPdfInput(BaseModel):
+    cuenta_id: uuid.UUID = Field(description="CuentaCobro id to render to PDF.")
+
+
+@tool(
+    name="generar_cuenta_cobro_pdf",
+    description=(
+        "Render a cuenta de cobro to a PDF document using the user's custom template (or the "
+        "built-in default), upload it to storage, and return a 1-hour presigned download URL — "
+        "the agent-tool twin of `POST /cuentas-cobro/{id}/generar-pdf`. Does NOT check checklist "
+        "completeness or cuenta estado; it renders whatever activities/data exist right now, same "
+        "as the existing HTTP endpoint. Args: cuenta_id (UUID of the cuenta de cobro; must belong "
+        "to the authenticated user)."
+    ),
+    input_model=GenerarCuentaCobroPdfInput,
+    output_model=GenerarPDFResponse,
+    tags=("write",),
+)
+async def generar_cuenta_cobro_pdf(ctx: ToolContext, params: GenerarCuentaCobroPdfInput) -> GenerarPDFResponse:
+    storage = _get_storage(settings.S3_BUCKET_PDFS)
+    return await cuenta_cobro_service.generar_pdf(ctx.db, ctx.usuario_id, params.cuenta_id, storage)

@@ -30,6 +30,7 @@ from app.tools.catalog import (
     radicacion,
     requisitos,
     secop,
+    stepper,
 )
 
 __all__ = [
@@ -49,4 +50,5 @@ __all__ = [
     "radicacion",
     "requisitos",
     "secop",
+    "stepper",
 ]
