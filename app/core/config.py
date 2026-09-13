@@ -106,6 +106,33 @@ class Settings(BaseSettings):
             _log.warning("llm_provider_invalid_value_fallback_to_litellm", received=v)
         return "litellm"
 
+    # FAKE_LLM_SCRIPT: only read when LLM_PROVIDER=fake — selects which scripted
+    # behavior `FakeLLMPort.complete()` runs (see app/adapters/llm/fake_adapter.py):
+    #   None/unset (default) or "happy" -> the normal HAPPY_PATH_SEQUENCE chain.
+    #   "malformed" -> one scripted tool call in the chain deliberately carries
+    #       arguments that fail the tool's own input_model validation, to exercise
+    #       the future Playwright `llm-respuesta-malformada` edge case end-to-end
+    #       (through the REAL `invoke_tool` validation path, not a fake-only check).
+    #   "stall" -> the adapter always returns a plain-text reply, never a tool
+    #       call, to exercise "the agent gave up mid-chain".
+    # Same case/whitespace-normalize-with-safe-fallback pattern as LLM_PROVIDER
+    # above: an invalid value must never crash Settings load nor silently pick an
+    # unintended script — it folds to `None` (the safe, inert happy-path default).
+    FAKE_LLM_SCRIPT: Literal["happy", "malformed", "stall"] | None = None
+
+    @field_validator("FAKE_LLM_SCRIPT", mode="before")
+    @classmethod
+    def _normalize_fake_llm_script(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        normalized = str(v).strip().lower()
+        if normalized in ("happy", "malformed", "stall"):
+            return normalized
+        if normalized == "":
+            return None
+        _log.warning("fake_llm_script_invalid_value_fallback_to_none", received=v)
+        return None
+
     # LLM — Groq for fast chat/routing; Gemini 2.5 Flash for document extraction (generous free tier)
     # Gemini free tier: 1,000,000 TPM/day vs Groq 8b: ~20,000 TPM/day
     # Note: gemini-2.0-flash and gemini-1.5-flash are deprecated for new accounts — use gemini-2.5-flash

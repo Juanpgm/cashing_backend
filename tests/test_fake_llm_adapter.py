@@ -19,9 +19,15 @@ import pytest
 import structlog
 from app.adapters.llm import get_llm
 from app.adapters.llm.fake_adapter import (
+    _DEFAULT_TEXT_RESPONSE,
+    _GAVE_UP_TEXT_RESPONSE,
     HAPPY_PATH_SEQUENCE,
     FakeLLMPort,
+    _known_ids,
     _last_tool_called,
+    _parse_tool_result_content,
+    _resolve_next_tool,
+    _tool_results,
     build_tool_call,
     synthesize_tool_arguments,
 )
@@ -29,10 +35,13 @@ from app.adapters.llm.litellm_adapter import LiteLLMAdapter
 from app.core.config import Settings, settings
 from app.core.security import hash_password
 from app.models.contrato import Contrato
+from app.models.cuenta_cobro import CuentaCobro
 from app.models.usuario import Usuario
 from app.schemas.agent import LLMMessage
 from app.services import agent_chat_service
 from app.tools.registry import TOOL_REGISTRY
+from pydantic import BaseModel, ValidationError
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # --- LLM_PROVIDER setting / get_llm() factory routing ------------------------
@@ -74,6 +83,39 @@ def test_llm_provider_fake_is_case_and_whitespace_insensitive(raw_value: str) ->
     intended to stay network-free."""
     s = Settings(LLM_PROVIDER=raw_value, SECOP_APP_TOKEN=_NON_EMPTY_SECOP_TOKEN)  # type: ignore[call-arg]
     assert s.LLM_PROVIDER == "fake"
+
+
+# --- FAKE_LLM_SCRIPT setting (Phase 0, slice 0.6) ----------------------------
+
+
+def test_fake_llm_script_defaults_to_none() -> None:
+    s = Settings(SECOP_APP_TOKEN=_NON_EMPTY_SECOP_TOKEN)  # type: ignore[call-arg]
+    assert s.FAKE_LLM_SCRIPT is None
+
+
+@pytest.mark.parametrize("raw_value", ["malformed", "MALFORMED", " Malformed "])
+def test_fake_llm_script_accepts_malformed_case_and_whitespace_insensitive(raw_value: str) -> None:
+    s = Settings(FAKE_LLM_SCRIPT=raw_value, SECOP_APP_TOKEN=_NON_EMPTY_SECOP_TOKEN)  # type: ignore[call-arg]
+    assert s.FAKE_LLM_SCRIPT == "malformed"
+
+
+@pytest.mark.parametrize("raw_value", ["stall", "STALL", " stall "])
+def test_fake_llm_script_accepts_stall_case_and_whitespace_insensitive(raw_value: str) -> None:
+    s = Settings(FAKE_LLM_SCRIPT=raw_value, SECOP_APP_TOKEN=_NON_EMPTY_SECOP_TOKEN)  # type: ignore[call-arg]
+    assert s.FAKE_LLM_SCRIPT == "stall"
+
+
+def test_fake_llm_script_accepts_happy_explicitly() -> None:
+    s = Settings(FAKE_LLM_SCRIPT="happy", SECOP_APP_TOKEN=_NON_EMPTY_SECOP_TOKEN)  # type: ignore[call-arg]
+    assert s.FAKE_LLM_SCRIPT == "happy"
+
+
+def test_fake_llm_script_invalid_value_falls_back_to_none() -> None:
+    """An unrecognized value must never crash Settings load, nor silently pick a
+    random script — it normalizes to `None`, i.e. the default happy path, mirroring
+    `LLM_PROVIDER`'s own fold-to-default behavior for an invalid value."""
+    s = Settings(FAKE_LLM_SCRIPT="banana", SECOP_APP_TOKEN=_NON_EMPTY_SECOP_TOKEN)  # type: ignore[call-arg]
+    assert s.FAKE_LLM_SCRIPT is None
 
 
 def test_llm_provider_invalid_value_logs_a_warning() -> None:
@@ -141,7 +183,510 @@ def test_last_tool_called_reads_the_most_recent_assistant_tool_call() -> None:
     assert _last_tool_called(messages) == "listar_contratos"
 
 
+# --- _tool_results / _known_ids: real cross-turn ID threading (Phase 0, 0.6) -
+
+
+def _assistant_call(call_id: str, name: str) -> LLMMessage:
+    return LLMMessage(
+        role="assistant",
+        content="",
+        tool_calls=[{"id": call_id, "type": "function", "function": {"name": name, "arguments": "{}"}}],
+    )
+
+
+def test_tool_results_pairs_each_assistant_call_with_its_later_tool_message() -> None:
+    messages = [
+        LLMMessage(role="user", content="hola"),
+        _assistant_call("1", "listar_contratos"),
+        LLMMessage(role="tool", tool_call_id="1", content='{"contratos": []}'),
+        _assistant_call("2", "crear_cuenta_cobro"),
+        LLMMessage(role="tool", tool_call_id="2", content='{"id": "not-checked-here"}'),
+    ]
+    results = _tool_results(messages)
+    assert results == [
+        ("1", "listar_contratos", {"contratos": []}),
+        ("2", "crear_cuenta_cobro", {"id": "not-checked-here"}),
+    ]
+
+
+def test_tool_results_unpaired_assistant_call_is_not_included() -> None:
+    """An assistant `tool_calls` message with no LATER `role=\"tool\"` message
+    carrying a matching `tool_call_id` produces no result entry — the call hasn't
+    resolved yet, so `_known_ids` has nothing to extract from it."""
+    messages = [_assistant_call("1", "listar_contratos")]
+    assert _tool_results(messages) == []
+
+
+def test_known_ids_aliases_listar_contratos_result_into_contrato_id() -> None:
+    real_id = str(uuid.uuid4())
+    messages = [
+        _assistant_call("1", "listar_contratos"),
+        LLMMessage(
+            role="tool",
+            tool_call_id="1",
+            content=json.dumps({"contratos": [{"id": real_id, "numero_contrato": "C-1"}]}),
+        ),
+    ]
+    assert _known_ids(messages) == {"id": real_id, "contrato_id": real_id}
+
+
+def test_known_ids_aliases_crear_cuenta_cobro_result_into_cuenta_id() -> None:
+    cuenta_id = str(uuid.uuid4())
+    contrato_id = str(uuid.uuid4())
+    messages = [
+        _assistant_call("1", "crear_cuenta_cobro"),
+        LLMMessage(
+            role="tool",
+            tool_call_id="1",
+            content=json.dumps({"id": cuenta_id, "contrato_id": contrato_id, "mes": 3}),
+        ),
+    ]
+    known = _known_ids(messages)
+    assert known["cuenta_id"] == cuenta_id
+    assert known["contrato_id"] == contrato_id
+    assert known["id"] == cuenta_id
+
+
+def test_known_ids_two_tools_alias_to_different_keys_without_cross_contamination() -> None:
+    """`listar_contratos` and `crear_cuenta_cobro` BOTH expose a generic top-level
+    `id` key — each must alias into the field name the NEXT tool actually expects
+    (`contrato_id` vs `cuenta_id`), never leak one tool's id under the other's
+    target key."""
+    contrato_id = str(uuid.uuid4())
+    cuenta_id = str(uuid.uuid4())
+    messages = [
+        _assistant_call("1", "listar_contratos"),
+        LLMMessage(role="tool", tool_call_id="1", content=json.dumps({"contratos": [{"id": contrato_id}]})),
+        _assistant_call("2", "crear_cuenta_cobro"),
+        LLMMessage(role="tool", tool_call_id="2", content=json.dumps({"id": cuenta_id, "contrato_id": contrato_id})),
+    ]
+    known = _known_ids(messages)
+    assert known["contrato_id"] == contrato_id
+    assert known["cuenta_id"] == cuenta_id
+    assert known["contrato_id"] != known["cuenta_id"]
+
+
+def test_known_ids_missing_id_key_does_not_crash_and_yields_no_entry() -> None:
+    messages = [
+        _assistant_call("1", "listar_contratos"),
+        LLMMessage(role="tool", tool_call_id="1", content=json.dumps({"contratos": []})),
+    ]
+    assert _known_ids(messages) == {}
+
+
+def test_known_ids_malformed_json_content_yields_empty_dict_no_exception() -> None:
+    messages = [
+        _assistant_call("1", "listar_contratos"),
+        LLMMessage(role="tool", tool_call_id="1", content="not json at all"),
+    ]
+    assert _known_ids(messages) == {}
+
+
+def test_parse_tool_result_content_logs_a_warning_when_content_is_unparseable() -> None:
+    """A tool result string that isn't valid JSON and has no tool-specific
+    fallback to recover it (unlike `listar_contratos`'s compact-pipe format) —
+    the shape `agent_chat_service._serialize_tool_result`'s
+    `_MAX_TOOL_RESULT_CHARS` truncation produces (`"... (truncado)"` breaking
+    `json.loads` mid-structure) — must not degrade silently: a queryable
+    warning log line is emitted, so this "no ids threaded" case is observable
+    in production logs instead of only inferable from an absent id.
+
+    Uses `structlog.testing.capture_logs()`, never `monkeypatch.setattr` on the
+    module logger directly (see
+    `test_llm_provider_invalid_value_logs_a_warning`'s docstring for why)."""
+    with structlog.testing.capture_logs() as captured:
+        result = _parse_tool_result_content("crear_cuenta_cobro", '{"id": "abc"... (truncado)')
+
+    assert result is None
+    warn_events = [e for e in captured if e.get("event") == "fake_llm_tool_result_unparseable"]
+    assert warn_events, "expected a queryable warning log for unparseable tool-result content"
+    assert warn_events[0]["tool"] == "crear_cuenta_cobro"
+
+
+def test_known_ids_parses_listar_contratos_real_compact_pipe_format() -> None:
+    """`listar_contratos`'s REAL tool-result content in the running app is NOT
+    JSON — `agent_chat_service._compact_listar_contratos` serializes it as
+    `numero_contrato | entidad | valor_mensual | id` pipe-delimited plain text
+    (bypassing the generic JSON path entirely for this tool). `_known_ids` must
+    still recover the real `contrato_id` from that shape, not just from a
+    hand-built JSON dict — otherwise the fix never actually threads IDs through
+    the REAL running app, only through synthetic test histories."""
+    real_id = str(uuid.uuid4())
+    messages = [
+        _assistant_call("1", "listar_contratos"),
+        LLMMessage(role="tool", tool_call_id="1", content=f"C-1 | Alcaldia | 1000000 | {real_id}"),
+    ]
+    assert _known_ids(messages)["contrato_id"] == real_id
+
+
+def test_known_ids_definir_requisitos_checklist_aliases_cuenta_cobro_id() -> None:
+    cuenta_id = str(uuid.uuid4())
+    messages = [
+        _assistant_call("1", "definir_requisitos_checklist"),
+        LLMMessage(
+            role="tool",
+            tool_call_id="1",
+            content=json.dumps({"cuenta_cobro_id": cuenta_id, "modo": "estandar", "requisitos_custom": 0}),
+        ),
+    ]
+    assert _known_ids(messages)["cuenta_id"] == cuenta_id
+
+
+def test_known_ids_resumen_checklist_real_compact_text_yields_no_cuenta_id() -> None:
+    """`resumen_checklist`'s REAL tool-result content in the running app is
+    `_compact_resumen_checklist`'s plain-text summary (see
+    `agent_chat_service._COMPACT_SERIALIZERS`) — `"resumen: total=... / {codigo}
+    {estado}"` lines, NEVER JSON, and it never carries a `cuenta_cobro_id` field
+    at all. `_ID_ALIASES["resumen_checklist"]` is therefore a documented no-op on
+    THIS (live, same-turn) path — see that dict's docstring — it only matters on
+    the cross-turn recap-resume path (see
+    `test_complete_resumes_from_recap_threads_cuenta_id_via_resumen_checklist_alias`
+    below, which reads the raw dumped dict, not this serialized text). This test
+    replaces a previous version that fed `_known_ids` a hand-built
+    `json.dumps({"cuenta_cobro_id": ...})` payload the real app never produces
+    for this tool — a green test exercising a dead path."""
+    messages = [
+        _assistant_call("1", "resumen_checklist"),
+        LLMMessage(
+            role="tool",
+            tool_call_id="1",
+            content="resumen: total=3 cumplidos=1 pendientes=2 radicacion_lista=False\nRUT cumplido",
+        ),
+    ]
+    assert _known_ids(messages) == {}
+    assert _parse_tool_result_content("resumen_checklist", messages[1].content) is None
+
+
+async def test_complete_resumes_from_recap_threads_cuenta_id_via_resumen_checklist_alias() -> None:
+    """The recap-resume path is where `_ID_ALIASES["resumen_checklist"]`
+    genuinely matters: `agent_chat_service._build_tool_context_recap` builds
+    recap lines from the RAW dumped tool-result dict (`call_results`), not the
+    compact serialized text (see `_extract_recap_ids`) — so a
+    `resumen_checklist:ok cuenta_cobro_id=<uuid>` recap entry DOES carry the id,
+    and `_resume_from_recap` must alias it into `cuenta_id` for the next
+    scripted tool (`radicar_cuenta`), same as the live-call alias would if the
+    serialized content ever were JSON.
+
+    Builds the recap via the REAL `agent_chat_service._build_tool_context_recap`
+    (not a hand-built f-string) — same rationale as
+    `test_complete_resumes_from_recap_when_no_tool_calls_in_history`."""
+    cuenta_id = str(uuid.uuid4())
+    recap_content = agent_chat_service._build_tool_context_recap(
+        [("resumen_checklist", "ok", {"cuenta_cobro_id": cuenta_id})]
+    )
+    assert recap_content is not None
+    fake = FakeLLMPort()
+    tools = [{"type": "function", "function": {"name": "radicar_cuenta"}}]
+    messages = [
+        LLMMessage(role="system", content=recap_content),
+        LLMMessage(role="user", content="seguí con la radicación"),
+    ]
+    response = await fake.complete(messages, tools=tools)
+    assert response.tool_calls is not None
+    assert response.tool_calls[0].name == "radicar_cuenta"
+    assert response.tool_calls[0].arguments["cuenta_id"] == cuenta_id
+
+
+def test_synthesize_tool_arguments_uses_known_id_for_matching_uuid_field() -> None:
+    from app.tools.catalog.cuentas import CrearCuentaCobroInput
+
+    real_contrato_id = str(uuid.uuid4())
+    args = synthesize_tool_arguments(CrearCuentaCobroInput, known={"contrato_id": real_contrato_id})
+    assert args["contrato_id"] == real_contrato_id
+
+
+def test_synthesize_tool_arguments_ignores_known_when_field_not_present() -> None:
+    from app.tools.catalog.cuentas import CrearCuentaCobroInput
+
+    args = synthesize_tool_arguments(CrearCuentaCobroInput, known={"cuenta_id": str(uuid.uuid4())})
+    assert "cuenta_id" not in args
+    # contrato_id still synthesized (falls back to a random UUID, today's behavior)
+    uuid.UUID(args["contrato_id"])
+
+
+def test_synthesize_tool_arguments_known_none_default_matches_pre_existing_behavior() -> None:
+    """Explicit regression proof for the `known: dict[str, str] | None = None`
+    default — every field must still be synthesized exactly like before this
+    slice when no `known` dict is passed at all."""
+    from app.tools.catalog.cuentas import CrearCuentaCobroInput
+
+    args = synthesize_tool_arguments(CrearCuentaCobroInput)
+    assert set(args) == {"contrato_id", "mes", "anio"}
+    uuid.UUID(args["contrato_id"])
+
+
 # --- Malformed / unrecognized input -> safe default, never a crash ----------
+
+
+async def test_complete_threads_real_contrato_id_into_crear_cuenta_cobro_call() -> None:
+    """The core bug this slice fixes: `crear_cuenta_cobro`'s synthesized
+    `contrato_id` must be the REAL id `listar_contratos` returned in this same
+    history, not a fresh random `uuid.uuid4()`."""
+    fake = FakeLLMPort()
+    real_contrato_id = str(uuid.uuid4())
+    tools = [{"type": "function", "function": {"name": "crear_cuenta_cobro"}}]
+    messages = [
+        _assistant_call("1", "listar_contratos"),
+        LLMMessage(
+            role="tool",
+            tool_call_id="1",
+            content=json.dumps({"contratos": [{"id": real_contrato_id, "numero_contrato": "C-1"}]}),
+        ),
+    ]
+    response = await fake.complete(messages, tools=tools)
+    assert response.tool_calls is not None
+    assert response.tool_calls[0].name == "crear_cuenta_cobro"
+    assert response.tool_calls[0].arguments["contrato_id"] == real_contrato_id
+
+
+async def test_complete_retries_the_same_tool_once_after_a_failed_result() -> None:
+    fake = FakeLLMPort()
+    tools = [{"type": "function", "function": {"name": "crear_cuenta_cobro"}}]
+    messages = [
+        _assistant_call("1", "crear_cuenta_cobro"),
+        LLMMessage(role="tool", tool_call_id="1", content=json.dumps({"error": "boom"})),
+    ]
+    response = await fake.complete(messages, tools=tools)
+    assert response.tool_calls is not None
+    assert response.tool_calls[0].name == "crear_cuenta_cobro"
+
+
+async def test_complete_gives_up_after_a_retry_also_fails() -> None:
+    fake = FakeLLMPort()
+    tools = [{"type": "function", "function": {"name": "crear_cuenta_cobro"}}]
+    messages = [
+        _assistant_call("1", "crear_cuenta_cobro"),
+        LLMMessage(role="tool", tool_call_id="1", content=json.dumps({"error": "boom"})),
+        _assistant_call("2", "crear_cuenta_cobro"),
+        LLMMessage(role="tool", tool_call_id="2", content=json.dumps({"error": "boom again"})),
+    ]
+    response = await fake.complete(messages, tools=tools)
+    assert response.tool_calls is None
+    assert response.content
+
+
+async def test_complete_advances_normally_when_last_result_succeeded() -> None:
+    """Sibling of the retry test above: a SUCCESSFUL paired result must still
+    advance `HAPPY_PATH_SEQUENCE` normally (outcome-aware routing must not
+    accidentally start retrying successful calls too)."""
+    fake = FakeLLMPort()
+    tools = [{"type": "function", "function": {"name": "crear_cuenta_cobro"}}]
+    messages = [
+        _assistant_call("1", "listar_contratos"),
+        LLMMessage(role="tool", tool_call_id="1", content=json.dumps({"contratos": []})),
+    ]
+    response = await fake.complete(messages, tools=tools)
+    assert response.tool_calls is not None
+    assert response.tool_calls[0].name == "crear_cuenta_cobro"
+
+
+# --- response_format structured output (Phase 0, slice 0.6) -----------------
+
+
+async def test_complete_honors_response_format_and_returns_valid_structured_json() -> None:
+    """Every real `response_format=` call site (extraction.py, document_service.py,
+    checklist_service.py, requisito_inference_service.py) expects a JSON string
+    matching the given Pydantic model back in `response.content` — NOT a tool
+    call, NOT prose. This is a general-mechanism proof using a test-local dummy
+    model (mirrors `test_complete_degrades_safely_when_synthesized_arguments_fail_validation`'s
+    pattern) — `_synthesize_field_value` doesn't handle nested BaseModel fields,
+    so a REAL response_format model with a required nested model field would
+    still degrade safely (see the sibling test below) rather than produce valid
+    output; this proves the MECHANISM works for the shapes it does support."""
+
+    class _DummyStructuredOutput(BaseModel):
+        resumen: str
+        confianza: int
+
+    fake = FakeLLMPort()
+    response = await fake.complete([LLMMessage(role="user", content="hola")], response_format=_DummyStructuredOutput)
+    assert response.tool_calls is None
+    parsed = json.loads(response.content)
+    _DummyStructuredOutput.model_validate(parsed)
+
+
+async def test_complete_response_format_degrades_safely_when_unsynthesizable() -> None:
+    class _UnsynthesizableStructuredOutput(BaseModel):
+        payload: bytes  # not a shape _synthesize_field_value knows how to fill
+
+    fake = FakeLLMPort()
+    response = await fake.complete(
+        [LLMMessage(role="user", content="hola")], response_format=_UnsynthesizableStructuredOutput
+    )
+    assert response.tool_calls is None
+    assert response.content == _DEFAULT_TEXT_RESPONSE
+
+
+# --- FAKE_LLM_SCRIPT=stall / malformed (Phase 0, slice 0.6) -----------------
+
+
+async def test_complete_stall_script_always_returns_text_never_a_tool_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`FAKE_LLM_SCRIPT=stall` stalls UNCONDITIONALLY — even mid-sequence, with a
+    history that would normally advance to a real scripted tool call — proving
+    the "agent gave up mid-chain" edge case regardless of routing state."""
+    monkeypatch.setattr(settings, "FAKE_LLM_SCRIPT", "stall")
+    fake = FakeLLMPort()
+    tools = [{"type": "function", "function": {"name": "crear_cuenta_cobro"}}]
+    messages = [
+        _assistant_call("1", "listar_contratos"),
+        LLMMessage(role="tool", tool_call_id="1", content=json.dumps({"contratos": []})),
+    ]
+    response = await fake.complete(messages, tools=tools)
+    assert response.tool_calls is None
+    assert response.content
+
+
+async def test_chat_with_tools_stall_script_completes_one_turn_without_progress(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "LLM_PROVIDER", "fake")
+    monkeypatch.setattr(settings, "FAKE_LLM_SCRIPT", "stall")
+    user, _contrato = await _make_user_with_contrato(db)
+
+    result = await agent_chat_service.chat_with_tools(db, user, "Radicá mi cuenta", None, {})
+
+    assert result.tool_events == []
+    assert result.content
+    assert result.session_id
+
+
+async def test_complete_malformed_script_corrupts_crear_cuenta_cobro_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`FAKE_LLM_SCRIPT=malformed` deliberately emits a `mes` value (13) that
+    violates `CrearCuentaCobroInput.mes`'s `Field(ge=1, le=12)` — proving it
+    genuinely fails the tool's OWN schema (not just "some invalid string"),
+    and that the fake SKIPS its own `build_tool_call` self-check for this one
+    call (a real provider's tool-call arguments aren't pre-validated either)."""
+    from app.tools.catalog.cuentas import CrearCuentaCobroInput
+
+    monkeypatch.setattr(settings, "FAKE_LLM_SCRIPT", "malformed")
+    fake = FakeLLMPort()
+    tools = [{"type": "function", "function": {"name": "crear_cuenta_cobro"}}]
+    messages = [
+        _assistant_call("1", "listar_contratos"),
+        LLMMessage(
+            role="tool",
+            tool_call_id="1",
+            content=json.dumps({"contratos": [{"id": str(uuid.uuid4())}]}),
+        ),
+    ]
+    response = await fake.complete(messages, tools=tools)
+    assert response.tool_calls is not None
+    assert response.tool_calls[0].name == "crear_cuenta_cobro"
+    assert response.tool_calls[0].arguments["mes"] == 13
+    with pytest.raises(ValidationError):
+        CrearCuentaCobroInput.model_validate(response.tool_calls[0].arguments)
+
+
+async def test_chat_with_tools_malformed_script_surfaces_a_validation_error_not_a_network_failure(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Traces the malformed tool call THROUGH the real `agent_chat_service.
+    chat_with_tools` loop (not just asserting the fake returns bad JSON): the
+    resulting `ToolEvent` for `crear_cuenta_cobro` must be a genuine pydantic
+    `ValidationError`-shaped failure (`_format_tool_error`'s ValidationError
+    branch, naming the bad field) — per slice 0.4's own guidance, this must
+    NEVER be misdiagnosed as an LLM-network failure (the
+    "No pude contactar al modelo..." message from `chat_with_tools`'s outer
+    `except Exception` around `llm.complete()`)."""
+    monkeypatch.setattr(settings, "LLM_PROVIDER", "fake")
+    monkeypatch.setattr(settings, "FAKE_LLM_SCRIPT", "malformed")
+    user, _contrato = await _make_user_with_contrato(db)
+
+    result = await agent_chat_service.chat_with_tools(db, user, "Radicá mi cuenta de este mes", None, {})
+
+    # `FAKE_LLM_SCRIPT=malformed` corrupts `crear_cuenta_cobro`'s arguments
+    # EVERY time it's the scripted next step — including the outcome-aware
+    # retry (also this slice) — so it fails TWICE (initial attempt + retry)
+    # before the fake gives up, same shape as the plain retry-once test above.
+    crear_events = [e for e in result.tool_events if e.tool == "crear_cuenta_cobro"]
+    assert len(crear_events) == 2
+    assert all(e.status == "error" for e in crear_events)
+    assert all("mes" in e.resumen for e in crear_events)
+    assert "No pude contactar al modelo" not in result.content
+
+
+# --- Cross-turn recap resume (Phase 0, slice 0.6) ---------------------------
+
+
+async def test_complete_resumes_from_recap_when_no_tool_calls_in_history() -> None:
+    """A CONTINUATION turn on the same session_id replays history with the
+    cross-turn recap (`agent_chat_service._build_tool_context_recap`'s exact
+    format — role="system", `AGENT_RECAP_MARKER` prefix, `tool:status k=v`
+    entries) but NO assistant `tool_calls` at all (only the user + assistant
+    text from the persisted `Conversacion.mensajes_json`). The fake must
+    resume `HAPPY_PATH_SEQUENCE` from the recap's newest entry AND thread its
+    ids into the next call's arguments.
+
+    Builds the recap via the REAL `agent_chat_service._build_tool_context_recap`
+    (not a hand-built f-string) so a future format drift in that function fails
+    THIS test too, instead of only ever testing the replica parser's own
+    assumptions about the format."""
+    cuenta_id = str(uuid.uuid4())
+    contrato_id = str(uuid.uuid4())
+    recap_content = agent_chat_service._build_tool_context_recap(
+        [("crear_cuenta_cobro", "ok", {"id": cuenta_id, "contrato_id": contrato_id})]
+    )
+    assert recap_content is not None
+    fake = FakeLLMPort()
+    tools = [{"type": "function", "function": {"name": "definir_requisitos_checklist"}}]
+    messages = [
+        LLMMessage(role="system", content=recap_content),
+        LLMMessage(role="user", content="creá la cuenta"),
+        LLMMessage(role="assistant", content="Listo, la cuenta quedó creada."),
+        LLMMessage(role="user", content="seguí con el checklist"),
+    ]
+    response = await fake.complete(messages, tools=tools)
+    assert response.tool_calls is not None
+    assert response.tool_calls[0].name == "definir_requisitos_checklist"
+    assert response.tool_calls[0].arguments["cuenta_id"] == cuenta_id
+
+
+async def test_complete_falls_back_to_fresh_start_on_malformed_recap() -> None:
+    """A truncated/garbled recap line (never happens today — `_RECAP_MAX_CHARS`
+    truncates safely — but a hand-built or future history could still carry
+    one) must never raise, and must fall back to starting the sequence fresh,
+    same as no history/recap at all."""
+    from app.schemas.agent import AGENT_RECAP_MARKER
+
+    fake = FakeLLMPort()
+    tools = [{"type": "function", "function": {"name": "listar_contratos"}}]
+    messages = [
+        LLMMessage(role="system", content=f"{AGENT_RECAP_MARKER} garbled;;not-the-expected-format###"),
+        LLMMessage(role="user", content="seguí"),
+    ]
+    response = await fake.complete(messages, tools=tools)
+    assert response.tool_calls is not None
+    assert response.tool_calls[0].name == "listar_contratos"
+
+
+async def test_complete_recap_picks_the_newest_entry_when_multiple_lines_present() -> None:
+    """Recap lines are newest-first (`_build_tool_context_recap` builds from
+    `reversed(call_results)`) — the resume position must come from the FIRST
+    (most recent) `ok` entry, not an older one."""
+    from app.schemas.agent import AGENT_RECAP_MARKER
+
+    newer_cuenta_id = str(uuid.uuid4())
+    older_contrato_id = str(uuid.uuid4())
+    fake = FakeLLMPort()
+    tools = [{"type": "function", "function": {"name": "definir_requisitos_checklist"}}]
+    messages = [
+        LLMMessage(
+            role="system",
+            content=(
+                f"{AGENT_RECAP_MARKER} crear_cuenta_cobro:ok id={newer_cuenta_id} "
+                f"| listar_contratos:ok id={older_contrato_id}"
+            ),
+        ),
+        LLMMessage(role="user", content="seguí"),
+    ]
+    response = await fake.complete(messages, tools=tools)
+    assert response.tool_calls is not None
+    assert response.tool_calls[0].name == "definir_requisitos_checklist"
+    assert response.tool_calls[0].arguments["cuenta_id"] == newer_cuenta_id
 
 
 async def test_complete_with_malformed_tool_call_shape_returns_safe_default() -> None:
@@ -173,6 +718,25 @@ async def test_complete_with_unscripted_tool_name_returns_safe_default() -> None
     response = await fake.complete(messages)
     assert response.tool_calls is None
     assert response.content
+
+
+def test_resolve_next_tool_unscripted_tool_error_result_skips_retry_branch() -> None:
+    """An unscripted tool name (not a `HAPPY_PATH_SEQUENCE` key) whose paired
+    result is an ERROR must resolve straight to `(None, "unscripted", known)` —
+    the retry-once bookkeeping (`_is_error_result` + `trailing_failures`) is
+    reserved for SCRIPTED tools only. Before this fix, an unscripted tool's
+    error result fell into the retry branch anyway (bounded/harmless only
+    because the retried "next tool" is never a real registry entry) instead of
+    going straight to a text reply on the FIRST attempt, unlike the established
+    "unscripted → text" behavior for the non-error case
+    (`test_complete_with_unscripted_tool_name_returns_safe_default`)."""
+    messages = [
+        _assistant_call("1", "algo_no_scripteado"),
+        LLMMessage(role="tool", tool_call_id="1", content=json.dumps({"error": "boom"})),
+    ]
+    next_tool, reason, _known = _resolve_next_tool(messages)
+    assert next_tool is None
+    assert reason == "unscripted"
 
 
 async def test_complete_does_not_request_a_tool_the_caller_did_not_offer() -> None:
@@ -327,6 +891,46 @@ async def test_concurrent_calls_do_not_leak_state_between_sessions() -> None:
     assert all(r.tool_calls is not None and r.tool_calls[0].name == "crear_cuenta_cobro" for r in b_results)
 
 
+async def test_concurrent_calls_do_not_leak_known_ids_between_sessions() -> None:
+    """Sibling of the routing-leak test above, but for `known` IDS specifically
+    (the new slice 0.6 feature) — two sessions concurrently at the SAME routing
+    position (`crear_cuenta_cobro` next) but with DIFFERENT real `contrato_id`
+    values in their own history must each synthesize THEIR OWN id, never the
+    other session's — proving `_known_ids`/`synthesize_tool_arguments(known=)`
+    introduced no module-level mutable state either."""
+    fake = FakeLLMPort()
+    tools = [{"type": "function", "function": {"name": "crear_cuenta_cobro"}}]
+
+    contrato_id_a = str(uuid.uuid4())
+    contrato_id_b = str(uuid.uuid4())
+
+    def _messages_for(contrato_id: str) -> list[LLMMessage]:
+        return [
+            _assistant_call("1", "listar_contratos"),
+            LLMMessage(
+                role="tool",
+                tool_call_id="1",
+                content=json.dumps({"contratos": [{"id": contrato_id}]}),
+            ),
+        ]
+
+    session_a_messages = _messages_for(contrato_id_a)
+    session_b_messages = _messages_for(contrato_id_b)
+
+    results = await asyncio.gather(
+        *[fake.complete(session_a_messages, tools=tools) for _ in range(5)],
+        *[fake.complete(session_b_messages, tools=tools) for _ in range(5)],
+    )
+    a_results, b_results = results[:5], results[5:]
+
+    assert all(
+        r.tool_calls is not None and r.tool_calls[0].arguments["contrato_id"] == contrato_id_a for r in a_results
+    )
+    assert all(
+        r.tool_calls is not None and r.tool_calls[0].arguments["contrato_id"] == contrato_id_b for r in b_results
+    )
+
+
 # --- Full catalog schema validity (all 32 tools, not just the playbook) -----
 
 
@@ -394,49 +998,65 @@ async def _make_user_with_contrato(db: AsyncSession) -> tuple[Usuario, Contrato]
 async def test_fake_llm_completes_the_full_tool_sequence_even_when_synthesized_ids_dont_resolve(
     db: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Boots the REAL agent loop with LLM_PROVIDER=fake and asserts the turn
-    completes the whole scripted tool NAME sequence end-to-end — no
-    `bloquear_red_llm` opt-out needed (FakeLLMPort never imports litellm), no
-    `ScriptedLLM` monkeypatch of `get_llm` (the real factory routes to the fake
-    via the setting alone).
+    """Boots the REAL agent loop with LLM_PROVIDER=fake — no `bloquear_red_llm`
+    opt-out needed (FakeLLMPort never imports litellm), no `ScriptedLLM`
+    monkeypatch of `get_llm` (the real factory routes to the fake via the
+    setting alone).
 
-    IMPORTANT: this does NOT assert a fully successful radicación chain. Only
-    `listar_contratos` (the sole zero-required-argument tool in the sequence)
-    actually succeeds. Every other tool call is built with `synthesize_tool_arguments`
-    (see fake_adapter.py), which fills required fields with schema-valid but
-    RANDOM placeholder values (e.g. `uuid.uuid4()` for foreign keys) — it does
-    NOT thread real IDs from prior tool results (`crear_cuenta_cobro`'s real
-    `contrato.id`, etc.). So the remaining 5 calls in this script correctly
-    fail with domain "not found" errors against a real DB. This is a KNOWN,
-    TRACKED limitation of the Phase 0 fake-adapter seam (cross-turn ID
-    threading is future work, not part of this slice) — it is not a bug to fix
-    here. The point of this test is that the fake adapter still drives the
-    agent loop through the ENTIRE scripted tool-name sequence without crashing
-    or stalling, regardless of each call's individual domain outcome.
+    UPDATED for slice 0.6 (real cross-turn ID threading + outcome-aware
+    routing) — the docstring below describes the CURRENT, verified outcome;
+    the previous version of this test (pre-0.6) asserted only 1/6 calls could
+    ever succeed, which was exactly the threading gap this slice fixes.
+
+    Real observed outcome (verified by running this test): the first THREE
+    calls now genuinely succeed against the real DB — `listar_contratos`
+    discovers the seeded contrato, `crear_cuenta_cobro` receives its REAL
+    `contrato_id` (not a random `uuid4()` — see the DB assertion below, which
+    is the direct proof `FakeLLMPort._known_ids`/`known=` actually threaded
+    it), and `definir_requisitos_checklist` receives the REAL `cuenta_id`
+    `crear_cuenta_cobro` just created. `importar_documento` then fails twice
+    (an initial attempt + one outcome-aware retry, also this slice) — that
+    failure is NOT an ID-threading gap: this test supplies NO chat attachment,
+    so `synthesize_tool_arguments` can only synthesize a `filename` STRING
+    ("fake"), never a real uploaded file, and `ctx.attachments.get("fake")` is
+    always `None` regardless of ID threading (see
+    `app/tools/catalog/importar_documento.py`). Exercising a real file upload
+    end-to-end is a different tool's concern, out of scope here. `radicar_cuenta`
+    (script step 6) is correctly never reached — the chain gives up after
+    `importar_documento`'s retry also fails, instead of looping forever.
     """
     monkeypatch.setattr(settings, "LLM_PROVIDER", "fake")
-    user, _contrato = await _make_user_with_contrato(db)
+    user, contrato = await _make_user_with_contrato(db)
 
     result = await agent_chat_service.chat_with_tools(db, user, "Radicá mi cuenta de este mes", None, {})
 
-    # Real observed outcome (verified by running this test): only the first
-    # call (`listar_contratos`, the only tool with no required arguments) can
-    # succeed against a real DB with synthesized/random arguments — the other
-    # 5 calls fail with domain "not found" errors because their synthesized
-    # foreign-key IDs are random UUIDs, not IDs threaded from prior results.
     expected_events = [
         ("listar_contratos", "ok"),
-        ("crear_cuenta_cobro", "error"),
-        ("definir_requisitos_checklist", "error"),
+        ("crear_cuenta_cobro", "ok"),
+        ("definir_requisitos_checklist", "ok"),
         ("importar_documento", "error"),
-        ("resumen_checklist", "error"),
-        ("radicar_cuenta", "error"),
+        ("importar_documento", "error"),
     ]
-    expected_sequence = [name for name in HAPPY_PATH_SEQUENCE.values() if name is not None]
-    assert expected_sequence == [tool for tool, _status in expected_events]
     assert [(event.tool, event.status) for event in result.tool_events] == expected_events
-    assert result.content
+    assert result.content == _GAVE_UP_TEXT_RESPONSE
     assert result.session_id
+
+    # `importar_documento`'s failures each trigger `db.rollback()` inside
+    # `chat_with_tools`, which expires every object in the shared `db` session
+    # (regardless of `expire_on_commit`) — refresh `contrato` (created earlier,
+    # outside that rollback) before reading its attributes, exactly like the
+    # service itself does for its own long-lived objects after a rollback (see
+    # `test_chat_with_tools_fake_llm_is_deterministic_across_runs` below).
+    await db.refresh(contrato)
+
+    # Direct DB proof of real ID threading: the cuenta de cobro `crear_cuenta_cobro`
+    # created must be linked to the SAME contrato `listar_contratos` discovered — if
+    # `contrato_id` had been a random uuid4() (the pre-0.6 bug), `crear_cuenta_cobro`
+    # would have failed with "Contrato not found" and no row would exist here at all.
+    cuenta_result = await db.execute(select(CuentaCobro).where(CuentaCobro.contrato_id == contrato.id))
+    cuenta = cuenta_result.scalar_one()
+    assert cuenta.contrato_id == contrato.id
+    assert cuenta.requisitos_modo is not None  # definir_requisitos_checklist ran too
 
 
 async def test_chat_with_tools_fake_llm_is_deterministic_across_runs(
