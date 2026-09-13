@@ -20,6 +20,16 @@ make security       # Bandit + pip-audit vulnerability scan
 make lock           # Regenerate uv.lock + requirements*.txt after editing deps
 ```
 
+**Before merging:** run `.\scripts\pre-merge.ps1` (PowerShell). It mirrors
+`.github/workflows/ci.yml`'s pytest+coverage step exactly (fails the gate on any
+test failure or coverage below the 70% floor in `pyproject.toml`) and also runs
+ruff+mypy (reported, non-blocking — matches CI's own `continue-on-error: true`
+lint job). Prints a single `GATE OK <sha> tests=<n> coverage=<pct>%
+ruff=<clean|N> mypy=<clean|N> dirty=<yes|no>` line on success, or `GATE FAIL
+<step>` with a non-zero exit otherwise. Pass `-IncludePg` to also run the real
+PostgreSQL suite (`scripts/test-postgres.sh`, mirrors the nightly CI job) —
+skipped by default since it is slow.
+
 **Dependencies — single source of truth:** declare/version ALL dependencies in
 `pyproject.toml` only (`[project.dependencies]` for runtime, `[dependency-groups].dev`
 for tooling). `uv.lock`, `requirements.txt`, and `requirements-dev.txt` are GENERATED

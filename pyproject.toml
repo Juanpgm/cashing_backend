@@ -80,6 +80,11 @@ dev = [
     # [tool.pytest.ini_options]): run it by hand against a suspect file with
     # `--timeout=60 --timeout-method=thread` to get a stack dump of every thread.
     "pytest-timeout>=2.3,<3",
+    # `--cov` is a pytest-cov CLI flag, not provided by bare `coverage` — CI's
+    # own pytest+coverage step (`pytest --cov=app ...`) and `make test-cov`
+    # both silently required this without declaring it (discovered while
+    # building scripts/pre-merge.ps1, which mirrors that CI step exactly).
+    "pytest-cov>=5,<7",
     "coverage[toml]>=7,<8",
     "moto[s3]>=5,<6",
     "factory-boy>=3,<4",
