@@ -39,6 +39,7 @@ from app.agent.tools.document_parser import (
     iter_archive_members,
     parse_document,
 )
+from app.core import database
 from app.core.exceptions import DomainError
 from app.core.file_validation import _EXT_TO_MIME
 from app.core.observability import elapsed_ms
@@ -1673,15 +1674,37 @@ async def stream_chat_with_tools(
     starts, to scope the write-tool approval gate and the first `connected` event to
     the real `session_id` even for a brand-new conversation) — every other line of
     actual agent-loop logic is `_run_chat_turn`, shared unchanged with the
-    synchronous endpoint.
+    synchronous endpoint. This initial setup uses `db` — the REQUEST-scoped session
+    FastAPI's `Depends(get_db)` supplies — because it always completes before the
+    first byte is streamed back, while the request is still guaranteed alive.
 
     The turn itself runs in a background `asyncio.Task` (see `_background_tasks`)
     that keeps running to completion — and commits its final state — even if this
     generator is abandoned early (the SSE client disconnects mid-stream): a
     reconnect, or the plain synchronous `POST /api/v1/agent/chat` endpoint on the
-    same `session_id`, will observe the same correct final state either way. This
-    generator itself never touches `db` directly — only the background task does —
-    so there is no concurrent-session-use hazard between the two.
+    same `session_id`, will observe the same correct final state either way.
+
+    BLOCKER 1 (phase3-agent-sse-approval-gate adversarial review): the background
+    task does NOT reuse the request-scoped `db` for the turn itself — it opens its
+    OWN independent session via `async_session_factory` and re-fetches `usuario`/
+    `convo` by id on that session before calling `_run_chat_turn`. A real client
+    disconnect tears the request-scoped `db` down via FastAPI's dependency
+    exit-stack (`app.core.database.get_db`'s `except`/`finally` — see
+    `Depends(get_db)`'s docs) the moment the SSE response finishes being awaited,
+    which happens WHILE the background task may still be running; sharing that same
+    session used to leave the background task holding an expunged/detached `convo`
+    (`db.refresh(convo)` then raising `sqlalchemy.exc.InvalidRequestError: Instance
+    ... is not persistent within this Session`), silently losing the turn's final
+    state even though an already-committed write tool call inside it had already
+    landed in the DB — see `test_client_disconnect_mid_turn_does_not_lose_the_
+    background_write` for the reproduction. Every WRITE tool call still commits
+    incrementally on its own session (`_execute_tool_once`'s existing
+    `if "write" in spec.tags: await db.commit()`), now against the background
+    task's own session, so a disconnect never rolls back a tool call that already
+    succeeded. This generator's OWN body (everything before `runner()` is
+    scheduled, plus the `sink`/`queue` relay loop below) never touches a DB session
+    that could be closed out from under it: the relay loop only reads from an
+    in-memory `asyncio.Queue`.
 
     Yields plain dicts (never SSE-formatted strings — that's `agent_chat_stream`'s
     job), each with a `"type"` key. Terminal event is always exactly one of
@@ -1703,23 +1726,43 @@ async def stream_chat_with_tools(
         turn_start = time.perf_counter()
         structlog.contextvars.bind_contextvars(session_id=str(convo.id))
         try:
-            result = await _run_chat_turn(
-                db,
-                usuario,
-                message,
-                attachments,
-                contrato_id,
-                convo,
-                turn_start,
-                tool_event_sink=sink,
-                approval_gate=gate,
-            )
+            # BLOCKER 1 (phase3-agent-sse-approval-gate adversarial review): open a
+            # session independent of the request-scoped `db` — see the module
+            # docstring above for why sharing `db` here is unsafe on disconnect.
+            # Accessed via the `database` module (not a direct `from ... import
+            # async_session_factory`) so tests can monkeypatch
+            # `database.async_session_factory` the same way `app/mcp/server.py`'s
+            # equivalent ad-hoc-session call site already does (see
+            # `tests/test_mcp_server.py`) — a plain import-time binding would freeze
+            # in the production factory and ignore that override.
+            async with database.async_session_factory() as bg_db:
+                bg_usuario = await bg_db.get(Usuario, usuario.id)
+                bg_convo = await bg_db.get(Conversacion, convo.id)
+                if bg_usuario is None or bg_convo is None:
+                    # Should not happen in practice — both rows were just
+                    # committed on `db` above, before this task was even
+                    # scheduled — but fail loudly rather than pass `None` into
+                    # `_run_chat_turn`.
+                    raise RuntimeError(
+                        f"agent_chat_stream_background_lookup_failed usuario={usuario.id} convo={convo.id}"
+                    )
+                result = await _run_chat_turn(
+                    bg_db,
+                    bg_usuario,
+                    message,
+                    attachments,
+                    contrato_id,
+                    bg_convo,
+                    turn_start,
+                    tool_event_sink=sink,
+                    approval_gate=gate,
+                )
             await queue.put({"type": "final", **result.model_dump()})
         except Exception as exc:
             # Defense in depth — `_run_chat_turn` already catches everything it
             # reasonably can and turns it into a normal assistant reply instead of
             # raising (see its own LLM/tool exception boundaries). Reaching here
-            # means something outside that (e.g. the initial `db.commit()` above, or
+            # means something outside that (e.g. the background lookup above, or
             # an unexpected bug) broke the whole turn.
             await logger.aerror("agent_chat_stream_failed", error=str(exc))
             await queue.put({"type": "error", "detail": str(exc)})

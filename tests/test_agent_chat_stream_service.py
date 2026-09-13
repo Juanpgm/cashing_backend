@@ -431,6 +431,19 @@ async def test_cancel_after_already_resolved_is_noop_not_a_crash(db: AsyncSessio
 # ---------------------------------------------------------------------------
 # SSE disconnect resilience — abandoning the generator still lets the turn finish
 # ---------------------------------------------------------------------------
+#
+# NOTE (BLOCKER 1, phase3-agent-sse-approval-gate adversarial review): the test
+# below only abandons a Python REFERENCE to the async generator — it never
+# closes the request-scoped DB session the way FastAPI's dependency exit-stack
+# does on a real client disconnect (see `app.core.database.get_db`). Its `db`
+# is the test's own long-lived fixture, which stays open and valid for the
+# rest of the test regardless of what happens to `agen`. It proves the
+# background task survives a dropped Python reference (a real, separate
+# guarantee — see the `_background_tasks` strong-reference comment in
+# `agent_chat_service.py`), but it does NOT prove the turn survives a real
+# disconnect tearing down its DB session. See
+# `test_client_disconnect_mid_turn_does_not_lose_the_background_write` below
+# for that scenario.
 
 
 async def test_abandoning_the_stream_still_completes_and_persists(
@@ -465,6 +478,15 @@ async def test_abandoning_the_stream_still_completes_and_persists(
 
     convo = await db.get(Conversacion, convo_id)
     assert convo is not None
+    # BLOCKER 1 fix (phase3-agent-sse-approval-gate adversarial review): the
+    # background task now commits through its OWN session
+    # (`database.async_session_factory`, redirected to this suite's test engine —
+    # see conftest.py), not `db`. `db` already has `convo` cached in its identity
+    # map from the earlier `_load_or_create_conversation` call inside
+    # `stream_chat_with_tools`, at which point `mensajes_json` was still empty —
+    # `expire_on_commit=False` means `db.get()` alone would return that STALE
+    # cached copy instead of re-querying. Refresh to see the background commit.
+    await db.refresh(convo)
     # The turn ran to completion in the background: the final assistant reply is
     # persisted even though nobody kept reading the stream.
     assert convo.mensajes_json[-1]["role"] in ("assistant", "system")
@@ -472,3 +494,116 @@ async def test_abandoning_the_stream_still_completes_and_persists(
 
     rows = await db.execute(select(CuentaCobro).where(CuentaCobro.contrato_id == contrato.id))
     assert rows.scalars().all() == []
+
+
+async def test_client_disconnect_mid_turn_does_not_lose_the_background_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reproduces the EXACT mechanism a real client disconnect triggers, not just an
+    abandoned Python reference (see the NOTE above the previous test).
+
+    On a real disconnect, `starlette.responses.StreamingResponse.__call__` raises
+    `ClientDisconnect` out of `stream_response()`; FastAPI's per-request
+    `AsyncExitStack` (`fastapi/routing.py::request_response`) propagates that
+    exception INTO the still-open `Depends(get_db)` generator via `athrow` —
+    running `get_db`'s `except Exception: await session.rollback(); raise` and then
+    `async with async_session_factory() as session:`'s own `__aexit__`, which calls
+    `session.close()` (expunges every ORM object the session was tracking). The
+    background `asyncio.Task` (`runner()` inside `stream_chat_with_tools`) is still
+    parked on the approval gate at that moment, holding a reference to that SAME
+    session/objects.
+
+    This suite's ASGI transport cannot drive a real disconnect end-to-end:
+    `httpx.ASGITransport.handle_async_request` (`.venv/Lib/site-packages/httpx/
+    _transports/asgi.py`) does `await self.app(scope, receive, send)` synchronously
+    to completion with no way to interrupt it early, and its own `receive()` never
+    yields `http.disconnect` before the response is already fully sent — verified by
+    reading that source file before writing this test. So instead of going through
+    `client`/`ASGITransport`, this test opens a request-scoped session the SAME way
+    `Depends(get_db)` does (byte-for-byte the same try/except/finally shape as
+    `app.core.database.get_db`, just pointed at the test engine — the real `get_db`
+    binds to `settings.DATABASE_URL`, not this suite's isolated test DB) and tears it
+    down by throwing the real `ClientDisconnect` exception into it, exactly like
+    FastAPI's exit-stack does.
+    """
+    from contextlib import asynccontextmanager
+
+    from starlette.requests import ClientDisconnect
+
+    from tests.conftest import async_session_test
+
+    # The autouse `_redirect_ad_hoc_db_sessions_to_test_engine` fixture (conftest.py)
+    # already points `database.async_session_factory` — what the BLOCKER 1 fix in
+    # `agent_chat_service.stream_chat_with_tools`'s background task opens its OWN
+    # session from — at this suite's isolated test engine, so no extra patch is
+    # needed here.
+
+    @asynccontextmanager
+    async def _request_scoped_session() -> Any:
+        # Byte-for-byte `app.core.database.get_db`'s body.
+        async with async_session_test() as session:
+            try:
+                yield session
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                raise
+
+    cm = _request_scoped_session()
+    request_db = await cm.__aenter__()
+
+    user, contrato = await _make_user_with_contrato(request_db, "0099")
+    tool_call = LLMToolCall(
+        id="call_1", name="crear_cuenta_cobro", arguments={"contrato_id": str(contrato.id), "mes": 9, "anio": 2026}
+    )
+    scripted = ScriptedLLM(
+        [
+            LLMResponse(content="", model="fake", tool_calls=[tool_call], total_tokens=5),
+            LLMResponse(content="Listo, la creé.", model="fake", total_tokens=8),
+        ]
+    )
+    _patch_llm(monkeypatch, scripted)
+
+    agen = agent_chat_service.stream_chat_with_tools(request_db, user, "Crea mi cuenta de septiembre", None, {})
+    session_id: str | None = None
+    call_id: str | None = None
+    async for event in agen:
+        if event["type"] == "connected":
+            session_id = event["session_id"]
+        if event["type"] == "tool_call_awaiting_approval":
+            call_id = event["call_id"]
+            break  # the write tool is now parked on the gate, waiting for approval
+    assert session_id is not None
+    assert call_id is not None
+
+    # The exact moment a real client disconnect fires: throw `ClientDisconnect` into
+    # the request-scoped session's exit path, tearing it down while `runner()` (the
+    # background task) still holds a reference to it. Calling `__aexit__` directly
+    # (bypassing the `async with` statement) mirrors exactly what FastAPI's
+    # `AsyncExitStack.__aexit__` does under the hood — it returns a falsy value to
+    # signal "not suppressed", and it is the STACK's job (not this call) to re-raise;
+    # a real `async with` block would do that re-raise for us.
+    suppressed = await cm.__aexit__(ClientDisconnect, ClientDisconnect(), None)
+    assert not suppressed, "the disconnect exception must propagate, not be swallowed by get_db's except block"
+
+    # A reconnected client (or another authenticated request on the same session_id)
+    # approves the still-pending write tool call.
+    agent_tool_approval.resolve(session_id, call_id, user.id, "approve")
+    await _drain_background_tasks()
+
+    # Verify from a FRESH session — never touches `request_db` — whether the turn's
+    # write survived the disconnect.
+    async with async_session_test() as fresh_db:
+        rows = await fresh_db.execute(select(CuentaCobro).where(CuentaCobro.contrato_id == contrato.id))
+        cuentas = rows.scalars().all()
+        assert len(cuentas) == 1, (
+            "crear_cuenta_cobro must be persisted even though the request-scoped "
+            "session was torn down mid-turn by a simulated client disconnect"
+        )
+
+        convo_id = uuid.UUID(session_id)
+        from app.models.conversacion import Conversacion
+
+        convo = await fresh_db.get(Conversacion, convo_id)
+        assert convo is not None
+        assert any(m.get("content") == "Listo, la creé." for m in convo.mensajes_json)
