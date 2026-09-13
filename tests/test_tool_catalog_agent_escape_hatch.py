@@ -172,7 +172,7 @@ async def test_marcar_requisito_rejected_on_cuenta_ya_enviada(db: AsyncSession) 
 
 
 @pytest.mark.asyncio
-async def test_marcar_requisito_cross_user_returns_not_found(db: AsyncSession) -> None:
+async def test_marcar_requisito_cross_user_returns_forbidden(db: AsyncSession) -> None:
     owner, contrato = await _make_user_with_contrato(db, email="escape_hatch_owner@example.com")
     owner_ctx = ToolContext(db=db, usuario=owner)
     cuenta = await _cuenta_con_checklist_definido(db, owner_ctx, contrato, mes=5)
