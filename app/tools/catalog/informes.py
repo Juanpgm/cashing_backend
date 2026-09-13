@@ -4,6 +4,22 @@ Mirrors `app/api/v1/checklist.py::generar_requisito`'s exact orchestration for t
 two fixed autogenerable requisitos (INFORME_ACTIVIDADES, INFORME_SUPERVISION): gate
 on the checklist being defined, ensure the checklist rows exist, generate + link the
 document, then return that one requisito's fresh checklist item.
+
+Deliberately TWO separate tools (`generar_informe_actividades` /
+`generar_informe_supervision`) instead of one `generar_informe(codigo=...)` tool
+(adversarial review, phase1-full-playbook-e2e, SUGGESTION 7 follow-up): the
+original rationale recorded for this was "the model would have to remember a
+magic requisito-codigo string", which this codebase's own conventions
+contradict — `checklist.py`'s `AccionChecklistInput.codigo` and
+`importar_documento.py`'s `requisito_codigo` both already ship a bare string
+param the model handles fine elsewhere in this same tool catalog. The REAL
+reason to keep these separate: their `description=` text below is materially
+different per tool, not a generic template — `generar_informe_supervision`'s
+carries an explicit "this IS supported, never refuse it" instruction the
+activities one doesn't need. Collapsing them into one tool would force a
+single generic description to carry both nuances, diluting the one that
+matters most (steering the model away from wrongly refusing the supervision
+report).
 """
 
 from __future__ import annotations

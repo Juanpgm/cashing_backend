@@ -911,6 +911,18 @@ def _record_ui_action(ui_actions: list[UiAction], action: UiAction) -> None:
 # A couple hundred characters, matching the task's explicit bound — enough for a
 # handful of "tool:status id=value" entries, never enough to meaningfully eat
 # into the model's context budget even after many turns.
+#
+# TODO(follow-up, tracked at phase1-full-playbook-e2e adversarial review,
+# WARNING 4): this budget genuinely can't hold more than ~1-2
+# "importar_documento:ok" entries (~115 chars each — two real UUIDs) once
+# earlier-turn entries compete for the same space. That's a REAL reliability
+# gap for a real model resuming mid-upload-loop too, not just
+# `tests/test_agente_cadena_completa_chat_loop.py`'s fake-LLM harness — it
+# risks a real model re-uploading an already-imported file (duplicate) or
+# silently skipping ahead (gap) once more than ~1-2 calls of a repeating tool
+# are interrupted by a turn boundary. Deliberately NOT fixed in that slice
+# (scope creep on an already-large change) — flagged here so it isn't
+# silently buried as harness-only.
 _RECAP_MAX_CHARS = 240
 _RECAP_ROLE = "system"
 

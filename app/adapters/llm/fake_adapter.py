@@ -277,6 +277,20 @@ _ID_ALIASES: dict[str, dict[str, str]] = {
     # Found by the full-playbook chat-loop E2E test — every other alias in this
     # dict was added deliberately when its producing tool was scripted, but this
     # one was missed when `preparar_radicacion` was added to the chain.
+    #
+    # SCOPE (adversarial review follow-up): this whole `_ID_ALIASES` dict, like
+    # `_resolve_next_tool`/`_next_argument_override`/`_count_recap_ok_entries`
+    # below, is internal to THIS fake adapter's own deterministic argument
+    # synthesis — a real LLM never calls through here, it reads the id straight
+    # out of the tool result text. Missing this entry only ever made
+    # `FakeLLMPort` itself synthesize a wrong id for its next scripted call
+    # (confirmed by reverting this line: 0 test failures anywhere outside this
+    # file's own suite). It was never a production bug in `agent_chat_service`
+    # or `radicacion_prep_service` — both already resolve either `cuenta_id` or
+    # `cuenta_cobro_id` spelling correctly today (see
+    # `app.tools.phase_gating._CUENTA_ID_IN_TEXT_RE` and
+    # `agent_chat_service._extract_recap_ids`). Do not read this as "fixed a
+    # user-facing reliability bug" — it fixed a test-harness-only gap.
     "preparar_radicacion": {"cuenta_cobro_id": "cuenta_id"},
 }
 
@@ -695,6 +709,18 @@ def _resolve_next_tool(messages: list[LLMMessage]) -> tuple[str | None, str, dic
         # restart the queue at index 0 (a duplicate call) or skip straight to
         # `HAPPY_PATH_SEQUENCE[recap_tool]`, silently dropping every
         # not-yet-made call in the queue.
+        #
+        # SCOPE (adversarial review follow-up): both this check and the
+        # `known` merge just below fix how THIS deterministic fake decides
+        # its own next scripted call and synthesizes its own arguments — a
+        # real reasoning model resuming a turn reads the recap text itself
+        # and reasons about it directly, it never goes through
+        # `HAPPY_PATH_SEQUENCE`/`_ARGUMENT_OVERRIDES` at all. Reverting either
+        # fix in isolation produces 0 failures anywhere outside this file's
+        # own suite (`fake_adapter.py` / `test_fake_llm_adapter.py`) —
+        # confirmed by the adversarial review. Read these as FakeLLMPort
+        # test-harness fixes (they make the local E2E fixture behave
+        # correctly), not as production reliability fixes.
         if recap_tool is not None and _next_argument_override(recap_tool, messages, recap_known) is not None:
             return recap_tool, "call", recap_known
         next_tool, reason = _advance(recap_tool)
