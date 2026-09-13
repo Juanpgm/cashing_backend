@@ -84,6 +84,82 @@ def test_cuenta_known_from_recap_false_on_failed_call_only() -> None:
     assert phase_gating.cuenta_known_from_recap(recap) is False
 
 
+def test_cuenta_known_from_recap_true_on_cuenta_id_evidence_from_a_non_scoped_tool_name() -> None:
+    """BLOCKER 1 regression: `listar_cuentas_cobro` is neither `crear_cuenta_cobro`
+    nor a cuenta-SCOPED tool (its input never requires a cuenta id), but its
+    output can still reveal a real one — the marker/tool-name allowlist alone
+    must not be the only signal."""
+    recap = "[agent-recap] listar_cuentas_cobro:ok cuenta_id=33333333-3333-3333-3333-333333333333"
+    assert phase_gating.cuenta_known_from_recap(recap) is True
+
+
+def test_cuenta_known_from_recap_true_on_cuenta_cobro_id_field_name_variant() -> None:
+    recap = "[agent-recap] some_future_tool:ok cuenta_cobro_id=44444444-4444-4444-4444-444444444444"
+    assert phase_gating.cuenta_known_from_recap(recap) is True
+
+
+def test_find_cuenta_ids_none_dumped_returns_empty() -> None:
+    assert phase_gating.find_cuenta_ids(None) == []
+    assert phase_gating.find_cuenta_ids({}) == []
+
+
+def test_find_cuenta_ids_finds_top_level_cuenta_record_shape() -> None:
+    """Mirrors `crear_cuenta_cobro`'s own dumped output shape — a top-level
+    CuentaCobroResponse-like record with `id` + the CuentaCobro field signature."""
+    dumped = {
+        "id": "11111111-1111-1111-1111-111111111111",
+        "contrato_id": "22222222-2222-2222-2222-222222222222",
+        "mes": 5,
+        "anio": 2026,
+        "estado": "borrador",
+        "valor": "1000000.00",
+    }
+    assert phase_gating.find_cuenta_ids(dumped) == ["11111111-1111-1111-1111-111111111111"]
+
+
+def test_find_cuenta_ids_finds_nested_list_cuenta_record_shape() -> None:
+    """Mirrors `listar_cuentas_cobro`'s dumped output — a top-level `cuentas` list
+    of CuentaCobroResumen-shaped items, the exact BLOCKER 1 reproduction shape."""
+    dumped = {
+        "cuentas": [
+            {
+                "id": "55555555-5555-5555-5555-555555555555",
+                "contrato_id": "66666666-6666-6666-6666-666666666666",
+                "mes": 8,
+                "anio": 2026,
+                "estado": "radicada",
+                "valor": "2000000.00",
+            }
+        ]
+    }
+    assert phase_gating.find_cuenta_ids(dumped) == ["55555555-5555-5555-5555-555555555555"]
+
+
+def test_find_cuenta_ids_empty_list_yields_no_evidence() -> None:
+    """A `listar_cuentas_cobro` call that legitimately found nothing yet must
+    NOT unlock cuenta-scoped tools — an empty list is not evidence."""
+    assert phase_gating.find_cuenta_ids({"cuentas": []}) == []
+
+
+def test_find_cuenta_ids_ignores_unrelated_id_shaped_records() -> None:
+    """`listar_contratos` also returns `id`-bearing dict items, but they are
+    NOT cuenta records (no contrato_id/mes/anio/estado/valor signature) — must
+    never be mistaken for cuenta evidence."""
+    dumped = {
+        "contratos": [
+            {"id": "77777777-7777-7777-7777-777777777777", "numero_contrato": "C-1", "objeto": "x"},
+        ]
+    }
+    assert phase_gating.find_cuenta_ids(dumped) == []
+
+
+def test_called_tool_names_from_recap_includes_failed_calls_for_retry_visibility() -> None:
+    """CRITICAL 3: a FAILED orthogonal-gated call is even more reason to keep the
+    tool visible for a retry on the very next iteration."""
+    recap = "[agent-recap] registrar_adicion_contrato:error"
+    assert phase_gating.called_tool_names_from_recap(recap) == frozenset({"registrar_adicion_contrato"})
+
+
 def test_called_tool_names_from_recap_empty_when_no_recap() -> None:
     assert phase_gating.called_tool_names_from_recap(None) == frozenset()
     assert phase_gating.called_tool_names_from_recap("") == frozenset()
@@ -134,6 +210,56 @@ def test_hidden_tool_names_keyword_match_is_case_insensitive() -> None:
     )
     assert "registrar_adicion_contrato" not in hidden
     assert "listar_adiciones_contrato" not in hidden
+
+
+def test_hidden_tool_names_reveals_adicion_tools_on_otrosi_synonym() -> None:
+    """CRITICAL 3: 'otrosí' never contains the substring 'adici' — the old
+    keyword set missed this real-world synonym entirely."""
+    hidden = phase_gating.hidden_tool_names(
+        message="Firmamos un otrosí que cambia el plazo del contrato", cuenta_known=True, called_tool_names=frozenset()
+    )
+    assert "registrar_adicion_contrato" not in hidden
+    assert "listar_adiciones_contrato" not in hidden
+
+
+def test_hidden_tool_names_reveals_adicion_tools_on_prorroga_synonym_without_accent() -> None:
+    hidden = phase_gating.hidden_tool_names(
+        message="Necesito una prorroga del contrato por 3 meses", cuenta_known=True, called_tool_names=frozenset()
+    )
+    assert "registrar_adicion_contrato" not in hidden
+    assert "listar_adiciones_contrato" not in hidden
+
+
+def test_hidden_tool_names_reveals_plantilla_tools_on_machote_synonym() -> None:
+    hidden = phase_gating.hidden_tool_names(
+        message="¿Tenés el machote que usa la entidad para el PDF?", cuenta_known=True, called_tool_names=frozenset()
+    )
+    assert "ingerir_plantilla_organismo" not in hidden
+    assert "obtener_plantilla_organismo" not in hidden
+
+
+def test_hidden_tool_names_matches_keyword_from_recent_messages_not_only_current() -> None:
+    """CRITICAL 3(b): the trigger keyword can be a MESSAGE OR TWO ago — the
+    current message alone ('dale, seguí') must not be the only window checked."""
+    hidden = phase_gating.hidden_tool_names(
+        message="dale, seguí",
+        cuenta_known=True,
+        called_tool_names=frozenset(),
+        recent_messages=("Quiero registrar un otrosí de prórroga",),
+    )
+    assert "registrar_adicion_contrato" not in hidden
+    assert "listar_adiciones_contrato" not in hidden
+
+
+def test_hidden_tool_names_recent_messages_default_does_not_leak_unrelated_keywords() -> None:
+    hidden = phase_gating.hidden_tool_names(
+        message="dale, seguí",
+        cuenta_known=True,
+        called_tool_names=frozenset(),
+        recent_messages=("Quiero cargar el RUT",),
+    )
+    assert "registrar_adicion_contrato" in hidden
+    assert "listar_adiciones_contrato" in hidden
 
 
 def test_hidden_tool_names_stays_revealed_once_already_called_even_without_keyword() -> None:
