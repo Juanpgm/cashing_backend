@@ -114,13 +114,13 @@ _INTERACTIVE_LLM_TIMEOUT_SECONDS = 15
 # (2 * 93s single-model-chain-exhaustion math above's per-model share, ~31s
 # each = ~62s) plus ordinary per-call latency on the rest, leaving too little
 # margin. 180s keeps `MAX_TOOL_ITERATIONS * _INTERACTIVE_LLM_TIMEOUT_SECONDS`
-# (20 * 15 = 300s) as the outer ceiling, comfortably exceeds TWO full
-# fallback-chain exhaustions back to back (2 * 93s = 186s is already close —
-# one exhaustion plus routine latency on the rest of a long chain fits with
-# room to spare) so a genuinely full-chain outage still surfaces well before
-# a user would call the request "hung", while giving a healthy multi-round-trip
-# playbook turn enough headroom to survive one bad model without being cut off
-# mid-chain.
+# (20 * 15 = 300s) as the outer ceiling. Note 180s does NOT cover two full
+# fallback-chain exhaustions back to back (2 * 93s = 186s > 180s) — it covers
+# ONE full exhaustion (93s) plus meaningful headroom (~87s) for the rest of a
+# healthy multi-round-trip playbook turn's ordinary per-call latency, so a
+# genuinely full-chain outage still surfaces well before a user would call the
+# request "hung", while giving that turn enough room to survive one bad model
+# without being cut off mid-chain.
 _TURN_LLM_BUDGET_SECONDS = 180
 
 # User-facing message on ANY LLM-side turn timeout — either the whole model
@@ -966,6 +966,18 @@ def _build_tool_context_recap(
     if not call_results:
         return None
 
+    # Reserve the sticky line's budget BEFORE the per-line loop runs (round-2
+    # adversarial review, MEDIUM follow-up to BLOCKER 2): a busy turn's own
+    # lines used to fill `_RECAP_MAX_CHARS` first, and only then would the
+    # sticky line get a chance to fit — silently dropping it whenever the
+    # loop's own lines were themselves long enough to eat the whole budget
+    # (e.g. several always-visible-tool calls each returning a single id).
+    # Reducing the loop's available budget up front guarantees the sticky
+    # line — appended last, so recap ordering is unchanged — always has room.
+    sticky_line = f"cuenta_conocida:ok cuenta_id={sticky_cuenta_id}" if sticky_cuenta_id else None
+    sticky_cost = (len(sticky_line) + 3) if sticky_line else 0  # +3 for " | " separator
+    loop_max_chars = _RECAP_MAX_CHARS - sticky_cost
+
     lines: list[str] = []
     budget = len(AGENT_RECAP_MARKER) + 1
     cuenta_id_represented = False
@@ -980,28 +992,26 @@ def _build_tool_context_recap(
             # Never fabricate an id for a failed/unknown call — status only.
             line = f"{tool_name}:{status}"
         added = len(line) + 3  # separator " | "
-        if budget + added > _RECAP_MAX_CHARS:
+        if budget + added > loop_max_chars:
             # The cap applies to the FIRST line too — a single oversized result
             # (e.g. a tool returning many id fields) must never blow the cap
             # outright just because `lines` was still empty. Truncate it to fit
             # rather than skipping the check.
             if not lines:
-                allowed = max(_RECAP_MAX_CHARS - budget, 0)
+                allowed = max(loop_max_chars - budget, 0)
                 if allowed > 0:
                     lines.append(line[:allowed])
             break
         lines.append(line)
         budget += added
 
-    if sticky_cuenta_id and not cuenta_id_represented:
-        sticky_line = f"cuenta_conocida:ok cuenta_id={sticky_cuenta_id}"
-        added = len(sticky_line) + 3
+    if sticky_line and not cuenta_id_represented:
+        added = sticky_cost
         if budget + added <= _RECAP_MAX_CHARS:
             lines.append(sticky_line)
             budget += added
-        # If it doesn't fit within the cap, the sticky fact is silently
-        # dropped this turn rather than growing the recap past its hard
-        # budget — same fail-safe posture as the per-line truncation above.
+        # Reserving `sticky_cost` above means this should always fit; the
+        # check stays as a fail-safe, not an expected path.
 
     if not lines:
         return None
