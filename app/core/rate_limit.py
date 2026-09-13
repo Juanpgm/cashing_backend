@@ -4,7 +4,29 @@ from fastapi import Request
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
-limiter = Limiter(key_func=get_remote_address, default_limits=["100/minute"])
+from app.core.config import Settings, settings
+
+
+def build_limiter(settings_obj: Settings) -> Limiter:
+    """Construct the app's `Limiter`, honoring `settings_obj.RATE_LIMIT_ENABLED`.
+
+    Extracted as a pure factory (instead of inlining the construction below)
+    so the wiring — "settings value in, `Limiter.enabled` out" — is directly
+    unit-testable without reloading modules or touching the process-wide
+    `limiter` singleton other modules already imported by reference.
+    """
+    return Limiter(
+        key_func=get_remote_address,
+        default_limits=["100/minute"],
+        enabled=settings_obj.RATE_LIMIT_ENABLED,
+    )
+
+
+# `enabled` mirrors `settings.RATE_LIMIT_ENABLED` (default True — identical
+# behavior to before this flag existed). See config.py's docstring for when
+# and how to flip it locally. `tests/conftest.py` disables this limiter
+# unconditionally, independent of this setting.
+limiter = build_limiter(settings)
 
 # Specific rate limit decorators — use on endpoints:
 # @limiter.limit("5/minute")   for auth endpoints
