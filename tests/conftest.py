@@ -15,7 +15,8 @@ from app.core.security import create_access_token, hash_password
 from app.main import app as fastapi_app
 from cryptography.fernet import Fernet
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import text
+from sqlalchemy import event, text
+from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 # Disable rate limiting in tests
@@ -193,6 +194,91 @@ async def client() -> AsyncGenerator[AsyncClient, None]:
     transport = ASGITransport(app=fastapi_app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
+
+
+class QueryCounter:
+    """Counts SQL statements issued through the shared test engine.
+
+    Reusable across every query-budget regression test (radicacion-sin-friccion,
+    slice 0.2 onward — Phase 2 optimizations will assert their own *reductions*
+    against this same counter). Attaches a `before_cursor_execute` listener to
+    the sync engine underlying `engine_test` — the same engine backing both the
+    `db` fixture and the ASGI `client` fixture (via `_override_get_db`), so a
+    single counter instance sees every statement issued by an HTTP call made
+    through `client`, direct `db` session use, or both combined.
+
+    Nested SAVEPOINTs (`session.begin_nested()`) are NOT hidden from the count:
+    SQLAlchemy emits `SAVEPOINT ...` / `RELEASE SAVEPOINT ...` (or `ROLLBACK TO
+    SAVEPOINT ...`) as real `cursor.execute()` calls, so they go through this
+    same listener like any other statement — see
+    `test_query_counter_counts_queries_inside_nested_savepoint`.
+
+    Postgres vs SQLite: the listener is attached to the *engine* object, so the
+    counting mechanism itself is driver-agnostic (asyncpg vs aiosqlite both
+    funnel through `before_cursor_execute`). What WILL differ between backends
+    is the actual statement count for a given endpoint: Postgres round-trips
+    for `DROP SCHEMA CASCADE`/enum handling differently than SQLite's
+    create_all/drop_all (see `setup_database` above), and asyncpg may prepare
+    statements the aiosqlite driver does not. Budgets pinned against SQLite are
+    NOT guaranteed to hold byte-for-byte against `TEST_DATABASE_URL` pointed at
+    Postgres — this is intentionally not exercised here (out of scope for this
+    slice); a future slice that runs the budget suite against Postgres in CI
+    should re-measure rather than assume parity.
+    """
+
+    def __init__(self, sync_engine: Engine) -> None:
+        self._sync_engine = sync_engine
+        self.count = 0
+        self.statements: list[str] = []
+
+    def _listener(
+        self, conn: Any, cursor: Any, statement: str, parameters: Any, context: Any, executemany: bool
+    ) -> None:
+        self.count += 1
+        self.statements.append(statement)
+
+    def reset(self) -> None:
+        """Clear counts/statements. Call between two measured calls in the same
+        test — each call's queries must be attributable to that call alone,
+        never bleeding over from a previous request or from fixture setup."""
+        self.count = 0
+        self.statements.clear()
+
+    def start(self) -> None:
+        event.listen(self._sync_engine, "before_cursor_execute", self._listener)
+
+    def stop(self) -> None:
+        event.remove(self._sync_engine, "before_cursor_execute", self._listener)
+
+    def assert_budget(self, budget: int, *, label: str = "") -> None:
+        """Assert at most `budget` statements were issued since the last reset().
+
+        Failure message names both the actual and budgeted count plus every
+        captured statement, so a regression is diagnosable without re-running
+        with a debugger.
+        """
+        if self.count > budget:
+            detail = "\n".join(f"  {i + 1}. {s}" for i, s in enumerate(self.statements))
+            raise AssertionError(
+                f"{label or 'query budget'}: {self.count} queries issued, budget was {budget} "
+                f"(over by {self.count - budget}).\nStatements:\n{detail}"
+            )
+
+
+@pytest.fixture
+def query_counter() -> Generator[QueryCounter, None, None]:
+    """A `QueryCounter` already listening on the shared test engine.
+
+    Starts counting immediately on fixture setup — call `.reset()` right
+    before the call(s) you actually want to measure, since fixture/session
+    setup before your test body runs will otherwise be included in the count.
+    """
+    counter = QueryCounter(engine_test.sync_engine)
+    counter.start()
+    try:
+        yield counter
+    finally:
+        counter.stop()
 
 
 @pytest.fixture
