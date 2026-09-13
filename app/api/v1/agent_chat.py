@@ -22,7 +22,11 @@ logger = structlog.get_logger("api.agent_chat")
 
 router = APIRouter(prefix="/agent", tags=["agent"])
 
-MAX_CHAT_FILES = 5
+# 6, not 5: covers every MANDATORY upload-only (non-autogen) checklist requisito in
+# one message — CONTRATO, RPC, SEGURIDAD_SOCIAL, CEDULA, RUT, ACTA_INICIO (see
+# `checklist_service._CATALOGO_SEED`). Raised for radicacion-sin-friccion 1.9: a user
+# attaching every mandatory support at once used to be rejected purely on file count.
+MAX_CHAT_FILES = 6
 
 # Aggregate cap across all attachments in one message — a per-file cap alone still
 # lets a client attach many files that are each individually small but sum to a
@@ -48,7 +52,7 @@ async def chat(
     creating cuentas de cobro, managing the checklist, generating informes, finding
     evidence, etc. — in whatever order is needed to resolve the request.
 
-    Accepts up to 5 file attachments per message, any format except executables
+    Accepts up to 6 file attachments per message, any format except executables
     (same allowlist as evidence uploads — see `validate_evidence_file`), with a
     combined size cap of 40 MB across all attachments in the message.
 
