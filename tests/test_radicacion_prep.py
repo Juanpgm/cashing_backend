@@ -286,6 +286,67 @@ async def test_preparar_radicacion_raises_checklist_incomplete_when_pending(
     assert excinfo.value.code == "CHECKLIST_INCOMPLETE"
 
 
+async def test_preparar_radicacion_on_undefined_requisitos_modo_materializes_estandar_set(
+    db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
+) -> None:
+    """Adversarial-review WARNING (chained after the requisitos_modo=None gate fix
+    on the agent-tool surface): `preparar_radicacion` calls
+    `construir_checklist_completo` without checking `requisitos_modo is None`
+    first. This is confirmed harmless rather than gated, because
+    `checklist_service.modo_efectivo` already collapses `None` to the same
+    `"estandar"` default `asegurar_checklist` would use for an EXPLICIT
+    `requisitos_modo="estandar"` cuenta — so the row set materialized for a
+    NULL-mode cuenta is byte-for-byte identical to an explicit-estandar
+    cuenta's. Proven two ways: (1) same CHECKLIST_INCOMPLETE outcome, (2) the
+    exact same materialized `requisito_codigo` set as an explicit
+    `requisitos_modo="estandar"` sibling cuenta on the same contrato."""
+    from app.models.documento_cuenta_cobro import DocumentoCuentaCobro
+    from sqlalchemy import select
+
+    cuenta_null = CuentaCobro(
+        contrato_id=contrato.id,
+        mes=2,
+        anio=2024,
+        estado=EstadoCuentaCobro.BORRADOR,
+        valor=1_000_000,
+        # requisitos_modo intentionally left unset (None) — gate never resolved.
+    )
+    cuenta_estandar = CuentaCobro(
+        contrato_id=contrato.id,
+        mes=3,
+        anio=2024,
+        estado=EstadoCuentaCobro.BORRADOR,
+        valor=1_000_000,
+        requisitos_modo="estandar",
+    )
+    db.add_all([cuenta_null, cuenta_estandar])
+    await db.commit()
+    await db.refresh(cuenta_null)
+    await db.refresh(cuenta_estandar)
+    assert cuenta_null.requisitos_modo is None
+
+    async def _codigos(cuenta_id: Any) -> set[str]:
+        with pytest.raises(ValidationError) as excinfo:
+            await radicacion_prep_service.preparar_radicacion(db, test_user["user"].id, cuenta_id)
+        assert excinfo.value.code == "CHECKLIST_INCOMPLETE"
+        filas = await db.execute(
+            select(DocumentoCuentaCobro.requisito_codigo).where(
+                DocumentoCuentaCobro.cuenta_cobro_id == cuenta_id,
+                DocumentoCuentaCobro.requisito_codigo.is_not(None),
+            )
+        )
+        return {c for (c,) in filas.all()}
+
+    codigos_null = await _codigos(cuenta_null.id)
+    codigos_estandar = await _codigos(cuenta_estandar.id)
+
+    assert codigos_null, "expected the standard catalog to materialize checklist rows"
+    assert codigos_null == codigos_estandar, (
+        "a NULL requisitos_modo cuenta must materialize the exact same standard "
+        "codigos as an explicit requisitos_modo='estandar' cuenta"
+    )
+
+
 async def test_preparar_radicacion_checklist_incompleto_message_names_etiqueta_not_uuid(
     db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
 ) -> None:

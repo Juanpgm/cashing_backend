@@ -1233,6 +1233,15 @@ async def radicar_cuenta(
                 advertencias=len(findings),
             )
 
+    # No `requisitos_modo is None` gate here (unlike the agent tools in
+    # app/tools/catalog/checklist.py / app/api/v1/checklist.py): confirmed
+    # harmless (adversarial-review WARNING, see
+    # tests/test_radicacion_prep.py::
+    # test_preparar_radicacion_on_undefined_requisitos_modo_materializes_estandar_set,
+    # which covers this same construir_checklist_completo codepath). `modo_efectivo`
+    # collapses `None` to the same "estandar" default an EXPLICIT
+    # `requisitos_modo="estandar"` cuenta gets, so the materialized row set never
+    # differs from what the user would get by choosing "estandar" later.
     payload = await checklist_service.construir_checklist_completo(db, cuenta)
     resumen = payload["resumen"]
     if not resumen["radicacion_lista"]:

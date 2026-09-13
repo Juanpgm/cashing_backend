@@ -73,6 +73,17 @@ async def preparar_radicacion(
     cuenta = await cuenta_cobro_service._get_cuenta_con_ownership(db, usuario_id, cuenta_id)
 
     # 1. Checklist — runs FIRST.
+    # No `requisitos_modo is None` gate here (unlike the agent tools in
+    # app/tools/catalog/checklist.py / app/api/v1/checklist.py): confirmed
+    # harmless (adversarial-review WARNING, see
+    # tests/test_radicacion_prep.py::
+    # test_preparar_radicacion_on_undefined_requisitos_modo_materializes_estandar_set).
+    # `checklist_service.modo_efectivo` collapses `None` to the same "estandar"
+    # default `asegurar_checklist` uses for an EXPLICIT `requisitos_modo="estandar"`
+    # cuenta, so materializing here never produces a different row set than the
+    # user would get by choosing "estandar" later — adding a gate would only
+    # change the error message, not the outcome, for zero data-loss/inconsistency
+    # benefit.
     payload = await checklist_service.construir_checklist_completo(db, cuenta)
     resumen = payload["resumen"]
     if not resumen["radicacion_lista"]:
