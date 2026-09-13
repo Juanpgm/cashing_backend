@@ -81,9 +81,47 @@ class PendingToolCall:
 
 _store: dict[str, PendingToolCall] = {}
 
+# Statuses a `PendingToolCall` never transitions OUT of — a decision/execution
+# outcome, not an in-flight state. Used by `_sweep_expired_terminal_entries` below
+# to decide what is safe to evict.
+_TERMINAL_STATUSES: frozenset[ToolCallStatus] = frozenset({"success", "error", "rejected", "cancelled", "expired"})
+
 
 def _key(session_id: str, call_id: str) -> str:
     return f"{session_id}:{call_id}"
+
+
+def _sweep_expired_terminal_entries() -> None:
+    """Evict every entry that is BOTH terminal AND past its TTL window (BLOCKER 2,
+    phase3-agent-sse-approval-gate adversarial review).
+
+    Without this, terminal entries accumulate in `_store` forever — `discard()`
+    below was dead code, never called anywhere in `app/` — each still holding the
+    FULL normalized tool-call args (potentially free-text/PII) for the life of the
+    process. Mirrors the lazy-eviction principle `app.services.evidence_handle_cache.
+    redeem()` already applies on every access to THAT store; this one has no single
+    per-entry accessor called for every live entry, so eviction is instead swept
+    from `register()` — a frequent, cheap entry point every new write-tool call
+    already goes through.
+
+    Deliberately terminal-only: a LIVE entry (`pending_approval`, `approved`,
+    `running`, `awaiting_retry_decision`) needs its OWN in-flight `ToolCallGate`
+    coroutine to transition it — evicting it here, even past `expires_at`, would
+    strand that coroutine's later `resolve()`/`get_owned()` lookups. And a terminal
+    entry still WITHIN its TTL window is kept on purpose: `get_owned`'s own
+    docstring explains why a terminal-but-not-yet-swept entry should resolve a
+    racing control-endpoint call (e.g. a "cancel" click landing right as the call
+    finishes) to a graceful no-op response, not a bare 404 — this sweep only ever
+    removes an entry once nothing legitimate should still be asking about it.
+    """
+    now = time.monotonic()
+    stale = [
+        (entry.session_id, entry.call_id)
+        for entry in _store.values()
+        if entry.status in _TERMINAL_STATUSES and now >= entry.expires_at
+    ]
+    for session_id, call_id in stale:
+        discard(session_id, call_id)
 
 
 def register(
@@ -93,7 +131,14 @@ def register(
     tool_name: str,
     args_summary: dict[str, Any],
 ) -> PendingToolCall:
-    """Create (or reset) the pending entry for one write tool call, status=pending_approval."""
+    """Create (or reset) the pending entry for one write tool call, status=pending_approval.
+
+    Also sweeps expired terminal entries out of the store first (see
+    `_sweep_expired_terminal_entries`) — bounding the store's lifetime memory
+    footprint regardless of how many prior calls' entries were never explicitly
+    discarded.
+    """
+    _sweep_expired_terminal_entries()
     entry = PendingToolCall(
         call_id=call_id,
         session_id=session_id,
