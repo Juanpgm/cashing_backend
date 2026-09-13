@@ -183,6 +183,30 @@ async def _override_get_db() -> AsyncGenerator[AsyncSession, None]:
 fastapi_app.dependency_overrides[get_db] = _override_get_db
 
 
+@pytest.fixture(autouse=True)
+def _redirect_ad_hoc_db_sessions_to_test_engine(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point every ad-hoc (non-`Depends(get_db)`) session factory at the isolated
+    test engine, same as `fastapi_app.dependency_overrides[get_db]` does for the
+    FastAPI-DI path above.
+
+    Some call sites intentionally open their OWN `AsyncSession` outside the
+    request/response cycle — e.g. `app/mcp/server.py`'s per-tool-call session, and
+    `app.services.agent_chat_service.stream_chat_with_tools`'s background
+    `asyncio.Task` (BLOCKER 1, phase3-agent-sse-approval-gate adversarial review:
+    that task deliberately does NOT reuse the request-scoped session, since a real
+    client disconnect tears it down while the task may still be running — see that
+    function's docstring). Both reference `app.core.database.async_session_factory`
+    via the `database` MODULE (not a frozen `from ... import async_session_factory`
+    binding) specifically so this monkeypatch reaches them. Without this, those code
+    paths would bind to `settings.DATABASE_URL` — a real, unrelated database — the
+    same way `tests/test_mcp_server.py` already had to patch this per-test before
+    `agent_chat_service` gained a second caller of the same pattern.
+    """
+    from app.core import database
+
+    monkeypatch.setattr(database, "async_session_factory", async_session_test)
+
+
 @pytest.fixture
 async def db() -> AsyncGenerator[AsyncSession, None]:
     async with async_session_test() as session:

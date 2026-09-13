@@ -293,6 +293,29 @@ class AgentChatResult(BaseModel):
     ui_actions: list[UiAction] = Field(default_factory=list)
 
 
+# --- Streaming agent chat (SSE) — write-tool approval/cancel/retry gate ---
+#
+# Response contract for the tool-call control endpoints under
+# POST /api/v1/agent/chat/stream/{session_id}/tool-calls/{call_id}/... — see
+# `app.api.v1.agent_chat_stream` and `app.services.agent_tool_approval`.
+
+
+class ToolCallControlResponse(BaseModel):
+    """Result of one approve/reject/cancel/retry action on a pending write tool call."""
+
+    call_id: str
+    tool: str
+    status: str = Field(description="Current `PendingToolCall.status` after this action.")
+    action: str = Field(
+        description=(
+            "What this request actually did: 'approved' | 'rejected' | 'cancelled' | "
+            "'retry_requested' | 'no_op' (the call was already past the point where "
+            "this action applies — see `message` for why)."
+        )
+    )
+    message: str
+
+
 # --- Agent state schemas ---
 
 

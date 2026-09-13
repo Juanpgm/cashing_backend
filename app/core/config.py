@@ -353,6 +353,15 @@ class Settings(BaseSettings):
     # enough that a stale handle can't be replayed long after the fact.
     EVIDENCE_HANDLE_TTL_SECONDS: int = 1200
 
+    # Write-tool approval gate for the streaming agent chat (radicacion-sin-friccion
+    # 3.10): in-process TTL for a pending WRITE tool call awaiting the user's
+    # approve/reject/cancel decision (or, after a failed attempt, their retry/cancel
+    # decision) via `POST /api/v1/agent/chat/stream/{session_id}/tool-calls/{call_id}/...`.
+    # 2 min is generous for a human reading a short confirmation prompt in the docked
+    # wizard chat, short enough that a truly abandoned turn doesn't leave a pending
+    # write dangling indefinitely — see `app.services.agent_tool_approval`.
+    AGENT_TOOL_APPROVAL_TTL_SECONDS: int = 120
+
     # Waitlist / invite-code gate: when True, account creation (email + first-time
     # Google sign-in) requires a valid, active, non-exhausted invite code.
     WAITLIST_ENABLED: bool = False

@@ -20,10 +20,11 @@ import mimetypes
 import re
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import structlog
 from pydantic import BaseModel, ValidationError
@@ -38,6 +39,7 @@ from app.agent.tools.document_parser import (
     iter_archive_members,
     parse_document,
 )
+from app.core import database
 from app.core.exceptions import DomainError
 from app.core.file_validation import _EXT_TO_MIME
 from app.core.observability import elapsed_ms
@@ -53,13 +55,32 @@ from app.schemas.agent import (
     UiAction,
 )
 from app.services import contrato_service
+from app.services.agent_tool_gate import ToolCallGate
 from app.tools import phase_gating
 from app.tools.context import ToolAttachment, ToolContext
 from app.tools.invoke import invoke_tool
 from app.tools.llm_schema import to_openai_tools
-from app.tools.registry import TOOL_REGISTRY
+from app.tools.registry import TOOL_REGISTRY, ToolSpec
 
 logger = structlog.get_logger("services.agent_chat")
+
+# Callback `_run_chat_turn` invokes (when supplied) right after every tool-call
+# lifecycle transition — see `stream_chat_with_tools` / `app.api.v1.agent_chat_stream`
+# for the only caller that ever sets it. `None` (the default, used by the existing
+# synchronous `chat_with_tools` call path) means "no streaming, behave exactly as
+# before this slice" — the callback is purely additive instrumentation, it never
+# changes what `_run_chat_turn` itself does or returns.
+ToolEventSink = Callable[[dict[str, Any]], Awaitable[None]]
+
+# Fire-and-forget task registry for `stream_chat_with_tools`'s background turn
+# runner: a bare reference-less `asyncio.create_task(...)` is eligible for
+# garbage-collection-triggered cancellation the moment nothing else holds a strong
+# reference to it (a documented asyncio gotcha) — which would happen exactly when a
+# client disconnects mid-stream and the generator that created the task goes out of
+# scope. Keeping a strong reference here lets an abandoned turn still run to
+# completion and commit its final state (see the SSE-disconnect behavior documented
+# on `stream_chat_with_tools`).
+_background_tasks: set[asyncio.Task[None]] = set()
 
 # A full end-to-end radicación chain (listar_contratos → crear_cuenta_cobro →
 # definir_requisitos_checklist → importar_documento xN → auto_vincular_documentos →
@@ -1058,6 +1079,94 @@ async def _load_or_create_conversation(db: AsyncSession, usuario: Usuario, sessi
     return convo
 
 
+# Resumen shown to the LLM (and, via the SSE `tool_call_result` event, to the
+# streaming UI) when a write tool call never actually ran because the user
+# rejected/cancelled it, or the approval request timed out — radicacion-sin-friccion
+# 3.10. Never used by the synchronous `chat_with_tools` path (approval_gate=None
+# there means these outcomes can't occur).
+_APPROVAL_OUTCOME_RESUMEN: dict[str, str] = {
+    "rejected": "El usuario rechazó esta acción antes de ejecutarla.",
+    "cancelled": "El usuario canceló esta acción antes de ejecutarla.",
+    "expired": "La solicitud de aprobación expiró sin respuesta del usuario.",
+}
+
+
+@dataclass
+class _ToolCallOutcome:
+    """Uniform result of ONE tool handler invocation attempt.
+
+    `status == "ok"` guarantees `output_model` and `dumped` are both set;
+    `status == "error"` guarantees both are `None` (`result_payload` carries the
+    `{"error": ...}` shape instead) — see `_execute_tool_once`.
+    """
+
+    status: Literal["ok", "error"]
+    tool_event: ToolEvent
+    dumped: dict[str, Any] | None
+    output_model: BaseModel | None
+    result_payload: Any
+
+
+async def _execute_tool_once(
+    db: AsyncSession,
+    usuario: Usuario,
+    convo: Conversacion,
+    tool_ctx: ToolContext,
+    spec: ToolSpec,
+    call: LLMToolCall,
+) -> _ToolCallOutcome:
+    """Run ONE tool handler invocation and shape its outcome uniformly.
+
+    Extracted from `_run_chat_turn`'s per-call loop (radicacion-sin-friccion 3.10) so
+    the SAME commit/rollback/error-formatting behavior can be reused for a
+    user-triggered RETRY of the same call (streaming endpoint only, see
+    `app.services.agent_tool_gate.ToolCallGate.request_retry_decision`) without
+    duplicating this logic. Byte-for-byte the same commit-on-write-success /
+    rollback-and-refresh-on-error sequence `chat_with_tools` always ran inline here —
+    this refactor changes no observable behavior for the existing synchronous
+    `POST /api/v1/agent/chat` endpoint.
+    """
+    tool_start = time.perf_counter()
+    try:
+        output = await invoke_tool(call.name, tool_ctx, _normalize_tool_args(call.arguments))
+        if "write" in spec.tags:
+            await db.commit()
+        dumped = output.model_dump(mode="json")
+        return _ToolCallOutcome(
+            status="ok",
+            tool_event=ToolEvent(
+                tool=call.name,
+                status="ok",
+                resumen=_summarize_tool_result(dumped),
+                duration_ms=round(elapsed_ms(tool_start), 2),
+            ),
+            dumped=dumped,
+            output_model=output,
+            result_payload=dumped,
+        )
+    except Exception as exc:
+        # Broad by design — see the identical rationale on the call site this was
+        # extracted from (a tool doing real I/O can raise anything).
+        # BaseException (KeyboardInterrupt/SystemExit/CancelledError) is
+        # intentionally NOT caught here.
+        tool_duration_ms = round(elapsed_ms(tool_start), 2)
+        await db.rollback()
+        # rollback() expires every object in the session (regardless of
+        # expire_on_commit) — refresh the two long-lived objects the rest of the
+        # loop (and the final persistence step) still reads.
+        await db.refresh(usuario)
+        await db.refresh(convo)
+        user_resumen, llm_detail = _format_tool_error(exc, call.name)
+        await logger.awarning("agent_chat_tool_error", tool=call.name, error=str(exc), duration_ms=tool_duration_ms)
+        return _ToolCallOutcome(
+            status="error",
+            tool_event=ToolEvent(tool=call.name, status="error", resumen=user_resumen, duration_ms=tool_duration_ms),
+            dumped=None,
+            output_model=None,
+            result_payload={"error": llm_detail},
+        )
+
+
 async def chat_with_tools(
     db: AsyncSession,
     usuario: Usuario,
@@ -1080,6 +1189,11 @@ async def chat_with_tools(
     `contrato_id` is an OPTIONAL contract context supplied by the caller (e.g. the
     contract the user currently has open in the UI) — see `_resolve_contrato_context`.
     It saves the agent a round trip of asking the user for a UUID they don't have.
+
+    Always runs with no live-progress streaming and no interactive write-tool
+    approval gate (`_run_chat_turn`'s `tool_event_sink`/`approval_gate` both default
+    to `None`) — see `stream_chat_with_tools` for the streaming counterpart that
+    supplies both.
     """
     attachments = attachments or {}
 
@@ -1111,10 +1225,25 @@ async def _run_chat_turn(
     contrato_id: str | None,
     convo: Conversacion,
     turn_start: float,
+    *,
+    tool_event_sink: ToolEventSink | None = None,
+    approval_gate: ToolCallGate | None = None,
 ) -> AgentChatResult:
     """Body of `chat_with_tools`, split out so the outer function can bind/unbind
     the `session_id` structlog contextvar around it (including on exception) via
-    try/finally without indenting this entire body under it."""
+    try/finally without indenting this entire body under it.
+
+    `tool_event_sink`/`approval_gate` (radicacion-sin-friccion 3.10) are the ONLY
+    difference between the synchronous and streaming call paths — both default to
+    `None`, in which case every write tool executes immediately exactly as it always
+    has (`chat_with_tools`, the only caller before this slice, never passes them).
+    When both are supplied (`stream_chat_with_tools` always passes both together),
+    every WRITE tool call (`"write" in spec.tags`) blocks on `approval_gate.
+    request_approval` before executing, and a failed WRITE tool attempt blocks again
+    on `approval_gate.request_retry_decision` before the loop accepts the failure as
+    final — see `app.services.agent_tool_gate.ToolCallGate`. Read tools are never
+    gated regardless of whether `approval_gate` is set.
+    """
     history = [LLMMessage(**m) for m in convo.mensajes_json]
 
     documentos: list[DocumentoAdjuntoResumen] = []
@@ -1289,93 +1418,232 @@ async def _run_chat_turn(
 
         for call in calls:
             spec = TOOL_REGISTRY.get(call.name)
-            output_model: BaseModel | None = None
             if spec is None:
                 llm_detail = f"Unknown tool: {call.name}"
                 user_resumen = f"No reconozco la herramienta solicitada ({call.name})."
                 tool_events.append(ToolEvent(tool=call.name, status="error", resumen=user_resumen))
-                result_payload: Any = {"error": llm_detail}
                 call_results.append((call.name, "error", None))
-            else:
-                tool_start = time.perf_counter()
-                try:
-                    output = await invoke_tool(call.name, tool_ctx, _normalize_tool_args(call.arguments))
-                    if "write" in spec.tags:
-                        await db.commit()
-                    output_model = output
-                    dumped = output.model_dump(mode="json")
-                    result_payload = dumped
-                    tool_events.append(
-                        ToolEvent(
-                            tool=call.name,
-                            status="ok",
-                            resumen=_summarize_tool_result(dumped),
-                            duration_ms=round(elapsed_ms(tool_start), 2),
+                if tool_event_sink is not None:
+                    await tool_event_sink(
+                        {
+                            "type": "tool_call_result",
+                            "call_id": call.id,
+                            "tool": call.name,
+                            "status": "error",
+                            "resumen": user_resumen,
+                            "duration_ms": None,
+                            "attempt": 1,
+                        }
+                    )
+                messages.append(
+                    LLMMessage(
+                        role="tool",
+                        tool_call_id=call.id,
+                        content=_serialize_tool_result({"error": llm_detail}, call.name, None),
+                    )
+                )
+                continue
+
+            is_write = "write" in spec.tags
+            if tool_event_sink is not None:
+                await tool_event_sink(
+                    {
+                        "type": "tool_call_started",
+                        "call_id": call.id,
+                        "tool": call.name,
+                        "write": is_write,
+                        "attempt": 1,
+                    }
+                )
+
+            # --- Approval gate (radicacion-sin-friccion 3.10, streaming path only) ---
+            # `approval_gate` is only ever non-None when `tool_event_sink` is too (see
+            # `stream_chat_with_tools`), and only WRITE tools are ever gated — a read
+            # tool always falls straight through to `_execute_tool_once` below with no
+            # pause, gate or not.
+            if is_write and approval_gate is not None:
+                # WARNING fix (phase3-agent-sse-approval-gate adversarial review,
+                # follow-up to BLOCKER 1): commit and release the connection BEFORE
+                # parking on `request_approval` below — that call can block for up to
+                # the approval TTL (~120s, see `ToolCallGate._await_decision`) waiting
+                # on a human. Holding `db`'s pooled connection checked out the whole
+                # time is invisible on this suite's SQLite backend but would exhaust a
+                # real Postgres pool (`pool_size=10, max_overflow=5`, see
+                # `database.py`) after ~15 concurrent parked approvals, blocking ALL
+                # other traffic. `expire_on_commit=False` (see `database.py`) keeps
+                # `usuario`/`convo`/every other already-loaded ORM object on this
+                # session usable after the commit with no lazy-load needed — the next
+                # statement (e.g. `_execute_tool_once` below) transparently re-acquires
+                # a connection from the pool, exactly as SQLAlchemy's autobegin design
+                # intends.
+                #
+                # Committed HERE — before the `tool_call_awaiting_approval` sink event
+                # below — and not right before `request_approval`, to preserve an
+                # existing invariant: emitting that event and `request_approval`'s own
+                # `store.register()` must stay back-to-back with no real `await` (i.e.
+                # no actual event-loop suspension) between them, so a client reacting
+                # to the SSE event can never race ahead of the entry existing in
+                # `agent_tool_approval`'s store. `db.commit()` performs real I/O and
+                # WOULD suspend if placed between them.
+                await db.commit()
+                if tool_event_sink is not None:
+                    await tool_event_sink(
+                        {"type": "tool_call_awaiting_approval", "call_id": call.id, "tool": call.name}
+                    )
+                approval_outcome = await approval_gate.request_approval(
+                    call.id, call.name, _normalize_tool_args(call.arguments)
+                )
+                if tool_event_sink is not None:
+                    await tool_event_sink(
+                        {"type": f"tool_call_{approval_outcome}", "call_id": call.id, "tool": call.name}
+                    )
+                if approval_outcome != "approved":
+                    not_run_resumen = _APPROVAL_OUTCOME_RESUMEN[approval_outcome]
+                    tool_events.append(ToolEvent(tool=call.name, status="error", resumen=not_run_resumen))
+                    call_results.append((call.name, "error", None))
+                    if tool_event_sink is not None:
+                        await tool_event_sink(
+                            {
+                                "type": "tool_call_result",
+                                "call_id": call.id,
+                                "tool": call.name,
+                                "status": "error",
+                                "resumen": not_run_resumen,
+                                "duration_ms": None,
+                                "attempt": 1,
+                            }
+                        )
+                    messages.append(
+                        LLMMessage(
+                            role="tool",
+                            tool_call_id=call.id,
+                            content=_serialize_tool_result(
+                                {"error": f"Tool call not executed: {not_run_resumen}"}, call.name, None
+                            ),
                         )
                     )
-                    call_results.append((call.name, "ok", dumped))
-                    action = _run_ui_action_builder(call.name, output)
-                    if action is not None:
-                        _record_ui_action(ui_actions, action)
-                    # Phase-gating state for the NEXT iteration (see the
-                    # `hidden_tool_names` call above the loop). BLOCKER 1
-                    # (phase-gating adversarial review): unlock on EVIDENCE,
-                    # not just tool name — `crear_cuenta_cobro`/any already
-                    # cuenta-scoped tool succeeding is still a fast, always-true
-                    # signal, but `find_cuenta_ids` ALSO catches tools like
-                    # `listar_cuentas_cobro` (a "read" tool, never cuenta-scoped
-                    # by its OWN input schema) whose dumped result reveals a
-                    # real cuenta record regardless of which tool produced it.
-                    if (
-                        call.name == "crear_cuenta_cobro"
-                        or call.name in phase_gating.cuenta_scoped_tool_names()
-                        or phase_gating.find_cuenta_ids(dumped)
-                    ):
-                        cuenta_known_this_turn = True
-                    # Any orthogonal-gated tool that just succeeded stays visible
-                    # for the rest of this turn even without repeating its
-                    # trigger keyword.
-                    if call.name in phase_gating.ORTHOGONAL_TOOL_KEYWORDS:
-                        called_tool_names_this_turn.add(call.name)
-                except Exception as exc:
-                    # Broad by design: a tool doing real I/O can raise anything (DomainError,
-                    # pydantic ValidationError, KeyError/ValueError/TypeError from bad
-                    # arguments, but also IntegrityError, httpx errors, RuntimeError, OSError,
-                    # etc). Any of these escaping the loop would 500 the whole request and —
-                    # since a PRIOR write tool in the same turn may already have committed —
-                    # desync those committed side effects from a never-persisted conversation
-                    # history. BaseException (KeyboardInterrupt/SystemExit/CancelledError) is
-                    # intentionally NOT caught here.
-                    tool_duration_ms = round(elapsed_ms(tool_start), 2)
-                    await db.rollback()
-                    # rollback() expires every object in the session (regardless of
-                    # expire_on_commit) — refresh the two long-lived objects the rest
-                    # of this loop (and the final persistence step) still reads, so a
-                    # later plain attribute access doesn't try a lazy-load outside of
-                    # an async-aware context (SQLAlchemy's MissingGreenlet).
-                    await db.refresh(usuario)
-                    await db.refresh(convo)
-                    user_resumen, llm_detail = _format_tool_error(exc, call.name)
-                    result_payload = {"error": llm_detail}
-                    tool_events.append(
-                        ToolEvent(tool=call.name, status="error", resumen=user_resumen, duration_ms=tool_duration_ms)
+                    continue
+
+            outcome = await _execute_tool_once(db, usuario, convo, tool_ctx, spec, call)
+            attempt = 1
+
+            # --- Retry-after-failure gate (streaming path only, WRITE tools only) ---
+            # A read-tool failure, or ANY failure on the synchronous (non-streaming)
+            # path, is accepted as final immediately — this loop only runs at all when
+            # both an approval_gate is wired up AND the failing tool is a write tool.
+            while outcome.status == "error" and is_write and approval_gate is not None:
+                # WARNING fix (phase3-agent-sse-approval-gate adversarial review,
+                # follow-up to the write-tool approval fix above): commit and
+                # release the connection BEFORE parking on
+                # `request_retry_decision` below — that call carries the IDENTICAL
+                # pool-exhaustion risk as `request_approval` above (same ~120s TTL,
+                # see `ToolCallGate._await_decision`), and can be hit up to
+                # `MAX_RETRY_ATTEMPTS` (3) times per failing write-tool call.
+                # Committed HERE — before the `tool_call_awaiting_retry` sink event
+                # below — and not between that event and `request_retry_decision`,
+                # for the exact same reason as the approval fix above: the sink
+                # event and the gate's own `store` bookkeeping must stay
+                # back-to-back with no real `await` between them, or a client
+                # reacting to the SSE event could race ahead of the gate being
+                # ready for it — the `PendingToolCallNotFoundError` regression the
+                # approval fix hit when first placed between the two.
+                await db.commit()
+                if tool_event_sink is not None:
+                    await tool_event_sink(
+                        {"type": "tool_call_awaiting_retry", "call_id": call.id, "tool": call.name, "attempt": attempt}
                     )
-                    call_results.append((call.name, "error", None))
-                    # CRITICAL 3 (phase-gating adversarial review): a FAILED
-                    # orthogonal-gated call is even MORE reason to keep the
-                    # tool visible for a retry on the next iteration than a
-                    # successful one is — mirrors `called_tool_names_from_recap`.
-                    if call.name in phase_gating.ORTHOGONAL_TOOL_KEYWORDS:
-                        called_tool_names_this_turn.add(call.name)
-                    await logger.awarning(
-                        "agent_chat_tool_error", tool=call.name, error=str(exc), duration_ms=tool_duration_ms
+                retry_outcome = await approval_gate.request_retry_decision(call.id)
+                if tool_event_sink is not None:
+                    await tool_event_sink(
+                        {"type": f"tool_call_retry_{retry_outcome}", "call_id": call.id, "tool": call.name}
                     )
+                if retry_outcome != "retry":
+                    break
+                # Append-only history: the FAILED attempt's own ToolEvent is recorded
+                # now, distinct from whatever the re-attempt below produces next — see
+                # the "Retry after a genuine failure" edge case this satisfies.
+                tool_events.append(outcome.tool_event)
+                call_results.append((call.name, "error", None))
+                if tool_event_sink is not None:
+                    await tool_event_sink(
+                        {
+                            "type": "tool_call_result",
+                            "call_id": call.id,
+                            "tool": call.name,
+                            "status": "error",
+                            "resumen": outcome.tool_event.resumen,
+                            "duration_ms": outcome.tool_event.duration_ms,
+                            "attempt": attempt,
+                        }
+                    )
+                attempt += 1
+                if tool_event_sink is not None:
+                    await tool_event_sink(
+                        {
+                            "type": "tool_call_started",
+                            "call_id": call.id,
+                            "tool": call.name,
+                            "write": True,
+                            "attempt": attempt,
+                        }
+                    )
+                outcome = await _execute_tool_once(db, usuario, convo, tool_ctx, spec, call)
+
+            tool_events.append(outcome.tool_event)
+            call_results.append((call.name, outcome.status, outcome.dumped))
+            if tool_event_sink is not None:
+                await tool_event_sink(
+                    {
+                        "type": "tool_call_result",
+                        "call_id": call.id,
+                        "tool": call.name,
+                        "status": outcome.status,
+                        "resumen": outcome.tool_event.resumen,
+                        "duration_ms": outcome.tool_event.duration_ms,
+                        "attempt": attempt,
+                    }
+                )
+
+            if outcome.status == "ok":
+                # Invariant of `_execute_tool_once`: status == "ok" always carries both.
+                assert outcome.output_model is not None
+                assert outcome.dumped is not None
+                action = _run_ui_action_builder(call.name, outcome.output_model)
+                if action is not None:
+                    _record_ui_action(ui_actions, action)
+                # Phase-gating state for the NEXT iteration (see the
+                # `hidden_tool_names` call above the loop). BLOCKER 1
+                # (phase-gating adversarial review): unlock on EVIDENCE,
+                # not just tool name — `crear_cuenta_cobro`/any already
+                # cuenta-scoped tool succeeding is still a fast, always-true
+                # signal, but `find_cuenta_ids` ALSO catches tools like
+                # `listar_cuentas_cobro` (a "read" tool, never cuenta-scoped
+                # by its OWN input schema) whose dumped result reveals a
+                # real cuenta record regardless of which tool produced it.
+                if (
+                    call.name == "crear_cuenta_cobro"
+                    or call.name in phase_gating.cuenta_scoped_tool_names()
+                    or phase_gating.find_cuenta_ids(outcome.dumped)
+                ):
+                    cuenta_known_this_turn = True
+                # Any orthogonal-gated tool that just succeeded stays visible
+                # for the rest of this turn even without repeating its
+                # trigger keyword.
+                if call.name in phase_gating.ORTHOGONAL_TOOL_KEYWORDS:
+                    called_tool_names_this_turn.add(call.name)
+            else:
+                # CRITICAL 3 (phase-gating adversarial review): a FAILED
+                # orthogonal-gated call is even MORE reason to keep the
+                # tool visible for a retry on the next iteration than a
+                # successful one is — mirrors `called_tool_names_from_recap`.
+                if call.name in phase_gating.ORTHOGONAL_TOOL_KEYWORDS:
+                    called_tool_names_this_turn.add(call.name)
 
             messages.append(
                 LLMMessage(
                     role="tool",
                     tool_call_id=call.id,
-                    content=_serialize_tool_result(result_payload, call.name, output_model),
+                    content=_serialize_tool_result(outcome.result_payload, call.name, outcome.output_model),
                 )
             )
     else:
@@ -1426,3 +1694,130 @@ async def _run_chat_turn(
         tokens_used=tokens_used,
         ui_actions=ui_actions,
     )
+
+
+async def stream_chat_with_tools(
+    db: AsyncSession,
+    usuario: Usuario,
+    message: str,
+    session_id: str | None,
+    attachments: dict[str, ToolAttachment] | None = None,
+    contrato_id: str | None = None,
+) -> AsyncIterator[dict[str, Any]]:
+    """Streaming counterpart to `chat_with_tools` — SAME core loop (`_run_chat_turn`
+    — see its docstring), yielding live progress events instead of only the final
+    `AgentChatResult`. Used exclusively by `POST /api/v1/agent/chat/stream` (see
+    `app.api.v1.agent_chat_stream` for SSE formatting and the full event vocabulary).
+
+    Duplicates only the small "load/create the conversation, bind session_id for
+    logging" wrapper `chat_with_tools` itself does (needed here BEFORE the turn
+    starts, to scope the write-tool approval gate and the first `connected` event to
+    the real `session_id` even for a brand-new conversation) — every other line of
+    actual agent-loop logic is `_run_chat_turn`, shared unchanged with the
+    synchronous endpoint. This initial setup uses `db` — the REQUEST-scoped session
+    FastAPI's `Depends(get_db)` supplies — because it always completes before the
+    first byte is streamed back, while the request is still guaranteed alive.
+
+    The turn itself runs in a background `asyncio.Task` (see `_background_tasks`)
+    that keeps running to completion — and commits its final state — even if this
+    generator is abandoned early (the SSE client disconnects mid-stream): a
+    reconnect, or the plain synchronous `POST /api/v1/agent/chat` endpoint on the
+    same `session_id`, will observe the same correct final state either way.
+
+    BLOCKER 1 (phase3-agent-sse-approval-gate adversarial review): the background
+    task does NOT reuse the request-scoped `db` for the turn itself — it opens its
+    OWN independent session via `async_session_factory` and re-fetches `usuario`/
+    `convo` by id on that session before calling `_run_chat_turn`. A real client
+    disconnect tears the request-scoped `db` down via FastAPI's dependency
+    exit-stack (`app.core.database.get_db`'s `except`/`finally` — see
+    `Depends(get_db)`'s docs) the moment the SSE response finishes being awaited,
+    which happens WHILE the background task may still be running; sharing that same
+    session used to leave the background task holding an expunged/detached `convo`
+    (`db.refresh(convo)` then raising `sqlalchemy.exc.InvalidRequestError: Instance
+    ... is not persistent within this Session`), silently losing the turn's final
+    state even though an already-committed write tool call inside it had already
+    landed in the DB — see `test_client_disconnect_mid_turn_does_not_lose_the_
+    background_write` for the reproduction. Every WRITE tool call still commits
+    incrementally on its own session (`_execute_tool_once`'s existing
+    `if "write" in spec.tags: await db.commit()`), now against the background
+    task's own session, so a disconnect never rolls back a tool call that already
+    succeeded. This generator's OWN body (everything before `runner()` is
+    scheduled, plus the `sink`/`queue` relay loop below) never touches a DB session
+    that could be closed out from under it: the relay loop only reads from an
+    in-memory `asyncio.Queue`.
+
+    Yields plain dicts (never SSE-formatted strings — that's `agent_chat_stream`'s
+    job), each with a `"type"` key. Terminal event is always exactly one of
+    `"final"` (carries the same fields as `AgentChatResult`, flattened) or `"error"`
+    (the turn could not complete at all — `_run_chat_turn` already turns almost
+    every failure into a normal assistant reply instead of raising).
+    """
+    attachments = attachments or {}
+    convo = await _load_or_create_conversation(db, usuario, session_id)
+    await db.commit()
+
+    gate = ToolCallGate(session_id=str(convo.id), usuario_id=usuario.id)
+    queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+
+    async def sink(event: dict[str, Any]) -> None:
+        await queue.put(event)
+
+    async def runner() -> None:
+        turn_start = time.perf_counter()
+        structlog.contextvars.bind_contextvars(session_id=str(convo.id))
+        try:
+            # BLOCKER 1 (phase3-agent-sse-approval-gate adversarial review): open a
+            # session independent of the request-scoped `db` — see the module
+            # docstring above for why sharing `db` here is unsafe on disconnect.
+            # Accessed via the `database` module (not a direct `from ... import
+            # async_session_factory`) so tests can monkeypatch
+            # `database.async_session_factory` the same way `app/mcp/server.py`'s
+            # equivalent ad-hoc-session call site already does (see
+            # `tests/test_mcp_server.py`) — a plain import-time binding would freeze
+            # in the production factory and ignore that override.
+            async with database.async_session_factory() as bg_db:
+                bg_usuario = await bg_db.get(Usuario, usuario.id)
+                bg_convo = await bg_db.get(Conversacion, convo.id)
+                if bg_usuario is None or bg_convo is None:
+                    # Should not happen in practice — both rows were just
+                    # committed on `db` above, before this task was even
+                    # scheduled — but fail loudly rather than pass `None` into
+                    # `_run_chat_turn`.
+                    raise RuntimeError(
+                        f"agent_chat_stream_background_lookup_failed usuario={usuario.id} convo={convo.id}"
+                    )
+                result = await _run_chat_turn(
+                    bg_db,
+                    bg_usuario,
+                    message,
+                    attachments,
+                    contrato_id,
+                    bg_convo,
+                    turn_start,
+                    tool_event_sink=sink,
+                    approval_gate=gate,
+                )
+            await queue.put({"type": "final", **result.model_dump()})
+        except Exception as exc:
+            # Defense in depth — `_run_chat_turn` already catches everything it
+            # reasonably can and turns it into a normal assistant reply instead of
+            # raising (see its own LLM/tool exception boundaries). Reaching here
+            # means something outside that (e.g. the background lookup above, or
+            # an unexpected bug) broke the whole turn.
+            await logger.aerror("agent_chat_stream_failed", error=str(exc))
+            await queue.put({"type": "error", "detail": str(exc)})
+        finally:
+            structlog.contextvars.unbind_contextvars("session_id")
+            await queue.put(None)
+
+    task = asyncio.create_task(runner())
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+    yield {"type": "connected", "session_id": str(convo.id)}
+
+    while True:
+        item = await queue.get()
+        if item is None:
+            break
+        yield item
