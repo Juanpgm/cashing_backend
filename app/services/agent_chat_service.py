@@ -14,6 +14,7 @@ here would duplicate that logic and risk drifting out of sync with it.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import mimetypes
 import re
@@ -52,6 +53,7 @@ from app.schemas.agent import (
     UiAction,
 )
 from app.services import contrato_service
+from app.tools import phase_gating
 from app.tools.context import ToolAttachment, ToolContext
 from app.tools.invoke import invoke_tool
 from app.tools.llm_schema import to_openai_tools
@@ -67,6 +69,70 @@ logger = structlog.get_logger("services.agent_chat")
 # a conversation that (before the recap below existed) had no memory of what
 # already ran. Raised with headroom for a retry or two along the way.
 MAX_TOOL_ITERATIONS = 20
+
+# How many of the user's most recent prior messages (this turn's current
+# message is always checked too, separately) `phase_gating.hidden_tool_names`
+# also scans for an orthogonal-topic trigger keyword (CRITICAL 3, phase-gating
+# adversarial review). A short follow-up ("dale, hacelo") frequently doesn't
+# repeat the keyword the user already said one or two messages earlier.
+_ORTHOGONAL_KEYWORD_MESSAGE_WINDOW = 3
+
+# Per-model-attempt wall-clock budget for THIS interactive loop's llm.complete()
+# calls only — forwarded as `LiteLLMAdapter.complete`'s `timeout_seconds` kwarg
+# (default 120s, unchanged for every OTHER caller: batch/pipeline extraction,
+# document generation, etc. — see that kwarg's docstring). Chosen so a full
+# fallback-chain exhaustion stays comfortably under the 2-minute target: with
+# the real configured chain (`gemini` -> `groq` -> `ollama`, 3 models) and
+# tenacity's 2 attempts per model (`LiteLLMAdapter._call_model`'s
+# `@retry(stop_after_attempt(2))`), a full exhaustion now bounds EXACTLY at
+# 3 models * (2 attempts * 15s + 1s backoff) = 93s: `stop_after_attempt(2)`
+# allows only ONE retry per model, and `wait_exponential(min=1, max=4)`'s
+# `attempt_number` is always 1 on that single retry, so the backoff resolves
+# to its `min=1` floor every time — never the full `max=4` (SUGGESTION 5,
+# phase-gating adversarial review corrected this from a prior "~90-102s"
+# estimate that conflated this exact figure with
+# `tests/test_litellm_adapter.py::TestTimeoutSeconds`'s deliberately looser
+# `max_backoff_per_model=4` upper-bound test assertion), instead of the OLD
+# 120s-per-call value's worst case of 3 models * 2 attempts * 120s = 720s
+# (~12 minutes).
+_INTERACTIVE_LLM_TIMEOUT_SECONDS = 15
+
+# Cumulative wall-clock ceiling on time spent AWAITING llm.complete() across
+# every iteration of ONE turn — deliberately excludes tool execution time. A
+# write tool (e.g. generar_informe_actividades, preparar_radicacion) can
+# legitimately run long and may already have committed a DB write by the time
+# it finishes; cutting it off mid-flight would desync stored side effects from
+# a never-persisted conversation history (see the broad `except Exception`
+# around the tool-call block below for the existing precedent of never
+# interrupting a mid-flight write). The ~12-minute hang this slice fixes only
+# ever happened in LLM round trips, never in tool execution, so the budget is
+# scoped there on purpose — see `_INTERACTIVE_LLM_TIMEOUT_SECONDS` above.
+# Raised 100s -> 180s (SUGGESTION 5, phase-gating adversarial review): the
+# canonical playbook chain is 10-15 tool calls, i.e. roughly as many LLM round
+# trips — a HEALTHY turn like that could still get truncated by the old 100s
+# ceiling if just 2 of those round trips hit a degraded/retrying model
+# (2 * 93s single-model-chain-exhaustion math above's per-model share, ~31s
+# each = ~62s) plus ordinary per-call latency on the rest, leaving too little
+# margin. 180s keeps `MAX_TOOL_ITERATIONS * _INTERACTIVE_LLM_TIMEOUT_SECONDS`
+# (20 * 15 = 300s) as the outer ceiling. Note 180s does NOT cover two full
+# fallback-chain exhaustions back to back (2 * 93s = 186s > 180s) — it covers
+# ONE full exhaustion (93s) plus meaningful headroom (~87s) for the rest of a
+# healthy multi-round-trip playbook turn's ordinary per-call latency, so a
+# genuinely full-chain outage still surfaces well before a user would call the
+# request "hung", while giving that turn enough room to survive one bad model
+# without being cut off mid-chain.
+_TURN_LLM_BUDGET_SECONDS = 180
+
+# User-facing message on ANY LLM-side turn timeout — either the whole model
+# fallback chain failing (`RuntimeError` from `LiteLLMAdapter.complete`) or
+# this turn's cumulative LLM budget running out before the next call. Kept as
+# ONE shared string (not two near-duplicate messages) so the app's register
+# stays consistent regardless of which of the two timeout paths fired.
+_LLM_TIMEOUT_MESSAGE = (
+    "No pude contactar al modelo de IA en este momento. Lo que ya se alcanzó a "
+    "completar en esta solicitud quedó guardado — escribime de nuevo en un momento "
+    "para continuar."
+)
 
 # Tool results fed back to the LLM are truncated so a single verbose tool output
 # (e.g. a full checklist dump) doesn't blow past the model's context window. Live
@@ -852,7 +918,15 @@ _RECAP_ROLE = "system"
 def _extract_recap_ids(dumped: dict[str, Any]) -> dict[str, str]:
     """Pull UUID-shaped `id`/`*_id` fields straight off a successful tool's dumped
     output — the only identifiers a recap is allowed to carry, since they came
-    from a call THIS user's own context just made (never another user's data)."""
+    from a call THIS user's own context just made (never another user's data).
+
+    Also merges in a `cuenta_id` entry (BLOCKER 1/2, phase-gating adversarial
+    review) whenever `phase_gating.find_cuenta_ids` recognizes a real cuenta
+    record ANYWHERE in the dumped payload — including nested one, like
+    `listar_cuentas_cobro`'s `cuentas` list — so the recap text always carries
+    literal `cuenta_id=<uuid>` evidence for `phase_gating.cuenta_known_from_recap`
+    to find, regardless of which tool produced it.
+    """
     ids: dict[str, str] = {}
     for key, value in dumped.items():
         if not isinstance(value, str) or not (key == "id" or key.endswith("_id")):
@@ -862,40 +936,82 @@ def _extract_recap_ids(dumped: dict[str, Any]) -> dict[str, str]:
         except (ValueError, AttributeError, TypeError):
             continue
         ids[key] = value
+    if "cuenta_id" not in ids and "cuenta_cobro_id" not in ids:
+        cuenta_ids = phase_gating.find_cuenta_ids(dumped)
+        if cuenta_ids:
+            ids["cuenta_id"] = cuenta_ids[0]
     return ids
 
 
-def _build_tool_context_recap(call_results: list[tuple[str, str, dict[str, Any] | None]]) -> str | None:
+def _build_tool_context_recap(
+    call_results: list[tuple[str, str, dict[str, Any] | None]],
+    *,
+    sticky_cuenta_id: str | None = None,
+) -> str | None:
     """Build ONE bounded recap line from this turn's tool calls, newest-first (the
     most recent call is the most likely to matter for "seguí con eso"). Returns
     `None` when there is nothing to say (no calls this turn) so a pure-chat turn
-    never gets a recap message at all."""
+    never gets a recap message at all.
+
+    `sticky_cuenta_id` (BLOCKER 2, phase-gating adversarial review): the cuenta
+    id already known at the START of this turn (see `phase_gating.
+    latest_cuenta_id_from_recap` on the PREVIOUS recap). The recap is rebuilt
+    WHOLESALE from only THIS turn's `call_results` every time — a turn that
+    only calls always-visible tools (e.g. `importar_documento`) would
+    otherwise silently drop the earlier cuenta evidence and re-hide every
+    cuenta-scoped tool on the next turn, even though the cuenta genuinely
+    still exists. When this turn's own lines don't already carry a cuenta id,
+    a dedicated sticky line keeps the earlier one alive.
+    """
     if not call_results:
         return None
 
+    # Reserve the sticky line's budget BEFORE the per-line loop runs (round-2
+    # adversarial review, MEDIUM follow-up to BLOCKER 2): a busy turn's own
+    # lines used to fill `_RECAP_MAX_CHARS` first, and only then would the
+    # sticky line get a chance to fit — silently dropping it whenever the
+    # loop's own lines were themselves long enough to eat the whole budget
+    # (e.g. several always-visible-tool calls each returning a single id).
+    # Reducing the loop's available budget up front guarantees the sticky
+    # line — appended last, so recap ordering is unchanged — always has room.
+    sticky_line = f"cuenta_conocida:ok cuenta_id={sticky_cuenta_id}" if sticky_cuenta_id else None
+    sticky_cost = (len(sticky_line) + 3) if sticky_line else 0  # +3 for " | " separator
+    loop_max_chars = _RECAP_MAX_CHARS - sticky_cost
+
     lines: list[str] = []
     budget = len(AGENT_RECAP_MARKER) + 1
+    cuenta_id_represented = False
     for tool_name, status, dumped in reversed(call_results):
         if status == "ok" and dumped:
             ids = _extract_recap_ids(dumped)
+            if "cuenta_id" in ids or "cuenta_cobro_id" in ids:
+                cuenta_id_represented = True
             id_part = " ".join(f"{k}={v}" for k, v in ids.items())
             line = f"{tool_name}:ok {id_part}".strip()
         else:
             # Never fabricate an id for a failed/unknown call — status only.
             line = f"{tool_name}:{status}"
         added = len(line) + 3  # separator " | "
-        if budget + added > _RECAP_MAX_CHARS:
+        if budget + added > loop_max_chars:
             # The cap applies to the FIRST line too — a single oversized result
             # (e.g. a tool returning many id fields) must never blow the cap
             # outright just because `lines` was still empty. Truncate it to fit
             # rather than skipping the check.
             if not lines:
-                allowed = max(_RECAP_MAX_CHARS - budget, 0)
+                allowed = max(loop_max_chars - budget, 0)
                 if allowed > 0:
                     lines.append(line[:allowed])
             break
         lines.append(line)
         budget += added
+
+    if sticky_line and not cuenta_id_represented:
+        added = sticky_cost
+        if budget + added <= _RECAP_MAX_CHARS:
+            lines.append(sticky_line)
+            budget += added
+        # Reserving `sticky_cost` above means this should always fit; the
+        # check stays as a fail-safe, not an expected path.
 
     if not lines:
         return None
@@ -1012,8 +1128,33 @@ async def _run_chat_turn(
     ]
 
     llm = get_llm()
-    tools = to_openai_tools()
+    # Full catalog computed once — the per-iteration OFFERED subset is derived
+    # from this via `phase_gating.filter_openai_tools` below (see that call
+    # site's comment for why the filter must be recomputed every iteration,
+    # not once per turn).
+    all_tools = to_openai_tools()
     tool_ctx = ToolContext(db=db, usuario=usuario, attachments=expanded_attachments)
+
+    # Phase-gating (radicacion-sin-friccion 1.8): seed this turn's gate state
+    # from the cross-turn recap (the newest recap message in `history`, if
+    # any) — see `app.tools.phase_gating` module docstring for the full
+    # rationale and safety argument.
+    _recap_for_gating = next(
+        (str(m.content) for m in reversed(history) if _is_recap_message(m.model_dump())),
+        None,
+    )
+    cuenta_known_this_turn = phase_gating.cuenta_known_from_recap(_recap_for_gating)
+    called_tool_names_this_turn: set[str] = set(phase_gating.called_tool_names_from_recap(_recap_for_gating))
+    # BLOCKER 2 (phase-gating adversarial review): the cuenta id already known
+    # at the START of this turn, carried forward into the recap rebuilt at the
+    # end of this turn (see `_build_tool_context_recap`'s `sticky_cuenta_id`)
+    # so it survives a turn that only calls always-visible tools.
+    _sticky_cuenta_id = phase_gating.latest_cuenta_id_from_recap(_recap_for_gating)
+    # CRITICAL 3 (phase-gating adversarial review): the orthogonal-topic
+    # keyword match (gate 2) also scans a few RECENT user messages, not just
+    # this turn's own — the triggering phrase ("quiero registrar un otrosí")
+    # is often a message earlier than a short follow-up ("dale, hacelo").
+    _recent_user_messages = [str(m.content) for m in history if m.role == "user"][-_ORTHOGONAL_KEYWORD_MESSAGE_WINDOW:]
 
     tool_events: list[ToolEvent] = []
     ui_actions: list[UiAction] = []
@@ -1025,30 +1166,69 @@ async def _run_chat_turn(
     tokens_used = 0
     final_content = ""
     iterations_run = 0
+    # Cumulative seconds already spent AWAITING llm.complete() this turn — see
+    # `_TURN_LLM_BUDGET_SECONDS` for what this bounds and why tool execution
+    # time is deliberately excluded.
+    llm_elapsed_seconds = 0.0
 
     for iteration in range(MAX_TOOL_ITERATIONS):
         iterations_run = iteration + 1
+
+        remaining_budget = _TURN_LLM_BUDGET_SECONDS - llm_elapsed_seconds
+        if remaining_budget <= 0:
+            await logger.awarning("agent_chat_llm_turn_budget_exhausted", elapsed_seconds=round(llm_elapsed_seconds, 2))
+            final_content = _LLM_TIMEOUT_MESSAGE
+            messages.append(LLMMessage(role="assistant", content=final_content))
+            break
+
+        # Recomputed EVERY iteration (not once per turn): a tool that becomes
+        # relevant mid-turn — e.g. definir_requisitos_checklist right after
+        # crear_cuenta_cobro succeeds two lines below — must be visible to the
+        # very next llm.complete() call, or the autonomous within-turn chain
+        # the canonical playbook depends on breaks (see phase_gating module
+        # docstring).
+        hidden_tools = phase_gating.hidden_tool_names(
+            message=message,
+            cuenta_known=cuenta_known_this_turn,
+            called_tool_names=frozenset(called_tool_names_this_turn),
+            recent_messages=_recent_user_messages,
+        )
+        tools = phase_gating.filter_openai_tools(all_tools, hidden_tools)
         llm_start = time.perf_counter()
         try:
-            response = await llm.complete(messages, tools=tools, temperature=0.2, max_tokens=1024)
+            # `asyncio.timeout` is defense-in-depth ON TOP OF `timeout_seconds`
+            # (litellm's own per-attempt timeout kwarg, forwarded to the
+            # provider SDK): a hard OS-level cutoff that fires regardless of
+            # whether litellm/httpx/the provider client actually honors its
+            # own timeout internally (e.g. a hang before the HTTP request is
+            # even sent). Bounded by whatever's LEFT of this turn's budget so
+            # the last iteration before exhaustion can't overrun it either.
+            async with asyncio.timeout(remaining_budget):
+                response = await llm.complete(
+                    messages,
+                    tools=tools,
+                    temperature=0.2,
+                    max_tokens=1024,
+                    timeout_seconds=max(1, min(_INTERACTIVE_LLM_TIMEOUT_SECONDS, int(remaining_budget))),
+                )
         except Exception as exc:
             # Broad by design, mirroring the per-tool-call exception boundary below:
             # `LiteLLMAdapter.complete` raises `RuntimeError` when its ENTIRE model
-            # fallback chain fails, but a provider SDK could raise anything network-
-            # shaped. Letting this escape `chat_with_tools` used to 500 the whole
-            # request AND skip the final `db.commit()` below — losing the user
-            # message, the assistant reply, and the recap of tool calls that
-            # already succeeded and committed in an EARLIER iteration this same
-            # turn. BaseException (KeyboardInterrupt/SystemExit/CancelledError) is
-            # intentionally NOT caught here.
+            # fallback chain fails, and `asyncio.timeout` raises `TimeoutError` when
+            # this turn's cumulative LLM budget runs out mid-call — but a provider
+            # SDK could raise anything network-shaped too. Letting any of these
+            # escape `chat_with_tools` used to 500 the whole request AND skip the
+            # final `db.commit()` below — losing the user message, the assistant
+            # reply, and the recap of tool calls that already succeeded and
+            # committed in an EARLIER iteration this same turn. BaseException
+            # (KeyboardInterrupt/SystemExit/CancelledError) is intentionally NOT
+            # caught here.
             await logger.awarning("agent_chat_llm_unreachable", error=str(exc))
-            final_content = (
-                "No pude contactar al modelo de IA en este momento. Lo que ya se alcanzó a "
-                "completar en esta solicitud quedó guardado — escribime de nuevo en un momento "
-                "para continuar."
-            )
+            final_content = _LLM_TIMEOUT_MESSAGE
             messages.append(LLMMessage(role="assistant", content=final_content))
             break
+        finally:
+            llm_elapsed_seconds += elapsed_ms(llm_start) / 1000
         tokens_used += response.total_tokens
         await logger.ainfo(
             "agent_chat_llm_turn",
@@ -1125,6 +1305,26 @@ async def _run_chat_turn(
                     action = _run_ui_action_builder(call.name, output)
                     if action is not None:
                         _record_ui_action(ui_actions, action)
+                    # Phase-gating state for the NEXT iteration (see the
+                    # `hidden_tool_names` call above the loop). BLOCKER 1
+                    # (phase-gating adversarial review): unlock on EVIDENCE,
+                    # not just tool name — `crear_cuenta_cobro`/any already
+                    # cuenta-scoped tool succeeding is still a fast, always-true
+                    # signal, but `find_cuenta_ids` ALSO catches tools like
+                    # `listar_cuentas_cobro` (a "read" tool, never cuenta-scoped
+                    # by its OWN input schema) whose dumped result reveals a
+                    # real cuenta record regardless of which tool produced it.
+                    if (
+                        call.name == "crear_cuenta_cobro"
+                        or call.name in phase_gating.cuenta_scoped_tool_names()
+                        or phase_gating.find_cuenta_ids(dumped)
+                    ):
+                        cuenta_known_this_turn = True
+                    # Any orthogonal-gated tool that just succeeded stays visible
+                    # for the rest of this turn even without repeating its
+                    # trigger keyword.
+                    if call.name in phase_gating.ORTHOGONAL_TOOL_KEYWORDS:
+                        called_tool_names_this_turn.add(call.name)
                 except Exception as exc:
                     # Broad by design: a tool doing real I/O can raise anything (DomainError,
                     # pydantic ValidationError, KeyError/ValueError/TypeError from bad
@@ -1149,6 +1349,12 @@ async def _run_chat_turn(
                         ToolEvent(tool=call.name, status="error", resumen=user_resumen, duration_ms=tool_duration_ms)
                     )
                     call_results.append((call.name, "error", None))
+                    # CRITICAL 3 (phase-gating adversarial review): a FAILED
+                    # orthogonal-gated call is even MORE reason to keep the
+                    # tool visible for a retry on the next iteration than a
+                    # successful one is — mirrors `called_tool_names_from_recap`.
+                    if call.name in phase_gating.ORTHOGONAL_TOOL_KEYWORDS:
+                        called_tool_names_this_turn.add(call.name)
                     await logger.awarning(
                         "agent_chat_tool_error", tool=call.name, error=str(exc), duration_ms=tool_duration_ms
                     )
@@ -1182,7 +1388,7 @@ async def _run_chat_turn(
     # recap message and appends a fresh one, keeping exactly one in history no
     # matter how many turns the conversation runs — a turn with zero tool calls
     # leaves a previous recap untouched (still useful context) and adds no new one.
-    recap_text = _build_tool_context_recap(call_results)
+    recap_text = _build_tool_context_recap(call_results, sticky_cuenta_id=_sticky_cuenta_id)
     if recap_text:
         current_messages = [m for m in current_messages if not _is_recap_message(m)]
         new_messages.append(LLMMessage(role=_RECAP_ROLE, content=recap_text).model_dump())

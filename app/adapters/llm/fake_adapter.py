@@ -604,6 +604,7 @@ class FakeLLMPort:
         tool_choice: str | dict[str, Any] | None = None,
         reasoning_effort: str | None = None,
         fallback: bool = True,
+        timeout_seconds: int = 120,
     ) -> LLMResponse:
         """Route to the next scripted tool call, or a plain text reply.
 
@@ -623,7 +624,7 @@ class FakeLLMPort:
         still always agree, which is all `test_concurrent_calls_do_not_leak_state_between_sessions`
         (unset/happy throughout) actually needs.
         """
-        del temperature, max_tokens, tool_choice, reasoning_effort, fallback
+        del temperature, max_tokens, tool_choice, reasoning_effort, fallback, timeout_seconds
         used_model = model or self._default_model
         script = settings.FAKE_LLM_SCRIPT
 

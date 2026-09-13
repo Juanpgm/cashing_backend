@@ -311,3 +311,30 @@ def test_build_tool_context_recap_caps_the_first_line_too() -> None:
 
     assert recap is not None
     assert len(recap) <= agent_chat_service._RECAP_MAX_CHARS
+
+
+def test_build_tool_context_recap_never_drops_sticky_line_under_budget_pressure() -> None:
+    """Round-2 adversarial review (MEDIUM): the sticky `cuenta_conocida` line was
+    appended AFTER the per-line budget loop already filled `_RECAP_MAX_CHARS`,
+    so a busy turn's own lines could crowd it out entirely — reintroducing the
+    original recap-amnesia bug in this narrow case. Reproduces the reviewer's
+    exact scenario: 3 always-visible-tool calls, each returning only a single
+    `id` field (not a full cuenta record, so none of these lines independently
+    carry `cuenta_id`/`cuenta_cobro_id` evidence), on top of a sticky cuenta id
+    from an earlier turn's `crear_cuenta_cobro:ok`. The sticky line must always
+    survive, even if that means truncating the per-line loop's own output."""
+    from app.tools import phase_gating
+
+    sticky_cuenta_id = str(uuid.uuid4())
+    call_results: list[tuple[str, str, dict[str, Any] | None]] = [
+        ("importar_documento", "ok", {"id": str(uuid.uuid4())}),
+        ("importar_documento", "ok", {"id": str(uuid.uuid4())}),
+        ("importar_documento", "ok", {"id": str(uuid.uuid4())}),
+    ]
+
+    recap = agent_chat_service._build_tool_context_recap(call_results, sticky_cuenta_id=sticky_cuenta_id)
+
+    assert recap is not None
+    assert len(recap) <= agent_chat_service._RECAP_MAX_CHARS
+    assert f"cuenta_id={sticky_cuenta_id}" in recap
+    assert phase_gating.cuenta_known_from_recap(recap) is True
