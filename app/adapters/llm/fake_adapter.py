@@ -270,6 +270,14 @@ _ID_ALIASES: dict[str, dict[str, str]] = {
     "crear_cuenta_cobro": {"id": "cuenta_id"},
     "definir_requisitos_checklist": {"cuenta_cobro_id": "cuenta_id"},
     "resumen_checklist": {"cuenta_cobro_id": "cuenta_id"},
+    # `PreparaRadicacionResponse.cuenta_cobro_id` (radicacion-sin-friccion 1.9) —
+    # without this, `radicar_cuenta` (the very next HAPPY_PATH_SEQUENCE step)
+    # synthesizes a RANDOM uuid4() instead of the real cuenta id and fails with
+    # "CuentaCobro not found" immediately after a successful preparar_radicacion.
+    # Found by the full-playbook chat-loop E2E test — every other alias in this
+    # dict was added deliberately when its producing tool was scripted, but this
+    # one was missed when `preparar_radicacion` was added to the chain.
+    "preparar_radicacion": {"cuenta_cobro_id": "cuenta_id"},
 }
 
 

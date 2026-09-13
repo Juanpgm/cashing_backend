@@ -1043,6 +1043,42 @@ async def test_importar_documento_repeats_with_six_distinct_overrides_then_advan
     )
 
 
+async def test_preparar_radicacion_result_aliases_cuenta_cobro_id_into_radicar_cuenta() -> None:
+    """`preparar_radicacion` dumps `cuenta_cobro_id` (`PreparaRadicacionResponse`),
+    never a bare `cuenta_id` — without an alias, `radicar_cuenta`'s next scripted
+    call would synthesize a RANDOM `uuid.uuid4()` instead of the real cuenta id,
+    and fail with 'CuentaCobro not found' immediately after a successful
+    preparar_radicacion. Caught by the full-playbook E2E test
+    (radicacion-sin-friccion 1.9) — `preparar_radicacion` was missing from
+    `_ID_ALIASES` entirely."""
+    fake = FakeLLMPort()
+    tools = [{"type": "function", "function": {"name": "radicar_cuenta"}}]
+    cuenta_id = str(uuid.uuid4())
+    messages: list[LLMMessage] = [
+        _assistant_call("0", "preparar_radicacion"),
+        LLMMessage(
+            role="tool",
+            tool_call_id="0",
+            content=json.dumps(
+                {
+                    "cuenta_cobro_id": cuenta_id,
+                    "storage_key": "fake/key.zip",
+                    "filename": "evidencias.zip",
+                    "size_bytes": 123,
+                    "listo_para_radicar": True,
+                    "pendientes": [],
+                    "advertencias_coherencia": [],
+                    "es_borrador": False,
+                }
+            ),
+        ),
+    ]
+    response = await fake.complete(messages, tools=tools)
+    assert response.tool_calls is not None
+    assert response.tool_calls[0].name == "radicar_cuenta"
+    assert response.tool_calls[0].arguments["cuenta_id"] == cuenta_id
+
+
 async def test_subir_evidencias_desde_chat_scripted_with_non_empty_filenames() -> None:
     """The generic synthesizer alone would emit `filenames=[]` (a schema-valid but
     useless empty list for a required `list[str]` field) — the scripted override
