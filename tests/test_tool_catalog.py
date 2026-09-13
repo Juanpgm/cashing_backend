@@ -16,6 +16,7 @@ import pytest
 from app.core.exceptions import CHECKLIST_INCOMPLETE, DomainError, NotFoundError
 from app.core.security import hash_password
 from app.models.contrato import Contrato
+from app.models.documento_cuenta_cobro import DocumentoCuentaCobro
 from app.models.usuario import Usuario
 from app.schemas.cuenta_cobro import CuentaCobroCreate
 from app.tools.catalog.cuentas import CrearCuentaCobroInput
@@ -23,6 +24,7 @@ from app.tools.context import ToolContext
 from app.tools.invoke import invoke_tool, list_tools
 from app.tools.registry import TOOL_REGISTRY
 from pydantic import ValidationError
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 EXPECTED_TOOL_NAMES = {
@@ -147,6 +149,61 @@ async def test_resumen_checklist_end_to_end(db: AsyncSession) -> None:
     resumen = await invoke_tool("resumen_checklist", ctx, {"cuenta_id": str(cuenta_response.id)})
     assert resumen.requisitos_definidos is False
     assert resumen.items == []
+
+
+@pytest.mark.asyncio
+async def test_detectar_desde_secop_gates_on_undefined_requisitos_modo(db: AsyncSession) -> None:
+    """Agent-tool twin of the `POST /refresh-secop` fix (app/api/v1/checklist.py's
+    `_checklist_no_definido`): a cuenta whose `requisitos_modo` is still NULL has
+    no checklist to scan yet. `detectar_desde_secop` must NOT materialize the
+    standard checklist (asegurar_checklist) — it must report the same
+    `requisitos_definidos=False` signal `resumen_checklist` already uses, with no
+    candidates and no DocumentoCuentaCobro rows created."""
+    user, contrato = await _make_user_with_contrato(db)
+    ctx = ToolContext(db=db, usuario=user)
+
+    cuenta_response = await invoke_tool(
+        "crear_cuenta_cobro",
+        ctx,
+        {"contrato_id": str(contrato.id), "mes": 6, "anio": 2026},
+    )
+
+    resultado = await invoke_tool("detectar_desde_secop", ctx, {"cuenta_id": str(cuenta_response.id)})
+
+    assert resultado.requisitos_definidos is False
+    assert resultado.candidatos_por_requisito == {}
+
+    filas = await db.execute(
+        select(DocumentoCuentaCobro).where(DocumentoCuentaCobro.cuenta_cobro_id == cuenta_response.id)
+    )
+    assert filas.scalars().all() == [], "gate must not materialize any checklist row"
+
+
+@pytest.mark.asyncio
+async def test_auto_vincular_documentos_gates_on_undefined_requisitos_modo(db: AsyncSession) -> None:
+    """Agent-tool twin of the `POST /auto-vincular-documentos` fix: a cuenta whose
+    `requisitos_modo` is still NULL has no checklist rows to link anything to yet.
+    `auto_vincular_documentos` must NOT materialize the standard checklist — it
+    must report the same `requisitos_definidos=False` signal `resumen_checklist`
+    already uses, with vinculados=0 and no DocumentoCuentaCobro rows created."""
+    user, contrato = await _make_user_with_contrato(db)
+    ctx = ToolContext(db=db, usuario=user)
+
+    cuenta_response = await invoke_tool(
+        "crear_cuenta_cobro",
+        ctx,
+        {"contrato_id": str(contrato.id), "mes": 7, "anio": 2026},
+    )
+
+    resultado = await invoke_tool("auto_vincular_documentos", ctx, {"cuenta_id": str(cuenta_response.id)})
+
+    assert resultado.requisitos_definidos is False
+    assert resultado.vinculados == 0
+
+    filas = await db.execute(
+        select(DocumentoCuentaCobro).where(DocumentoCuentaCobro.cuenta_cobro_id == cuenta_response.id)
+    )
+    assert filas.scalars().all() == [], "gate must not materialize any checklist row"
 
 
 @pytest.mark.asyncio
