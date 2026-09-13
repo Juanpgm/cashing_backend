@@ -33,6 +33,8 @@ from app.services import checklist_service
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from tests.factories import UsuarioFactory
+
 pytestmark = pytest.mark.asyncio
 
 
@@ -60,9 +62,7 @@ async def contrato(db: AsyncSession, test_user: dict[str, Any]) -> Contrato:
     return c
 
 
-async def _make_cuenta(
-    db: AsyncSession, contrato: Contrato, mes: int = 1, anio: int = 2024
-) -> CuentaCobro:
+async def _make_cuenta(db: AsyncSession, contrato: Contrato, mes: int = 1, anio: int = 2024) -> CuentaCobro:
     cc = CuentaCobro(
         contrato_id=contrato.id,
         mes=mes,
@@ -105,9 +105,7 @@ async def _add_documento_fuente(
     return df
 
 
-async def _fila(
-    db: AsyncSession, cuenta: CuentaCobro, codigo: str
-) -> DocumentoCuentaCobro:
+async def _fila(db: AsyncSession, cuenta: CuentaCobro, codigo: str) -> DocumentoCuentaCobro:
     res = await db.execute(
         select(DocumentoCuentaCobro).where(
             DocumentoCuentaCobro.cuenta_cobro_id == cuenta.id,
@@ -120,9 +118,7 @@ async def _fila(
 # ── construir_checklist_completo default is READ-ONLY ───────────────────────
 
 
-async def test_get_default_does_not_autolink(
-    db: AsyncSession, contrato: Contrato, test_user: dict[str, Any]
-) -> None:
+async def test_get_default_does_not_autolink(db: AsyncSession, contrato: Contrato, test_user: dict[str, Any]) -> None:
     """A matching uploaded doc must NOT be linked by the default GET path."""
     user = test_user["user"]
     await _add_documento_fuente(
@@ -158,9 +154,7 @@ async def test_explicit_autovincular_true_links_document(
         nombre="contrato.pdf",
     )
 
-    await checklist_service.construir_checklist_completo(
-        db, cuenta, auto_vincular=True
-    )
+    await checklist_service.construir_checklist_completo(db, cuenta, auto_vincular=True)
     await db.commit()
 
     fila = await _fila(db, cuenta, "CONTRATO")
@@ -386,22 +380,8 @@ async def test_autolink_ignores_docs_of_other_user(
     db: AsyncSession, contrato: Contrato, test_user: dict[str, Any]
 ) -> None:
     """A null-contrato doc owned by a different user must NOT be linked."""
-    from app.core.security import hash_password
-    from app.models.usuario import Usuario
-
-    other = Usuario(
-        email="other@example.com",
-        nombre="Other",
-        cedula="999999999",
-        telefono="+573009999999",
-        password_hash=hash_password("OtherPass123!"),
-        rol="contratista",
-        activo=True,
-        creditos_disponibles=10,
-    )
-    db.add(other)
+    other = await UsuarioFactory.create_async(db)
     await db.commit()
-    await db.refresh(other)
 
     await _add_documento_fuente(
         db,
@@ -421,9 +401,7 @@ async def test_autolink_ignores_docs_of_other_user(
     assert fila.estado == EstadoRequisito.PENDIENTE
 
 
-async def test_autolink_skips_below_threshold(
-    db: AsyncSession, contrato: Contrato, test_user: dict[str, Any]
-) -> None:
+async def test_autolink_skips_below_threshold(db: AsyncSession, contrato: Contrato, test_user: dict[str, Any]) -> None:
     """A doc with no matching signal (tipo=instrucciones, categoria=OTROS)
     scores 0 and must not be linked to anything."""
     user = test_user["user"]
