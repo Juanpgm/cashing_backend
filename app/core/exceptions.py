@@ -178,6 +178,19 @@ EXCEPTION_STATUS_MAP: dict[type[DomainError], int] = {
 
 
 def domain_to_http(exc: DomainError) -> HTTPException:
-    """Convert a domain exception to an HTTPException."""
-    status_code = EXCEPTION_STATUS_MAP.get(type(exc), status.HTTP_500_INTERNAL_SERVER_ERROR)
+    """Convert a domain exception to an HTTPException.
+
+    Resolves the HTTP status by walking `type(exc).__mro__` (most specific
+    class first) and using the first class found in `EXCEPTION_STATUS_MAP`.
+    This means an unregistered subclass of an already-mapped domain
+    exception (e.g. a new `ValidationError` subclass) inherits its mapped
+    ancestor's status instead of silently falling back to 500. Falls back to
+    500 only when nothing in the MRO is registered.
+    """
+    status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+    for exc_cls in type(exc).__mro__:
+        mapped_status = EXCEPTION_STATUS_MAP.get(exc_cls)
+        if mapped_status is not None:
+            status_code = mapped_status
+            break
     return HTTPException(status_code=status_code, detail=exc.detail)
