@@ -133,6 +133,19 @@ class Settings(BaseSettings):
         _log.warning("fake_llm_script_invalid_value_fallback_to_none", received=v)
         return None
 
+    # RATE_LIMIT_ENABLED: True (default, every environment including production
+    # and CI) keeps slowapi's per-route limits (`app/core/rate_limit.py`) active,
+    # e.g. `/auth/register` and `/auth/login` at 5/minute per caller IP. Set to
+    # False ONLY via a local, git-ignored override (`secrets/.env.local`) when
+    # running many real registrations back-to-back from the same host — e.g. a
+    # local Playwright journey suite that seeds a fresh user per test/spec and
+    # would otherwise legitimately trip the same per-IP bucket a real attacker
+    # would. pytest's own suite does not read this: `tests/conftest.py` disables
+    # the limiter unconditionally (`limiter.enabled = False`), independent of
+    # this setting, and that assignment always runs after this module's import
+    # so it is never overridden by a stray environment value during test runs.
+    RATE_LIMIT_ENABLED: bool = True
+
     # LLM — Groq for fast chat/routing; Gemini 2.5 Flash for document extraction (generous free tier)
     # Gemini free tier: 1,000,000 TPM/day vs Groq 8b: ~20,000 TPM/day
     # Note: gemini-2.0-flash and gemini-1.5-flash are deprecated for new accounts — use gemini-2.5-flash
