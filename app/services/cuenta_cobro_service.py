@@ -6,7 +6,7 @@ import re
 import uuid
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import structlog
 from jinja2 import BaseLoader, Environment
@@ -200,12 +200,16 @@ async def _get_cuenta_con_ownership(
 ) -> CuentaCobro:
     """Load a CuentaCobro with actividades, verifying the user owns it via the contrato.
 
-    `for_update=True` adds `SELECT ... FOR UPDATE` on the CuentaCobro row (radicar
-    idempotency/concurrency, radicacion-sin-friccion slice 1.2): Postgres blocks a
-    concurrent transaction's own `FOR UPDATE` read on the same row until the first
-    transaction commits, so the second reader observes the post-transition state
-    instead of a stale in-memory read. SQLite (aiosqlite) silently ignores the
-    clause — same idiom already used in `secop_service.py`'s reimport race guard.
+    `for_update=True` adds `SELECT ... FOR UPDATE` on the CuentaCobro row: Postgres
+    blocks a concurrent transaction's own `FOR UPDATE` read on the same row until
+    the first transaction commits, so the second reader observes the
+    post-transition state instead of a stale in-memory read. SQLite (aiosqlite)
+    silently ignores the clause — same idiom already used in `secop_service.py`'s
+    reimport race guard. As of the W2 lock-window narrowing (radicacion-sin-friccion
+    slice 1.2 follow-up), `radicar_cuenta` no longer passes `for_update=True` here —
+    it uses the lighter `_leer_estado_bajo_lock` (estado-only, no eager loads)
+    immediately before the transition instead. Kept as a general-purpose option on
+    this helper for any future caller that needs a locked, fully-loaded read.
     """
     stmt = (
         select(CuentaCobro)
@@ -1004,30 +1008,35 @@ async def cambiar_estado(
     estado_actual = cuenta.estado
 
     if nuevo_estado == EstadoCuentaCobro.ENVIADA:
-        # Compare-and-set (radicacion-sin-friccion slice 1.2), evaluated BEFORE the
-        # generic `_TRANSICIONES` gate below: the `estado_actual` we just read is
-        # only a point-in-time snapshot, and the ONLY production caller of this
-        # branch (`radicar_cuenta`) already re-reads the row with `FOR UPDATE`
+        # Compare-and-set (radicacion-sin-friccion slice 1.2, W2/S1 follow-up),
+        # evaluated BEFORE the generic `_TRANSICIONES` gate below: the
+        # `estado_actual` we just read is only a point-in-time snapshot, and the
+        # ONLY production caller of this branch (`radicar_cuenta`) already
+        # re-reads the row with `FOR UPDATE` (`_leer_estado_bajo_lock`) IMMEDIATELY
         # before calling us — so a race landing here mid-flight (e.g. another
-        # writer committing the ENVIADA transition between radicar_cuenta's own
-        # read and this call) must resolve to idempotent success, not a spurious
-        # "transición inválida: enviada → enviada" (which the stale-snapshot gate
-        # below would raise, since ENVIADA→ENVIADA isn't a listed transition). A
-        # plain `cuenta.estado = nuevo_estado` would additionally let two
-        # concurrent writers both flip estado and both stamp their own
-        # fecha_envio, the second silently clobbering the first. The bulk
-        # UPDATE's WHERE re-checks the CURRENT row at write time; only one
-        # writer's UPDATE can match (`rowcount == 1`) — same idiom as
-        # `auth_service._consume_invite_code` and `secop_service`'s reimport
-        # guard. `synchronize_session=False`: we explicitly expire `cuenta`
-        # below instead of relying on the ORM's best-effort in-session sync,
-        # which isn't guaranteed to evaluate an `estado.in_(...)` WHERE clause
-        # consistently across dialects.
+        # writer committing the ENVIADA transition between that re-read and this
+        # call) must resolve to idempotent success, not a spurious "transición
+        # inválida: enviada → enviada" (which the stale-snapshot gate below would
+        # raise, since ENVIADA→ENVIADA isn't a listed transition). A plain
+        # `cuenta.estado = nuevo_estado` would additionally let two concurrent
+        # writers both flip estado and both stamp their own fecha_envio, the
+        # second silently clobbering the first. The bulk UPDATE's WHERE re-checks
+        # the CURRENT row at write time; only one writer's UPDATE can match
+        # (`rowcount == 1`) — same idiom as `auth_service._consume_invite_code`
+        # and `secop_service`'s reimport guard. `deleted_at IS NULL` (S1 fix)
+        # keeps a soft-delete landing in this same window from being silently
+        # revived into ENVIADA — the fallback re-read below already filters it,
+        # so the CAS must exclude it too or the two checks disagree.
+        # `synchronize_session=False`: we explicitly expire `cuenta` below instead
+        # of relying on the ORM's best-effort in-session sync, which isn't
+        # guaranteed to evaluate an `estado.in_(...)` WHERE clause consistently
+        # across dialects.
         ahora = datetime.now(UTC)
         cas_result = await db.execute(
             sa_update(CuentaCobro)
             .where(
                 CuentaCobro.id == cuenta_id,
+                CuentaCobro.deleted_at.is_(None),
                 CuentaCobro.estado.in_([EstadoCuentaCobro.BORRADOR, EstadoCuentaCobro.RECHAZADA]),
             )
             .values(estado=EstadoCuentaCobro.ENVIADA, fecha_envio=ahora)
@@ -1086,6 +1095,45 @@ async def cambiar_estado(
     return await _reload_cuenta_response(db, cuenta_id)
 
 
+async def _leer_estado_bajo_lock(db: AsyncSession, cuenta_id: uuid.UUID) -> EstadoCuentaCobro:
+    """Minimal `SELECT ... FOR UPDATE` used ONLY to observe the current `estado`
+    immediately before the ENVIADA transition (radicacion-sin-friccion slice 1.2,
+    W2 fix). Deliberately selects just `estado` — no eager-loaded
+    actividades/contrato — so it doesn't pay the `_get_cuenta_con_ownership`
+    selectinload cost twice per `radicar_cuenta` call; ownership was already
+    verified by the plain read at the top of `radicar_cuenta`, within the same
+    call, so it isn't re-checked here.
+
+    Narrows the FOR UPDATE lock window to right before the write instead of
+    holding it across the whole coherence/checklist gate run (~76 of the ~80
+    queries `radicar_cuenta` issues) — under Postgres that used to block a
+    concurrent transaction's own locking read for the full gate duration and
+    pin pool connections. Postgres serializes concurrent readers of this
+    statement on the same row; SQLite (aiosqlite) silently ignores the clause
+    (same idiom already used in `secop_service.py`'s reimport race guard).
+
+    Raises `NotFoundError` if the row is gone (hard-deleted or soft-deleted
+    concurrently) — `radicar_cuenta` treats that as "nothing to transition"
+    rather than silently proceeding on stale data.
+    """
+    stmt = (
+        select(CuentaCobro.estado)
+        .where(CuentaCobro.id == cuenta_id, CuentaCobro.deleted_at.is_(None))
+        .with_for_update()
+    )
+    result = await db.execute(stmt)
+    estado = result.scalar_one_or_none()
+    if estado is None:
+        raise NotFoundError("CuentaCobro", str(cuenta_id))
+    return estado
+
+
+def _raise_estado_invalido_para_radicar(estado: EstadoCuentaCobro) -> NoReturn:
+    raise ValidationError(
+        f"No se puede radicar una cuenta en estado '{estado}'. Solo se permite en borrador o rechazada."
+    )
+
+
 async def radicar_cuenta(
     db: AsyncSession,
     usuario_id: uuid.UUID,
@@ -1103,23 +1151,28 @@ async def radicar_cuenta(
     delegated to `cambiar_estado`, which owns the state machine — this function
     never mutates `cuenta.estado` directly.
 
-    Idempotent + concurrency-safe (radicacion-sin-friccion slice 1.2): the row is
-    re-read with `SELECT ... FOR UPDATE` (`_get_cuenta_con_ownership(for_update=True)`)
-    before any gate. If it's already ENVIADA, this short-circuits to the existing
-    response BEFORE the coherence/checklist gates run again — a duplicate click or
-    retry must not raise a spurious 422, nor re-validate a cuenta that already made
-    it through. `cambiar_estado`'s compare-and-set UPDATE is the second line of
-    defense for the genuine race (both callers read BORRADOR before either wrote).
+    Idempotent + concurrency-safe (radicacion-sin-friccion slice 1.2, narrowed in
+    the W2 follow-up): a PLAIN (unlocked) ownership read happens first — if
+    already ENVIADA, this short-circuits to the existing response BEFORE the
+    coherence/checklist gates run at all. The coherence and checklist gates then
+    run UNLOCKED (they used to run under a held `FOR UPDATE`, which blocked a
+    concurrent transaction's own locking read for the entire ~76-query gate
+    duration and pinned pool connections under Postgres). Only immediately before
+    the transition does `_leer_estado_bajo_lock` re-read the row with
+    `SELECT ... FOR UPDATE`: if a concurrent winner already moved it to ENVIADA,
+    this short-circuits again; if it moved to APROBADA/PAGADA, this raises the
+    same 422 as the top-of-function check. The lock only narrows this final
+    window — `cambiar_estado`'s compare-and-set UPDATE remains the actual
+    correctness guarantee for the genuine race (both callers observing a
+    pre-ENVIADA state before either one writes).
     """
-    cuenta = await _get_cuenta_con_ownership(db, usuario_id, cuenta_id, for_update=True)
+    cuenta = await _get_cuenta_con_ownership(db, usuario_id, cuenta_id)
 
     if cuenta.estado == EstadoCuentaCobro.ENVIADA:
         return await _reload_cuenta_response(db, cuenta_id)
 
     if cuenta.estado not in (EstadoCuentaCobro.BORRADOR, EstadoCuentaCobro.RECHAZADA):
-        raise ValidationError(
-            f"No se puede radicar una cuenta en estado '{cuenta.estado}'. Solo se permite en borrador o rechazada."
-        )
+        _raise_estado_invalido_para_radicar(cuenta.estado)
 
     advertencias: list[FindingOut] = []
     if settings.COHERENCE_GATE_ENABLED:
@@ -1158,6 +1211,14 @@ async def radicar_cuenta(
             f"No se puede radicar: faltan requisitos del checklist. Pendientes: {pendientes}.",
             code=CHECKLIST_INCOMPLETE,
         )
+
+    # W2: narrow the lock window to right before the write — see docstring above
+    # and `_leer_estado_bajo_lock`.
+    estado_bajo_lock = await _leer_estado_bajo_lock(db, cuenta_id)
+    if estado_bajo_lock == EstadoCuentaCobro.ENVIADA:
+        return await _reload_cuenta_response(db, cuenta_id)
+    if estado_bajo_lock not in (EstadoCuentaCobro.BORRADOR, EstadoCuentaCobro.RECHAZADA):
+        _raise_estado_invalido_para_radicar(estado_bajo_lock)
 
     resultado = await cambiar_estado(db, usuario_id, cuenta_id, EstadoCuentaCobro.ENVIADA)
     if advertencias:

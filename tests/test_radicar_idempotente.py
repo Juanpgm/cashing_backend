@@ -26,17 +26,20 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from datetime import date
+from datetime import UTC, date, datetime
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from app.core.exceptions import NotFoundError
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
-from app.services import checklist_service, cuenta_cobro_service
+from app.services import checklist_service, coherence_validator_service, cuenta_cobro_service
 from httpx import AsyncClient
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from tests.conftest import _IS_PG, async_session_test
 
 pytestmark = pytest.mark.asyncio
 
@@ -327,3 +330,166 @@ async def test_radicar_cas_loser_devuelve_estado_actual(
 # 8. Query budget guard: see tests/test_query_budgets.py::test_query_budget_radicar
 # (kept in that module since it shares its fixtures/QueryCounter — re-measured and
 # tightened as part of this slice per the plan's requirement).
+
+
+# ---------------------------------------------------------------------------
+# 9. S1 — the CAS UPDATE's WHERE must exclude soft-deleted rows.
+# ---------------------------------------------------------------------------
+
+
+async def test_radicar_cas_no_transiciona_fila_soft_deleted(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S1 (adversarial review): `cambiar_estado`'s CAS UPDATE originally matched on
+    `id == cuenta_id AND estado IN (borrador, rechazada)` alone, with no
+    `deleted_at IS NULL` guard. Simulates a soft-delete landing between the
+    ownership read and the CAS UPDATE (e.g. a concurrent hard-delete-adjacent
+    request): without the guard, the CAS still matches on `estado` alone and
+    silently revives a deleted cuenta into ENVIADA. With the fix, the CAS
+    misses (rowcount == 0) and the fallback re-read — which already filters
+    `deleted_at IS NULL` — raises NotFoundError instead of transitioning.
+    """
+    user = test_user["user"]
+    cuenta_id = cuenta.id
+    real_get = cuenta_cobro_service._get_cuenta_con_ownership
+
+    async def _leer_y_soft_borrar(
+        session: AsyncSession, usuario_id: uuid.UUID, cuenta_id_: uuid.UUID, **kwargs: Any
+    ) -> CuentaCobro:
+        resultado = await real_get(session, usuario_id, cuenta_id_, **kwargs)
+        await session.execute(
+            update(CuentaCobro).where(CuentaCobro.id == cuenta_id_).values(deleted_at=datetime.now(UTC))
+        )
+        return resultado
+
+    monkeypatch.setattr(cuenta_cobro_service, "_get_cuenta_con_ownership", _leer_y_soft_borrar)
+
+    with pytest.raises(NotFoundError):
+        await cuenta_cobro_service.cambiar_estado(db, user.id, cuenta_id, EstadoCuentaCobro.ENVIADA)
+
+    # Raw check bypassing ownership/deleted_at filters — the row must remain
+    # untouched: still BORRADOR, still soft-deleted, no fecha_envio stamped.
+    raw = await db.execute(
+        select(CuentaCobro.estado, CuentaCobro.deleted_at, CuentaCobro.fecha_envio).where(CuentaCobro.id == cuenta_id)
+    )
+    estado, deleted_at, fecha_envio = raw.one()
+    assert estado == EstadoCuentaCobro.BORRADOR
+    assert deleted_at is not None
+    assert fecha_envio is None
+
+
+# ---------------------------------------------------------------------------
+# 10. S2 — promote the short-circuit spy probe: gates must NOT re-run on an
+#     already-ENVIADA cuenta.
+# ---------------------------------------------------------------------------
+
+
+async def test_radicar_segunda_vez_no_reejecuta_gates(
+    client: AsyncClient, test_user: dict[str, Any], cuenta: CuentaCobro, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S2 (adversarial review): the idempotent short-circuit for an
+    already-ENVIADA cuenta was only exercised indirectly (via response equality
+    in test #1). This pins it directly: on the second radicar,
+    `coherence_validator_service.validar_coherencia` and
+    `checklist_service.construir_checklist_completo` must have `await_count == 0`
+    — proof the short-circuit returns BEFORE the gates run again, not just that
+    the gates happen to produce the same result twice.
+    """
+    await _completar_checklist(client, test_user["headers"], cuenta.id)
+
+    first = await client.post(f"/api/v1/cuentas-cobro/{cuenta.id}/radicar", headers=test_user["headers"])
+    assert first.status_code == 200, first.text
+
+    checklist_spy = AsyncMock(side_effect=checklist_service.construir_checklist_completo)
+    monkeypatch.setattr(cuenta_cobro_service.checklist_service, "construir_checklist_completo", checklist_spy)
+    coherencia_spy = AsyncMock(side_effect=coherence_validator_service.validar_coherencia)
+    monkeypatch.setattr(cuenta_cobro_service.coherence_validator_service, "validar_coherencia", coherencia_spy)
+
+    second = await client.post(f"/api/v1/cuentas-cobro/{cuenta.id}/radicar", headers=test_user["headers"])
+    assert second.status_code == 200, second.text
+
+    assert checklist_spy.await_count == 0
+    assert coherencia_spy.await_count == 0
+
+
+# ---------------------------------------------------------------------------
+# 11. W1 — mutation-killer for the pre-transition lock (SQLite, no Docker
+#     needed): pins `with_for_update()` at the SQL-construction level.
+# ---------------------------------------------------------------------------
+
+
+async def test_radicar_lock_read_contiene_for_update_en_postgres(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro
+) -> None:
+    """W1 (adversarial review): on SQLite, `for_update=True -> False` on the
+    pre-transition lock read survives every other test in this suite (SQLite
+    silently no-ops `FOR UPDATE`). This asserts at the SQL-construction level —
+    captures every statement `radicar_cuenta` sends through the session and
+    compiles it against the postgresql dialect, so removing `with_for_update()`
+    fails this test even without Docker/Postgres.
+    """
+    from sqlalchemy.dialects import postgresql
+
+    user = test_user["user"]
+    await checklist_service.construir_checklist_completo(db, cuenta)
+    for codigo in _CODIGOS_OBLIGATORIOS:
+        await checklist_service.marcar_cumplido_manual(db, cuenta.id, codigo)
+    await db.commit()
+    await db.refresh(cuenta)
+
+    captured: list[Any] = []
+    original_execute = db.execute
+
+    async def _spy_execute(stmt: Any, *args: Any, **kwargs: Any) -> Any:
+        captured.append(stmt)
+        return await original_execute(stmt, *args, **kwargs)
+
+    db.execute = _spy_execute  # type: ignore[method-assign]
+    try:
+        await cuenta_cobro_service.radicar_cuenta(db, user.id, cuenta.id)
+    finally:
+        db.execute = original_execute  # type: ignore[method-assign]
+
+    locked = [
+        stmt
+        for stmt in captured
+        if hasattr(stmt, "compile") and "FOR UPDATE" in str(stmt.compile(dialect=postgresql.dialect()))
+    ]
+    assert locked, "expected radicar_cuenta's pre-transition read to use with_for_update()"
+
+
+# ---------------------------------------------------------------------------
+# 12. W1 — Postgres-only: the pre-transition lock actually blocks a concurrent
+#     transaction (`make test-pg`; skipped on SQLite).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not _IS_PG, reason="row-lock timing is only observable under real Postgres")
+async def test_radicar_lock_bloquea_segunda_transaccion_bajo_postgres(cuenta: CuentaCobro) -> None:
+    """W1 (adversarial review): proves `with_for_update()` on the pre-transition
+    read genuinely serializes two concurrent transactions under Postgres — the
+    SQLite test DB shares a single in-memory connection across sessions, so it
+    cannot host two overlapping transactions (see the honesty note on
+    `test_radicar_concurrente_una_sola_transicion` above).
+    """
+    async with async_session_test() as session_a, async_session_test() as session_b:
+        # Session A takes the lock and holds its transaction open.
+        await cuenta_cobro_service._leer_estado_bajo_lock(session_a, cuenta.id)
+
+        # Session B's own locking read of the SAME row must NOT complete within
+        # ~0.5s while A still holds its transaction.
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(
+                cuenta_cobro_service._leer_estado_bajo_lock(session_b, cuenta.id),
+                timeout=0.5,
+            )
+
+        await session_a.commit()
+
+        # Now that A released the lock, B's read completes promptly.
+        estado = await asyncio.wait_for(
+            cuenta_cobro_service._leer_estado_bajo_lock(session_b, cuenta.id),
+            timeout=2.0,
+        )
+        assert estado == EstadoCuentaCobro.BORRADOR
+        await session_b.commit()
