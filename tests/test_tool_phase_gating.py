@@ -303,17 +303,28 @@ def test_hidden_tool_names_never_hides_a_pre_cuenta_happy_path_sequence_tool() -
 
 
 def test_hidden_tool_names_reveals_cuenta_scoped_happy_path_tools_once_cuenta_known() -> None:
-    """The REST of `HAPPY_PATH_SEQUENCE` (definir_requisitos_checklist,
-    resumen_checklist, radicar_cuenta) IS cuenta-scoped and correctly hidden
-    while `cuenta_known=False` — the agent_chat_service integration is what
-    guarantees `cuenta_known` flips True the instant `crear_cuenta_cobro`
-    succeeds, before the NEXT llm.complete() call offers tools again."""
+    """The REST of `HAPPY_PATH_SEQUENCE` (radicacion-sin-friccion 1.9: extended
+    past the old 6-tool stub to the full documented playbook) IS cuenta-scoped
+    and correctly hidden while `cuenta_known=False` — the agent_chat_service
+    integration is what guarantees `cuenta_known` flips True the instant
+    `crear_cuenta_cobro` succeeds, before the NEXT llm.complete() call offers
+    tools again."""
     from app.adapters.llm.fake_adapter import HAPPY_PATH_SEQUENCE
 
     happy_path_tools = {name for name in HAPPY_PATH_SEQUENCE if name is not None}
     happy_path_tools |= {v for v in HAPPY_PATH_SEQUENCE.values() if v is not None}
     cuenta_scoped_happy_path = happy_path_tools & phase_gating.cuenta_scoped_tool_names()
-    assert cuenta_scoped_happy_path == {"definir_requisitos_checklist", "resumen_checklist", "radicar_cuenta"}
+    assert cuenta_scoped_happy_path == {
+        "definir_requisitos_checklist",
+        "auto_vincular_documentos",
+        "crear_actividades_desde_obligaciones",
+        "subir_evidencias_desde_chat",
+        "generar_informe_actividades",
+        "generar_informe_supervision",
+        "resumen_checklist",
+        "preparar_radicacion",
+        "radicar_cuenta",
+    }
 
     hidden = phase_gating.hidden_tool_names(message="", cuenta_known=True, called_tool_names=frozenset())
     assert not (hidden & cuenta_scoped_happy_path)

@@ -21,6 +21,7 @@ from app.adapters.llm import get_llm
 from app.adapters.llm.fake_adapter import (
     _DEFAULT_TEXT_RESPONSE,
     _GAVE_UP_TEXT_RESPONSE,
+    _IMPORTAR_DOCUMENTO_OVERRIDES,
     HAPPY_PATH_SEQUENCE,
     FakeLLMPort,
     _known_ids,
@@ -370,8 +371,9 @@ async def test_complete_resumes_from_recap_threads_cuenta_id_via_resumen_checkli
     compact serialized text (see `_extract_recap_ids`) — so a
     `resumen_checklist:ok cuenta_cobro_id=<uuid>` recap entry DOES carry the id,
     and `_resume_from_recap` must alias it into `cuenta_id` for the next
-    scripted tool (`radicar_cuenta`), same as the live-call alias would if the
-    serialized content ever were JSON.
+    scripted tool (`preparar_radicacion` — radicacion-sin-friccion 1.9 inserted
+    this step between `resumen_checklist` and `radicar_cuenta`), same as the
+    live-call alias would if the serialized content ever were JSON.
 
     Builds the recap via the REAL `agent_chat_service._build_tool_context_recap`
     (not a hand-built f-string) — same rationale as
@@ -382,14 +384,14 @@ async def test_complete_resumes_from_recap_threads_cuenta_id_via_resumen_checkli
     )
     assert recap_content is not None
     fake = FakeLLMPort()
-    tools = [{"type": "function", "function": {"name": "radicar_cuenta"}}]
+    tools = [{"type": "function", "function": {"name": "preparar_radicacion"}}]
     messages = [
         LLMMessage(role="system", content=recap_content),
         LLMMessage(role="user", content="seguí con la radicación"),
     ]
     response = await fake.complete(messages, tools=tools)
     assert response.tool_calls is not None
-    assert response.tool_calls[0].name == "radicar_cuenta"
+    assert response.tool_calls[0].name == "preparar_radicacion"
     assert response.tool_calls[0].arguments["cuenta_id"] == cuenta_id
 
 
@@ -822,13 +824,31 @@ async def test_complete_first_turn_calls_listar_contratos() -> None:
 
 
 async def test_complete_advances_through_the_full_happy_path_sequence() -> None:
+    """Walks the ENTIRE extended chain (radicacion-sin-friccion 1.9) start to
+    finish, including `importar_documento`'s 6x repeat-with-different-overrides
+    loop — `HAPPY_PATH_SEQUENCE.values()` alone can no longer describe the
+    expected call sequence 1:1 (a repeated tool name appears only ONCE as a
+    dict value), so the expected sequence is built explicitly here instead."""
     fake = FakeLLMPort()
-    all_tool_names = [name for name in HAPPY_PATH_SEQUENCE.values() if name is not None]
-    tools = [{"type": "function", "function": {"name": name}} for name in all_tool_names]
+    expected_sequence = [
+        "listar_contratos",
+        "crear_cuenta_cobro",
+        "definir_requisitos_checklist",
+        *(["importar_documento"] * len(_IMPORTAR_DOCUMENTO_OVERRIDES)),
+        "auto_vincular_documentos",
+        "crear_actividades_desde_obligaciones",
+        "subir_evidencias_desde_chat",
+        "generar_informe_actividades",
+        "generar_informe_supervision",
+        "resumen_checklist",
+        "preparar_radicacion",
+        "radicar_cuenta",
+    ]
+    tools = [{"type": "function", "function": {"name": name}} for name in TOOL_REGISTRY]
 
     messages: list[LLMMessage] = [LLMMessage(role="user", content="radicar todo")]
     called: list[str] = []
-    for _ in range(len(all_tool_names) + 1):
+    for _ in range(len(expected_sequence) + 1):
         response = await fake.complete(messages, tools=tools)
         if not response.tool_calls:
             break
@@ -846,7 +866,7 @@ async def test_complete_advances_through_the_full_happy_path_sequence() -> None:
         )
         messages.append(LLMMessage(role="tool", tool_call_id=call.id, content="{}"))
 
-    assert called == all_tool_names
+    assert called == expected_sequence
 
 
 async def test_stream_yields_the_same_content_as_complete() -> None:
@@ -935,6 +955,113 @@ async def test_concurrent_calls_do_not_leak_known_ids_between_sessions() -> None
     assert all(
         r.tool_calls is not None and r.tool_calls[0].arguments["contrato_id"] == contrato_id_b for r in b_results
     )
+
+
+# --- Full playbook script (radicacion-sin-friccion 1.9) ---------------------
+# HAPPY_PATH_SEQUENCE was extended from a 6-tool stub (…resumen_checklist ->
+# radicar_cuenta directly) to the REAL documented 10-step playbook
+# (agent_chat_service.SYSTEM_PROMPT_TEMPLATE), including looping
+# importar_documento 6 times (one per mandatory upload-only requisito) with a
+# DISTINCT filename/tipo each time — the generic random-string synthesizer
+# alone can never do this (every call would ask for a file literally named
+# "fake"), which is exactly the gap `test_fake_llm_completes_the_full_tool_sequence_
+# even_when_synthesized_ids_dont_resolve` above documents as "out of scope" for
+# slice 0.6.
+
+
+def test_happy_path_sequence_reaches_preparar_radicacion_before_radicar() -> None:
+    """resumen_checklist must route to preparar_radicacion (which packages the
+    evidence ZIP) BEFORE radicar_cuenta (which actually submits) — matching
+    SYSTEM_PROMPT_TEMPLATE's steps 9-10, not the old direct
+    resumen_checklist -> radicar_cuenta shortcut."""
+    assert HAPPY_PATH_SEQUENCE["resumen_checklist"] == "preparar_radicacion"
+    assert HAPPY_PATH_SEQUENCE["preparar_radicacion"] == "radicar_cuenta"
+    assert HAPPY_PATH_SEQUENCE["radicar_cuenta"] is None
+
+
+def test_happy_path_sequence_covers_actividades_evidencias_and_both_informes() -> None:
+    """The extended chain must actually visit every step SYSTEM_PROMPT_TEMPLATE
+    documents between the checklist definition and resumen_checklist — not just
+    jump straight from one upload to the final steps."""
+    chained = set(HAPPY_PATH_SEQUENCE) | {v for v in HAPPY_PATH_SEQUENCE.values() if v is not None}
+    for expected_tool in (
+        "auto_vincular_documentos",
+        "crear_actividades_desde_obligaciones",
+        "subir_evidencias_desde_chat",
+        "generar_informe_actividades",
+        "generar_informe_supervision",
+        "preparar_radicacion",
+    ):
+        assert expected_tool in chained, f"{expected_tool} missing from the extended HAPPY_PATH_SEQUENCE chain"
+
+
+async def test_importar_documento_repeats_with_six_distinct_overrides_then_advances() -> None:
+    """The 6 mandatory upload-only requisitos (CONTRATO, RPC, CEDULA, RUT,
+    ACTA_INICIO, SEGURIDAD_SOCIAL) each need a DIFFERENT filename/tipo pair —
+    importar_documento must be scripted 6 times in a row with distinct
+    arguments before the chain advances to auto_vincular_documentos."""
+    fake = FakeLLMPort()
+    tools = [{"type": "function", "function": {"name": name}} for name in TOOL_REGISTRY]
+    cuenta_id = str(uuid.uuid4())
+    messages: list[LLMMessage] = [
+        _assistant_call("0", "definir_requisitos_checklist"),
+        LLMMessage(
+            role="tool",
+            tool_call_id="0",
+            content=json.dumps({"cuenta_cobro_id": cuenta_id, "modo": "estandar", "requisitos_custom": 0}),
+        ),
+    ]
+
+    seen_filenames: list[str] = []
+    seen_tipos: list[str] = []
+    for i in range(6):
+        response = await fake.complete(messages, tools=tools)
+        assert response.tool_calls is not None, f"call {i}: expected a scripted tool call"
+        call = response.tool_calls[0]
+        assert call.name == "importar_documento", f"call {i}: expected importar_documento, got {call.name}"
+        seen_filenames.append(call.arguments["filename"])
+        seen_tipos.append(call.arguments["tipo"])
+        assert call.arguments["cuenta_cobro_id"] == cuenta_id
+        messages.append(
+            LLMMessage(
+                role="assistant",
+                content="",
+                tool_calls=[{"id": call.id, "type": "function", "function": {"name": call.name, "arguments": "{}"}}],
+            )
+        )
+        messages.append(
+            LLMMessage(role="tool", tool_call_id=call.id, content=json.dumps({"documento_id": str(uuid.uuid4())}))
+        )
+
+    assert len(set(seen_filenames)) == 6, f"expected 6 distinct filenames, got {seen_filenames}"
+    assert len(set(seen_tipos)) == 6, f"expected 6 distinct tipos, got {seen_tipos}"
+
+    response = await fake.complete(messages, tools=tools)
+    assert response.tool_calls is not None
+    assert response.tool_calls[0].name == "auto_vincular_documentos", (
+        "after 6 successful importar_documento calls the chain must advance, not repeat forever"
+    )
+
+
+async def test_subir_evidencias_desde_chat_scripted_with_non_empty_filenames() -> None:
+    """The generic synthesizer alone would emit `filenames=[]` (a schema-valid but
+    useless empty list for a required `list[str]` field) — the scripted override
+    must supply real filenames so the tool actually has something to upload."""
+    fake = FakeLLMPort()
+    tools = [{"type": "function", "function": {"name": name}} for name in TOOL_REGISTRY]
+    messages: list[LLMMessage] = [
+        _assistant_call("0", "crear_actividades_desde_obligaciones"),
+        LLMMessage(
+            role="tool",
+            tool_call_id="0",
+            content=json.dumps({"creadas": 3, "saltadas": 0, "actividades": []}),
+        ),
+    ]
+    response = await fake.complete(messages, tools=tools)
+    assert response.tool_calls is not None
+    call = response.tool_calls[0]
+    assert call.name == "subir_evidencias_desde_chat"
+    assert call.arguments["filenames"], "expected the scripted override to supply real filenames"
 
 
 # --- Full catalog schema validity (all 32 tools, not just the playbook) -----

@@ -104,8 +104,7 @@ async def test_exactly_max_chat_files_accepted(client: AsyncClient, test_user: d
 @pytest.mark.asyncio
 async def test_more_than_max_files_rejected(client: AsyncClient, test_user: dict[str, Any]) -> None:
     files = [
-        ("files", (f"doc_{i}.pdf", _PDF_MAGIC, "application/pdf"))
-        for i in range(agent_chat_module.MAX_CHAT_FILES + 1)
+        ("files", (f"doc_{i}.pdf", _PDF_MAGIC, "application/pdf")) for i in range(agent_chat_module.MAX_CHAT_FILES + 1)
     ]
 
     response = await client.post(
