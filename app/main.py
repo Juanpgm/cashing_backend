@@ -72,8 +72,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     import app.models  # noqa: F401 — register all models
     from app.core.database import Base, engine
+    from app.core.startup_checks import assert_production_llm_fallback_configured
 
     log = structlog.get_logger("startup")
+
+    # Fail fast and loud (not the softer log.warning pattern below for
+    # SECOP_APP_TOKEN) — see app.core.startup_checks module docstring for why
+    # this one invariant is worth crashing the boot over.
+    assert_production_llm_fallback_configured(
+        is_production=settings.is_production, fallback_model=settings.LLM_PRODUCTION_FALLBACK_MODEL
+    )
 
     # 1. Base schema — create_all is the source of truth (idempotent).
     #    Migrations do NOT build the base schema; they only carry ALTER deltas.
