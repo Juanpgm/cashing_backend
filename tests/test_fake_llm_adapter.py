@@ -19,6 +19,7 @@ import pytest
 import structlog
 from app.adapters.llm import get_llm
 from app.adapters.llm.fake_adapter import (
+    _DEFAULT_TEXT_RESPONSE,
     _GAVE_UP_TEXT_RESPONSE,
     HAPPY_PATH_SEQUENCE,
     FakeLLMPort,
@@ -37,6 +38,7 @@ from app.models.usuario import Usuario
 from app.schemas.agent import LLMMessage
 from app.services import agent_chat_service
 from app.tools.registry import TOOL_REGISTRY
+from pydantic import BaseModel, ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -407,6 +409,135 @@ async def test_complete_advances_normally_when_last_result_succeeded() -> None:
     response = await fake.complete(messages, tools=tools)
     assert response.tool_calls is not None
     assert response.tool_calls[0].name == "crear_cuenta_cobro"
+
+
+# --- response_format structured output (Phase 0, slice 0.6) -----------------
+
+
+async def test_complete_honors_response_format_and_returns_valid_structured_json() -> None:
+    """Every real `response_format=` call site (extraction.py, document_service.py,
+    checklist_service.py, requisito_inference_service.py) expects a JSON string
+    matching the given Pydantic model back in `response.content` — NOT a tool
+    call, NOT prose. This is a general-mechanism proof using a test-local dummy
+    model (mirrors `test_complete_degrades_safely_when_synthesized_arguments_fail_validation`'s
+    pattern) — `_synthesize_field_value` doesn't handle nested BaseModel fields,
+    so a REAL response_format model with a required nested model field would
+    still degrade safely (see the sibling test below) rather than produce valid
+    output; this proves the MECHANISM works for the shapes it does support."""
+
+    class _DummyStructuredOutput(BaseModel):
+        resumen: str
+        confianza: int
+
+    fake = FakeLLMPort()
+    response = await fake.complete([LLMMessage(role="user", content="hola")], response_format=_DummyStructuredOutput)
+    assert response.tool_calls is None
+    parsed = json.loads(response.content)
+    _DummyStructuredOutput.model_validate(parsed)
+
+
+async def test_complete_response_format_degrades_safely_when_unsynthesizable() -> None:
+    class _UnsynthesizableStructuredOutput(BaseModel):
+        payload: bytes  # not a shape _synthesize_field_value knows how to fill
+
+    fake = FakeLLMPort()
+    response = await fake.complete(
+        [LLMMessage(role="user", content="hola")], response_format=_UnsynthesizableStructuredOutput
+    )
+    assert response.tool_calls is None
+    assert response.content == _DEFAULT_TEXT_RESPONSE
+
+
+# --- FAKE_LLM_SCRIPT=stall / malformed (Phase 0, slice 0.6) -----------------
+
+
+async def test_complete_stall_script_always_returns_text_never_a_tool_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`FAKE_LLM_SCRIPT=stall` stalls UNCONDITIONALLY — even mid-sequence, with a
+    history that would normally advance to a real scripted tool call — proving
+    the "agent gave up mid-chain" edge case regardless of routing state."""
+    monkeypatch.setattr(settings, "FAKE_LLM_SCRIPT", "stall")
+    fake = FakeLLMPort()
+    tools = [{"type": "function", "function": {"name": "crear_cuenta_cobro"}}]
+    messages = [
+        _assistant_call("1", "listar_contratos"),
+        LLMMessage(role="tool", tool_call_id="1", content=json.dumps({"contratos": []})),
+    ]
+    response = await fake.complete(messages, tools=tools)
+    assert response.tool_calls is None
+    assert response.content
+
+
+async def test_chat_with_tools_stall_script_completes_one_turn_without_progress(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "LLM_PROVIDER", "fake")
+    monkeypatch.setattr(settings, "FAKE_LLM_SCRIPT", "stall")
+    user, _contrato = await _make_user_with_contrato(db)
+
+    result = await agent_chat_service.chat_with_tools(db, user, "Radicá mi cuenta", None, {})
+
+    assert result.tool_events == []
+    assert result.content
+    assert result.session_id
+
+
+async def test_complete_malformed_script_corrupts_crear_cuenta_cobro_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`FAKE_LLM_SCRIPT=malformed` deliberately emits a `mes` value (13) that
+    violates `CrearCuentaCobroInput.mes`'s `Field(ge=1, le=12)` — proving it
+    genuinely fails the tool's OWN schema (not just "some invalid string"),
+    and that the fake SKIPS its own `build_tool_call` self-check for this one
+    call (a real provider's tool-call arguments aren't pre-validated either)."""
+    from app.tools.catalog.cuentas import CrearCuentaCobroInput
+
+    monkeypatch.setattr(settings, "FAKE_LLM_SCRIPT", "malformed")
+    fake = FakeLLMPort()
+    tools = [{"type": "function", "function": {"name": "crear_cuenta_cobro"}}]
+    messages = [
+        _assistant_call("1", "listar_contratos"),
+        LLMMessage(
+            role="tool",
+            tool_call_id="1",
+            content=json.dumps({"contratos": [{"id": str(uuid.uuid4())}]}),
+        ),
+    ]
+    response = await fake.complete(messages, tools=tools)
+    assert response.tool_calls is not None
+    assert response.tool_calls[0].name == "crear_cuenta_cobro"
+    assert response.tool_calls[0].arguments["mes"] == 13
+    with pytest.raises(ValidationError):
+        CrearCuentaCobroInput.model_validate(response.tool_calls[0].arguments)
+
+
+async def test_chat_with_tools_malformed_script_surfaces_a_validation_error_not_a_network_failure(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Traces the malformed tool call THROUGH the real `agent_chat_service.
+    chat_with_tools` loop (not just asserting the fake returns bad JSON): the
+    resulting `ToolEvent` for `crear_cuenta_cobro` must be a genuine pydantic
+    `ValidationError`-shaped failure (`_format_tool_error`'s ValidationError
+    branch, naming the bad field) — per slice 0.4's own guidance, this must
+    NEVER be misdiagnosed as an LLM-network failure (the
+    "No pude contactar al modelo..." message from `chat_with_tools`'s outer
+    `except Exception` around `llm.complete()`)."""
+    monkeypatch.setattr(settings, "LLM_PROVIDER", "fake")
+    monkeypatch.setattr(settings, "FAKE_LLM_SCRIPT", "malformed")
+    user, _contrato = await _make_user_with_contrato(db)
+
+    result = await agent_chat_service.chat_with_tools(db, user, "Radicá mi cuenta de este mes", None, {})
+
+    # `FAKE_LLM_SCRIPT=malformed` corrupts `crear_cuenta_cobro`'s arguments
+    # EVERY time it's the scripted next step — including the outcome-aware
+    # retry (also this slice) — so it fails TWICE (initial attempt + retry)
+    # before the fake gives up, same shape as the plain retry-once test above.
+    crear_events = [e for e in result.tool_events if e.tool == "crear_cuenta_cobro"]
+    assert len(crear_events) == 2
+    assert all(e.status == "error" for e in crear_events)
+    assert all("mes" in e.resumen for e in crear_events)
+    assert "No pude contactar al modelo" not in result.content
 
 
 # --- Cross-turn recap resume (Phase 0, slice 0.6) ---------------------------
