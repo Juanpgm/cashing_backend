@@ -38,7 +38,8 @@ from typing import Any, get_args, get_origin
 import structlog
 from pydantic import BaseModel, ValidationError
 
-from app.schemas.agent import LLMMessage, LLMResponse, LLMToolCall
+from app.core.config import settings
+from app.schemas.agent import AGENT_RECAP_MARKER, LLMMessage, LLMResponse, LLMToolCall
 from app.tools.registry import TOOL_REGISTRY
 
 logger = structlog.get_logger("llm.fake")
@@ -62,6 +63,17 @@ HAPPY_PATH_SEQUENCE: dict[str | None, str | None] = {
 
 _DONE_TEXT_RESPONSE = "Listo, terminé la cadena de radicación."
 _DEFAULT_TEXT_RESPONSE = "Listo — no hay más pasos programados en el guion determinístico (FakeLLMPort)."
+# `FAKE_LLM_SCRIPT=stall` — always returned instead of ANY tool call (see
+# `FakeLLMPort.complete`'s early return), regardless of history.
+_STALL_TEXT_RESPONSE = "Me detuve acá — no sigo con el siguiente paso (FAKE_LLM_SCRIPT=stall)."
+# Outcome-aware routing: a scripted tool failed twice in a row (the retry also
+# failed) — give up instead of looping forever.
+_GAVE_UP_TEXT_RESPONSE = "No pude completar ese paso tras reintentarlo — me detengo acá."
+# FAKE_LLM_SCRIPT=malformed corrupts exactly this ONE tool call in the sequence
+# (see the "malformed" branch in `FakeLLMPort.complete`) — chosen because
+# `crear_cuenta_cobro` has multiple required fields and a real, well-defined
+# `ValidationError` -> `_format_tool_error` path in `agent_chat_service`.
+_MALFORMED_TARGET_TOOL = "crear_cuenta_cobro"
 
 
 def _last_tool_called(messages: list[LLMMessage]) -> str | None:
@@ -96,6 +108,38 @@ def _safe_json_dict(content: Any) -> dict[str, Any] | None:
     return loaded if isinstance(loaded, dict) else None
 
 
+def _extract_ids_from_compact_listar_contratos(content: str) -> dict[str, str]:
+    """`listar_contratos`'s REAL tool-result content in the running app is NOT
+    JSON: `agent_chat_service._compact_listar_contratos` serializes it as plain
+    `numero_contrato | entidad | valor_mensual | id` lines (one per contrato,
+    most-recent-first, matching `listar_contratos`'s own ordering) — bypassing
+    the generic `json.dumps(model_dump())` path entirely for this one tool, to
+    keep the full list readable for the model without JSON overhead. Parses the
+    LAST pipe-separated token of the FIRST line as `contrato_id` — guarded: any
+    shape mismatch (no contratos, no pipes, a malformed line) yields `{}`,
+    never raises."""
+    first_line = content.strip().splitlines()[0] if content.strip() else ""
+    if "|" not in first_line:
+        return {}
+    candidate = first_line.rsplit("|", 1)[-1].strip()
+    return {"id": candidate} if _is_uuid_shaped(candidate) else {}
+
+
+def _parse_tool_result_content(tool_name: str, content: Any) -> dict[str, Any] | None:
+    """`json.loads(content)` guarded, PLUS a tool-specific fallback for
+    `listar_contratos`'s non-JSON compact real-app serialization (see
+    `_extract_ids_from_compact_listar_contratos`) — every other tool's content
+    is plain JSON (`_serialize_tool_result`'s generic path) and only needs the
+    guarded `json.loads`."""
+    parsed = _safe_json_dict(content)
+    if parsed is not None:
+        return parsed
+    if tool_name == "listar_contratos" and isinstance(content, str):
+        compact_ids = _extract_ids_from_compact_listar_contratos(content)
+        return compact_ids or None
+    return None
+
+
 def _tool_results(messages: list[LLMMessage]) -> list[tuple[str, str, dict[str, Any] | None]]:
     """Pair each assistant `tool_calls[0]` `(id, name)` with the `role="tool"`
     message carrying a matching `tool_call_id` LATER in `messages` — mirrors how
@@ -120,7 +164,7 @@ def _tool_results(messages: list[LLMMessage]) -> list[tuple[str, str, dict[str, 
         elif message.role == "tool" and message.tool_call_id in pending:
             call_id = message.tool_call_id
             name = pending.pop(call_id)
-            results.append((call_id, name, _safe_json_dict(message.content)))
+            results.append((call_id, name, _parse_tool_result_content(name, message.content)))
     return results
 
 
@@ -329,6 +373,104 @@ def build_tool_call(
     return LLMToolCall(id=call_id, name=tool_name, arguments=arguments)
 
 
+def _is_error_result(result: dict[str, Any] | None) -> bool:
+    """Whether a paired tool-result payload represents a FAILED call.
+
+    Matches the REAL shape `agent_chat_service.chat_with_tools` actually
+    serializes for a failed tool call: `{"error": <str>}` (see
+    `_format_tool_error` + `result_payload = {"error": llm_detail}` in that
+    module). `"detail"` is accepted too as a defensive extra for hand-built
+    test histories using that common FastAPI convention — the real app never
+    produces it at this call site, only `"error"`.
+
+    A `None` result (no paired tool message yet, or its content wasn't valid
+    JSON) is treated as NOT a failure — there is no evidence either way, and
+    defaulting to "keep going" matches this file's existing safe-degrade
+    philosophy over retry-looping on content it can't even parse.
+    """
+    if result is None:
+        return False
+    return "error" in result or "detail" in result
+
+
+def _resume_from_recap(messages: list[LLMMessage]) -> tuple[str | None, dict[str, str]]:
+    """Placeholder — replaced by the real cross-turn recap parser below (see
+    the "Cross-turn continuity" section further down this file). Always "no
+    recap" until then: `(None, {})`."""
+    del messages
+    return None, {}
+
+
+def _advance(last_tool: str | None) -> tuple[str | None, str]:
+    """Look up the next scripted tool for `last_tool` in `HAPPY_PATH_SEQUENCE`.
+
+    Returns `(next_tool, reason)`. `reason` is only meaningful when `next_tool`
+    is `None`: `"unscripted"` (last_tool isn't a HAPPY_PATH_SEQUENCE key at all)
+    vs `"done"` (last_tool's next step is the terminal `None` — the chain
+    finished normally). `last_tool=None` itself is a normal, scripted key (the
+    "no tool called yet" / first-turn position), not unscripted.
+    """
+    if last_tool not in HAPPY_PATH_SEQUENCE:
+        return None, "unscripted"
+    next_tool = HAPPY_PATH_SEQUENCE[last_tool]
+    return next_tool, ("call" if next_tool is not None else "done")
+
+
+def _resolve_next_tool(messages: list[LLMMessage]) -> tuple[str | None, str, dict[str, str]]:
+    """OUTCOME-aware routing decision for one `complete()` call.
+
+    Returns `(next_tool_or_None, reason, known_ids)`:
+    - `reason` is `"call"` when `next_tool` is set; otherwise one of `"done"`
+      (chain finished), `"unscripted"` (last tool called isn't in the happy
+      path), or `"gave_up"` (a scripted tool failed twice in a row — see
+      below).
+    - `known_ids` is the `{field_name: uuid_string}` pool to thread into
+      `synthesize_tool_arguments` for whichever tool gets called next (see
+      `_known_ids` / `_resume_from_recap`).
+
+    A scripted step only counts as "successfully done" when its paired tool
+    result did NOT fail (`_is_error_result`) — this is what makes routing
+    outcome-aware instead of blindly trusting that a tool NAME being called
+    means it succeeded (the exact gap flagged in slice 0.4's review). A failed
+    call retries the SAME tool name once; a SECOND consecutive failure of that
+    same tool gives up (plain text reply) instead of looping forever.
+
+    `_last_tool_called` (name-only, no pairing required) is still used to find
+    "the last tool called" — this keeps every pre-existing test/behavior built
+    around it (e.g. an assistant `tool_calls` message with no paired result
+    yet) working unchanged; `_tool_results`/`_is_error_result` only ADD the
+    outcome check on top.
+    """
+    last_tool = _last_tool_called(messages)
+
+    if last_tool is None:
+        recap_tool, recap_known = _resume_from_recap(messages)
+        next_tool, reason = _advance(recap_tool)
+        return next_tool, reason, recap_known
+
+    known = _known_ids(messages)
+    tool_results = _tool_results(messages)
+    last_result: dict[str, Any] | None = None
+    for _call_id, name, result in reversed(tool_results):
+        if name == last_tool:
+            last_result = result
+            break
+
+    if not _is_error_result(last_result):
+        next_tool, reason = _advance(last_tool)
+        return next_tool, reason, known
+
+    trailing_failures = 0
+    for _call_id, name, result in reversed(tool_results):
+        if name == last_tool and _is_error_result(result):
+            trailing_failures += 1
+        else:
+            break
+    if trailing_failures >= 2:
+        return None, "gave_up", known
+    return last_tool, "call", known
+
+
 class FakeLLMPort:
     """Deterministic `LLMPort` implementation. No network, no `litellm` import."""
 
@@ -355,24 +497,47 @@ class FakeLLMPort:
         `_DEFAULT_TEXT_RESPONSE`), exactly like the real provider chain
         eventually would after exhausting its fallbacks, so callers built around
         `LiteLLMAdapter`'s contract don't need special-casing for the fake.
+
+        Reads the process-wide `settings.FAKE_LLM_SCRIPT` config knob (see
+        `app.core.config.Settings`) to select "stall"/"malformed" behavior — the
+        one piece of state this otherwise pure-function-of-`messages` adapter
+        depends on. It's a deliberate, documented exception: it's a dev/test
+        SCRIPT SELECTION knob (like `LLM_PROVIDER` itself, which already governs
+        whether this class is even instantiated), not per-session mutable state —
+        two calls with the same `messages` AND the same `FAKE_LLM_SCRIPT` value
+        still always agree, which is all `test_concurrent_calls_do_not_leak_state_between_sessions`
+        (unset/happy throughout) actually needs.
         """
-        del temperature, max_tokens, response_format, tool_choice, reasoning_effort, fallback
+        del temperature, max_tokens, tool_choice, reasoning_effort, fallback
         used_model = model or self._default_model
+        script = settings.FAKE_LLM_SCRIPT
+
+        if script == "stall":
+            # Always stall, regardless of history — exercises "the agent gave up
+            # mid-chain": one turn, no tool call, no progress, no crash.
+            return LLMResponse(content=_STALL_TEXT_RESPONSE, model=used_model)
+
+        if isinstance(response_format, type) and issubclass(response_format, BaseModel):
+            try:
+                known_for_structured = _resolve_next_tool(messages)[2]
+                structured = synthesize_tool_arguments(response_format, known=known_for_structured)
+                response_format.model_validate(structured)
+            except Exception:
+                await logger.awarning("fake_llm_structured_output_synthesis_failed", model=response_format.__name__)
+                return LLMResponse(content=_DEFAULT_TEXT_RESPONSE, model=used_model)
+            return LLMResponse(content=json.dumps(structured), model=used_model)
 
         try:
-            last_tool = _last_tool_called(messages)
+            next_tool, reason, known = _resolve_next_tool(messages)
         except Exception:
             await logger.awarning("fake_llm_malformed_history")
             return LLMResponse(content=_DEFAULT_TEXT_RESPONSE, model=used_model)
 
-        if last_tool not in HAPPY_PATH_SEQUENCE:
-            # Unknown/unscripted position — e.g. a tool outside the happy path was
-            # called, or the fake was dropped into a history it didn't build itself.
-            return LLMResponse(content=_DEFAULT_TEXT_RESPONSE, model=used_model)
-
-        next_tool = HAPPY_PATH_SEQUENCE[last_tool]
         if next_tool is None:
-            return LLMResponse(content=_DONE_TEXT_RESPONSE, model=used_model)
+            text = {"done": _DONE_TEXT_RESPONSE, "gave_up": _GAVE_UP_TEXT_RESPONSE}.get(
+                reason, _DEFAULT_TEXT_RESPONSE
+            )
+            return LLMResponse(content=text, model=used_model)
 
         if tools is not None:
             offered: set[str | None] = set()
@@ -397,8 +562,24 @@ class FakeLLMPort:
             return LLMResponse(content=_DEFAULT_TEXT_RESPONSE, model=used_model)
 
         call_id = f"fake_call_{len(messages)}_{next_tool}"
+
+        if script == "malformed" and next_tool == _MALFORMED_TARGET_TOOL:
+            # Deliberately SKIP this adapter's own `build_tool_call` self-check
+            # (`input_model.model_validate`) for this ONE scripted call — emit
+            # arguments the tool's REAL `invoke_tool` validation will reject
+            # (`mes=13` violates `CrearCuentaCobroInput.mes`'s `Field(ge=1,
+            # le=12)`), so the `ValidationError` propagates all the way into
+            # `agent_chat_service.chat_with_tools`'s per-tool-call handler and
+            # its `_format_tool_error` — exercising the real
+            # "malformed LLM response" path end-to-end, not just a fake-only
+            # short-circuit. See tests exercising `FAKE_LLM_SCRIPT=malformed`.
+            malformed_args = synthesize_tool_arguments(spec.input_model, known=known)
+            malformed_args["mes"] = 13
+            tool_call = LLMToolCall(id=call_id, name=next_tool, arguments=malformed_args)
+            return LLMResponse(content="", model=used_model, tool_calls=[tool_call])
+
         try:
-            tool_call = build_tool_call(next_tool, spec.input_model, call_id=call_id)
+            tool_call = build_tool_call(next_tool, spec.input_model, call_id=call_id, known=known)
         except ValidationError:
             # The synthesizer produced a value the tool's own schema rejects
             # (e.g. a constraint shape `_synthesize_field_value` doesn't know

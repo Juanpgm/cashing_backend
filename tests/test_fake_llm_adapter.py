@@ -21,6 +21,7 @@ from app.adapters.llm import get_llm
 from app.adapters.llm.fake_adapter import (
     HAPPY_PATH_SEQUENCE,
     FakeLLMPort,
+    _GAVE_UP_TEXT_RESPONSE,
     _known_ids,
     _last_tool_called,
     _tool_results,
@@ -31,10 +32,12 @@ from app.adapters.llm.litellm_adapter import LiteLLMAdapter
 from app.core.config import Settings, settings
 from app.core.security import hash_password
 from app.models.contrato import Contrato
+from app.models.cuenta_cobro import CuentaCobro
 from app.models.usuario import Usuario
 from app.schemas.agent import LLMMessage
 from app.services import agent_chat_service
 from app.tools.registry import TOOL_REGISTRY
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # --- LLM_PROVIDER setting / get_llm() factory routing ------------------------
@@ -275,6 +278,22 @@ def test_known_ids_malformed_json_content_yields_empty_dict_no_exception() -> No
     assert _known_ids(messages) == {}
 
 
+def test_known_ids_parses_listar_contratos_real_compact_pipe_format() -> None:
+    """`listar_contratos`'s REAL tool-result content in the running app is NOT
+    JSON — `agent_chat_service._compact_listar_contratos` serializes it as
+    `numero_contrato | entidad | valor_mensual | id` pipe-delimited plain text
+    (bypassing the generic JSON path entirely for this tool). `_known_ids` must
+    still recover the real `contrato_id` from that shape, not just from a
+    hand-built JSON dict — otherwise the fix never actually threads IDs through
+    the REAL running app, only through synthetic test histories."""
+    real_id = str(uuid.uuid4())
+    messages = [
+        _assistant_call("1", "listar_contratos"),
+        LLMMessage(role="tool", tool_call_id="1", content=f"C-1 | Alcaldia | 1000000 | {real_id}"),
+    ]
+    assert _known_ids(messages)["contrato_id"] == real_id
+
+
 def test_known_ids_definir_requisitos_checklist_aliases_cuenta_cobro_id() -> None:
     cuenta_id = str(uuid.uuid4())
     messages = [
@@ -326,6 +345,68 @@ def test_synthesize_tool_arguments_known_none_default_matches_pre_existing_behav
 
 
 # --- Malformed / unrecognized input -> safe default, never a crash ----------
+
+
+async def test_complete_threads_real_contrato_id_into_crear_cuenta_cobro_call() -> None:
+    """The core bug this slice fixes: `crear_cuenta_cobro`'s synthesized
+    `contrato_id` must be the REAL id `listar_contratos` returned in this same
+    history, not a fresh random `uuid.uuid4()`."""
+    fake = FakeLLMPort()
+    real_contrato_id = str(uuid.uuid4())
+    tools = [{"type": "function", "function": {"name": "crear_cuenta_cobro"}}]
+    messages = [
+        _assistant_call("1", "listar_contratos"),
+        LLMMessage(
+            role="tool",
+            tool_call_id="1",
+            content=json.dumps({"contratos": [{"id": real_contrato_id, "numero_contrato": "C-1"}]}),
+        ),
+    ]
+    response = await fake.complete(messages, tools=tools)
+    assert response.tool_calls is not None
+    assert response.tool_calls[0].name == "crear_cuenta_cobro"
+    assert response.tool_calls[0].arguments["contrato_id"] == real_contrato_id
+
+
+async def test_complete_retries_the_same_tool_once_after_a_failed_result() -> None:
+    fake = FakeLLMPort()
+    tools = [{"type": "function", "function": {"name": "crear_cuenta_cobro"}}]
+    messages = [
+        _assistant_call("1", "crear_cuenta_cobro"),
+        LLMMessage(role="tool", tool_call_id="1", content=json.dumps({"error": "boom"})),
+    ]
+    response = await fake.complete(messages, tools=tools)
+    assert response.tool_calls is not None
+    assert response.tool_calls[0].name == "crear_cuenta_cobro"
+
+
+async def test_complete_gives_up_after_a_retry_also_fails() -> None:
+    fake = FakeLLMPort()
+    tools = [{"type": "function", "function": {"name": "crear_cuenta_cobro"}}]
+    messages = [
+        _assistant_call("1", "crear_cuenta_cobro"),
+        LLMMessage(role="tool", tool_call_id="1", content=json.dumps({"error": "boom"})),
+        _assistant_call("2", "crear_cuenta_cobro"),
+        LLMMessage(role="tool", tool_call_id="2", content=json.dumps({"error": "boom again"})),
+    ]
+    response = await fake.complete(messages, tools=tools)
+    assert response.tool_calls is None
+    assert response.content
+
+
+async def test_complete_advances_normally_when_last_result_succeeded() -> None:
+    """Sibling of the retry test above: a SUCCESSFUL paired result must still
+    advance `HAPPY_PATH_SEQUENCE` normally (outcome-aware routing must not
+    accidentally start retrying successful calls too)."""
+    fake = FakeLLMPort()
+    tools = [{"type": "function", "function": {"name": "crear_cuenta_cobro"}}]
+    messages = [
+        _assistant_call("1", "listar_contratos"),
+        LLMMessage(role="tool", tool_call_id="1", content=json.dumps({"contratos": []})),
+    ]
+    response = await fake.complete(messages, tools=tools)
+    assert response.tool_calls is not None
+    assert response.tool_calls[0].name == "crear_cuenta_cobro"
 
 
 async def test_complete_with_malformed_tool_call_shape_returns_safe_default() -> None:
@@ -578,49 +659,65 @@ async def _make_user_with_contrato(db: AsyncSession) -> tuple[Usuario, Contrato]
 async def test_fake_llm_completes_the_full_tool_sequence_even_when_synthesized_ids_dont_resolve(
     db: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Boots the REAL agent loop with LLM_PROVIDER=fake and asserts the turn
-    completes the whole scripted tool NAME sequence end-to-end — no
-    `bloquear_red_llm` opt-out needed (FakeLLMPort never imports litellm), no
-    `ScriptedLLM` monkeypatch of `get_llm` (the real factory routes to the fake
-    via the setting alone).
+    """Boots the REAL agent loop with LLM_PROVIDER=fake — no `bloquear_red_llm`
+    opt-out needed (FakeLLMPort never imports litellm), no `ScriptedLLM`
+    monkeypatch of `get_llm` (the real factory routes to the fake via the
+    setting alone).
 
-    IMPORTANT: this does NOT assert a fully successful radicación chain. Only
-    `listar_contratos` (the sole zero-required-argument tool in the sequence)
-    actually succeeds. Every other tool call is built with `synthesize_tool_arguments`
-    (see fake_adapter.py), which fills required fields with schema-valid but
-    RANDOM placeholder values (e.g. `uuid.uuid4()` for foreign keys) — it does
-    NOT thread real IDs from prior tool results (`crear_cuenta_cobro`'s real
-    `contrato.id`, etc.). So the remaining 5 calls in this script correctly
-    fail with domain "not found" errors against a real DB. This is a KNOWN,
-    TRACKED limitation of the Phase 0 fake-adapter seam (cross-turn ID
-    threading is future work, not part of this slice) — it is not a bug to fix
-    here. The point of this test is that the fake adapter still drives the
-    agent loop through the ENTIRE scripted tool-name sequence without crashing
-    or stalling, regardless of each call's individual domain outcome.
+    UPDATED for slice 0.6 (real cross-turn ID threading + outcome-aware
+    routing) — the docstring below describes the CURRENT, verified outcome;
+    the previous version of this test (pre-0.6) asserted only 1/6 calls could
+    ever succeed, which was exactly the threading gap this slice fixes.
+
+    Real observed outcome (verified by running this test): the first THREE
+    calls now genuinely succeed against the real DB — `listar_contratos`
+    discovers the seeded contrato, `crear_cuenta_cobro` receives its REAL
+    `contrato_id` (not a random `uuid4()` — see the DB assertion below, which
+    is the direct proof `FakeLLMPort._known_ids`/`known=` actually threaded
+    it), and `definir_requisitos_checklist` receives the REAL `cuenta_id`
+    `crear_cuenta_cobro` just created. `importar_documento` then fails twice
+    (an initial attempt + one outcome-aware retry, also this slice) — that
+    failure is NOT an ID-threading gap: this test supplies NO chat attachment,
+    so `synthesize_tool_arguments` can only synthesize a `filename` STRING
+    ("fake"), never a real uploaded file, and `ctx.attachments.get("fake")` is
+    always `None` regardless of ID threading (see
+    `app/tools/catalog/importar_documento.py`). Exercising a real file upload
+    end-to-end is a different tool's concern, out of scope here. `radicar_cuenta`
+    (script step 6) is correctly never reached — the chain gives up after
+    `importar_documento`'s retry also fails, instead of looping forever.
     """
     monkeypatch.setattr(settings, "LLM_PROVIDER", "fake")
-    user, _contrato = await _make_user_with_contrato(db)
+    user, contrato = await _make_user_with_contrato(db)
 
     result = await agent_chat_service.chat_with_tools(db, user, "Radicá mi cuenta de este mes", None, {})
 
-    # Real observed outcome (verified by running this test): only the first
-    # call (`listar_contratos`, the only tool with no required arguments) can
-    # succeed against a real DB with synthesized/random arguments — the other
-    # 5 calls fail with domain "not found" errors because their synthesized
-    # foreign-key IDs are random UUIDs, not IDs threaded from prior results.
     expected_events = [
         ("listar_contratos", "ok"),
-        ("crear_cuenta_cobro", "error"),
-        ("definir_requisitos_checklist", "error"),
+        ("crear_cuenta_cobro", "ok"),
+        ("definir_requisitos_checklist", "ok"),
         ("importar_documento", "error"),
-        ("resumen_checklist", "error"),
-        ("radicar_cuenta", "error"),
+        ("importar_documento", "error"),
     ]
-    expected_sequence = [name for name in HAPPY_PATH_SEQUENCE.values() if name is not None]
-    assert expected_sequence == [tool for tool, _status in expected_events]
     assert [(event.tool, event.status) for event in result.tool_events] == expected_events
-    assert result.content
+    assert result.content == _GAVE_UP_TEXT_RESPONSE
     assert result.session_id
+
+    # `importar_documento`'s failures each trigger `db.rollback()` inside
+    # `chat_with_tools`, which expires every object in the shared `db` session
+    # (regardless of `expire_on_commit`) — refresh `contrato` (created earlier,
+    # outside that rollback) before reading its attributes, exactly like the
+    # service itself does for its own long-lived objects after a rollback (see
+    # `test_chat_with_tools_fake_llm_is_deterministic_across_runs` below).
+    await db.refresh(contrato)
+
+    # Direct DB proof of real ID threading: the cuenta de cobro `crear_cuenta_cobro`
+    # created must be linked to the SAME contrato `listar_contratos` discovered — if
+    # `contrato_id` had been a random uuid4() (the pre-0.6 bug), `crear_cuenta_cobro`
+    # would have failed with "Contrato not found" and no row would exist here at all.
+    cuenta_result = await db.execute(select(CuentaCobro).where(CuentaCobro.contrato_id == contrato.id))
+    cuenta = cuenta_result.scalar_one()
+    assert cuenta.contrato_id == contrato.id
+    assert cuenta.requisitos_modo is not None  # definir_requisitos_checklist ran too
 
 
 async def test_chat_with_tools_fake_llm_is_deterministic_across_runs(
