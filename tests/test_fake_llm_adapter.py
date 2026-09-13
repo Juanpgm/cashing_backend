@@ -76,6 +76,39 @@ def test_llm_provider_fake_is_case_and_whitespace_insensitive(raw_value: str) ->
     assert s.LLM_PROVIDER == "fake"
 
 
+# --- FAKE_LLM_SCRIPT setting (Phase 0, slice 0.6) ----------------------------
+
+
+def test_fake_llm_script_defaults_to_none() -> None:
+    s = Settings(SECOP_APP_TOKEN=_NON_EMPTY_SECOP_TOKEN)  # type: ignore[call-arg]
+    assert s.FAKE_LLM_SCRIPT is None
+
+
+@pytest.mark.parametrize("raw_value", ["malformed", "MALFORMED", " Malformed "])
+def test_fake_llm_script_accepts_malformed_case_and_whitespace_insensitive(raw_value: str) -> None:
+    s = Settings(FAKE_LLM_SCRIPT=raw_value, SECOP_APP_TOKEN=_NON_EMPTY_SECOP_TOKEN)  # type: ignore[call-arg]
+    assert s.FAKE_LLM_SCRIPT == "malformed"
+
+
+@pytest.mark.parametrize("raw_value", ["stall", "STALL", " stall "])
+def test_fake_llm_script_accepts_stall_case_and_whitespace_insensitive(raw_value: str) -> None:
+    s = Settings(FAKE_LLM_SCRIPT=raw_value, SECOP_APP_TOKEN=_NON_EMPTY_SECOP_TOKEN)  # type: ignore[call-arg]
+    assert s.FAKE_LLM_SCRIPT == "stall"
+
+
+def test_fake_llm_script_accepts_happy_explicitly() -> None:
+    s = Settings(FAKE_LLM_SCRIPT="happy", SECOP_APP_TOKEN=_NON_EMPTY_SECOP_TOKEN)  # type: ignore[call-arg]
+    assert s.FAKE_LLM_SCRIPT == "happy"
+
+
+def test_fake_llm_script_invalid_value_falls_back_to_none() -> None:
+    """An unrecognized value must never crash Settings load, nor silently pick a
+    random script — it normalizes to `None`, i.e. the default happy path, mirroring
+    `LLM_PROVIDER`'s own fold-to-default behavior for an invalid value."""
+    s = Settings(FAKE_LLM_SCRIPT="banana", SECOP_APP_TOKEN=_NON_EMPTY_SECOP_TOKEN)  # type: ignore[call-arg]
+    assert s.FAKE_LLM_SCRIPT is None
+
+
 def test_llm_provider_invalid_value_logs_a_warning() -> None:
     """An unrecognized value doesn't just silently fold to "litellm" — it logs
     a warning naming the invalid value received, so a misconfigured env var
