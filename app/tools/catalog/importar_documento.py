@@ -185,16 +185,14 @@ async def _resolver_scope(
     name="importar_documento",
     description=(
         "Importa un archivo adjuntado por el usuario en el chat (PDF, DOCX, XLSX u otro formato "
-        "soportado) al sistema de documentos: lo valida, extrae su texto y lo vincula "
-        "automáticamente al lugar correcto según su 'tipo' — al CONTRATO si es un soporte a nivel "
-        "de contrato (contrato, rpc, cdp, cedula, rut, ficha_tecnica, acta_inicio) o al checklist "
-        "de la CUENTA de cobro si es a nivel de cuenta (seguridad_social, comprobante_pago_ss, "
-        "informe_actividades, informe_supervision, ds_consecutivo, dependientes). Si tipo=contrato "
-        "y no se da contrato_id, crea automáticamente el contrato y extrae sus obligaciones. Usa "
-        "esta herramienta cuando el usuario adjunte cualquier soporte del contrato o de la cuenta "
-        "de cobro en el chat y quiera que el agente lo procese. El 'filename' debe coincidir "
-        "exactamente con el nombre de un archivo adjuntado en este turno de la conversación — no "
-        "inventes nombres de archivo."
+        "soportado): lo valida, extrae su texto y lo vincula automáticamente según su 'tipo' — al "
+        "CONTRATO si es a nivel de contrato (contrato, rpc, cdp, cedula, rut, ficha_tecnica, "
+        "acta_inicio) o al checklist de la CUENTA si es a nivel de cuenta (seguridad_social, "
+        "comprobante_pago_ss, informe_actividades, informe_supervision, ds_consecutivo, "
+        "dependientes). Si tipo=contrato y no se da contrato_id, crea el contrato automáticamente "
+        "y extrae sus obligaciones. Usá esta herramienta para cualquier soporte que el usuario "
+        "adjunte en el chat. El 'filename' debe coincidir exactamente con un archivo adjuntado en "
+        "este turno — no inventes nombres de archivo."
     ),
     input_model=ImportarDocumentoInput,
     output_model=ImportarDocumentoOutput,

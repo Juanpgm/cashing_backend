@@ -111,24 +111,19 @@ async def _tiene_progreso(db: AsyncSession, cuenta_id: uuid.UUID) -> bool:
 @tool(
     name="definir_requisitos_checklist",
     description=(
-        "Define el modo de construcción del checklist de documentos de una cuenta de cobro y lo "
-        "materializa. OBLIGATORIO llamar esta herramienta INMEDIATAMENTE después de "
-        "crear_cuenta_cobro y ANTES de cualquier otra herramienta sobre esa cuenta "
-        "(resumen_checklist, detectar_desde_secop, auto_vincular_documentos, importar_documento "
-        "con cuenta_cobro_id, generar_informe_actividades, generar_informe_supervision, "
-        "preparar_radicacion, radicar_cuenta) — una cuenta recién creada tiene "
-        "requisitos_modo=NULL y esas herramientas fallan o devuelven un checklist vacío (o "
-        "requisitos_definidos=false, sin materializar nada) hasta que esto se llama. Si el "
-        "usuario NO te dio un documento con los requisitos "
-        "de la entidad contratante, usa modo='estandar' (el default) sin argumento 'requisitos' — "
-        "esa es la opción correcta en la mayoría de los casos. Args: cuenta_id (UUID de la cuenta "
-        "de cobro; debe pertenecer al usuario autenticado); modo ('estandar'/'augment'/"
-        "'reemplazar', default 'estandar'); requisitos (lista opcional de requisitos custom, solo "
-        "relevante para 'augment'/'reemplazar'). LLAMALA UNA SOLA VEZ por cuenta, inmediatamente "
-        "después de crearla. NUNCA la vuelvas a llamar sobre una cuenta que ya tiene documentos "
-        "vinculados en su checklist — reemplaza el set completo y arrastra en cascada el borrado "
-        "de esos vínculos. Si igual la llamás de nuevo en ese caso, la herramienta detecta el "
-        "riesgo y no hace nada (devuelve el checklist actual sin tocarlo)."
+        "Define el modo del checklist de documentos de una cuenta y lo materializa. OBLIGATORIO "
+        "llamarla INMEDIATAMENTE después de crear_cuenta_cobro y ANTES de cualquier otra "
+        "herramienta sobre esa cuenta (resumen_checklist, detectar_desde_secop, "
+        "auto_vincular_documentos, importar_documento con cuenta_cobro_id, "
+        "generar_informe_actividades, generar_informe_supervision, preparar_radicacion, "
+        "radicar_cuenta) — con requisitos_modo=NULL esas herramientas fallan o no materializan "
+        "nada. Args: cuenta_id (UUID de la cuenta de cobro; debe pertenecer al usuario "
+        "autenticado); modo ('estandar' = default correcto si el usuario NO dio un documento de "
+        "requisitos de la entidad; 'augment' = estándar + 'requisitos' custom; 'reemplazar' = "
+        "solo 'requisitos' custom); requisitos (custom, solo para 'augment'/'reemplazar'). "
+        "LLAMALA UNA SOLA VEZ por cuenta: si ya tiene documentos vinculados en su checklist, es "
+        "un no-op seguro (devuelve el checklist actual sin tocarlo, para no perder lo ya "
+        "cargado)."
     ),
     input_model=DefinirRequisitosChecklistInput,
     output_model=DefinirRequisitosChecklistOutput,
