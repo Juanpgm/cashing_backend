@@ -25,6 +25,8 @@ from app.adapters.llm.fake_adapter import (
     FakeLLMPort,
     _known_ids,
     _last_tool_called,
+    _parse_tool_result_content,
+    _resolve_next_tool,
     _tool_results,
     build_tool_call,
     synthesize_tool_arguments,
@@ -280,6 +282,27 @@ def test_known_ids_malformed_json_content_yields_empty_dict_no_exception() -> No
     assert _known_ids(messages) == {}
 
 
+def test_parse_tool_result_content_logs_a_warning_when_content_is_unparseable() -> None:
+    """A tool result string that isn't valid JSON and has no tool-specific
+    fallback to recover it (unlike `listar_contratos`'s compact-pipe format) —
+    the shape `agent_chat_service._serialize_tool_result`'s
+    `_MAX_TOOL_RESULT_CHARS` truncation produces (`"... (truncado)"` breaking
+    `json.loads` mid-structure) — must not degrade silently: a queryable
+    warning log line is emitted, so this "no ids threaded" case is observable
+    in production logs instead of only inferable from an absent id.
+
+    Uses `structlog.testing.capture_logs()`, never `monkeypatch.setattr` on the
+    module logger directly (see
+    `test_llm_provider_invalid_value_logs_a_warning`'s docstring for why)."""
+    with structlog.testing.capture_logs() as captured:
+        result = _parse_tool_result_content("crear_cuenta_cobro", '{"id": "abc"... (truncado)')
+
+    assert result is None
+    warn_events = [e for e in captured if e.get("event") == "fake_llm_tool_result_unparseable"]
+    assert warn_events, "expected a queryable warning log for unparseable tool-result content"
+    assert warn_events[0]["tool"] == "crear_cuenta_cobro"
+
+
 def test_known_ids_parses_listar_contratos_real_compact_pipe_format() -> None:
     """`listar_contratos`'s REAL tool-result content in the running app is NOT
     JSON — `agent_chat_service._compact_listar_contratos` serializes it as
@@ -309,13 +332,59 @@ def test_known_ids_definir_requisitos_checklist_aliases_cuenta_cobro_id() -> Non
     assert _known_ids(messages)["cuenta_id"] == cuenta_id
 
 
-def test_known_ids_resumen_checklist_aliases_cuenta_cobro_id() -> None:
-    cuenta_id = str(uuid.uuid4())
+def test_known_ids_resumen_checklist_real_compact_text_yields_no_cuenta_id() -> None:
+    """`resumen_checklist`'s REAL tool-result content in the running app is
+    `_compact_resumen_checklist`'s plain-text summary (see
+    `agent_chat_service._COMPACT_SERIALIZERS`) — `"resumen: total=... / {codigo}
+    {estado}"` lines, NEVER JSON, and it never carries a `cuenta_cobro_id` field
+    at all. `_ID_ALIASES["resumen_checklist"]` is therefore a documented no-op on
+    THIS (live, same-turn) path — see that dict's docstring — it only matters on
+    the cross-turn recap-resume path (see
+    `test_complete_resumes_from_recap_threads_cuenta_id_via_resumen_checklist_alias`
+    below, which reads the raw dumped dict, not this serialized text). This test
+    replaces a previous version that fed `_known_ids` a hand-built
+    `json.dumps({"cuenta_cobro_id": ...})` payload the real app never produces
+    for this tool — a green test exercising a dead path."""
     messages = [
         _assistant_call("1", "resumen_checklist"),
-        LLMMessage(role="tool", tool_call_id="1", content=json.dumps({"cuenta_cobro_id": cuenta_id})),
+        LLMMessage(
+            role="tool",
+            tool_call_id="1",
+            content="resumen: total=3 cumplidos=1 pendientes=2 radicacion_lista=False\nRUT cumplido",
+        ),
     ]
-    assert _known_ids(messages)["cuenta_id"] == cuenta_id
+    assert _known_ids(messages) == {}
+    assert _parse_tool_result_content("resumen_checklist", messages[1].content) is None
+
+
+async def test_complete_resumes_from_recap_threads_cuenta_id_via_resumen_checklist_alias() -> None:
+    """The recap-resume path is where `_ID_ALIASES["resumen_checklist"]`
+    genuinely matters: `agent_chat_service._build_tool_context_recap` builds
+    recap lines from the RAW dumped tool-result dict (`call_results`), not the
+    compact serialized text (see `_extract_recap_ids`) — so a
+    `resumen_checklist:ok cuenta_cobro_id=<uuid>` recap entry DOES carry the id,
+    and `_resume_from_recap` must alias it into `cuenta_id` for the next
+    scripted tool (`radicar_cuenta`), same as the live-call alias would if the
+    serialized content ever were JSON.
+
+    Builds the recap via the REAL `agent_chat_service._build_tool_context_recap`
+    (not a hand-built f-string) — same rationale as
+    `test_complete_resumes_from_recap_when_no_tool_calls_in_history`."""
+    cuenta_id = str(uuid.uuid4())
+    recap_content = agent_chat_service._build_tool_context_recap(
+        [("resumen_checklist", "ok", {"cuenta_cobro_id": cuenta_id})]
+    )
+    assert recap_content is not None
+    fake = FakeLLMPort()
+    tools = [{"type": "function", "function": {"name": "radicar_cuenta"}}]
+    messages = [
+        LLMMessage(role="system", content=recap_content),
+        LLMMessage(role="user", content="seguí con la radicación"),
+    ]
+    response = await fake.complete(messages, tools=tools)
+    assert response.tool_calls is not None
+    assert response.tool_calls[0].name == "radicar_cuenta"
+    assert response.tool_calls[0].arguments["cuenta_id"] == cuenta_id
 
 
 def test_synthesize_tool_arguments_uses_known_id_for_matching_uuid_field() -> None:
@@ -550,18 +619,22 @@ async def test_complete_resumes_from_recap_when_no_tool_calls_in_history() -> No
     entries) but NO assistant `tool_calls` at all (only the user + assistant
     text from the persisted `Conversacion.mensajes_json`). The fake must
     resume `HAPPY_PATH_SEQUENCE` from the recap's newest entry AND thread its
-    ids into the next call's arguments."""
-    from app.schemas.agent import AGENT_RECAP_MARKER
+    ids into the next call's arguments.
 
+    Builds the recap via the REAL `agent_chat_service._build_tool_context_recap`
+    (not a hand-built f-string) so a future format drift in that function fails
+    THIS test too, instead of only ever testing the replica parser's own
+    assumptions about the format."""
     cuenta_id = str(uuid.uuid4())
     contrato_id = str(uuid.uuid4())
+    recap_content = agent_chat_service._build_tool_context_recap(
+        [("crear_cuenta_cobro", "ok", {"id": cuenta_id, "contrato_id": contrato_id})]
+    )
+    assert recap_content is not None
     fake = FakeLLMPort()
     tools = [{"type": "function", "function": {"name": "definir_requisitos_checklist"}}]
     messages = [
-        LLMMessage(
-            role="system",
-            content=f"{AGENT_RECAP_MARKER} crear_cuenta_cobro:ok id={cuenta_id} contrato_id={contrato_id}",
-        ),
+        LLMMessage(role="system", content=recap_content),
         LLMMessage(role="user", content="creá la cuenta"),
         LLMMessage(role="assistant", content="Listo, la cuenta quedó creada."),
         LLMMessage(role="user", content="seguí con el checklist"),
@@ -645,6 +718,25 @@ async def test_complete_with_unscripted_tool_name_returns_safe_default() -> None
     response = await fake.complete(messages)
     assert response.tool_calls is None
     assert response.content
+
+
+def test_resolve_next_tool_unscripted_tool_error_result_skips_retry_branch() -> None:
+    """An unscripted tool name (not a `HAPPY_PATH_SEQUENCE` key) whose paired
+    result is an ERROR must resolve straight to `(None, "unscripted", known)` —
+    the retry-once bookkeeping (`_is_error_result` + `trailing_failures`) is
+    reserved for SCRIPTED tools only. Before this fix, an unscripted tool's
+    error result fell into the retry branch anyway (bounded/harmless only
+    because the retried "next tool" is never a real registry entry) instead of
+    going straight to a text reply on the FIRST attempt, unlike the established
+    "unscripted → text" behavior for the non-error case
+    (`test_complete_with_unscripted_tool_name_returns_safe_default`)."""
+    messages = [
+        _assistant_call("1", "algo_no_scripteado"),
+        LLMMessage(role="tool", tool_call_id="1", content=json.dumps({"error": "boom"})),
+    ]
+    next_tool, reason, _known = _resolve_next_tool(messages)
+    assert next_tool is None
+    assert reason == "unscripted"
 
 
 async def test_complete_does_not_request_a_tool_the_caller_did_not_offer() -> None:

@@ -143,7 +143,15 @@ def _parse_tool_result_content(tool_name: str, content: Any) -> dict[str, Any] |
         return parsed
     if tool_name == "listar_contratos" and isinstance(content, str):
         compact_ids = _extract_ids_from_compact_listar_contratos(content)
-        return compact_ids or None
+        if compact_ids:
+            return compact_ids
+    # Genuinely unparseable (or listar_contratos's own compact fallback found
+    # no ids either) — fail open (never raise), but make the degrade
+    # observable: this is the path a `_MAX_TOOL_RESULT_CHARS` truncation
+    # (`agent_chat_service._serialize_tool_result`) silently hits, breaking
+    # `json.loads` mid-structure with no other signal that ids stopped
+    # threading through `_known_ids`.
+    logger.warning("fake_llm_tool_result_unparseable", tool=tool_name)
     return None
 
 
@@ -199,10 +207,21 @@ def _is_uuid_shaped(value: Any) -> bool:
 #   - definir_requisitos_checklist -> DefinirRequisitosChecklistOutput.
 #     cuenta_cobro_id (app/tools/catalog/requisitos.py) -> `cuenta_id`.
 #   - resumen_checklist -> ChecklistResponse.cuenta_cobro_id
-#     (app/schemas/checklist.py, same field name as above) -> `cuenta_id`. This one
-#     is load-bearing for the happy path: radicar_cuenta (the step right after
-#     resumen_checklist) needs `cuenta_id`, and resumen_checklist's own result is
-#     the most recent id source at that point in the script.
+#     (app/schemas/checklist.py, same field name as above) -> `cuenta_id`. NOTE:
+#     this alias is a documented NO-OP on the LIVE, same-turn path (`_known_ids`
+#     via `_tool_results`/`_parse_tool_result_content`) — the real app never
+#     serializes `resumen_checklist`'s tool-result content as JSON at all, it
+#     goes through `agent_chat_service._compact_resumen_checklist`'s plain-text
+#     summary (`"resumen: total=... / {codigo} {estado}"` lines, no id field),
+#     which `_parse_tool_result_content` correctly can't parse and returns
+#     `None` for (see `test_known_ids_resumen_checklist_real_compact_text_yields_no_cuenta_id`).
+#     It DOES matter on the cross-turn recap-resume path (`_resume_from_recap`),
+#     which reads the RAW dumped dict `agent_chat_service._build_tool_context_recap`
+#     built the recap from, not this serialized text — see
+#     `test_complete_resumes_from_recap_threads_cuenta_id_via_resumen_checklist_alias`.
+#     Kept here (rather than removed) for that reason, and because `cuenta_id` is
+#     harmlessly already known by this point in the live happy path anyway (from
+#     `crear_cuenta_cobro`'s own alias, earlier in the same `messages` history).
 _ID_ALIASES: dict[str, dict[str, str]] = {
     "listar_contratos": {"id": "contrato_id"},
     "crear_cuenta_cobro": {"id": "cuenta_id"},
@@ -535,6 +554,16 @@ def _resolve_next_tool(messages: list[LLMMessage]) -> tuple[str | None, str, dic
         return next_tool, reason, recap_known
 
     known = _known_ids(messages)
+
+    if last_tool not in HAPPY_PATH_SEQUENCE:
+        # Unscripted tool (not a key in HAPPY_PATH_SEQUENCE at all) — the
+        # retry-once bookkeeping below only makes sense for a SCRIPTED tool
+        # (whose next step is a real, known entry). Check membership before
+        # even looking at the result's outcome, matching the non-error
+        # "unscripted -> text" behavior below instead of accidentally
+        # entering the retry branch first.
+        return None, "unscripted", known
+
     tool_results = _tool_results(messages)
     last_result: dict[str, Any] | None = None
     for _call_id, name, result in reversed(tool_results):
