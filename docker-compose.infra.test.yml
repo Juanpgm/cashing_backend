@@ -1,0 +1,18 @@
+# Test-only override for docker-compose.infra.yml, applied ONLY by
+# scripts/test-postgres.sh (via `-f docker-compose.infra.yml -f docker-compose.infra.test.yml`).
+#
+# Why this exists: scripts/test-postgres.sh runs the suite INSIDE the `app`
+# container, which reaches Postgres at `db:5432` purely over the shared external
+# Docker network `cashing-net` — the host port publish declared in
+# docker-compose.infra.yml (`5432:5432`) is never used by that flow. Resetting it
+# here means the test script does not need host port 5432 to be free (e.g. a
+# sibling project's own Postgres container already bound to it), WITHOUT touching
+# the shared infra file that other developer workflows (direct `psql`/GUI clients
+# from the host, scripts/up-infra.ps1) rely on for host access.
+#
+# `!reset []` (Compose Specification merge tag) clears the inherited `ports` list
+# instead of appending to it — plain YAML merging concatenates lists, which would
+# keep the host publish.
+services:
+  db:
+    ports: !reset []

@@ -17,8 +17,14 @@ services:
     # Backend is ALWAYS on 8000 (host) -> 8000 (container).
     ports:
       - "8000:8000"
+    # Optional: a fresh checkout/worktree (e.g. CI-mirroring local runs) has no
+    # local `.env` — `required: false` (Compose Specification) stops that from
+    # being a hard `docker compose` failure. This mirrors app/core/config.py's
+    # own Settings.model_config.env_file tuple, which already tolerates a
+    # missing `.env` and falls back to safe field defaults / `.env.example`.
     env_file:
-      - .env
+      - path: .env
+        required: false
     environment:
       # `db` / `minio` resolve over the shared `cashing-net` network to the
       # independent infra stack (docker-compose.infra.yml).
