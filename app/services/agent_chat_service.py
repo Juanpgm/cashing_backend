@@ -70,6 +70,13 @@ logger = structlog.get_logger("services.agent_chat")
 # already ran. Raised with headroom for a retry or two along the way.
 MAX_TOOL_ITERATIONS = 20
 
+# How many of the user's most recent prior messages (this turn's current
+# message is always checked too, separately) `phase_gating.hidden_tool_names`
+# also scans for an orthogonal-topic trigger keyword (CRITICAL 3, phase-gating
+# adversarial review). A short follow-up ("dale, hacelo") frequently doesn't
+# repeat the keyword the user already said one or two messages earlier.
+_ORTHOGONAL_KEYWORD_MESSAGE_WINDOW = 3
+
 # Per-model-attempt wall-clock budget for THIS interactive loop's llm.complete()
 # calls only — forwarded as `LiteLLMAdapter.complete`'s `timeout_seconds` kwarg
 # (default 120s, unchanged for every OTHER caller: batch/pipeline extraction,
@@ -897,7 +904,15 @@ _RECAP_ROLE = "system"
 def _extract_recap_ids(dumped: dict[str, Any]) -> dict[str, str]:
     """Pull UUID-shaped `id`/`*_id` fields straight off a successful tool's dumped
     output — the only identifiers a recap is allowed to carry, since they came
-    from a call THIS user's own context just made (never another user's data)."""
+    from a call THIS user's own context just made (never another user's data).
+
+    Also merges in a `cuenta_id` entry (BLOCKER 1/2, phase-gating adversarial
+    review) whenever `phase_gating.find_cuenta_ids` recognizes a real cuenta
+    record ANYWHERE in the dumped payload — including nested one, like
+    `listar_cuentas_cobro`'s `cuentas` list — so the recap text always carries
+    literal `cuenta_id=<uuid>` evidence for `phase_gating.cuenta_known_from_recap`
+    to find, regardless of which tool produced it.
+    """
     ids: dict[str, str] = {}
     for key, value in dumped.items():
         if not isinstance(value, str) or not (key == "id" or key.endswith("_id")):
@@ -907,22 +922,44 @@ def _extract_recap_ids(dumped: dict[str, Any]) -> dict[str, str]:
         except (ValueError, AttributeError, TypeError):
             continue
         ids[key] = value
+    if "cuenta_id" not in ids and "cuenta_cobro_id" not in ids:
+        cuenta_ids = phase_gating.find_cuenta_ids(dumped)
+        if cuenta_ids:
+            ids["cuenta_id"] = cuenta_ids[0]
     return ids
 
 
-def _build_tool_context_recap(call_results: list[tuple[str, str, dict[str, Any] | None]]) -> str | None:
+def _build_tool_context_recap(
+    call_results: list[tuple[str, str, dict[str, Any] | None]],
+    *,
+    sticky_cuenta_id: str | None = None,
+) -> str | None:
     """Build ONE bounded recap line from this turn's tool calls, newest-first (the
     most recent call is the most likely to matter for "seguí con eso"). Returns
     `None` when there is nothing to say (no calls this turn) so a pure-chat turn
-    never gets a recap message at all."""
+    never gets a recap message at all.
+
+    `sticky_cuenta_id` (BLOCKER 2, phase-gating adversarial review): the cuenta
+    id already known at the START of this turn (see `phase_gating.
+    latest_cuenta_id_from_recap` on the PREVIOUS recap). The recap is rebuilt
+    WHOLESALE from only THIS turn's `call_results` every time — a turn that
+    only calls always-visible tools (e.g. `importar_documento`) would
+    otherwise silently drop the earlier cuenta evidence and re-hide every
+    cuenta-scoped tool on the next turn, even though the cuenta genuinely
+    still exists. When this turn's own lines don't already carry a cuenta id,
+    a dedicated sticky line keeps the earlier one alive.
+    """
     if not call_results:
         return None
 
     lines: list[str] = []
     budget = len(AGENT_RECAP_MARKER) + 1
+    cuenta_id_represented = False
     for tool_name, status, dumped in reversed(call_results):
         if status == "ok" and dumped:
             ids = _extract_recap_ids(dumped)
+            if "cuenta_id" in ids or "cuenta_cobro_id" in ids:
+                cuenta_id_represented = True
             id_part = " ".join(f"{k}={v}" for k, v in ids.items())
             line = f"{tool_name}:ok {id_part}".strip()
         else:
@@ -941,6 +978,16 @@ def _build_tool_context_recap(call_results: list[tuple[str, str, dict[str, Any] 
             break
         lines.append(line)
         budget += added
+
+    if sticky_cuenta_id and not cuenta_id_represented:
+        sticky_line = f"cuenta_conocida:ok cuenta_id={sticky_cuenta_id}"
+        added = len(sticky_line) + 3
+        if budget + added <= _RECAP_MAX_CHARS:
+            lines.append(sticky_line)
+            budget += added
+        # If it doesn't fit within the cap, the sticky fact is silently
+        # dropped this turn rather than growing the recap past its hard
+        # budget — same fail-safe posture as the per-line truncation above.
 
     if not lines:
         return None
@@ -1074,6 +1121,16 @@ async def _run_chat_turn(
     )
     cuenta_known_this_turn = phase_gating.cuenta_known_from_recap(_recap_for_gating)
     called_tool_names_this_turn: set[str] = set(phase_gating.called_tool_names_from_recap(_recap_for_gating))
+    # BLOCKER 2 (phase-gating adversarial review): the cuenta id already known
+    # at the START of this turn, carried forward into the recap rebuilt at the
+    # end of this turn (see `_build_tool_context_recap`'s `sticky_cuenta_id`)
+    # so it survives a turn that only calls always-visible tools.
+    _sticky_cuenta_id = phase_gating.latest_cuenta_id_from_recap(_recap_for_gating)
+    # CRITICAL 3 (phase-gating adversarial review): the orthogonal-topic
+    # keyword match (gate 2) also scans a few RECENT user messages, not just
+    # this turn's own — the triggering phrase ("quiero registrar un otrosí")
+    # is often a message earlier than a short follow-up ("dale, hacelo").
+    _recent_user_messages = [str(m.content) for m in history if m.role == "user"][-_ORTHOGONAL_KEYWORD_MESSAGE_WINDOW:]
 
     tool_events: list[ToolEvent] = []
     ui_actions: list[UiAction] = []
@@ -1110,6 +1167,7 @@ async def _run_chat_turn(
             message=message,
             cuenta_known=cuenta_known_this_turn,
             called_tool_names=frozenset(called_tool_names_this_turn),
+            recent_messages=_recent_user_messages,
         )
         tools = phase_gating.filter_openai_tools(all_tools, hidden_tools)
         llm_start = time.perf_counter()
@@ -1224,13 +1282,23 @@ async def _run_chat_turn(
                     if action is not None:
                         _record_ui_action(ui_actions, action)
                     # Phase-gating state for the NEXT iteration (see the
-                    # `hidden_tool_names` call above the loop): a successful
-                    # crear_cuenta_cobro (or any already-visible cuenta-scoped
-                    # tool) proves a cuenta now exists; any orthogonal-gated
-                    # tool that just succeeded stays visible for the rest of
-                    # this turn even without repeating its trigger keyword.
-                    if call.name == "crear_cuenta_cobro" or call.name in phase_gating.cuenta_scoped_tool_names():
+                    # `hidden_tool_names` call above the loop). BLOCKER 1
+                    # (phase-gating adversarial review): unlock on EVIDENCE,
+                    # not just tool name — `crear_cuenta_cobro`/any already
+                    # cuenta-scoped tool succeeding is still a fast, always-true
+                    # signal, but `find_cuenta_ids` ALSO catches tools like
+                    # `listar_cuentas_cobro` (a "read" tool, never cuenta-scoped
+                    # by its OWN input schema) whose dumped result reveals a
+                    # real cuenta record regardless of which tool produced it.
+                    if (
+                        call.name == "crear_cuenta_cobro"
+                        or call.name in phase_gating.cuenta_scoped_tool_names()
+                        or phase_gating.find_cuenta_ids(dumped)
+                    ):
                         cuenta_known_this_turn = True
+                    # Any orthogonal-gated tool that just succeeded stays visible
+                    # for the rest of this turn even without repeating its
+                    # trigger keyword.
                     if call.name in phase_gating.ORTHOGONAL_TOOL_KEYWORDS:
                         called_tool_names_this_turn.add(call.name)
                 except Exception as exc:
@@ -1257,6 +1325,12 @@ async def _run_chat_turn(
                         ToolEvent(tool=call.name, status="error", resumen=user_resumen, duration_ms=tool_duration_ms)
                     )
                     call_results.append((call.name, "error", None))
+                    # CRITICAL 3 (phase-gating adversarial review): a FAILED
+                    # orthogonal-gated call is even MORE reason to keep the
+                    # tool visible for a retry on the next iteration than a
+                    # successful one is — mirrors `called_tool_names_from_recap`.
+                    if call.name in phase_gating.ORTHOGONAL_TOOL_KEYWORDS:
+                        called_tool_names_this_turn.add(call.name)
                     await logger.awarning(
                         "agent_chat_tool_error", tool=call.name, error=str(exc), duration_ms=tool_duration_ms
                     )
@@ -1290,7 +1364,7 @@ async def _run_chat_turn(
     # recap message and appends a fresh one, keeping exactly one in history no
     # matter how many turns the conversation runs — a turn with zero tool calls
     # leaves a previous recap untouched (still useful context) and adds no new one.
-    recap_text = _build_tool_context_recap(call_results)
+    recap_text = _build_tool_context_recap(call_results, sticky_cuenta_id=_sticky_cuenta_id)
     if recap_text:
         current_messages = [m for m in current_messages if not _is_recap_message(m)]
         new_messages.append(LLMMessage(role=_RECAP_ROLE, content=recap_text).model_dump())
