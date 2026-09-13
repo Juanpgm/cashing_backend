@@ -17,8 +17,9 @@ from datetime import date
 
 from pydantic import BaseModel, Field
 
+from app.schemas.actividad import ActividadResponse, ActividadUpdate
 from app.schemas.cuenta_cobro import ActividadesBulkResponse
-from app.services import cuenta_cobro_service
+from app.services import actividad_service, cuenta_cobro_service
 from app.tools.context import ToolContext
 from app.tools.registry import tool
 
@@ -169,3 +170,42 @@ async def agregar_actividades_desde_texto(
         vincular_obligaciones=params.vincular_obligaciones,
     )
     return _compactar(bulk)
+
+
+class EditarActividadInput(BaseModel):
+    cuenta_id: uuid.UUID = Field(description="CuentaCobro id the activity belongs to.")
+    actividad_id: uuid.UUID = Field(description="Actividad id to edit.")
+    descripcion: str | None = Field(default=None, min_length=10, max_length=2000)
+    justificacion: str | None = Field(default=None, max_length=5000)
+    fecha_realizacion: date | None = None
+    obligacion_id: uuid.UUID | None = None
+
+
+@tool(
+    name="editar_actividad",
+    description=(
+        "Edit one or more fields of an existing actividad — the agent-tool twin of `PATCH "
+        "/actividades/{actividad_id}`. Only descripcion, justificacion, fecha_realizacion and "
+        "obligacion_id can be changed; omit a field to leave it unchanged (None means 'do not "
+        "touch', not 'clear the value'). Only allowed while the cuenta is BORRADOR — rejects with "
+        "a validation error otherwise. descripcion, if provided, must be 10-2000 characters. Args: "
+        "cuenta_id (UUID of the cuenta de cobro the activity belongs to; must belong to the "
+        "authenticated user); actividad_id (UUID of the activity to edit); descripcion "
+        "(optional, 10-2000 chars); justificacion (optional, up to 5000 chars); fecha_realizacion "
+        "(optional date); obligacion_id (optional UUID to relink the activity to a different "
+        "obligación)."
+    ),
+    input_model=EditarActividadInput,
+    output_model=ActividadResponse,
+    tags=("write",),
+)
+async def editar_actividad(ctx: ToolContext, params: EditarActividadInput) -> ActividadResponse:
+    data = ActividadUpdate(
+        descripcion=params.descripcion,
+        justificacion=params.justificacion,
+        fecha_realizacion=params.fecha_realizacion,
+        obligacion_id=params.obligacion_id,
+    )
+    return await actividad_service.actualizar_actividad(
+        ctx.db, ctx.usuario_id, params.cuenta_id, params.actividad_id, data
+    )
