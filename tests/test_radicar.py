@@ -123,9 +123,14 @@ async def test_radicar_checklist_completo_200(
     assert body["fecha_envio"] is not None
 
 
-async def test_radicar_cuenta_ya_enviada_400(
+async def test_radicar_cuenta_ya_enviada_200_idempotente(
     client: AsyncClient, test_user: dict[str, Any], cuenta: CuentaCobro
 ) -> None:
+    """Superseded expectation (radicacion-sin-friccion slice 1.2): a second radicar
+    on an already-ENVIADA cuenta used to 400/422 ("no se puede radicar..."). It is
+    now idempotent — a duplicate click or retry returns the SAME response instead
+    of a spurious error. See tests/test_radicar_idempotente.py for the full race/
+    CAS coverage."""
     await _completar_checklist(client, test_user["headers"], cuenta.id)
 
     first = await client.post(
@@ -138,7 +143,8 @@ async def test_radicar_cuenta_ya_enviada_400(
         f"/api/v1/cuentas-cobro/{cuenta.id}/radicar",
         headers=test_user["headers"],
     )
-    assert second.status_code in (400, 422)
+    assert second.status_code == 200, second.text
+    assert second.json() == first.json()
 
 
 async def test_radicar_cuenta_de_otro_usuario_404(client: AsyncClient, db: AsyncSession, cuenta: CuentaCobro) -> None:

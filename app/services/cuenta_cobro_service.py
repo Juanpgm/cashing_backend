@@ -6,7 +6,7 @@ import re
 import uuid
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import structlog
 from jinja2 import BaseLoader, Environment
@@ -191,13 +191,34 @@ _DEFAULT_TEMPLATE_HTML = """\
 """
 
 
-async def _get_cuenta_con_ownership(db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: uuid.UUID) -> CuentaCobro:
-    """Load a CuentaCobro with actividades, verifying the user owns it via the contrato."""
-    result = await db.execute(
+async def _get_cuenta_con_ownership(
+    db: AsyncSession,
+    usuario_id: uuid.UUID,
+    cuenta_id: uuid.UUID,
+    *,
+    for_update: bool = False,
+) -> CuentaCobro:
+    """Load a CuentaCobro with actividades, verifying the user owns it via the contrato.
+
+    `for_update=True` adds `SELECT ... FOR UPDATE` on the CuentaCobro row: Postgres
+    blocks a concurrent transaction's own `FOR UPDATE` read on the same row until
+    the first transaction commits, so the second reader observes the
+    post-transition state instead of a stale in-memory read. SQLite (aiosqlite)
+    silently ignores the clause — same idiom already used in `secop_service.py`'s
+    reimport race guard. As of the W2 lock-window narrowing (radicacion-sin-friccion
+    slice 1.2 follow-up), `radicar_cuenta` no longer passes `for_update=True` here —
+    it uses the lighter `_leer_estado_bajo_lock` (estado-only, no eager loads)
+    immediately before the transition instead. Kept as a general-purpose option on
+    this helper for any future caller that needs a locked, fully-loaded read.
+    """
+    stmt = (
         select(CuentaCobro)
         .options(selectinload(CuentaCobro.actividades), selectinload(CuentaCobro.contrato))
         .where(CuentaCobro.id == cuenta_id, CuentaCobro.deleted_at.is_(None))
     )
+    if for_update:
+        stmt = stmt.with_for_update()
+    result = await db.execute(stmt)
     cuenta = result.scalar_one_or_none()
     if cuenta is None:
         raise NotFoundError("CuentaCobro", str(cuenta_id))
@@ -207,11 +228,28 @@ async def _get_cuenta_con_ownership(db: AsyncSession, usuario_id: uuid.UUID, cue
 
 
 async def _reload_cuenta_response(db: AsyncSession, cuenta_id: uuid.UUID) -> CuentaCobroResponse:
-    """Re-query a CuentaCobro fresh from the DB with all eager-loaded relationships for serialization."""
+    """Re-query a CuentaCobro fresh from the DB with all eager-loaded relationships for serialization.
+
+    `populate_existing=True` is load-bearing, not cosmetic: SQLAlchemy's identity map
+    returns an already-loaded, non-expired object AS-IS for a plain `select()` — it does
+    NOT refresh its attributes from the new row. Every caller of this helper (radicar's
+    post-lock short-circuit, `cambiar_estado`'s CAS-loser fallback, etc.) may be reloading
+    a `CuentaCobro` that was loaded EARLIER in this same session (e.g. `radicar_cuenta`'s
+    top-of-function `_get_cuenta_con_ownership` read) and never explicitly expired before
+    this call. Without `populate_existing`, this function silently returns that stale
+    cached instance instead of the row's true current state — observed concretely under
+    Postgres: a concurrent request's committed ENVIADA transition (a DIFFERENT session,
+    so `db.expire()` in that other session's code path never touches THIS session's
+    identity map) was reported back as BORRADOR to the caller that only just observed
+    ENVIADA via `_leer_estado_bajo_lock`. `populate_existing` forces every matching row to
+    overwrite the cached instance's attributes, which is exactly this function's documented
+    contract ("fresh from the DB").
+    """
     result = await db.execute(
         select(CuentaCobro)
         .options(selectinload(CuentaCobro.actividades), selectinload(CuentaCobro.contrato))
         .where(CuentaCobro.id == cuenta_id)
+        .execution_options(populate_existing=True)
     )
     cuenta = result.scalar_one()
     return CuentaCobroResponse.model_validate(cuenta)
@@ -986,6 +1024,64 @@ async def cambiar_estado(
     cuenta = await _get_cuenta_con_ownership(db, usuario_id, cuenta_id)
     estado_actual = cuenta.estado
 
+    if nuevo_estado == EstadoCuentaCobro.ENVIADA:
+        # Compare-and-set (radicacion-sin-friccion slice 1.2, W2/S1 follow-up),
+        # evaluated BEFORE the generic `_TRANSICIONES` gate below: the
+        # `estado_actual` we just read is only a point-in-time snapshot, and the
+        # ONLY production caller of this branch (`radicar_cuenta`) already
+        # re-reads the row with `FOR UPDATE` (`_leer_estado_bajo_lock`) IMMEDIATELY
+        # before calling us — so a race landing here mid-flight (e.g. another
+        # writer committing the ENVIADA transition between that re-read and this
+        # call) must resolve to idempotent success, not a spurious "transición
+        # inválida: enviada → enviada" (which the stale-snapshot gate below would
+        # raise, since ENVIADA→ENVIADA isn't a listed transition). A plain
+        # `cuenta.estado = nuevo_estado` would additionally let two concurrent
+        # writers both flip estado and both stamp their own fecha_envio, the
+        # second silently clobbering the first. The bulk UPDATE's WHERE re-checks
+        # the CURRENT row at write time; only one writer's UPDATE can match
+        # (`rowcount == 1`) — same idiom as `auth_service._consume_invite_code`
+        # and `secop_service`'s reimport guard. `deleted_at IS NULL` (S1 fix)
+        # keeps a soft-delete landing in this same window from being silently
+        # revived into ENVIADA — the fallback re-read below already filters it,
+        # so the CAS must exclude it too or the two checks disagree.
+        # `synchronize_session=False`: we explicitly expire `cuenta` below instead
+        # of relying on the ORM's best-effort in-session sync, which isn't
+        # guaranteed to evaluate an `estado.in_(...)` WHERE clause consistently
+        # across dialects.
+        ahora = datetime.now(UTC)
+        cas_result = await db.execute(
+            sa_update(CuentaCobro)
+            .where(
+                CuentaCobro.id == cuenta_id,
+                CuentaCobro.deleted_at.is_(None),
+                CuentaCobro.estado.in_([EstadoCuentaCobro.BORRADOR, EstadoCuentaCobro.RECHAZADA]),
+            )
+            .values(estado=EstadoCuentaCobro.ENVIADA, fecha_envio=ahora)
+            .execution_options(synchronize_session=False)
+        )
+        db.expire(cuenta)
+        if cas_result.rowcount == 0:
+            # Lost the race (or the row was never in a valid pre-ENVIADA state to
+            # begin with). Re-read to distinguish the two: already ENVIADA is
+            # idempotent success; anything else is a genuine invalid transition.
+            actual = await _get_cuenta_con_ownership(db, usuario_id, cuenta_id)
+            if actual.estado == EstadoCuentaCobro.ENVIADA:
+                return await _reload_cuenta_response(db, cuenta_id)
+            validas = ", ".join(e.value for e in _TRANSICIONES.get(actual.estado, set())) or "ninguna"
+            raise ValidationError(
+                f"Transición inválida: {actual.estado} → {nuevo_estado}. "
+                f"Transiciones válidas desde '{actual.estado}': {validas}."
+            )
+
+        await logger.ainfo(
+            "cuenta_cobro_estado_cambiado",
+            cuenta_id=str(cuenta_id),
+            usuario_id=str(usuario_id),
+            estado_anterior=estado_actual,
+            estado_nuevo=nuevo_estado,
+        )
+        return await _reload_cuenta_response(db, cuenta_id)
+
     if nuevo_estado not in _TRANSICIONES.get(estado_actual, set()):
         validas = ", ".join(e.value for e in _TRANSICIONES.get(estado_actual, set())) or "ninguna"
         raise ValidationError(
@@ -994,9 +1090,7 @@ async def cambiar_estado(
         )
 
     cuenta.estado = nuevo_estado
-    if nuevo_estado == EstadoCuentaCobro.ENVIADA:
-        cuenta.fecha_envio = datetime.now(UTC)
-    elif nuevo_estado == EstadoCuentaCobro.BORRADOR:
+    if nuevo_estado == EstadoCuentaCobro.BORRADOR:
         # Reopening (e.g. ENVIADA -> BORRADOR) clears the radicación stamp so a
         # fresh radicar_cuenta call re-stamps it, AND the stale PDF reference
         # (REL-002): otherwise obtener_url_pdf and the email/Drive senders could
@@ -1018,6 +1112,53 @@ async def cambiar_estado(
     return await _reload_cuenta_response(db, cuenta_id)
 
 
+async def _leer_estado_bajo_lock(db: AsyncSession, cuenta_id: uuid.UUID, *, nowait: bool = False) -> EstadoCuentaCobro:
+    """Minimal `SELECT ... FOR UPDATE` used ONLY to observe the current `estado`
+    immediately before the ENVIADA transition (radicacion-sin-friccion slice 1.2,
+    W2 fix). Deliberately selects just `estado` — no eager-loaded
+    actividades/contrato — so it doesn't pay the `_get_cuenta_con_ownership`
+    selectinload cost twice per `radicar_cuenta` call; ownership was already
+    verified by the plain read at the top of `radicar_cuenta`, within the same
+    call, so it isn't re-checked here.
+
+    Narrows the FOR UPDATE lock window to right before the write instead of
+    holding it across the whole coherence/checklist gate run (~76 of the ~80
+    queries `radicar_cuenta` issues) — under Postgres that used to block a
+    concurrent transaction's own locking read for the full gate duration and
+    pin pool connections. Postgres serializes concurrent readers of this
+    statement on the same row; SQLite (aiosqlite) silently ignores the clause
+    (same idiom already used in `secop_service.py`'s reimport race guard).
+
+    `nowait` (keyword-only, default `False`) is a test-only knob: with `nowait=True`,
+    Postgres raises immediately (`55P03 lock_not_available`) instead of blocking when
+    the row is already locked by another transaction. Production `radicar_cuenta`
+    never passes it — it deliberately waits for the holder to commit/rollback so the
+    request can observe the outcome. Added so `tests/test_radicar_idempotente.py`'s
+    lock-blocking test can probe "is this row currently locked?" deterministically
+    without racing an `asyncio.wait_for` cancellation against an in-flight statement.
+
+    Raises `NotFoundError` if the row is gone (hard-deleted or soft-deleted
+    concurrently) — `radicar_cuenta` treats that as "nothing to transition"
+    rather than silently proceeding on stale data.
+    """
+    stmt = (
+        select(CuentaCobro.estado)
+        .where(CuentaCobro.id == cuenta_id, CuentaCobro.deleted_at.is_(None))
+        .with_for_update(nowait=nowait)
+    )
+    result = await db.execute(stmt)
+    estado = result.scalar_one_or_none()
+    if estado is None:
+        raise NotFoundError("CuentaCobro", str(cuenta_id))
+    return estado
+
+
+def _raise_estado_invalido_para_radicar(estado: EstadoCuentaCobro) -> NoReturn:
+    raise ValidationError(
+        f"No se puede radicar una cuenta en estado '{estado}'. Solo se permite en borrador o rechazada."
+    )
+
+
 async def radicar_cuenta(
     db: AsyncSession,
     usuario_id: uuid.UUID,
@@ -1034,13 +1175,29 @@ async def radicar_cuenta(
     their labels. The actual state transition (and `fecha_envio` stamping) is
     delegated to `cambiar_estado`, which owns the state machine — this function
     never mutates `cuenta.estado` directly.
+
+    Idempotent + concurrency-safe (radicacion-sin-friccion slice 1.2, narrowed in
+    the W2 follow-up): a PLAIN (unlocked) ownership read happens first — if
+    already ENVIADA, this short-circuits to the existing response BEFORE the
+    coherence/checklist gates run at all. The coherence and checklist gates then
+    run UNLOCKED (they used to run under a held `FOR UPDATE`, which blocked a
+    concurrent transaction's own locking read for the entire ~76-query gate
+    duration and pinned pool connections under Postgres). Only immediately before
+    the transition does `_leer_estado_bajo_lock` re-read the row with
+    `SELECT ... FOR UPDATE`: if a concurrent winner already moved it to ENVIADA,
+    this short-circuits again; if it moved to APROBADA/PAGADA, this raises the
+    same 422 as the top-of-function check. The lock only narrows this final
+    window — `cambiar_estado`'s compare-and-set UPDATE remains the actual
+    correctness guarantee for the genuine race (both callers observing a
+    pre-ENVIADA state before either one writes).
     """
     cuenta = await _get_cuenta_con_ownership(db, usuario_id, cuenta_id)
 
+    if cuenta.estado == EstadoCuentaCobro.ENVIADA:
+        return await _reload_cuenta_response(db, cuenta_id)
+
     if cuenta.estado not in (EstadoCuentaCobro.BORRADOR, EstadoCuentaCobro.RECHAZADA):
-        raise ValidationError(
-            f"No se puede radicar una cuenta en estado '{cuenta.estado}'. Solo se permite en borrador o rechazada."
-        )
+        _raise_estado_invalido_para_radicar(cuenta.estado)
 
     advertencias: list[FindingOut] = []
     if settings.COHERENCE_GATE_ENABLED:
@@ -1079,6 +1236,14 @@ async def radicar_cuenta(
             f"No se puede radicar: faltan requisitos del checklist. Pendientes: {pendientes}.",
             code=CHECKLIST_INCOMPLETE,
         )
+
+    # W2: narrow the lock window to right before the write — see docstring above
+    # and `_leer_estado_bajo_lock`.
+    estado_bajo_lock = await _leer_estado_bajo_lock(db, cuenta_id)
+    if estado_bajo_lock == EstadoCuentaCobro.ENVIADA:
+        return await _reload_cuenta_response(db, cuenta_id)
+    if estado_bajo_lock not in (EstadoCuentaCobro.BORRADOR, EstadoCuentaCobro.RECHAZADA):
+        _raise_estado_invalido_para_radicar(estado_bajo_lock)
 
     resultado = await cambiar_estado(db, usuario_id, cuenta_id, EstadoCuentaCobro.ENVIADA)
     if advertencias:

@@ -269,7 +269,20 @@ async def test_query_budget_radicar(
     """POST /api/v1/cuentas-cobro/{id}/radicar — audit estimate ~60-80.
     Measured baseline: 80 (radicar rebuilds the full checklist to re-validate
     the radicacion_lista gate before flipping estado, so it pays the same cost
-    as the checklist GET above, 47, plus the state-machine transition)."""
+    as the checklist GET above, 47, plus the state-machine transition).
+
+    Raised to 81 by the W2 adversarial-review fix (radicacion-sin-friccion slice
+    1.2 follow-up): the `FOR UPDATE` lock used to be held from the very first
+    read, across the whole coherence/checklist gate run — under Postgres that
+    blocked a concurrent transaction's own locking read for the entire ~76-query
+    gate duration and pinned pool connections. It's now taken immediately before
+    the state transition instead, via `_leer_estado_bajo_lock` — a single
+    `SELECT cuentas_cobro.estado ... FOR UPDATE` with NO eager-loaded
+    actividades/contrato (unlike the original full-object locked read this
+    replaces), so the narrowed lock window costs exactly +1 query, not the +3
+    a naive full re-read would have added. That +1 is the minimum price of
+    re-checking `estado` right before the write; there is no remaining
+    redundant read to remove without dropping the lock-window narrowing itself."""
     cuenta = escenario_completo["cuenta"]
     headers = escenario_completo["headers"]
     query_counter.reset()
@@ -277,7 +290,7 @@ async def test_query_budget_radicar(
     resp = await client.post(f"/api/v1/cuentas-cobro/{cuenta.id}/radicar", headers=headers)
 
     assert resp.status_code == 200, resp.text
-    query_counter.assert_budget(80, label="POST /cuentas-cobro/{id}/radicar")
+    query_counter.assert_budget(81, label="POST /cuentas-cobro/{id}/radicar")
 
 
 async def test_query_budget_stepper_state(
