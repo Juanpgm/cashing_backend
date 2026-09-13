@@ -84,12 +84,17 @@ _ORTHOGONAL_KEYWORD_MESSAGE_WINDOW = 3
 # fallback-chain exhaustion stays comfortably under the 2-minute target: with
 # the real configured chain (`gemini` -> `groq` -> `ollama`, 3 models) and
 # tenacity's 2 attempts per model (`LiteLLMAdapter._call_model`'s
-# `@retry(stop_after_attempt(2))`), a full exhaustion now bounds at roughly
-# 3 models * 2 attempts * 15s = 90s (+ a few seconds of exponential backoff
-# between attempts, `wait_exponential(min=1, max=4)`) — see
-# `tests/test_litellm_adapter.py::TestTimeoutSeconds` for the exact math,
-# instead of the OLD 120s-per-call value's worst case of
-# 3 models * 2 attempts * 120s = 720s (~12 minutes).
+# `@retry(stop_after_attempt(2))`), a full exhaustion now bounds EXACTLY at
+# 3 models * (2 attempts * 15s + 1s backoff) = 93s: `stop_after_attempt(2)`
+# allows only ONE retry per model, and `wait_exponential(min=1, max=4)`'s
+# `attempt_number` is always 1 on that single retry, so the backoff resolves
+# to its `min=1` floor every time — never the full `max=4` (SUGGESTION 5,
+# phase-gating adversarial review corrected this from a prior "~90-102s"
+# estimate that conflated this exact figure with
+# `tests/test_litellm_adapter.py::TestTimeoutSeconds`'s deliberately looser
+# `max_backoff_per_model=4` upper-bound test assertion), instead of the OLD
+# 120s-per-call value's worst case of 3 models * 2 attempts * 120s = 720s
+# (~12 minutes).
 _INTERACTIVE_LLM_TIMEOUT_SECONDS = 15
 
 # Cumulative wall-clock ceiling on time spent AWAITING llm.complete() across
@@ -102,12 +107,21 @@ _INTERACTIVE_LLM_TIMEOUT_SECONDS = 15
 # interrupting a mid-flight write). The ~12-minute hang this slice fixes only
 # ever happened in LLM round trips, never in tool execution, so the budget is
 # scoped there on purpose — see `_INTERACTIVE_LLM_TIMEOUT_SECONDS` above.
-# Set below MAX_TOOL_ITERATIONS * _INTERACTIVE_LLM_TIMEOUT_SECONDS (20 * 15 =
-# 300s) so a genuinely long multi-iteration chain still gets cut off well
-# before a user would call the request "hung", while comfortably exceeding
-# the single-full-fallback-exhaustion cost (~90-102s) computed above so ONE
-# outage-triggered retry never eats the whole budget by itself.
-_TURN_LLM_BUDGET_SECONDS = 100
+# Raised 100s -> 180s (SUGGESTION 5, phase-gating adversarial review): the
+# canonical playbook chain is 10-15 tool calls, i.e. roughly as many LLM round
+# trips — a HEALTHY turn like that could still get truncated by the old 100s
+# ceiling if just 2 of those round trips hit a degraded/retrying model
+# (2 * 93s single-model-chain-exhaustion math above's per-model share, ~31s
+# each = ~62s) plus ordinary per-call latency on the rest, leaving too little
+# margin. 180s keeps `MAX_TOOL_ITERATIONS * _INTERACTIVE_LLM_TIMEOUT_SECONDS`
+# (20 * 15 = 300s) as the outer ceiling, comfortably exceeds TWO full
+# fallback-chain exhaustions back to back (2 * 93s = 186s is already close —
+# one exhaustion plus routine latency on the rest of a long chain fits with
+# room to spare) so a genuinely full-chain outage still surfaces well before
+# a user would call the request "hung", while giving a healthy multi-round-trip
+# playbook turn enough headroom to survive one bad model without being cut off
+# mid-chain.
+_TURN_LLM_BUDGET_SECONDS = 180
 
 # User-facing message on ANY LLM-side turn timeout — either the whole model
 # fallback chain failing (`RuntimeError` from `LiteLLMAdapter.complete`) or

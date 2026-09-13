@@ -5,8 +5,10 @@ module's timeout constants monkeypatched down to sub-second values) instead of
 purely mocking `asyncio.timeout` away — this proves the mechanism actually
 cancels a hung call, not just that the code *would* handle a `TimeoutError` if
 one arrived. No test in this file waits anywhere near the real ~12-minute old
-worst case or the real 2-minute target; every wait is a monkeypatched
-fraction of a second.
+worst case, the real ~93s single-fallback-chain-exhaustion target
+(`_INTERACTIVE_LLM_TIMEOUT_SECONDS`), or the real 180s per-turn budget
+(`_TURN_LLM_BUDGET_SECONDS`); every wait is a monkeypatched fraction of a
+second.
 """
 
 from __future__ import annotations
