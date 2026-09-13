@@ -244,6 +244,11 @@ async def _reload_cuenta_response(db: AsyncSession, cuenta_id: uuid.UUID) -> Cue
     ENVIADA via `_leer_estado_bajo_lock`. `populate_existing` forces every matching row to
     overwrite the cached instance's attributes, which is exactly this function's documented
     contract ("fresh from the DB").
+
+    `populate_existing=True` is safe here only because the session runs with
+    `autoflush=True` (the default): any pending in-session changes on the cuenta are
+    flushed to the DB before this `select()` executes, so the reload never loses an
+    uncommitted write from earlier in the same request.
     """
     result = await db.execute(
         select(CuentaCobro)
