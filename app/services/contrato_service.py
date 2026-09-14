@@ -38,9 +38,7 @@ _ESTADOS_ACTIVOS = {
 }
 
 
-async def _get_contrato_con_ownership(
-    db: AsyncSession, usuario_id: uuid.UUID, contrato_id: uuid.UUID
-) -> Contrato:
+async def _get_contrato_con_ownership(db: AsyncSession, usuario_id: uuid.UUID, contrato_id: uuid.UUID) -> Contrato:
     result = await db.execute(
         select(Contrato)
         .options(selectinload(Contrato.obligaciones))
@@ -56,18 +54,22 @@ async def _get_contrato_con_ownership(
     return contrato
 
 
-async def _reload_contrato_response(db: AsyncSession, contrato_id: uuid.UUID) -> ContratoResponse:
-    # populate_existing overwrites the identity-mapped Contrato and its cached
-    # `.obligaciones` collection with fresh DB rows. Without it, a Contrato already in
-    # the session (e.g. right after eliminar_obligacion) keeps its stale collection —
-    # the just-deleted obligación would still show up in the reloaded response.
-    result = await db.execute(
-        select(Contrato)
-        .options(selectinload(Contrato.obligaciones))
-        .where(Contrato.id == contrato_id)
-        .execution_options(populate_existing=True)
-    )
-    contrato = result.scalar_one()
+async def _response_from_contrato(db: AsyncSession, contrato: Contrato) -> ContratoResponse:
+    """Build a ContratoResponse from an ALREADY fully-loaded, in-session Contrato
+    (its `.obligaciones` collection reflecting the caller's own latest reads/writes),
+    enriched with the SECOP portal URL if available.
+
+    Deliberately does NOT re-query the Contrato row itself (radicacion-sin-friccion
+    slice 2.2 perf cleanup) — callers that already hold a fresh, eager-loaded
+    `Contrato` (e.g. `_get_contrato_con_ownership`'s return value, still accurate
+    because nothing besides scalar `setattr`s + a `flush()` happened since) can pass
+    it here directly instead of paying for a second SELECT + selectin round-trip.
+    Callers whose in-session `.obligaciones` may be stale or incomplete (e.g.
+    `crear_contrato`, which inserts sibling `Obligacion` rows via a bare `contrato_id=`
+    FK instead of `contrato.obligaciones.append(...)` — SQLAlchemy does NOT sync that
+    collection automatically) must use `_reload_contrato_response` instead, which
+    re-queries fresh.
+    """
     response = ContratoResponse.model_validate(contrato)
 
     # Enrich with SECOP portal URL if available
@@ -86,9 +88,25 @@ async def _reload_contrato_response(db: AsyncSession, contrato_id: uuid.UUID) ->
     return response
 
 
+async def _reload_contrato_response(db: AsyncSession, contrato_id: uuid.UUID) -> ContratoResponse:
+    # populate_existing overwrites the identity-mapped Contrato and its cached
+    # `.obligaciones` collection with fresh DB rows. Without it, a Contrato already in
+    # the session (e.g. right after eliminar_obligacion) keeps its stale collection —
+    # the just-deleted obligación would still show up in the reloaded response.
+    result = await db.execute(
+        select(Contrato)
+        .options(selectinload(Contrato.obligaciones))
+        .where(Contrato.id == contrato_id)
+        .execution_options(populate_existing=True)
+    )
+    contrato = result.scalar_one()
+    return await _response_from_contrato(db, contrato)
+
+
 def _derivar_valor_total(valor_mensual: "Decimal", fecha_inicio: date, fecha_fin: date) -> "Decimal":
     """Derive valor_total as valor_mensual × calendar months spanned (both endpoints inclusive)."""
     from decimal import Decimal as _Decimal
+
     meses = (fecha_fin.year - fecha_inicio.year) * 12 + (fecha_fin.month - fecha_inicio.month)
     if fecha_fin.day >= fecha_inicio.day:
         meses += 1
@@ -110,6 +128,7 @@ async def crear_contrato(
         raise ValidationError("La fecha de fin debe ser posterior a la fecha de inicio.")
 
     from decimal import Decimal
+
     valor_total = data.valor_total
     if valor_total is None:
         valor_total = _derivar_valor_total(data.valor_mensual, data.fecha_inicio, data.fecha_fin)
@@ -158,6 +177,7 @@ async def crear_contrato(
     # Generate pgvector embeddings for all new obligations (best-effort)
     try:
         from app.services.embedding_service import generate_embeddings_for_contrato
+
         await generate_embeddings_for_contrato(db, contrato.id)
     except Exception as _emb_exc:  # noqa: BLE001
         await logger.awarning("embedding_generation_skipped", exc=str(_emb_exc))
@@ -190,12 +210,13 @@ async def listar_contratos(db: AsyncSession, usuario_id: uuid.UUID) -> list[Cont
     return items
 
 
-async def obtener_contrato(
-    db: AsyncSession, usuario_id: uuid.UUID, contrato_id: uuid.UUID
-) -> ContratoResponse:
+async def obtener_contrato(db: AsyncSession, usuario_id: uuid.UUID, contrato_id: uuid.UUID) -> ContratoResponse:
     """Get a contract with its obligaciones."""
-    await _get_contrato_con_ownership(db, usuario_id, contrato_id)
-    return await _reload_contrato_response(db, contrato_id)
+    contrato = await _get_contrato_con_ownership(db, usuario_id, contrato_id)
+    # `contrato` was just loaded fresh (with `.obligaciones` eager-loaded) by the
+    # read above, in this same call — no writes happened in between, so a second
+    # re-SELECT is redundant (radicacion-sin-friccion slice 2.2).
+    return await _response_from_contrato(db, contrato)
 
 
 async def actualizar_contrato(
@@ -220,12 +241,22 @@ async def actualizar_contrato(
         setattr(contrato, field, value)
 
     await db.flush()
-    return await _reload_contrato_response(db, contrato_id)
+    # `updated_at` has `onupdate=func.now()` (server-evaluated): unlike an INSERT
+    # (which SQLAlchemy auto-fetches via RETURNING), an UPDATE's onupdate value is
+    # NOT proactively re-fetched by `flush()` — the attribute is left expired, and
+    # reading it later synchronously inside `ContratoResponse.model_validate`
+    # (Pydantic's attribute walk cannot `await`) raises `MissingGreenlet`. One
+    # targeted, awaited refresh restores just that column — genuinely necessary,
+    # not the redundant multi-relationship reload this call site used to pay for.
+    await db.refresh(contrato, attribute_names=["updated_at"])
+    # Only scalar columns were mutated above (never `.obligaciones` itself) — the
+    # in-session `contrato` object (already eager-loaded by `_get_contrato_con_
+    # ownership`) remains accurate after `flush()`, so a full re-SELECT is
+    # redundant (radicacion-sin-friccion slice 2.2).
+    return await _response_from_contrato(db, contrato)
 
 
-async def eliminar_contrato(
-    db: AsyncSession, usuario_id: uuid.UUID, contrato_id: uuid.UUID
-) -> None:
+async def eliminar_contrato(db: AsyncSession, usuario_id: uuid.UUID, contrato_id: uuid.UUID) -> None:
     """Soft-delete a contract. Blocked if it has active (enviada/aprobada/pagada) cuentas."""
     await _get_contrato_con_ownership(db, usuario_id, contrato_id)
 
@@ -272,6 +303,7 @@ async def agregar_obligacion(
     # Generate embedding for this single new obligation (best-effort)
     try:
         from app.services.embedding_service import generate_embeddings_for_contrato
+
         await generate_embeddings_for_contrato(db, contrato_id)
     except Exception as _emb_exc:  # noqa: BLE001
         await logger.awarning("embedding_generation_skipped", exc=str(_emb_exc))
@@ -414,11 +446,7 @@ async def limpiar_obligaciones(
         await db.flush()
         return 0
 
-    await db.execute(
-        update(Actividad)
-        .where(Actividad.obligacion_id.in_(ob_ids))
-        .values(obligacion_id=None)
-    )
+    await db.execute(update(Actividad).where(Actividad.obligacion_id.in_(ob_ids)).values(obligacion_id=None))
     await db.execute(delete(EvidenciaObligacion).where(EvidenciaObligacion.obligacion_id.in_(ob_ids)))
     result = await db.execute(delete(Obligacion).where(Obligacion.id.in_(ob_ids)))
     await db.flush()
@@ -426,8 +454,19 @@ async def limpiar_obligaciones(
 
 
 _MESES_ES = [
-    "", "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
-    "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre",
+    "",
+    "Enero",
+    "Febrero",
+    "Marzo",
+    "Abril",
+    "Mayo",
+    "Junio",
+    "Julio",
+    "Agosto",
+    "Septiembre",
+    "Octubre",
+    "Noviembre",
+    "Diciembre",
 ]
 
 _SYSTEM_PROMPT_TEMPLATE = """\
@@ -488,12 +527,14 @@ async def listar_periodos_pendientes(
 
     periodos: list[PeriodoPendienteResponse] = []
     while current <= end_month:
-        periodos.append(PeriodoPendienteResponse(
-            anio=current.year,
-            mes=current.month,
-            nombre_mes=_MESES_ES[current.month],
-            pendiente=(current.year, current.month) not in billed,
-        ))
+        periodos.append(
+            PeriodoPendienteResponse(
+                anio=current.year,
+                mes=current.month,
+                nombre_mes=_MESES_ES[current.month],
+                pendiente=(current.year, current.month) not in billed,
+            )
+        )
         # Advance one month
         if current.month == 12:
             current = date(current.year + 1, 1, 1)
@@ -532,15 +573,16 @@ async def obtener_contexto_agente(
 
     # Load cuentas previas
     cuentas_result = await db.execute(
-        select(CuentaCobro).where(
+        select(CuentaCobro)
+        .where(
             CuentaCobro.contrato_id == contrato_id,
             CuentaCobro.deleted_at.is_(None),
-        ).order_by(CuentaCobro.anio.desc(), CuentaCobro.mes.desc())
+        )
+        .order_by(CuentaCobro.anio.desc(), CuentaCobro.mes.desc())
     )
     cuentas = cuentas_result.scalars().all()
     cuentas_previas = [
-        {"mes": c.mes, "anio": c.anio, "estado": c.estado.value, "valor": float(c.valor)}
-        for c in cuentas
+        {"mes": c.mes, "anio": c.anio, "estado": c.estado.value, "valor": float(c.valor)} for c in cuentas
     ]
 
     # Determine readiness
@@ -560,10 +602,13 @@ async def obtener_contexto_agente(
     # Build system prompt
     system_prompt: str | None = None
     if tiene_obligaciones or tiene_texto:
-        obligaciones_str = "\n".join(
-            f"{i + 1}. [{ob.tipo.value.upper()}] {ob.descripcion}"
-            for i, ob in enumerate(sorted(contrato.obligaciones, key=lambda o: o.orden))
-        ) or "(sin obligaciones registradas)"
+        obligaciones_str = (
+            "\n".join(
+                f"{i + 1}. [{ob.tipo.value.upper()}] {ob.descripcion}"
+                for i, ob in enumerate(sorted(contrato.obligaciones, key=lambda o: o.orden))
+            )
+            or "(sin obligaciones registradas)"
+        )
 
         system_prompt = _SYSTEM_PROMPT_TEMPLATE.format(
             numero_contrato=contrato.numero_contrato,
@@ -677,8 +722,6 @@ async def asignar_secop_documento_a_contrato(
     # import cycle if one is ever introduced (existing codebase convention).
     from app.services import checklist_service
 
-    resultado = await checklist_service.asignar_secop_documento(
-        db, usuario_id, contrato, doc, tipo, best_effort=False
-    )
+    resultado = await checklist_service.asignar_secop_documento(db, usuario_id, contrato, doc, tipo, best_effort=False)
     assert resultado is not None  # best_effort=False always returns or raises
     return resultado

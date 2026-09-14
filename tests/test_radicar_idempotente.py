@@ -51,7 +51,7 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tests.conftest import _IS_PG, async_session_test
+from tests.conftest import _IS_PG, QueryCounter, async_session_test
 
 pytestmark = pytest.mark.asyncio
 
@@ -141,6 +141,29 @@ async def test_radicar_segunda_vez_devuelve_mismo_payload_200(
     # "still succeeds", but proof the second call didn't re-stamp/re-run gates.
     assert second.status_code == 200, second.text
     assert second.json() == first.json()
+
+
+async def test_radicar_segunda_vez_query_count_lower_than_first(
+    client: AsyncClient, test_user: dict[str, Any], cuenta: CuentaCobro, query_counter: QueryCounter
+) -> None:
+    """Regression guard for the redundant-reload removal (radicacion-sin-friccion
+    slice 2.2): the second (idempotent, already-ENVIADA) `radicar` call must short-
+    circuit at the very top of `radicar_cuenta` — BEFORE the coherence/checklist
+    gates run at all — building its response directly from the just-loaded `cuenta`
+    object instead of paying for a second re-SELECT. Its query count must therefore
+    be both a small ABSOLUTE ceiling and measurably lower than the first call's
+    real cost (which runs the full coherence + checklist + state-transition gates,
+    ~81 queries per `test_query_budget_radicar`)."""
+    await _completar_checklist(client, test_user["headers"], cuenta.id)
+
+    first = await client.post(f"/api/v1/cuentas-cobro/{cuenta.id}/radicar", headers=test_user["headers"])
+    assert first.status_code == 200, first.text
+
+    query_counter.reset()
+    second = await client.post(f"/api/v1/cuentas-cobro/{cuenta.id}/radicar", headers=test_user["headers"])
+
+    assert second.status_code == 200, second.text
+    query_counter.assert_budget(7, label="POST /cuentas-cobro/{id}/radicar (idempotent 2nd call)")
 
 
 # ---------------------------------------------------------------------------
@@ -420,7 +443,11 @@ async def test_radicar_short_circuito_post_lock_via_mutacion_en_sesion(
 
 
 async def test_radicar_cas_loser_verdadero_rowcount_cero(
-    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro, monkeypatch: pytest.MonkeyPatch
+    db: AsyncSession,
+    test_user: dict[str, Any],
+    cuenta: CuentaCobro,
+    monkeypatch: pytest.MonkeyPatch,
+    query_counter: QueryCounter,
 ) -> None:
     """Forces `radicar_cuenta` all the way into `cambiar_estado`'s CAS UPDATE by
     monkeypatching `_leer_estado_bajo_lock` to (incorrectly) report BORRADOR,
@@ -463,12 +490,19 @@ async def test_radicar_cas_loser_verdadero_rowcount_cero(
     ownership_spy = AsyncMock(side_effect=real_get_ownership)
     monkeypatch.setattr(cuenta_cobro_service, "_get_cuenta_con_ownership", ownership_spy)
 
+    query_counter.reset()
     resultado = await cuenta_cobro_service.radicar_cuenta(db, user.id, cuenta.id)
 
     assert resultado.estado == EstadoCuentaCobro.ENVIADA
     # No exception was raised — the CAS-loser (`rowcount == 0`) path returned the
     # current row. The 3rd call proves the fallback re-read branch actually ran.
     assert ownership_spy.await_count == 3
+    # Regression guard (radicacion-sin-friccion slice 2.2): `cambiar_estado`'s
+    # CAS-loser branch used to pay for a REDUNDANT extra re-SELECT
+    # (`_reload_cuenta_response`) on top of the `actual = await
+    # _get_cuenta_con_ownership(...)` read directly above it — building the
+    # response from `actual` instead removed exactly that duplicate round-trip.
+    query_counter.assert_budget(55, label="radicar_cuenta (CAS-loser rowcount==0 path)")
 
 
 # ---------------------------------------------------------------------------

@@ -225,7 +225,15 @@ async def test_query_budget_list_contratos(
 async def test_query_budget_detail_contrato(
     client: AsyncClient, escenario_completo: dict[str, Any], query_counter: QueryCounter
 ) -> None:
-    """GET /api/v1/contratos/{id} — audit estimate ~19. Measured baseline: 19."""
+    """GET /api/v1/contratos/{id} — original baseline: 19 (pre radicacion-sin-friccion
+    slice 2.2). `obtener_contrato` used to discard the fully-loaded `Contrato` object
+    returned by `_get_contrato_con_ownership` and immediately re-query it (plus its
+    `.obligaciones` — which cascades into a further `Obligacion.actividades` selectin
+    fetch, mapper-level default) via `_reload_contrato_response`, purely to re-run the
+    SECOP-enrichment lookup. Slice 2.2 splits that into `_response_from_contrato`,
+    which reuses the already-loaded object and only issues the SECOP query — tightened
+    here to the new measured count (re-measured directly, not estimated, per this
+    file's own methodology above)."""
     contrato = escenario_completo["contrato"]
     headers = escenario_completo["headers"]
     query_counter.reset()
@@ -233,7 +241,7 @@ async def test_query_budget_detail_contrato(
     resp = await client.get(f"/api/v1/contratos/{contrato.id}", headers=headers)
 
     assert resp.status_code == 200, resp.text
-    query_counter.assert_budget(19, label="GET /api/v1/contratos/{id}")
+    query_counter.assert_budget(11, label="GET /api/v1/contratos/{id}")
 
 
 async def test_query_budget_checklist(

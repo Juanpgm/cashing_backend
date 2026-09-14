@@ -439,6 +439,15 @@ async def crear_cuenta_cobro(
     )
     db.add(cuenta)
     await db.flush()
+    # `actividades` (lazy="selectin") is marked unloaded even on a brand-new,
+    # just-inserted object — SQLAlchemy's selectin strategy tracks "needs a query"
+    # independently of any pre-flush access, so accessing it later synchronously
+    # inside `CuentaCobroResponse.model_validate` (Pydantic's attribute walk cannot
+    # `await`) raises `MissingGreenlet`. One targeted, awaited refresh — genuinely
+    # necessary, not the redundant full multi-relationship reload this replaces —
+    # populates it correctly (it will always resolve to `[]` here; nothing has been
+    # added to this brand-new cuenta yet).
+    await db.refresh(cuenta, attribute_names=["actividades"])
 
     # The checklist is NOT materialised here: the cuenta nace con requisitos_modo
     # = NULL so the post-creation gate can ask the user how to build the checklist
@@ -453,7 +462,11 @@ async def crear_cuenta_cobro(
         mes=data.mes,
         anio=data.anio,
     )
-    return await _reload_cuenta_response(db, cuenta.id)
+    # `cuenta` is a brand-new object just flushed in THIS session — no concurrent
+    # writer could have raced it, and `.actividades` is already an empty in-memory
+    # collection (nothing has been added to it yet). A re-SELECT here is redundant
+    # (radicacion-sin-friccion slice 2.2).
+    return CuentaCobroResponse.model_validate(cuenta)
 
 
 async def listar_cuentas_cobro(
@@ -1072,7 +1085,10 @@ async def cambiar_estado(
             # idempotent success; anything else is a genuine invalid transition.
             actual = await _get_cuenta_con_ownership(db, usuario_id, cuenta_id)
             if actual.estado == EstadoCuentaCobro.ENVIADA:
-                return await _reload_cuenta_response(db, cuenta_id)
+                # `actual` was just loaded fresh (with actividades/contrato eager-
+                # loaded) by the read above — a second re-SELECT is redundant
+                # (radicacion-sin-friccion slice 2.2).
+                return CuentaCobroResponse.model_validate(actual)
             validas = ", ".join(e.value for e in _TRANSICIONES.get(actual.estado, set())) or "ninguna"
             raise ValidationError(
                 f"Transición inválida: {actual.estado} → {nuevo_estado}. "
@@ -1107,6 +1123,13 @@ async def cambiar_estado(
         cuenta.pdf_storage_key = None
 
     await db.flush()
+    # `updated_at` has `onupdate=func.now()` (server-evaluated): `flush()` does not
+    # proactively re-fetch an UPDATE's onupdate value (unlike an INSERT, which
+    # SQLAlchemy fetches via RETURNING) — the attribute is left expired, and a
+    # later synchronous read inside `CuentaCobroResponse.model_validate` (Pydantic
+    # cannot `await`) would raise `MissingGreenlet`. One targeted, awaited refresh
+    # restores just that column.
+    await db.refresh(cuenta, attribute_names=["updated_at"])
 
     await logger.ainfo(
         "cuenta_cobro_estado_cambiado",
@@ -1115,7 +1138,12 @@ async def cambiar_estado(
         estado_anterior=estado_actual,
         estado_nuevo=nuevo_estado,
     )
-    return await _reload_cuenta_response(db, cuenta_id)
+    # This generic (non-ENVIADA) branch only ever mutates `.estado`, and on a
+    # BORRADOR reopen `.fecha_envio`/`.pdf_storage_key`, directly on the already
+    # eager-loaded `cuenta` object — `.actividades` is untouched. Besides the
+    # `updated_at` refresh above, `cuenta` stays accurate and a full re-SELECT is
+    # redundant (radicacion-sin-friccion slice 2.2).
+    return CuentaCobroResponse.model_validate(cuenta)
 
 
 async def _leer_estado_bajo_lock(db: AsyncSession, cuenta_id: uuid.UUID, *, nowait: bool = False) -> EstadoCuentaCobro:
@@ -1200,7 +1228,12 @@ async def radicar_cuenta(
     cuenta = await _get_cuenta_con_ownership(db, usuario_id, cuenta_id)
 
     if cuenta.estado == EstadoCuentaCobro.ENVIADA:
-        return await _reload_cuenta_response(db, cuenta_id)
+        # `cuenta` was just loaded fresh by the read above, in this same call, with
+        # no writes in between — a re-SELECT is redundant (radicacion-sin-friccion
+        # slice 2.2). Contrast with the post-lock short-circuit below, which DOES
+        # need a genuine reload since a concurrent transaction may have committed
+        # in between.
+        return CuentaCobroResponse.model_validate(cuenta)
 
     if cuenta.estado not in (EstadoCuentaCobro.BORRADOR, EstadoCuentaCobro.RECHAZADA):
         _raise_estado_invalido_para_radicar(cuenta.estado)
@@ -1811,6 +1844,12 @@ async def actualizar_cuenta_cobro(
         cuenta.consecutivo_ds = data.consecutivo_ds.strip() if data.consecutivo_ds else None
 
     await db.flush()
+    # `updated_at` has `onupdate=func.now()` (server-evaluated): `flush()` does not
+    # proactively re-fetch an UPDATE's onupdate value — the attribute is left
+    # expired, and a later synchronous read inside `CuentaCobroResponse.model_
+    # validate` (Pydantic cannot `await`) would raise `MissingGreenlet`. One
+    # targeted, awaited refresh restores just that column.
+    await db.refresh(cuenta, attribute_names=["updated_at"])
     await logger.ainfo(
         "cuenta_cobro_actualizada",
         cuenta_id=str(cuenta_id),
@@ -1818,4 +1857,8 @@ async def actualizar_cuenta_cobro(
         mes=cuenta.mes,
         anio=cuenta.anio,
     )
-    return await _reload_cuenta_response(db, cuenta.id)
+    # Only scalar columns were mutated above (never `.actividades`) — the in-session
+    # `cuenta` object (already eager-loaded by `_get_cuenta_con_ownership`) remains
+    # accurate besides the `updated_at` refresh above, so a full re-SELECT is
+    # redundant (radicacion-sin-friccion slice 2.2).
+    return CuentaCobroResponse.model_validate(cuenta)
