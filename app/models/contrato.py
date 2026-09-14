@@ -55,9 +55,10 @@ class Contrato(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
     obligaciones: Mapped[list["Obligacion"]] = relationship(back_populates="contrato", lazy="selectin")  # type: ignore[name-defined]  # noqa: F821
     # lazy="raise_on_sql" (radicacion-sin-friccion slice 2.4a): callers that need
     # `Contrato.cuentas_cobro` must eager-load it explicitly (e.g.
-    # `.options(selectinload(Contrato.cuentas_cobro))`) — see call sites fixed in
-    # this slice for examples. Fails loud on an implicit lazy access instead of
-    # silently firing an extra round-trip.
+    # `.options(selectinload(Contrato.cuentas_cobro))`) — see
+    # `app/services/cobertura_service.py:76` for an existing example of this
+    # pattern on a sibling relationship. Fails loud on an implicit lazy access
+    # instead of silently firing an extra round-trip.
     cuentas_cobro: Mapped[list["CuentaCobro"]] = relationship(back_populates="contrato", lazy="raise_on_sql")  # type: ignore[name-defined]  # noqa: F821
     # Adición event log (billing-resilience-templates, slice #4). Deliberately NOT
     # `lazy="selectin"` — `adicion_contrato_service`/`coherence_validator_service` load
