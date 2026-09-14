@@ -163,6 +163,13 @@ async def subir_evidencias_desde_chat(
         usuario_id=ctx.usuario_id,
         cuenta_id=params.cuenta_id,
         archivos=archivos,
-        background_tasks=None,
+        # radicacion-sin-friccion Phase 2 slice 2.6: forward the REAL
+        # request-scoped BackgroundTasks when the caller has one (the
+        # synchronous POST /agent/chat path) so the multi-obligación
+        # classification step backgrounds correctly, same as the direct
+        # REST upload endpoint. `None` (streaming chat, MCP, tests) preserves
+        # the prior synchronous-inline behavior — see `ToolContext.
+        # background_tasks`'s docstring for why those callers stay `None`.
+        background_tasks=ctx.background_tasks,
     )
     return EvidenciasCuentaSubidaResponse(resultados=resultados, avisos=resultados.avisos)

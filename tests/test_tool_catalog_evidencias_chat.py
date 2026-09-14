@@ -14,9 +14,11 @@ from app.core.exceptions import DomainError, NotFoundError, ValidationError
 from app.core.security import hash_password
 from app.models.contrato import Contrato
 from app.models.usuario import Usuario
+from app.services import evidencia_service
 from app.tools.context import ToolAttachment, ToolContext
 from app.tools.invoke import invoke_tool
 from app.tools.registry import TOOL_REGISTRY
+from fastapi import BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 
 _PATCH_STORAGE = "app.tools.catalog.evidencias._get_storage"
@@ -146,6 +148,74 @@ async def test_subir_evidencias_desde_chat_rejects_other_users_cuenta(db: AsyncS
             ctx_a,
             {"cuenta_id": str(cuenta_b_id), "filenames": ["archivo.txt"]},
         )
+
+
+@pytest.mark.asyncio
+async def test_subir_evidencias_desde_chat_with_real_background_tasks_backgrounds_classification(
+    db: AsyncSession,
+) -> None:
+    """(radicacion-sin-friccion Phase 2 slice 2.6) Before this fix, `ctx.
+    background_tasks` didn't exist and `subir_evidencias_desde_chat` hardcoded
+    `background_tasks=None` — so the multi-obligación classification step
+    (`_clasificar_y_enlazar_lote`) ALWAYS ran inline for the chat path, even
+    when a real `BackgroundTasks` reaches this tool via a `ToolContext`.
+    A real (non-None) `background_tasks` must now genuinely background it —
+    `encolar_clasificacion` runs, `_clasificar_y_enlazar_lote` does NOT run
+    inline."""
+    user, contrato = await _make_user_with_contrato(db, "06")
+    ctx = ToolContext(db=db, usuario=user, background_tasks=BackgroundTasks())
+    cuenta_id = await _crear_cuenta(ctx, contrato.id)
+
+    ctx.attachments["evidencia1.txt"] = ToolAttachment(
+        filename="evidencia1.txt", content_type="text/plain", data=b"contenido de evidencia backgrounded"
+    )
+
+    inline_spy = AsyncMock(return_value=None)
+    with (
+        patch(_PATCH_STORAGE, return_value=_fake_storage()),
+        patch.object(evidencia_service, "_clasificar_y_enlazar_lote", inline_spy),
+    ):
+        result = await invoke_tool(
+            "subir_evidencias_desde_chat",
+            ctx,
+            {"cuenta_id": str(cuenta_id), "filenames": ["evidencia1.txt"]},
+        )
+
+    assert len(result.resultados) == 1
+    # The inline classification path must NOT have run — it was backgrounded.
+    inline_spy.assert_not_called()
+    # A real background unit of work was actually scheduled on the caller's
+    # BackgroundTasks (encolar_clasificacion's add_task), proving this went
+    # through the background branch, not a silent no-op.
+    assert ctx.background_tasks is not None
+    assert len(ctx.background_tasks.tasks) == 1
+
+
+@pytest.mark.asyncio
+async def test_subir_evidencias_desde_chat_without_background_tasks_runs_inline(db: AsyncSession) -> None:
+    """The default (`ctx.background_tasks=None`, e.g. streaming chat / MCP /
+    every other caller that never received a real BackgroundTasks) must
+    preserve the prior synchronous-inline behavior."""
+    user, contrato = await _make_user_with_contrato(db, "07")
+    ctx = ToolContext(db=db, usuario=user)  # background_tasks defaults to None
+    cuenta_id = await _crear_cuenta(ctx, contrato.id)
+
+    ctx.attachments["evidencia1.txt"] = ToolAttachment(
+        filename="evidencia1.txt", content_type="text/plain", data=b"contenido de evidencia inline"
+    )
+
+    inline_spy = AsyncMock(return_value=None)
+    with (
+        patch(_PATCH_STORAGE, return_value=_fake_storage()),
+        patch.object(evidencia_service, "_clasificar_y_enlazar_lote", inline_spy),
+    ):
+        await invoke_tool(
+            "subir_evidencias_desde_chat",
+            ctx,
+            {"cuenta_id": str(cuenta_id), "filenames": ["evidencia1.txt"]},
+        )
+
+    inline_spy.assert_called_once()
 
 
 @pytest.mark.asyncio

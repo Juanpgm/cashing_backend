@@ -28,8 +28,12 @@ from __future__ import annotations
 import uuid
 from datetime import date
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
+from app.adapters.storage.s3_adapter import S3StorageAdapter
+from app.api.deps import get_pdf_storage
+from app.main import app as fastapi_app
 from app.models.actividad import Actividad
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
@@ -325,3 +329,86 @@ async def test_query_budget_stepper_state(
 
     assert resp.status_code == 200, resp.text
     query_counter.assert_budget(24, label="GET /cuentas-cobro/{id}/stepper-state")
+
+
+def _mock_pdf_storage_para_budget() -> S3StorageAdapter:
+    mock = AsyncMock(spec=S3StorageAdapter)
+    mock.upload = AsyncMock(return_value="evidencias/fake/fake.bin")
+    mock.presigned_url = AsyncMock(return_value="https://storage.example.com/fake.bin")
+    mock.delete = AsyncMock(return_value=None)
+    return mock  # type: ignore[return-value]
+
+
+@pytest.fixture
+async def cuenta_sin_obligaciones(db: AsyncSession, test_user: dict[str, Any]) -> CuentaCobro:
+    """A dedicated (contrato, cuenta) pair with NO obligaciones — unlike
+    `escenario_completo`, deliberately kept OUT of the multi-obligación
+    matcher's LLM/embedding path (`evidence_matcher_node` short-circuits on
+    `not obligaciones`), so this budget stays deterministic and offline —
+    not dependent on a real/fake LLM embedding call's own query-adjacent
+    behavior, which is out of scope for an upload-path budget."""
+    user = test_user["user"]
+    contrato = Contrato(
+        usuario_id=user.id,
+        numero_contrato="CTR-QUERY-BUDGET-EVID-001",
+        objeto="Servicios profesionales para presupuesto de subida de evidencias",
+        valor_total=12_000_000,
+        valor_mensual=1_000_000,
+        fecha_inicio=date(2024, 1, 1),
+        fecha_fin=date(2024, 12, 31),
+        entidad="MinTIC",
+        dependencia="Sistemas",
+        supervisor_nombre="Sup",
+    )
+    db.add(contrato)
+    await db.commit()
+    await db.refresh(contrato)
+
+    cc = CuentaCobro(contrato_id=contrato.id, mes=2, anio=2024, estado=EstadoCuentaCobro.BORRADOR, valor=1_000_000)
+    db.add(cc)
+    await db.commit()
+    await db.refresh(cc)
+    return cc
+
+
+async def test_query_budget_subir_evidencias_cuenta(
+    client: AsyncClient, test_user: dict[str, Any], cuenta_sin_obligaciones: CuentaCobro, query_counter: QueryCounter
+) -> None:
+    """POST /api/v1/cuentas-cobro/{id}/evidencias/subir — first budget pinned
+    for this endpoint (radicacion-sin-friccion Phase 2 slice 2.6; no prior
+    budget existed here). Scenario: 3 genuinely distinct new files, contrato
+    has zero obligaciones (see `cuenta_sin_obligaciones` fixture — keeps the
+    classification/matcher LLM/embedding path, which has its own query
+    behavior, out of THIS budget; that path is covered by its own tests), so
+    every file resolves through the single shared unclassified stub
+    actividad. Backgrounds the multi-obligación classification step (real
+    `BackgroundTasks` — the endpoint always supplies one); `httpx.AsyncClient`
+    against the ASGI app runs background tasks to completion as part of the
+    awaited request/response cycle, so their queries ARE included in this
+    count — same as they would be in a real single-process deployment.
+
+    Measured directly against this exact scenario on SQLite, 2026-09-14 (the
+    day the batched-dedup + one-commit-per-batch refactor landed) — real
+    count, not an audit estimate.
+    """
+    headers = test_user["headers"]
+
+    fastapi_app.dependency_overrides[get_pdf_storage] = _mock_pdf_storage_para_budget
+    try:
+        query_counter.reset()
+        resp = await client.post(
+            f"/api/v1/cuentas-cobro/{cuenta_sin_obligaciones.id}/evidencias/subir",
+            headers=headers,
+            files=[
+                ("files", ("uno.txt", b"contenido distinto numero uno para presupuesto", "text/plain")),
+                ("files", ("dos.txt", b"contenido distinto numero dos para presupuesto", "text/plain")),
+                ("files", ("tres.txt", b"contenido distinto numero tres para presupuesto", "text/plain")),
+            ],
+        )
+    finally:
+        fastapi_app.dependency_overrides.pop(get_pdf_storage, None)
+
+    assert resp.status_code == 201, resp.text
+    data = resp.json()
+    assert len(data["resultados"]) == 3
+    query_counter.assert_budget(41, label="POST /cuentas-cobro/{id}/evidencias/subir")

@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import structlog
+from fastapi import BackgroundTasks
 from pydantic import BaseModel, ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -1174,6 +1175,7 @@ async def chat_with_tools(
     session_id: str | None,
     attachments: dict[str, ToolAttachment] | None = None,
     contrato_id: str | None = None,
+    background_tasks: BackgroundTasks | None = None,
 ) -> AgentChatResult:
     """Run the free-form tool-calling loop for one user message and persist history.
 
@@ -1194,6 +1196,30 @@ async def chat_with_tools(
     approval gate (`_run_chat_turn`'s `tool_event_sink`/`approval_gate` both default
     to `None`) — see `stream_chat_with_tools` for the streaming counterpart that
     supplies both.
+
+    `background_tasks` (radicacion-sin-friccion Phase 2 slice 2.6): the
+    request-scoped FastAPI `BackgroundTasks` from `POST /agent/chat`, when the
+    caller has one — threaded into `ToolContext.background_tasks` so a tool
+    handler (e.g. `subir_evidencias_desde_chat`) can background a follow-up
+    unit of work instead of running it inline. `None` (the default) preserves
+    the prior synchronous-everything behavior. This is SOUND specifically
+    because `chat_with_tools` runs on the request's own `Depends(get_db)`
+    session, whose post-yield teardown FastAPI's `AsyncExitStack` runs AFTER
+    every scheduled `BackgroundTasks` entry finishes (same verified-safe
+    mechanism `evidence_classification_service.py`'s own module docstring
+    documents for the REST upload endpoint).
+
+    `stream_chat_with_tools` does NOT pass one, and must not: precisely
+    verified (not assumed), its turn runs inside its own `runner()` background
+    `asyncio.Task`, opened with `async with database.async_session_factory()
+    as bg_db:` — that session is CLOSED the moment the `async with` block
+    exits, which happens BEFORE Starlette even starts running any
+    `BackgroundTasks` (those fire only after the StreamingResponse body is
+    fully sent). Wiring a `BackgroundTasks` through here would capture
+    `bg_db` — the runner's OWN session, not the original request's — and
+    hand a scheduled tool a session that is deterministically already closed
+    by the time it runs, not merely "may be torn down". See that function's
+    own docstring for the full mechanism.
     """
     attachments = attachments or {}
 
@@ -1212,7 +1238,9 @@ async def chat_with_tools(
     turn_start = time.perf_counter()
     structlog.contextvars.bind_contextvars(session_id=str(convo.id))
     try:
-        return await _run_chat_turn(db, usuario, message, attachments, contrato_id, convo, turn_start)
+        return await _run_chat_turn(
+            db, usuario, message, attachments, contrato_id, convo, turn_start, background_tasks=background_tasks
+        )
     finally:
         structlog.contextvars.unbind_contextvars("session_id")
 
@@ -1228,6 +1256,7 @@ async def _run_chat_turn(
     *,
     tool_event_sink: ToolEventSink | None = None,
     approval_gate: ToolCallGate | None = None,
+    background_tasks: BackgroundTasks | None = None,
 ) -> AgentChatResult:
     """Body of `chat_with_tools`, split out so the outer function can bind/unbind
     the `session_id` structlog contextvar around it (including on exception) via
@@ -1274,7 +1303,7 @@ async def _run_chat_turn(
     # site's comment for why the filter must be recomputed every iteration,
     # not once per turn).
     all_tools = to_openai_tools()
-    tool_ctx = ToolContext(db=db, usuario=usuario, attachments=expanded_attachments)
+    tool_ctx = ToolContext(db=db, usuario=usuario, attachments=expanded_attachments, background_tasks=background_tasks)
 
     # Phase-gating (radicacion-sin-friccion 1.8): seed this turn's gate state
     # from the cross-turn recap (the newest recap message in `history`, if

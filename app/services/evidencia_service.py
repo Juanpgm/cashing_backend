@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import mimetypes
 import shutil
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -135,20 +137,37 @@ async def _buscar_evidencia_duplicada_actividad(
     return result.scalars().first()
 
 
-async def _buscar_evidencia_duplicada_cuenta(db: AsyncSession, cuenta_id: uuid.UUID, sha256: str) -> Evidencia | None:
-    """Same dedup as `_buscar_evidencia_duplicada_actividad` but scoped to a
-    CuentaCobro (subir_evidencias_cuenta has no actividad_id yet at call time —
-    evidence can land on any stub actividad under the cuenta)."""
+async def _buscar_evidencias_duplicadas_cuenta_batch(
+    db: AsyncSession, cuenta_id: uuid.UUID, hashes: set[str]
+) -> dict[str, Evidencia]:
+    """Batched dedup lookup for `subir_evidencias_cuenta`: ONE `sha256 IN (...)`
+    query for the WHOLE upload batch (radicacion-sin-friccion Phase 2 slice 2.6)
+    instead of one dedup SELECT per file — same scoping as
+    `_buscar_evidencia_duplicada_actividad` (only already-stored rows) but
+    scoped to a CuentaCobro (`subir_evidencias_cuenta` has no `actividad_id`
+    yet at call time — evidence can land on any stub actividad under the
+    cuenta) and batched across every hash in the request. Returns at most one
+    Evidencia per hash.
+    """
+    if not hashes:
+        return {}
     result = await db.execute(
         select(Evidencia)
         .join(Actividad, Actividad.id == Evidencia.actividad_id)
         .where(
             Actividad.cuenta_cobro_id == cuenta_id,
-            Evidencia.sha256 == sha256,
+            Evidencia.sha256.in_(hashes),
             Evidencia.storage_key.isnot(None),
         )
     )
-    return result.scalars().first()
+    encontrados: dict[str, Evidencia] = {}
+    for ev in result.scalars().all():
+        # `setdefault` keeps the first row seen per hash — a (cuenta, sha256)
+        # pair is expected to resolve to at most one storage-backed row in
+        # practice (this dedup path is what prevents more than one from ever
+        # being created), so this is a safety net, not a real ordering choice.
+        encontrados.setdefault(ev.sha256, ev)  # type: ignore[arg-type]
+    return encontrados
 
 
 async def _commit_or_limpiar_storage(db: AsyncSession, storage: StoragePort, key: str) -> None:
@@ -584,6 +603,131 @@ def _expandir_archivos_comprimidos(
     return expandido, avisos
 
 
+# Uploads in `subir_evidencias_cuenta` run concurrently up to this many
+# in-flight `storage.upload()` calls at once (radicacion-sin-friccion Phase 2
+# slice 2.6) — bounded so a large batch doesn't open unbounded concurrent
+# connections against the storage backend (S3-compatible: MinIO dev / R2 prod).
+_UPLOAD_CONCURRENCY = 8
+
+
+@dataclass
+class _PlanEntry:
+    """One resolved plan for a single file in a `subir_evidencias_cuenta` batch.
+
+    Built during the sequential planning pass (dedup resolution, text
+    extraction, classification, actividad-stub assignment) BEFORE any upload
+    runs, so the concurrent upload phase only ever does I/O — no further
+    DB/LLM decisions are made while uploads are in flight.
+
+    `kind` is one of:
+    - "duplicate_db": the hash already exists as a committed row from a PRIOR
+      request — `evidencia_existente` is that row, nothing is uploaded.
+    - "duplicate_batch": the hash was already seen EARLIER in this SAME batch
+      (in-memory seen-set) — `canonical` points at the `_PlanEntry` that will
+      actually create/upload the row; nothing is uploaded for this entry.
+    - "new": genuinely new content — `data`/`key`/`evidencia` describe the
+      upload/insert this entry is responsible for.
+    """
+
+    kind: str
+    filename: str
+    sha256: str
+    evidencia_existente: Evidencia | None = None
+    canonical: _PlanEntry | None = None
+    content_type: str | None = None
+    data: bytes | None = None
+    key: str | None = None
+    evidencia: Evidencia | None = None
+    actividad: Actividad | None = None
+    ob_id: uuid.UUID | None = None
+    matched_ob: Obligacion | None = None
+
+
+async def _subir_uno_acotado(sem: asyncio.Semaphore, storage: StoragePort, entry: _PlanEntry) -> None:
+    # `entry.key`/`data`/`content_type` are only unset for "duplicate_db"/
+    # "duplicate_batch" entries — callers only ever pass "new" entries here
+    # (see `_subir_lote_acotado`'s only call site), where all three are set.
+    assert entry.key is not None
+    assert entry.data is not None
+    assert entry.content_type is not None
+    async with sem:
+        await storage.upload(key=entry.key, data=entry.data, content_type=entry.content_type)
+
+
+async def _subir_lote_acotado(storage: StoragePort, nuevos: list[_PlanEntry]) -> None:
+    """Upload every genuinely-new file in `nuevos` concurrently, bounded by
+    `_UPLOAD_CONCURRENCY` in-flight uploads at a time.
+
+    Partial-batch-failure design decision: if ANY upload raises, this
+    best-effort deletes every OTHER upload in this SAME batch that already
+    succeeded (on any HANDLED exception — same discipline as
+    `_commit_or_limpiar_storage`) and re-raises the ORIGINAL exception. The
+    whole batch fails atomically: no Evidencia row is added/committed before
+    this returns successfully, so a failure here never leaves a partially
+    written batch behind — matching the all-or-nothing contract the
+    up-front validation loop already establishes for this function.
+
+    KNOWN LIMITATION (radicacion-sin-friccion slice 2.6 review): this cleanup
+    only runs for exceptions Python actually gets to catch. A hard crash/
+    process-kill between an upload succeeding and this function's cleanup
+    running (or between all uploads succeeding and the caller's single
+    `db.commit()` in `_commit_lote_or_limpiar_storage`) leaves that batch's
+    storage objects genuinely orphaned with no compensating cleanup anywhere
+    in this codebase (`purgar_huerfanos_cuentas` only reaps orphaned DB rows,
+    not storage). This window is WIDER than the pre-slice-2.6 per-file-commit
+    design (which could orphan at most 1 object per crash, since each file
+    committed before the next uploaded) — a deliberate, accepted trade for
+    batch atomicity, not an oversight, but worth knowing before assuming
+    "never orphan" is an absolute guarantee.
+    """
+    if not nuevos:
+        return
+    sem = asyncio.Semaphore(_UPLOAD_CONCURRENCY)
+    resultados = await asyncio.gather(
+        *(_subir_uno_acotado(sem, storage, entry) for entry in nuevos), return_exceptions=True
+    )
+    fallos = [(entry, r) for entry, r in zip(nuevos, resultados, strict=True) if isinstance(r, BaseException)]
+    if not fallos:
+        return
+
+    exitosos = [entry.key for entry, r in zip(nuevos, resultados, strict=True) if not isinstance(r, BaseException)]
+    for key in exitosos:
+        try:
+            await storage.delete(key=key)  # type: ignore[arg-type]
+        except Exception:
+            logger.warning("evidencia_orphan_storage_cleanup_failed", key=key)
+
+    logger.error("evidencia_lote_upload_failed", n_fallos=len(fallos), n_total=len(nuevos))
+    raise fallos[0][1]
+
+
+async def _commit_lote_or_limpiar_storage(db: AsyncSession, storage: StoragePort, keys: list[str]) -> None:
+    """Batch version of `_commit_or_limpiar_storage`: ONE commit for every newly
+    uploaded Evidencia in this call. If the commit itself raises (a HANDLED
+    exception — e.g. a constraint violation), best-effort deletes EVERY key
+    uploaded in this batch (not just one) so a caught commit failure never
+    leaves any of them orphaned, then rolls back and re-raises.
+
+    Same KNOWN LIMITATION as `_subir_lote_acotado`'s docstring: a crash
+    between "every upload in this batch succeeded" and this function's
+    `db.commit()` completing is NOT covered — nothing here can catch a
+    process kill. Accepted trade for batch atomicity (see that docstring for
+    the full accounting against the pre-slice-2.6 per-file-commit design).
+    """
+    if not keys:
+        return
+    try:
+        await db.commit()
+    except Exception:
+        for key in keys:
+            try:
+                await storage.delete(key=key)
+            except Exception:
+                logger.warning("evidencia_orphan_storage_cleanup_failed", key=key)
+        await db.rollback()
+        raise
+
+
 async def subir_evidencias_cuenta(
     db: AsyncSession,
     storage: StoragePort,
@@ -621,6 +765,27 @@ async def subir_evidencias_cuenta(
     instead of running inline, so the HTTP response returns before it
     completes. `None` (the default — used by callers/tests that don't care
     about the background aspect) preserves the prior synchronous behavior.
+
+    Batching (radicacion-sin-friccion Phase 2 slice 2.6): dedup is resolved in
+    THREE tiers, cheapest/most-authoritative first — (1) one batched
+    `sha256 IN (...)` query against already-committed rows
+    (`_buscar_evidencias_duplicadas_cuenta_batch`), (2) an in-memory seen-set
+    for hashes repeated WITHIN this same batch (no earlier iteration has
+    committed anything yet — see below), (3) genuinely new content. Every
+    genuinely-new file's storage upload runs concurrently, bounded by
+    `_UPLOAD_CONCURRENCY` (`_subir_lote_acotado`), and the whole batch is
+    persisted with exactly ONE `db.commit()` (`_commit_lote_or_limpiar_storage`)
+    instead of one commit per file.
+
+    The in-memory seen-set is NOT optional polish — it is a correctness
+    requirement of moving to one-commit-per-batch. The OLD per-file-commit
+    design relied on each file committing before the next file's dedup SELECT
+    ran, so a same-hash file later in the batch would find the row the loop
+    JUST inserted. With a single end-of-batch commit, two same-hash files
+    processed in the same call would otherwise both slip past the DB-level
+    check (neither is committed when either checks) and both get uploaded —
+    the seen-set is what still catches that case in-memory, before any upload
+    happens.
     """
     if not archivos:
         raise ValidationError("Debe incluir al menos un archivo.")
@@ -645,15 +810,100 @@ async def subir_evidencias_cuenta(
     # when multiple files in the same request match the same obligación.
     actividad_cache: dict[uuid.UUID | None, Actividad] = {}
 
+    # ── Tier 1: ONE batched dedup query for the whole request ──────────────
+    hashes_por_archivo = [hashlib.sha256(data).hexdigest() for _f, _c, data in archivos]
+    existentes = await _buscar_evidencias_duplicadas_cuenta_batch(db, cuenta_id, set(hashes_por_archivo))
+
+    # ── Sequential planning pass: dedup resolution (tiers 2/3), text
+    # extraction, classification, actividad-stub assignment. No upload or
+    # commit happens here — every DB/LLM decision for the batch is made
+    # BEFORE the concurrent upload phase below starts. ──
+    seen_este_lote: dict[str, _PlanEntry] = {}
+    plan: list[_PlanEntry] = []
+
+    for (filename, content_type, data), sha256 in zip(archivos, hashes_por_archivo, strict=True):
+        existente = existentes.get(sha256)
+        if existente is not None:
+            plan.append(
+                _PlanEntry(kind="duplicate_db", filename=filename, sha256=sha256, evidencia_existente=existente)
+            )
+            continue
+
+        # Tier 2: in-memory seen-set — a repeat hash EARLIER in this same
+        # batch, not yet committed anywhere, so tier 1's DB query could never
+        # have found it.
+        canonical = seen_este_lote.get(sha256)
+        if canonical is not None:
+            plan.append(_PlanEntry(kind="duplicate_batch", filename=filename, sha256=sha256, canonical=canonical))
+            continue
+
+        texto = await _extraer_texto_seguro(filename, data)
+        matched_ob = await clasificar_evidencia(texto, obligaciones, llm=llm) if texto and obligaciones else None
+        ob_id = matched_ob.id if matched_ob is not None else None
+
+        actividad = actividad_cache.get(ob_id)
+        if actividad is None:
+            actividad = await _find_or_create_actividad_stub(db, cuenta_id, ob_id, filename)
+            actividad_cache[ob_id] = actividad
+
+        safe_filename = sanitize_filename(filename)
+        key = f"evidencias/{usuario_id}/{actividad.id}/{uuid.uuid4()}_{safe_filename}"
+        evidencia = Evidencia(
+            actividad_id=actividad.id,
+            storage_key=key,
+            nombre_archivo=filename,
+            tipo_archivo=content_type,
+            tamano_bytes=len(data),
+            texto_extraido=texto,
+            sha256=sha256,
+        )
+        entry = _PlanEntry(
+            kind="new",
+            filename=filename,
+            sha256=sha256,
+            content_type=content_type,
+            data=data,
+            key=key,
+            evidencia=evidencia,
+            actividad=actividad,
+            ob_id=ob_id,
+            matched_ob=matched_ob,
+        )
+        plan.append(entry)
+        seen_este_lote[sha256] = entry
+
+    nuevos = [entry for entry in plan if entry.kind == "new"]
+
+    # ── Concurrent upload phase (bounded), then ONE commit for the batch ───
+    try:
+        await _subir_lote_acotado(storage, nuevos)
+    except Exception:
+        # Explicit rollback here (radicacion-sin-friccion slice 2.6 review
+        # finding), not just relying on every caller's own rollback
+        # convention: the planning pass above may have `db.flush()`ed a NEW
+        # Actividad stub (`_find_or_create_actividad_stub`) that was never
+        # committed — without this, that flushed-but-uncommitted INSERT
+        # would stay pending in the session until whoever eventually calls
+        # this function's OWN caller rolls back (every production caller
+        # does today, but this function shouldn't depend on that convention
+        # holding forever). Rolling back HERE makes the invariant local and
+        # self-contained instead of an implicit cross-module contract.
+        await db.rollback()
+        raise
+    for entry in nuevos:
+        db.add(entry.evidencia)
+    await _commit_lote_or_limpiar_storage(db, storage, [entry.key for entry in nuevos])  # type: ignore[misc]
+    for entry in nuevos:
+        await db.refresh(entry.evidencia)
+
+    # ── Build responses in original request order ───────────────────────────
     resultados: list[EvidenciaClasificadaResponse] = []
-    evidencias_creadas: list[Evidencia] = []
-    for filename, content_type, data in archivos:
-        sha256 = hashlib.sha256(data).hexdigest()
-        duplicada = await _buscar_evidencia_duplicada_cuenta(db, cuenta_id, sha256)
-        if duplicada is not None:
-            # Also covers within-batch duplicates: each iteration commits
-            # before the next runs, so a repeat hash later in this SAME
-            # request already finds the row this loop just inserted.
+    evidencias_creadas: list[Evidencia] = [entry.evidencia for entry in nuevos]  # type: ignore[misc]
+
+    for entry in plan:
+        if entry.kind == "duplicate_db":
+            duplicada = entry.evidencia_existente
+            assert duplicada is not None
             logger.info("evidencia_duplicada_detectada", id=str(duplicada.id), cuenta_id=str(cuenta_id))
             actividad_dup = await db.get(Actividad, duplicada.actividad_id)
             ob_id_dup = actividad_dup.obligacion_id if actividad_dup is not None else None
@@ -682,55 +932,59 @@ async def subir_evidencias_cuenta(
             )
             continue
 
-        texto = await _extraer_texto_seguro(filename, data)
-        matched_ob = await clasificar_evidencia(texto, obligaciones, llm=llm) if texto and obligaciones else None
-        ob_id = matched_ob.id if matched_ob is not None else None
+        if entry.kind == "duplicate_batch":
+            canonical = entry.canonical
+            assert canonical is not None and canonical.evidencia is not None and canonical.actividad is not None
+            ev = canonical.evidencia
+            logger.info("evidencia_duplicada_detectada", id=str(ev.id), cuenta_id=str(cuenta_id))
+            try:
+                presigned = await storage.presigned_url(key=ev.storage_key, expires_in=3600)  # type: ignore[arg-type]
+            except Exception:
+                presigned = None
+            resultados.append(
+                EvidenciaClasificadaResponse(
+                    id=ev.id,
+                    actividad_id=canonical.actividad.id,
+                    obligacion_id=canonical.ob_id,
+                    obligacion_etiqueta=(canonical.matched_ob.etiqueta or None)
+                    if canonical.matched_ob is not None
+                    else None,
+                    nombre_archivo=ev.nombre_archivo,
+                    tipo_archivo=ev.tipo_archivo,
+                    tamano_bytes=ev.tamano_bytes,
+                    presigned_url=presigned,
+                    clasificado=canonical.matched_ob is not None,
+                    created_at=ev.created_at,
+                    duplicada=True,
+                )
+            )
+            continue
 
-        actividad = actividad_cache.get(ob_id)
-        if actividad is None:
-            actividad = await _find_or_create_actividad_stub(db, cuenta_id, ob_id, filename)
-            actividad_cache[ob_id] = actividad
-
-        safe_filename = sanitize_filename(filename)
-        key = f"evidencias/{usuario_id}/{actividad.id}/{uuid.uuid4()}_{safe_filename}"
-        await storage.upload(key=key, data=data, content_type=content_type)
-
-        evidencia = Evidencia(
-            actividad_id=actividad.id,
-            storage_key=key,
-            nombre_archivo=filename,
-            tipo_archivo=content_type,
-            tamano_bytes=len(data),
-            texto_extraido=texto,
-            sha256=sha256,
-        )
-        db.add(evidencia)
-        await _commit_or_limpiar_storage(db, storage, key)
-        await db.refresh(evidencia)
-        evidencias_creadas.append(evidencia)
-
+        # kind == "new"
+        assert entry.evidencia is not None and entry.actividad is not None
+        evidencia = entry.evidencia
         try:
-            presigned = await storage.presigned_url(key=key, expires_in=3600)
+            presigned = await storage.presigned_url(key=entry.key, expires_in=3600)  # type: ignore[arg-type]
         except Exception:
             presigned = None
 
         logger.info(
             "evidencia_clasificada",
             id=str(evidencia.id),
-            obligacion_id=str(ob_id) if ob_id else None,
-            filename=filename,
+            obligacion_id=str(entry.ob_id) if entry.ob_id else None,
+            filename=entry.filename,
         )
         resultados.append(
             EvidenciaClasificadaResponse(
                 id=evidencia.id,
-                actividad_id=actividad.id,
-                obligacion_id=ob_id,
-                obligacion_etiqueta=(matched_ob.etiqueta or None) if matched_ob is not None else None,
+                actividad_id=entry.actividad.id,
+                obligacion_id=entry.ob_id,
+                obligacion_etiqueta=(entry.matched_ob.etiqueta or None) if entry.matched_ob is not None else None,
                 nombre_archivo=evidencia.nombre_archivo,
                 tipo_archivo=evidencia.tipo_archivo,
                 tamano_bytes=evidencia.tamano_bytes,
                 presigned_url=presigned,
-                clasificado=matched_ob is not None,
+                clasificado=entry.matched_ob is not None,
                 created_at=evidencia.created_at,
             )
         )
