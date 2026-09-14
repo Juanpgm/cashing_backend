@@ -248,7 +248,7 @@ async def test_query_budget_checklist(
     client: AsyncClient, escenario_completo: dict[str, Any], query_counter: QueryCounter
 ) -> None:
     """GET /api/v1/cuentas-cobro/{id}/checklist — audit estimate ~36-40.
-    Measured baseline: 47 (above the estimate's upper bound — the fixture's
+    Previous baseline: 47 (above the estimate's upper bound — the fixture's
     fully-completed checklist plus a real actividad+evidencia+obligacion graph,
     AND a real uploaded RPC document (via the actual `/documentos/upload`
     endpoint, not a raw ORM insert), exercises more of
@@ -257,10 +257,16 @@ async def test_query_budget_checklist(
     and its own candidate/confianza resolution, which only fire once at least
     one requisito row has a real linked document. A checklist with zero
     uploaded documents (every requisito cumplido_manual, no real upload)
-    measures 44 instead — 47 is pinned here because that mixed shape is what
-    real production data actually looks like. Re-measured directly against
-    this test (not extrapolated) after a prior estimate of 45 turned out
-    wrong by 2 — see the adversarial review this fixture went through."""
+    measures 44 instead — 47 was pinned here because that mixed shape is what
+    real production data actually looks like.
+
+    Lowered to 36 by radicacion-sin-friccion slice 2.5 (re-measured directly
+    against this test, not extrapolated): `construir_checklist_completo` no
+    longer re-queries `cuenta.contrato` when the caller already eager-loaded
+    it (-1), and `listar_catalogo` now caches its result per `AsyncSession`
+    instead of re-running its 3-query seed-check+fetch on every call within
+    the same request — `asegurar_checklist` and `construir_checklist_completo`
+    each call it once per GET, so only the first pays the real cost now."""
     cuenta = escenario_completo["cuenta"]
     headers = escenario_completo["headers"]
     query_counter.reset()
@@ -268,14 +274,14 @@ async def test_query_budget_checklist(
     resp = await client.get(f"/api/v1/cuentas-cobro/{cuenta.id}/checklist", headers=headers)
 
     assert resp.status_code == 200, resp.text
-    query_counter.assert_budget(47, label="GET /cuentas-cobro/{id}/checklist")
+    query_counter.assert_budget(36, label="GET /cuentas-cobro/{id}/checklist")
 
 
 async def test_query_budget_radicar(
     client: AsyncClient, escenario_completo: dict[str, Any], query_counter: QueryCounter
 ) -> None:
     """POST /api/v1/cuentas-cobro/{id}/radicar — audit estimate ~60-80.
-    Measured baseline: 80 (radicar rebuilds the full checklist to re-validate
+    Previous baseline: 80 (radicar rebuilds the full checklist to re-validate
     the radicacion_lista gate before flipping estado, so it pays the same cost
     as the checklist GET above, 47, plus the state-machine transition).
 
@@ -290,7 +296,12 @@ async def test_query_budget_radicar(
     replaces), so the narrowed lock window costs exactly +1 query, not the +3
     a naive full re-read would have added. That +1 is the minimum price of
     re-checking `estado` right before the write; there is no remaining
-    redundant read to remove without dropping the lock-window narrowing itself."""
+    redundant read to remove without dropping the lock-window narrowing itself.
+
+    Lowered to 70 by radicacion-sin-friccion slice 2.5 (re-measured directly):
+    radicar rebuilds the checklist via the same `construir_checklist_completo`
+    path the GET budget above measures, so it gets the exact same contrato-reuse
+    and per-session catalog-cache savings measured there."""
     cuenta = escenario_completo["cuenta"]
     headers = escenario_completo["headers"]
     query_counter.reset()
@@ -298,7 +309,7 @@ async def test_query_budget_radicar(
     resp = await client.post(f"/api/v1/cuentas-cobro/{cuenta.id}/radicar", headers=headers)
 
     assert resp.status_code == 200, resp.text
-    query_counter.assert_budget(81, label="POST /cuentas-cobro/{id}/radicar")
+    query_counter.assert_budget(70, label="POST /cuentas-cobro/{id}/radicar")
 
 
 async def test_query_budget_stepper_state(
