@@ -1157,7 +1157,10 @@ async def generar_documento_soporte_xlsx(
         storage = _get_storage(settings.S3_BUCKET_DOCUMENTOS)
         original = await storage.download(doc_fuente.storage_key)
         valores = await _valores_plantilla(db, cuenta, contrato)
-        contenido = rellenar_xlsx(original, campos, valores)
+        # rellenar_xlsx (openpyxl fill+save) is CPU-bound; off the event loop
+        # like document_service.py's parse_document. `valores` is already
+        # resolved above — the thread never touches `db`.
+        contenido = await asyncio.to_thread(rellenar_xlsx, original, campos, valores)
     except Exception as exc:
         await logger.awarning(
             "documento_soporte_xlsx_fallo",
