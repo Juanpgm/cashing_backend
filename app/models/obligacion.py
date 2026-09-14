@@ -38,4 +38,9 @@ class Obligacion(UUIDMixin, TimestampMixin, Base):
 
     # Relationships
     contrato: Mapped["Contrato"] = relationship(back_populates="obligaciones")  # type: ignore[name-defined]  # noqa: F821
-    actividades: Mapped[list["Actividad"]] = relationship(back_populates="obligacion", lazy="selectin")  # type: ignore[name-defined]  # noqa: F821
+    # lazy="raise_on_sql" (radicacion-sin-friccion slice 2.4a): callers that need
+    # `Obligacion.actividades` must eager-load it explicitly (e.g.
+    # `.options(selectinload(Obligacion.actividades))`) — see call sites fixed in
+    # this slice for examples. Fails loud on an implicit lazy access instead of
+    # silently firing an extra round-trip.
+    actividades: Mapped[list["Actividad"]] = relationship(back_populates="obligacion", lazy="raise_on_sql")  # type: ignore[name-defined]  # noqa: F821
