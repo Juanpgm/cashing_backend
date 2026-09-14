@@ -574,19 +574,29 @@ async def agregar_actividades_bulk(
         if invalid:
             raise NotFoundError("Obligacion", str(next(iter(invalid))))
 
-    created: list[ActividadResponse] = []
-    for data in actividades:
-        act = Actividad(
+    # Batch INSERT (radicacion-sin-friccion slice 2.3): a single `add_all` +
+    # `flush()` replaces N per-item `add` + `flush` + `refresh` round-trips.
+    # `flush()` alone (no `refresh()`) is enough here — `id` is a Python-side
+    # default (`uuid.uuid4`, `UUIDMixin`) already set before insert, and
+    # `created_at`/`updated_at` (`server_default=func.now()`) are populated via
+    # the dialect's implicit `INSERT ... RETURNING`, which SQLAlchemy 2.0's
+    # "insertmanyvalues" feature supports per-row for a multi-value INSERT, not
+    # just a single-row one — verified against this suite's SQLite/aiosqlite
+    # engine (see the RETURNING clause on the INSERT statement in `QueryCounter`
+    # dumps), not merely assumed.
+    nuevas = [
+        Actividad(
             cuenta_cobro_id=cuenta_id,
             obligacion_id=data.obligacion_id,
             descripcion=data.descripcion,
             justificacion=data.justificacion,
             fecha_realizacion=data.fecha_realizacion,
         )
-        db.add(act)
-        await db.flush()
-        await db.refresh(act)
-        created.append(ActividadResponse.model_validate(act))
+        for data in actividades
+    ]
+    db.add_all(nuevas)
+    await db.flush()
+    created: list[ActividadResponse] = [ActividadResponse.model_validate(act) for act in nuevas]
 
     await logger.ainfo(
         "actividades_bulk_creadas",
@@ -664,23 +674,29 @@ async def agregar_actividades_desde_texto(
         ob_result = await db.execute(select(Ob).where(Ob.contrato_id == cuenta.contrato_id).order_by(Ob.orden))
         obligaciones = ob_result.scalars().all()
 
-    created: list[ActividadResponse] = []
+    # Validate ALL lines BEFORE creating anything (fail-fast, matching the
+    # original loop's all-or-nothing behavior: a short line at index N must not
+    # leave activities 0..N-1 already inserted).
     for i, desc in enumerate(descripciones):
         if len(desc) < 10:
             raise ValidationError(f"La actividad {i + 1} es demasiado corta (mínimo 10 caracteres): '{desc}'")
 
-        ob_id = obligaciones[i].id if (vincular_obligaciones and i < len(obligaciones)) else None
-
-        act = Actividad(
+    # Batch INSERT (radicacion-sin-friccion slice 2.3) — see `agregar_actividades_
+    # bulk`'s comment for why a single `add_all` + `flush()` (no per-item `refresh`)
+    # is sufficient: `id` is a Python-side default, `created_at`/`updated_at` come
+    # back via the dialect's implicit multi-row `INSERT ... RETURNING`.
+    nuevas = [
+        Actividad(
             cuenta_cobro_id=cuenta_id,
-            obligacion_id=ob_id,
+            obligacion_id=(obligaciones[i].id if (vincular_obligaciones and i < len(obligaciones)) else None),
             descripcion=desc,
             fecha_realizacion=fecha_realizacion,
         )
-        db.add(act)
-        await db.flush()
-        await db.refresh(act)
-        created.append(ActividadResponse.model_validate(act))
+        for i, desc in enumerate(descripciones)
+    ]
+    db.add_all(nuevas)
+    await db.flush()
+    created: list[ActividadResponse] = [ActividadResponse.model_validate(act) for act in nuevas]
 
     await logger.ainfo(
         "actividades_desde_texto_creadas",
@@ -928,7 +944,17 @@ async def generar_actividades_agente(
     )
     stubs_con_evidencia: dict[uuid.UUID | None, Actividad] = {act.obligacion_id: act for act in stubs_result.scalars()}
 
-    created: list[ActividadResponse] = []
+    # Batch INSERT+UPDATE (radicacion-sin-friccion slice 2.3): one `flush()` at the
+    # end persists both the reused/mutated stubs (already session-tracked — dirty
+    # attributes flush regardless of `add()`) and the brand-new activities
+    # (`add_all`'d below), instead of a per-item `flush()` + `refresh()` for each.
+    # `ActividadResponse` never reads `updated_at`, only `created_at` — for a
+    # reused stub that column was already loaded by the plain `stubs_result` query
+    # above (untouched by this update, so never expired); for a new activity it
+    # comes back via the dialect's implicit multi-row `INSERT ... RETURNING`. No
+    # `refresh()` is needed for either branch.
+    entries: list[Actividad] = []
+    nuevas: list[Actividad] = []
     for data in actividades_data:
         stub = stubs_con_evidencia.pop(data.obligacion_id, None)
         if stub is not None:
@@ -936,9 +962,7 @@ async def generar_actividades_agente(
             stub.justificacion = data.justificacion
             stub.justificacion_origen = JustificacionOrigen.LLM
             stub.fecha_realizacion = data.fecha_realizacion
-            await db.flush()
-            await db.refresh(stub)
-            created.append(ActividadResponse.model_validate(stub))
+            entries.append(stub)
             continue
         act = Actividad(
             cuenta_cobro_id=cuenta_id,
@@ -948,10 +972,12 @@ async def generar_actividades_agente(
             justificacion_origen=JustificacionOrigen.LLM,
             fecha_realizacion=data.fecha_realizacion,
         )
-        db.add(act)
-        await db.flush()
-        await db.refresh(act)
-        created.append(ActividadResponse.model_validate(act))
+        nuevas.append(act)
+        entries.append(act)
+
+    db.add_all(nuevas)
+    await db.flush()
+    created: list[ActividadResponse] = [ActividadResponse.model_validate(e) for e in entries]
 
     await logger.ainfo(
         "actividades_generadas_agente",
@@ -1005,23 +1031,28 @@ async def crear_actividades_desde_obligaciones(
     )
     obligacion_ids_con_actividad = {row[0] for row in existentes_result.all()}
 
-    created: list[ActividadResponse] = []
     saltadas = 0
+    nuevas: list[Actividad] = []
     for ob in obligaciones:
         if ob.id in obligacion_ids_con_actividad:
             saltadas += 1
             continue
-        act = Actividad(
-            cuenta_cobro_id=cuenta_id,
-            obligacion_id=ob.id,
-            descripcion=ob.descripcion,
-            justificacion="",
-            fecha_realizacion=None,
+        nuevas.append(
+            Actividad(
+                cuenta_cobro_id=cuenta_id,
+                obligacion_id=ob.id,
+                descripcion=ob.descripcion,
+                justificacion="",
+                fecha_realizacion=None,
+            )
         )
-        db.add(act)
-        await db.flush()
-        await db.refresh(act)
-        created.append(ActividadResponse.model_validate(act))
+
+    # Batch INSERT (radicacion-sin-friccion slice 2.3) — see `agregar_actividades_
+    # bulk`'s comment for why a single `add_all` + `flush()` (no per-item `refresh`)
+    # is sufficient.
+    db.add_all(nuevas)
+    await db.flush()
+    created: list[ActividadResponse] = [ActividadResponse.model_validate(act) for act in nuevas]
 
     await logger.ainfo(
         "actividades_desde_obligaciones",
