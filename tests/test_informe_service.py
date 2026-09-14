@@ -150,6 +150,90 @@ async def test_informe_actividades_genera_docx_valido(
     )
 
 
+async def test_informe_actividades_docx_build_runs_off_event_loop(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro
+) -> None:
+    """The from-scratch DOCX build (slice 2.1, perf/phase2-async-doc-generators)
+    must not block the event loop — a slow (mocked) sync builder call must not
+    stall a concurrently scheduled coroutine."""
+    import asyncio
+    import time as time_module
+
+    user = test_user["user"]
+
+    def _slow_build(*_args: object, **_kwargs: object) -> bytes:
+        time_module.sleep(0.2)
+        return b"fake-docx-bytes"
+
+    tracker_ticks: list[float] = []
+
+    async def _tracker() -> None:
+        loop = asyncio.get_event_loop()
+        start = loop.time()
+        for _ in range(10):
+            await asyncio.sleep(0.02)
+            tracker_ticks.append(loop.time() - start)
+
+    with patch(
+        "app.services.informe_service._construir_informe_actividades_docx",
+        side_effect=_slow_build,
+    ):
+        await asyncio.gather(
+            informe_service.generar_informe_actividades_docx(db, user.id, cuenta.id),
+            _tracker(),
+        )
+
+    assert tracker_ticks[-1] < 0.35, (
+        f"tracker was delayed past the offloaded build — got {tracker_ticks[-1]:.3f}s, expected ~0.2s"
+    )
+
+
+async def test_informe_actividades_docx_build_propagates_exception(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro
+) -> None:
+    """An exception raised inside the threaded DOCX-build call must propagate to
+    the async caller unchanged."""
+    user = test_user["user"]
+
+    class _DocxBuildFailureError(RuntimeError):
+        pass
+
+    with (
+        patch(
+            "app.services.informe_service._construir_informe_actividades_docx",
+            side_effect=_DocxBuildFailureError("docx build failed"),
+        ),
+        pytest.raises(_DocxBuildFailureError, match="docx build failed"),
+    ):
+        await informe_service.generar_informe_actividades_docx(db, user.id, cuenta.id)
+
+
+async def test_informe_actividades_docx_build_never_receives_db_session(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro
+) -> None:
+    """The offloaded sync builder must never be handed the AsyncSession (or any
+    coroutine) — it runs on a worker thread and touching an AsyncSession there
+    would be unsafe. All DB reads happen on the async side, before the call."""
+    import inspect
+
+    user = test_user["user"]
+    captured: dict[str, object] = {}
+
+    real_builder = informe_service._construir_informe_actividades_docx
+
+    def _spy(*args: object, **kwargs: object) -> bytes:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return real_builder(*args, **kwargs)
+
+    with patch("app.services.informe_service._construir_informe_actividades_docx", side_effect=_spy):
+        await informe_service.generar_informe_actividades_docx(db, user.id, cuenta.id)
+
+    all_values = list(captured["args"]) + list(captured["kwargs"].values())  # type: ignore[arg-type]
+    assert not any(isinstance(v, AsyncSession) for v in all_values)
+    assert not any(inspect.iscoroutine(v) for v in all_values)
+
+
 # ── es_borrador machine-readable field (slice #7, task 7.5d) ────────────────
 
 
@@ -208,6 +292,88 @@ async def test_informe_supervision_genera_docx_valido(
     assert "supervisi" in full_text.lower()
     table_texts = [cell.text for t in doc.tables for r in t.rows for cell in r.cells]
     assert any("Carlos Supervisor" in tx for tx in table_texts)
+
+
+async def test_informe_supervision_docx_build_runs_off_event_loop(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro
+) -> None:
+    """The from-scratch DOCX build (slice 2.1, perf/phase2-async-doc-generators)
+    must not block the event loop."""
+    import asyncio
+    import time as time_module
+
+    user = test_user["user"]
+
+    def _slow_build(*_args: object, **_kwargs: object) -> bytes:
+        time_module.sleep(0.2)
+        return b"fake-docx-bytes"
+
+    tracker_ticks: list[float] = []
+
+    async def _tracker() -> None:
+        loop = asyncio.get_event_loop()
+        start = loop.time()
+        for _ in range(10):
+            await asyncio.sleep(0.02)
+            tracker_ticks.append(loop.time() - start)
+
+    with patch(
+        "app.services.informe_service._construir_informe_supervision_docx",
+        side_effect=_slow_build,
+    ):
+        await asyncio.gather(
+            informe_service.generar_informe_supervision_docx(db, user.id, cuenta.id),
+            _tracker(),
+        )
+
+    assert tracker_ticks[-1] < 0.35, (
+        f"tracker was delayed past the offloaded build — got {tracker_ticks[-1]:.3f}s, expected ~0.2s"
+    )
+
+
+async def test_informe_supervision_docx_build_propagates_exception(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro
+) -> None:
+    """An exception raised inside the threaded DOCX-build call must propagate to
+    the async caller unchanged."""
+    user = test_user["user"]
+
+    class _DocxBuildFailureError(RuntimeError):
+        pass
+
+    with (
+        patch(
+            "app.services.informe_service._construir_informe_supervision_docx",
+            side_effect=_DocxBuildFailureError("docx build failed"),
+        ),
+        pytest.raises(_DocxBuildFailureError, match="docx build failed"),
+    ):
+        await informe_service.generar_informe_supervision_docx(db, user.id, cuenta.id)
+
+
+async def test_informe_supervision_docx_build_never_receives_db_session(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro
+) -> None:
+    """The offloaded sync builder must never be handed the AsyncSession (or any
+    coroutine)."""
+    import inspect
+
+    user = test_user["user"]
+    captured: dict[str, object] = {}
+
+    real_builder = informe_service._construir_informe_supervision_docx
+
+    def _spy(*args: object, **kwargs: object) -> bytes:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return real_builder(*args, **kwargs)
+
+    with patch("app.services.informe_service._construir_informe_supervision_docx", side_effect=_spy):
+        await informe_service.generar_informe_supervision_docx(db, user.id, cuenta.id)
+
+    all_values = list(captured["args"]) + list(captured["kwargs"].values())  # type: ignore[arg-type]
+    assert not any(isinstance(v, AsyncSession) for v in all_values)
+    assert not any(inspect.iscoroutine(v) for v in all_values)
 
 
 # ── ZIP evidencias ─────────────────────────────────────────────────────────

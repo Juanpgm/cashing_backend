@@ -8,6 +8,7 @@ Produces three artifacts on demand for the contractor's billing package:
 
 from __future__ import annotations
 
+import asyncio
 import calendar
 import io
 import uuid
@@ -843,6 +844,44 @@ async def generar_informe_actividades_docx(
 
     contexto_progresivo = await _construir_contexto_progresivo(db, contrato.id, cuenta)
 
+    # _construir_informe_actividades_docx is pure sync (python-docx build + save)
+    # with no DB/async I/O of its own; off the event loop like document_service.py's
+    # parse_document, so one report build can't stall other concurrent requests.
+    contenido = await asyncio.to_thread(
+        _construir_informe_actividades_docx,
+        contrato,
+        usuario,
+        cuenta,
+        layout,
+        actividades_visibles,
+        obligaciones_by_id,
+        contexto_progresivo,
+    )
+
+    await logger.ainfo(
+        "informe_actividades_generado",
+        cuenta_id=str(cuenta_id),
+        usuario_id=str(usuario_id),
+        size=len(contenido),
+    )
+    return contenido, filename
+
+
+def _construir_informe_actividades_docx(
+    contrato: Contrato,
+    usuario: Usuario,
+    cuenta: CuentaCobro,
+    layout: PlantillaOrganismo | None,
+    actividades_visibles: list[Actividad],
+    obligaciones_by_id: dict[uuid.UUID, Obligacion],
+    contexto_progresivo: str | None,
+) -> bytes:
+    """Pure sync DOCX build for the built-from-scratch activities informe.
+
+    No DB/async I/O — every argument is an already-resolved plain value, so
+    this is safe to run via `asyncio.to_thread` (never touches the caller's
+    AsyncSession from a worker thread).
+    """
     doc = Document()
     style = doc.styles["Normal"]
     style.font.name = "Calibri"
@@ -898,14 +937,7 @@ async def generar_informe_actividades_docx(
 
     buf = io.BytesIO()
     doc.save(buf)
-
-    await logger.ainfo(
-        "informe_actividades_generado",
-        cuenta_id=str(cuenta_id),
-        usuario_id=str(usuario_id),
-        size=len(buf.getvalue()),
-    )
-    return buf.getvalue(), filename
+    return buf.getvalue()
 
 
 async def generar_informe_supervision_docx(
@@ -953,6 +985,46 @@ async def generar_informe_supervision_docx(
 
     contexto_progresivo = await _construir_contexto_progresivo(db, contrato.id, cuenta)
 
+    # _construir_informe_supervision_docx is pure sync (python-docx build + save)
+    # with no DB/async I/O of its own; off the event loop like document_service.py's
+    # parse_document, so one report build can't stall other concurrent requests.
+    contenido = await asyncio.to_thread(
+        _construir_informe_supervision_docx,
+        contrato,
+        usuario,
+        cuenta,
+        layout,
+        actividades_visibles,
+        obligaciones_by_id,
+        overrides,
+        contexto_progresivo,
+    )
+
+    await logger.ainfo(
+        "informe_supervision_generado",
+        cuenta_id=str(cuenta_id),
+        usuario_id=str(usuario_id),
+        size=len(contenido),
+    )
+    return contenido, filename
+
+
+def _construir_informe_supervision_docx(
+    contrato: Contrato,
+    usuario: Usuario,
+    cuenta: CuentaCobro,
+    layout: PlantillaOrganismo | None,
+    actividades_visibles: list[Actividad],
+    obligaciones_by_id: dict[uuid.UUID, Obligacion],
+    overrides: dict[int, str],
+    contexto_progresivo: str | None,
+) -> bytes:
+    """Pure sync DOCX build for the built-from-scratch supervision informe.
+
+    No DB/async I/O — every argument is an already-resolved plain value, so
+    this is safe to run via `asyncio.to_thread` (never touches the caller's
+    AsyncSession from a worker thread).
+    """
     doc = Document()
     style = doc.styles["Normal"]
     style.font.name = "Calibri"
@@ -1016,14 +1088,7 @@ async def generar_informe_supervision_docx(
 
     buf = io.BytesIO()
     doc.save(buf)
-
-    await logger.ainfo(
-        "informe_supervision_generado",
-        cuenta_id=str(cuenta_id),
-        usuario_id=str(usuario_id),
-        size=len(buf.getvalue()),
-    )
-    return buf.getvalue(), filename
+    return buf.getvalue()
 
 
 async def generar_cuenta_cobro_docx(db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: uuid.UUID) -> tuple[bytes, str]:
