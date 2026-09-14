@@ -430,7 +430,7 @@ async def crear_cuenta_cobro(
         contrato_id=data.contrato_id,
         mes=data.mes,
         anio=data.anio,
-        valor=float(valor),
+        valor=valor,
         estado=EstadoCuentaCobro.BORRADOR,
         numero_cuota=numero_cuota,
         posicion=posicion,
@@ -439,6 +439,20 @@ async def crear_cuenta_cobro(
     )
     db.add(cuenta)
     await db.flush()
+    # `actividades` (lazy="selectin") is marked unloaded even on a brand-new,
+    # just-inserted object — SQLAlchemy's selectin strategy tracks "needs a query"
+    # independently of any pre-flush access, so accessing it later synchronously
+    # inside `CuentaCobroResponse.model_validate` (Pydantic's attribute walk cannot
+    # `await`) raises `MissingGreenlet`. One targeted, awaited refresh — genuinely
+    # necessary, not the redundant full multi-relationship reload this replaces —
+    # populates it correctly (it will always resolve to `[]` here; nothing has been
+    # added to this brand-new cuenta yet).
+    # `valor` is also refreshed here: Postgres normalizes NUMERIC(15, 2) scale
+    # only on a DB round-trip (e.g. this refresh's re-SELECT) — the in-memory
+    # `Decimal` we just assigned above keeps whatever scale the caller sent
+    # (e.g. "1234567.8"), so without this the response would silently disagree
+    # with what a fresh GET of the same row returns ("1234567.80").
+    await db.refresh(cuenta, attribute_names=["actividades", "valor"])
 
     # The checklist is NOT materialised here: the cuenta nace con requisitos_modo
     # = NULL so the post-creation gate can ask the user how to build the checklist
@@ -453,7 +467,11 @@ async def crear_cuenta_cobro(
         mes=data.mes,
         anio=data.anio,
     )
-    return await _reload_cuenta_response(db, cuenta.id)
+    # `cuenta` is a brand-new object just flushed in THIS session — no concurrent
+    # writer could have raced it, and `.actividades` is already an empty in-memory
+    # collection (nothing has been added to it yet). A re-SELECT here is redundant
+    # (radicacion-sin-friccion slice 2.2).
+    return CuentaCobroResponse.model_validate(cuenta)
 
 
 async def listar_cuentas_cobro(
@@ -561,19 +579,29 @@ async def agregar_actividades_bulk(
         if invalid:
             raise NotFoundError("Obligacion", str(next(iter(invalid))))
 
-    created: list[ActividadResponse] = []
-    for data in actividades:
-        act = Actividad(
+    # Batch INSERT (radicacion-sin-friccion slice 2.3): a single `add_all` +
+    # `flush()` replaces N per-item `add` + `flush` + `refresh` round-trips.
+    # `flush()` alone (no `refresh()`) is enough here — `id` is a Python-side
+    # default (`uuid.uuid4`, `UUIDMixin`) already set before insert, and
+    # `created_at`/`updated_at` (`server_default=func.now()`) are populated via
+    # the dialect's implicit `INSERT ... RETURNING`, which SQLAlchemy 2.0's
+    # "insertmanyvalues" feature supports per-row for a multi-value INSERT, not
+    # just a single-row one — verified against this suite's SQLite/aiosqlite
+    # engine (see the RETURNING clause on the INSERT statement in `QueryCounter`
+    # dumps), not merely assumed.
+    nuevas = [
+        Actividad(
             cuenta_cobro_id=cuenta_id,
             obligacion_id=data.obligacion_id,
             descripcion=data.descripcion,
             justificacion=data.justificacion,
             fecha_realizacion=data.fecha_realizacion,
         )
-        db.add(act)
-        await db.flush()
-        await db.refresh(act)
-        created.append(ActividadResponse.model_validate(act))
+        for data in actividades
+    ]
+    db.add_all(nuevas)
+    await db.flush()
+    created: list[ActividadResponse] = [ActividadResponse.model_validate(act) for act in nuevas]
 
     await logger.ainfo(
         "actividades_bulk_creadas",
@@ -651,23 +679,29 @@ async def agregar_actividades_desde_texto(
         ob_result = await db.execute(select(Ob).where(Ob.contrato_id == cuenta.contrato_id).order_by(Ob.orden))
         obligaciones = ob_result.scalars().all()
 
-    created: list[ActividadResponse] = []
+    # Validate ALL lines BEFORE creating anything (fail-fast, matching the
+    # original loop's all-or-nothing behavior: a short line at index N must not
+    # leave activities 0..N-1 already inserted).
     for i, desc in enumerate(descripciones):
         if len(desc) < 10:
             raise ValidationError(f"La actividad {i + 1} es demasiado corta (mínimo 10 caracteres): '{desc}'")
 
-        ob_id = obligaciones[i].id if (vincular_obligaciones and i < len(obligaciones)) else None
-
-        act = Actividad(
+    # Batch INSERT (radicacion-sin-friccion slice 2.3) — see `agregar_actividades_
+    # bulk`'s comment for why a single `add_all` + `flush()` (no per-item `refresh`)
+    # is sufficient: `id` is a Python-side default, `created_at`/`updated_at` come
+    # back via the dialect's implicit multi-row `INSERT ... RETURNING`.
+    nuevas = [
+        Actividad(
             cuenta_cobro_id=cuenta_id,
-            obligacion_id=ob_id,
+            obligacion_id=(obligaciones[i].id if (vincular_obligaciones and i < len(obligaciones)) else None),
             descripcion=desc,
             fecha_realizacion=fecha_realizacion,
         )
-        db.add(act)
-        await db.flush()
-        await db.refresh(act)
-        created.append(ActividadResponse.model_validate(act))
+        for i, desc in enumerate(descripciones)
+    ]
+    db.add_all(nuevas)
+    await db.flush()
+    created: list[ActividadResponse] = [ActividadResponse.model_validate(act) for act in nuevas]
 
     await logger.ainfo(
         "actividades_desde_texto_creadas",
@@ -915,7 +949,17 @@ async def generar_actividades_agente(
     )
     stubs_con_evidencia: dict[uuid.UUID | None, Actividad] = {act.obligacion_id: act for act in stubs_result.scalars()}
 
-    created: list[ActividadResponse] = []
+    # Batch INSERT+UPDATE (radicacion-sin-friccion slice 2.3): one `flush()` at the
+    # end persists both the reused/mutated stubs (already session-tracked — dirty
+    # attributes flush regardless of `add()`) and the brand-new activities
+    # (`add_all`'d below), instead of a per-item `flush()` + `refresh()` for each.
+    # `ActividadResponse` never reads `updated_at`, only `created_at` — for a
+    # reused stub that column was already loaded by the plain `stubs_result` query
+    # above (untouched by this update, so never expired); for a new activity it
+    # comes back via the dialect's implicit multi-row `INSERT ... RETURNING`. No
+    # `refresh()` is needed for either branch.
+    entries: list[Actividad] = []
+    nuevas: list[Actividad] = []
     for data in actividades_data:
         stub = stubs_con_evidencia.pop(data.obligacion_id, None)
         if stub is not None:
@@ -923,9 +967,7 @@ async def generar_actividades_agente(
             stub.justificacion = data.justificacion
             stub.justificacion_origen = JustificacionOrigen.LLM
             stub.fecha_realizacion = data.fecha_realizacion
-            await db.flush()
-            await db.refresh(stub)
-            created.append(ActividadResponse.model_validate(stub))
+            entries.append(stub)
             continue
         act = Actividad(
             cuenta_cobro_id=cuenta_id,
@@ -935,10 +977,12 @@ async def generar_actividades_agente(
             justificacion_origen=JustificacionOrigen.LLM,
             fecha_realizacion=data.fecha_realizacion,
         )
-        db.add(act)
-        await db.flush()
-        await db.refresh(act)
-        created.append(ActividadResponse.model_validate(act))
+        nuevas.append(act)
+        entries.append(act)
+
+    db.add_all(nuevas)
+    await db.flush()
+    created: list[ActividadResponse] = [ActividadResponse.model_validate(e) for e in entries]
 
     await logger.ainfo(
         "actividades_generadas_agente",
@@ -992,23 +1036,28 @@ async def crear_actividades_desde_obligaciones(
     )
     obligacion_ids_con_actividad = {row[0] for row in existentes_result.all()}
 
-    created: list[ActividadResponse] = []
     saltadas = 0
+    nuevas: list[Actividad] = []
     for ob in obligaciones:
         if ob.id in obligacion_ids_con_actividad:
             saltadas += 1
             continue
-        act = Actividad(
-            cuenta_cobro_id=cuenta_id,
-            obligacion_id=ob.id,
-            descripcion=ob.descripcion,
-            justificacion="",
-            fecha_realizacion=None,
+        nuevas.append(
+            Actividad(
+                cuenta_cobro_id=cuenta_id,
+                obligacion_id=ob.id,
+                descripcion=ob.descripcion,
+                justificacion="",
+                fecha_realizacion=None,
+            )
         )
-        db.add(act)
-        await db.flush()
-        await db.refresh(act)
-        created.append(ActividadResponse.model_validate(act))
+
+    # Batch INSERT (radicacion-sin-friccion slice 2.3) — see `agregar_actividades_
+    # bulk`'s comment for why a single `add_all` + `flush()` (no per-item `refresh`)
+    # is sufficient.
+    db.add_all(nuevas)
+    await db.flush()
+    created: list[ActividadResponse] = [ActividadResponse.model_validate(act) for act in nuevas]
 
     await logger.ainfo(
         "actividades_desde_obligaciones",
@@ -1072,7 +1121,10 @@ async def cambiar_estado(
             # idempotent success; anything else is a genuine invalid transition.
             actual = await _get_cuenta_con_ownership(db, usuario_id, cuenta_id)
             if actual.estado == EstadoCuentaCobro.ENVIADA:
-                return await _reload_cuenta_response(db, cuenta_id)
+                # `actual` was just loaded fresh (with actividades/contrato eager-
+                # loaded) by the read above — a second re-SELECT is redundant
+                # (radicacion-sin-friccion slice 2.2).
+                return CuentaCobroResponse.model_validate(actual)
             validas = ", ".join(e.value for e in _TRANSICIONES.get(actual.estado, set())) or "ninguna"
             raise ValidationError(
                 f"Transición inválida: {actual.estado} → {nuevo_estado}. "
@@ -1107,6 +1159,13 @@ async def cambiar_estado(
         cuenta.pdf_storage_key = None
 
     await db.flush()
+    # `updated_at` has `onupdate=func.now()` (server-evaluated): `flush()` does not
+    # proactively re-fetch an UPDATE's onupdate value (unlike an INSERT, which
+    # SQLAlchemy fetches via RETURNING) — the attribute is left expired, and a
+    # later synchronous read inside `CuentaCobroResponse.model_validate` (Pydantic
+    # cannot `await`) would raise `MissingGreenlet`. One targeted, awaited refresh
+    # restores just that column.
+    await db.refresh(cuenta, attribute_names=["updated_at"])
 
     await logger.ainfo(
         "cuenta_cobro_estado_cambiado",
@@ -1115,7 +1174,12 @@ async def cambiar_estado(
         estado_anterior=estado_actual,
         estado_nuevo=nuevo_estado,
     )
-    return await _reload_cuenta_response(db, cuenta_id)
+    # This generic (non-ENVIADA) branch only ever mutates `.estado`, and on a
+    # BORRADOR reopen `.fecha_envio`/`.pdf_storage_key`, directly on the already
+    # eager-loaded `cuenta` object — `.actividades` is untouched. Besides the
+    # `updated_at` refresh above, `cuenta` stays accurate and a full re-SELECT is
+    # redundant (radicacion-sin-friccion slice 2.2).
+    return CuentaCobroResponse.model_validate(cuenta)
 
 
 async def _leer_estado_bajo_lock(db: AsyncSession, cuenta_id: uuid.UUID, *, nowait: bool = False) -> EstadoCuentaCobro:
@@ -1200,7 +1264,12 @@ async def radicar_cuenta(
     cuenta = await _get_cuenta_con_ownership(db, usuario_id, cuenta_id)
 
     if cuenta.estado == EstadoCuentaCobro.ENVIADA:
-        return await _reload_cuenta_response(db, cuenta_id)
+        # `cuenta` was just loaded fresh by the read above, in this same call, with
+        # no writes in between — a re-SELECT is redundant (radicacion-sin-friccion
+        # slice 2.2). Contrast with the post-lock short-circuit below, which DOES
+        # need a genuine reload since a concurrent transaction may have committed
+        # in between.
+        return CuentaCobroResponse.model_validate(cuenta)
 
     if cuenta.estado not in (EstadoCuentaCobro.BORRADOR, EstadoCuentaCobro.RECHAZADA):
         _raise_estado_invalido_para_radicar(cuenta.estado)
@@ -1790,7 +1859,7 @@ async def actualizar_cuenta_cobro(
         cuenta.anio = nuevo_anio
 
     if data.valor is not None:
-        cuenta.valor = float(data.valor)
+        cuenta.valor = data.valor
 
     if data.informe_final is not None and data.informe_final != cuenta.informe_final:
         if data.informe_final:
@@ -1811,6 +1880,15 @@ async def actualizar_cuenta_cobro(
         cuenta.consecutivo_ds = data.consecutivo_ds.strip() if data.consecutivo_ds else None
 
     await db.flush()
+    # `updated_at` has `onupdate=func.now()` (server-evaluated): `flush()` does not
+    # proactively re-fetch an UPDATE's onupdate value — the attribute is left
+    # expired, and a later synchronous read inside `CuentaCobroResponse.model_
+    # validate` (Pydantic cannot `await`) would raise `MissingGreenlet`. One
+    # targeted, awaited refresh restores just that column.
+    # `valor` rides along on the same refresh: Postgres only normalizes
+    # NUMERIC(15, 2) scale on a DB round-trip, so a value like "1234567.8" sent
+    # by the caller stays un-normalized in-memory until re-fetched here.
+    await db.refresh(cuenta, attribute_names=["updated_at", "valor"])
     await logger.ainfo(
         "cuenta_cobro_actualizada",
         cuenta_id=str(cuenta_id),
@@ -1818,4 +1896,8 @@ async def actualizar_cuenta_cobro(
         mes=cuenta.mes,
         anio=cuenta.anio,
     )
-    return await _reload_cuenta_response(db, cuenta.id)
+    # Only scalar columns were mutated above (never `.actividades`) — the in-session
+    # `cuenta` object (already eager-loaded by `_get_cuenta_con_ownership`) remains
+    # accurate besides the `updated_at` refresh above, so a full re-SELECT is
+    # redundant (radicacion-sin-friccion slice 2.2).
+    return CuentaCobroResponse.model_validate(cuenta)
