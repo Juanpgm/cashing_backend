@@ -7,6 +7,7 @@ para montar la Cuenta de Cobro / Radicación.
 
 from __future__ import annotations
 
+import asyncio
 import re
 
 import structlog
@@ -25,6 +26,14 @@ from app.schemas.agent import LLMMessage
 from app.services.informe_constants import TEXTO_SIN_LABORES
 
 logger = structlog.get_logger("agent.nodes.evidence_justify")
+
+# Bounds the per-obligación LLM fan-out (radicacion-sin-friccion slice 2.6
+# review finding) — same rationale as `evidence_matcher.py`'s
+# `_LLM_FANOUT_CONCURRENCY`: the parallelized loop below fires one
+# `_generate_actividad_justificacion` LLM call per obligación via
+# `asyncio.gather`, left unbounded a large contrato would fire that many
+# simultaneous provider calls.
+_LLM_FANOUT_CONCURRENCY = 5
 
 
 def _obligation_text(ob: dict | str) -> str:
@@ -153,6 +162,44 @@ async def _generate_actividad_justificacion(
     return actividad, justificacion, "llm"
 
 
+async def _justificar_una_obligacion(
+    ob_id: str,
+    ob_texto: str,
+    evidencias: list[dict],
+    contrato_contexto: str,
+    actividades_previas: list[str],
+    contexto_usuario: str,
+    sem: asyncio.Semaphore,
+) -> dict:
+    """Resolve the actividad+justificación for ONE obligación — the
+    per-obligación body of the (now-parallelized) loop in
+    `evidence_justify_node`. Touches NO shared mutable state beyond its own
+    arguments/return value (no DB access at all in this node) and does at
+    most one LLM call (`_generate_actividad_justificacion`) — safe to run
+    concurrently with the same call for every other obligación via
+    `asyncio.gather` (radicacion-sin-friccion Phase 2 slice 2.6). The LLM
+    call itself is bounded by `sem` (`_LLM_FANOUT_CONCURRENCY`) so a large
+    contrato doesn't fire dozens of simultaneous provider calls.
+    """
+    if not evidencias:
+        # Sin evidencia para esta obligación en el período: texto con tacto,
+        # sin gastar una llamada LLM (que solo produciría meta-texto sobre la ausencia).
+        actividad, justificacion, origen = _deterministic_actividad(evidencias), TEXTO_SIN_LABORES, "sin_labores"
+    else:
+        async with sem:
+            actividad, justificacion, origen = await _generate_actividad_justificacion(
+                ob_texto, evidencias, contrato_contexto, actividades_previas, contexto_usuario
+            )
+    return {
+        "obligacion_id": ob_id,
+        "descripcion": ob_texto,
+        "actividad": actividad,
+        "justificacion": justificacion,
+        "origen": origen,
+        "evidencias": _evidence_links(evidencias),
+    }
+
+
 async def evidence_justify_node(state: AgentState) -> AgentState:
     """Genera actividad + justificación por obligación a partir de matched_evidence.
 
@@ -169,30 +216,27 @@ async def evidence_justify_node(state: AgentState) -> AgentState:
     actividades_previas = state.get("actividades_previas") or []
     contexto_usuario = str(state.get("contexto_usuario") or "")
 
-    justificaciones: list[dict] = []
+    # Every obligación's justificación generation runs CONCURRENTLY
+    # (radicacion-sin-friccion Phase 2 slice 2.6) — this loop touches no DB
+    # session and no shared mutable state across iterations (see
+    # `_justificar_una_obligacion`'s docstring), so it's safe to fan out with
+    # `asyncio.gather` instead of awaiting one obligación's LLM call at a
+    # time. `asyncio.gather` preserves input order in its results regardless
+    # of completion order, so the final `justificaciones` list is in the same
+    # order as `obligaciones` no matter which LLM call finishes first.
+    sem = asyncio.Semaphore(_LLM_FANOUT_CONCURRENCY)
+    tareas = []
     for i, ob in enumerate(obligaciones):
         ob_id = str(ob.get("id")) if isinstance(ob, dict) and ob.get("id") else str(i)
         ob_texto = _obligation_text(ob)
         evidencias = matched.get(ob_id, [])
-
-        if not evidencias:
-            # Sin evidencia para esta obligación en el período: texto con tacto,
-            # sin gastar una llamada LLM (que solo produciría meta-texto sobre la ausencia).
-            actividad, justificacion, origen = _deterministic_actividad(evidencias), TEXTO_SIN_LABORES, "sin_labores"
-        else:
-            actividad, justificacion, origen = await _generate_actividad_justificacion(
-                ob_texto, evidencias, contrato_contexto, actividades_previas, contexto_usuario
+        tareas.append(
+            _justificar_una_obligacion(
+                ob_id, ob_texto, evidencias, contrato_contexto, actividades_previas, contexto_usuario, sem
             )
-        justificaciones.append(
-            {
-                "obligacion_id": ob_id,
-                "descripcion": ob_texto,
-                "actividad": actividad,
-                "justificacion": justificacion,
-                "origen": origen,
-                "evidencias": _evidence_links(evidencias),
-            }
         )
+
+    justificaciones: list[dict] = list(await asyncio.gather(*tareas))
 
     await logger.ainfo("evidence_justify_done", obligaciones=len(justificaciones))
     return {

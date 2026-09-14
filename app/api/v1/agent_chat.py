@@ -6,7 +6,7 @@ endpoints) so this stays a small, focused surface for the free-form loop in
 """
 
 import structlog
-from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Request, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser
@@ -75,6 +75,7 @@ async def parse_chat_attachments(files: list[UploadFile]) -> dict[str, ToolAttac
 async def chat(
     request: Request,
     user: CurrentUser,
+    background_tasks: BackgroundTasks,
     message: str = Form(..., min_length=1, max_length=5000),
     session_id: str | None = Form(None),
     contrato_id: str | None = Form(None),
@@ -110,4 +111,5 @@ async def chat(
         session_id=session_id,
         attachments=attachments,
         contrato_id=contrato_id,
+        background_tasks=background_tasks,
     )

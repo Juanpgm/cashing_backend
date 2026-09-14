@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 
+from fastapi import BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.usuario import Usuario
@@ -40,6 +41,17 @@ class ToolContext:
     # caller except `agent_chat_service.chat_with_tools` — the MCP server and other
     # call sites never populate this, so existing tools are unaffected.
     attachments: dict[str, ToolAttachment] = field(default_factory=dict)
+    # Request-scoped FastAPI `BackgroundTasks`, when the caller has one to offer
+    # (radicacion-sin-friccion Phase 2 slice 2.6). Only the synchronous
+    # `POST /agent/chat` route (`agent_chat_service.chat_with_tools`) threads a
+    # real instance through today — every other ToolContext construction site
+    # (the SSE streaming chat path, the MCP server, `descubrir_evidencias`'s and
+    # `radicar_cuenta`'s direct REST endpoints, every test) leaves this `None`,
+    # which is the correct default wherever no request-scoped `BackgroundTasks`
+    # actually exists. Tools that want to background a follow-up unit of work
+    # (e.g. `subir_evidencias_desde_chat` backgrounding evidence classification)
+    # read this instead of hardcoding `None`.
+    background_tasks: BackgroundTasks | None = None
 
     @property
     def usuario_id(self) -> uuid.UUID:

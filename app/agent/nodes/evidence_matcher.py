@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from typing import TYPE_CHECKING, Any
@@ -23,6 +24,16 @@ logger = structlog.get_logger("agent.nodes.evidence_matcher")
 # unparseable output (see `_llm_relevance_batch`).
 _KEYWORD_THRESHOLD = 0.15
 _FALLBACK_ACCEPT_THRESHOLD = 0.30
+
+# Bounds the per-obligación LLM fan-out (radicacion-sin-friccion slice 2.6
+# review finding): the parallelized loop below fires one `_llm_relevance_batch`
+# call per obligación via `asyncio.gather` — left unbounded, a large contrato
+# (dozens of obligaciones) would fire that many SIMULTANEOUS LLM calls, the
+# same rate-limit-storm bug class this repo already hit once with Gmail
+# (`gmail_adapter.py`'s `_GMAIL_MAX_CONCURRENCY` semaphore) and already guards
+# against elsewhere for LLM-adjacent work (`requisito_inference_service.py`'s
+# `_INGEST_CONCURRENCY`).
+_LLM_FANOUT_CONCURRENCY = 5
 
 _RELEVANCE_BATCH_SYSTEM = """\
 Eres un clasificador. Dada una obligación contractual y una lista numerada de evidencias, \
@@ -214,7 +225,12 @@ async def _llm_relevance_batch(
         nums = json.loads(match.group(0))
         relevant_idx = {int(n) for n in nums if isinstance(n, (int, float))}
         return [(i + 1) in relevant_idx for i in range(len(evidences))]
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "evidence_matcher_llm_relevance_failed",
+            error=str(exc),
+            n_evidences=len(evidences),
+        )
         return _fallback_flags(keyword_scores, len(evidences))
 
 
@@ -254,6 +270,74 @@ async def clasificar_evidencia(texto_evidencia: str, obligaciones: list[Obligaci
     return await _clasificar_via_llm(texto_evidencia, [ob for ob, _score in candidates], llm, fallback=fallback)
 
 
+async def _match_una_obligacion(
+    ob_id: str,
+    ob_text: str,
+    ob_vec: list[float] | None,
+    evidence_raw: list[dict],
+    ev_embeddings: list[list[float]] | None,
+    llm: Any,
+    sem: asyncio.Semaphore,
+) -> tuple[str, list[dict], dict[str, float]]:
+    """Resolve matches for ONE obligación — the per-obligación body of the
+    (now-parallelized) loop in `evidence_matcher_node`. Touches NO shared
+    mutable state beyond its own arguments/return value (no DB access at all
+    in this node) and does exactly one `_llm_relevance_batch` LLM call at
+    most — safe to run concurrently with the same call for every other
+    obligación via `asyncio.gather` (radicacion-sin-friccion Phase 2 slice 2.6).
+    The LLM call itself is bounded by `sem` (`_LLM_FANOUT_CONCURRENCY`) so a
+    large contrato doesn't fire dozens of simultaneous provider calls.
+    """
+
+    def _score(idx: int, ev: dict) -> float:
+        kw = _keyword_score(ob_text, ev.get("content", ""))
+        cos = None
+        if ob_vec is not None and ev_embeddings is not None:
+            cos = _cosine_similarity(ob_vec, ev_embeddings[idx])
+        return _blended_score(kw, cos)
+
+    # Step 1: blended-score filter (≥0.15 threshold) — cosine can surface a
+    # candidate keyword scoring alone would miss entirely (cross-language match).
+    scored_all = [(ev, _score(idx, ev)) for idx, ev in enumerate(evidence_raw)]
+    candidates_scored = [(ev, s) for ev, s in scored_all if s >= _KEYWORD_THRESHOLD]
+
+    # Max-effort fallback: an obligación with ZERO candidates above threshold
+    # would otherwise stay silently empty. Instead, take its best candidates
+    # with ANY positive score (score > 0) and still let the LLM judge them —
+    # better an obligación gets a weak-but-checked candidate than none at all.
+    if not candidates_scored:
+        positive = [(ev, s) for ev, s in scored_all if s > 0]
+        positive.sort(key=lambda pair: pair[1], reverse=True)
+        candidates_scored = positive[:3]
+
+    # Step 2: LLM relevance on top-N candidates — ONE batched call, not one per candidate
+    if candidates_scored:
+        candidates_scored = sorted(candidates_scored, key=lambda pair: pair[1], reverse=True)[
+            : settings.EVIDENCE_MATCHER_TOP_N
+        ]
+        candidates = [ev for ev, _s in candidates_scored]
+        blended_scores = [s for _ev, s in candidates_scored]
+        async with sem:
+            flags = await _llm_relevance_batch(
+                ob_text, [ev.get("content", "") for ev in candidates], llm, blended_scores
+            )
+        matched_list = [ev for ev, keep in zip(candidates, flags, strict=True) if keep]
+        # Additive: the blended score behind each KEPT match, keyed by the
+        # evidence's own "id" field (present for local-upload evidence_raw
+        # dicts; simply absent/skipped for sources that don't set one, e.g.
+        # Google discovery — those flows don't consume this key).
+        scores_dict = {
+            ev["id"]: score
+            for ev, score, keep in zip(candidates, blended_scores, flags, strict=True)
+            if keep and "id" in ev
+        }
+    else:
+        matched_list = []
+        scores_dict = {}
+
+    return ob_id, matched_list, scores_dict
+
+
 async def evidence_matcher_node(state: AgentState) -> AgentState:
     """Match evidence to obligations using keyword score + LLM refinement.
 
@@ -284,63 +368,27 @@ async def evidence_matcher_node(state: AgentState) -> AgentState:
     ob_embeddings = await _embed_batch(ob_texts, llm)
     ev_embeddings = await _embed_batch(ev_texts, llm) if ob_embeddings is not None else None
 
+    # Every obligación's matching runs CONCURRENTLY (radicacion-sin-friccion
+    # Phase 2 slice 2.6) — this loop touches no DB session and no shared
+    # mutable state across iterations (see `_match_una_obligacion`'s
+    # docstring), so it's safe to fan out with `asyncio.gather` instead of
+    # awaiting one obligación's LLM call at a time. `asyncio.gather` preserves
+    # input order in its results regardless of completion order, so building
+    # `matched`/`matched_scores` from the results afterward needs no extra
+    # bookkeeping for out-of-order completions.
+    sem = asyncio.Semaphore(_LLM_FANOUT_CONCURRENCY)
+    tareas = []
     for i, ob in enumerate(obligaciones):
         ob_text = ob_texts[i]
         ob_id = ob.get("id") if isinstance(ob, dict) else str(i)
         if not ob_id:
             ob_id = str(i)
         ob_vec = ob_embeddings[i] if ob_embeddings is not None else None
+        tareas.append(_match_una_obligacion(str(ob_id), ob_text, ob_vec, evidence_raw, ev_embeddings, llm, sem))
 
-        def _score(
-            idx: int,
-            ev: dict,
-            ob_text: str = ob_text,
-            ob_vec: list[float] | None = ob_vec,
-            ev_embeddings: list[list[float]] | None = ev_embeddings,
-        ) -> float:
-            kw = _keyword_score(ob_text, ev.get("content", ""))
-            cos = None
-            if ob_vec is not None and ev_embeddings is not None:
-                cos = _cosine_similarity(ob_vec, ev_embeddings[idx])
-            return _blended_score(kw, cos)
-
-        # Step 1: blended-score filter (≥0.15 threshold) — cosine can surface a
-        # candidate keyword scoring alone would miss entirely (cross-language match).
-        scored_all = [(ev, _score(idx, ev)) for idx, ev in enumerate(evidence_raw)]
-        candidates_scored = [(ev, s) for ev, s in scored_all if s >= _KEYWORD_THRESHOLD]
-
-        # Max-effort fallback: an obligación with ZERO candidates above threshold
-        # would otherwise stay silently empty. Instead, take its best candidates
-        # with ANY positive score (score > 0) and still let the LLM judge them —
-        # better an obligación gets a weak-but-checked candidate than none at all.
-        if not candidates_scored:
-            positive = [(ev, s) for ev, s in scored_all if s > 0]
-            positive.sort(key=lambda pair: pair[1], reverse=True)
-            candidates_scored = positive[:3]
-
-        # Step 2: LLM relevance on top-N candidates — ONE batched call, not one per candidate
-        if candidates_scored:
-            candidates_scored = sorted(candidates_scored, key=lambda pair: pair[1], reverse=True)[
-                : settings.EVIDENCE_MATCHER_TOP_N
-            ]
-            candidates = [ev for ev, _s in candidates_scored]
-            blended_scores = [s for _ev, s in candidates_scored]
-            flags = await _llm_relevance_batch(
-                ob_text, [ev.get("content", "") for ev in candidates], llm, blended_scores
-            )
-            matched[str(ob_id)] = [ev for ev, keep in zip(candidates, flags) if keep]
-            # Additive: the blended score behind each KEPT match, keyed by the
-            # evidence's own "id" field (present for local-upload evidence_raw
-            # dicts; simply absent/skipped for sources that don't set one, e.g.
-            # Google discovery — those flows don't consume this key).
-            matched_scores[str(ob_id)] = {
-                ev["id"]: score
-                for ev, score, keep in zip(candidates, blended_scores, flags, strict=True)
-                if keep and "id" in ev
-            }
-        else:
-            matched[str(ob_id)] = []
-            matched_scores[str(ob_id)] = {}
+    for ob_id, matched_list, scores_dict in await asyncio.gather(*tareas):
+        matched[ob_id] = matched_list
+        matched_scores[ob_id] = scores_dict
 
     total_matched = sum(len(v) for v in matched.values())
     await logger.ainfo(

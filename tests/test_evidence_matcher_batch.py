@@ -6,7 +6,6 @@ from __future__ import annotations
 from unittest.mock import patch
 
 import pytest
-
 from app.agent.nodes import evidence_matcher
 
 
@@ -366,3 +365,92 @@ async def test_subir_evidencias_cuenta_constructs_llm_against_live_groq_model(db
         )
 
     mock_get_llm.assert_called_once_with(model="groq/openai/gpt-oss-20b")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Parallelization (radicacion-sin-friccion Phase 2 slice 2.6): every obligación's
+# matching (its `_llm_relevance_batch` call) must run CONCURRENTLY, not one at
+# a time.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_matcher_runs_llm_calls_concurrently_not_sequentially() -> None:
+    """5 obligaciones, each with a candidate evidencia (so each triggers a
+    real relevance call), each mocked to take 0.15s: sequential would take
+    >= 0.75s; concurrent (asyncio.gather, no bound here) should land close to
+    one call's delay."""
+    import asyncio
+    import time as time_module
+
+    async def _slow_complete(messages, temperature=0.0, max_tokens=64, **kwargs):
+        await asyncio.sleep(0.15)
+        return _FakeResp("[1]")
+
+    fake = _CountingLLM("[1]")
+    fake.complete = _slow_complete  # type: ignore[method-assign]
+
+    state = {
+        "obligaciones_extraidas": [
+            {"id": f"ob{i}", "descripcion": f"realizar informes tecnicos numero {i} consultoria"} for i in range(5)
+        ],
+        "evidence_raw": [
+            {"id": f"ev{i}", "content": f"informes tecnicos numero {i} realizados consultoria"} for i in range(5)
+        ],
+    }
+
+    start = time_module.perf_counter()
+    with patch.object(evidence_matcher, "get_llm", return_value=fake):
+        result = await evidence_matcher.evidence_matcher_node(state)
+    elapsed = time_module.perf_counter() - start
+
+    assert elapsed < 0.5, f"matcher calls took {elapsed:.3f}s — looks sequential, not concurrent"
+    assert len(result["matched_evidence"]) == 5
+
+
+@pytest.mark.asyncio
+async def test_matcher_result_order_matches_obligaciones_regardless_of_completion_order() -> None:
+    """Correctness under concurrency: obligaciones whose LLM calls complete
+    OUT OF ORDER (ob0's call is slowest, finishes last; ob2's is fastest,
+    finishes first) must still resolve to the CORRECT evidence per obligación
+    — `matched_evidence[ob_id]` always reflects that obligación's own LLM
+    answer, never a mixed-up one from whichever call finished first."""
+    import asyncio
+
+    # Each obligación matches a DIFFERENT single evidencia — if results got
+    # cross-assigned under concurrency, this would surface as the wrong
+    # evidencia id landing under the wrong obligación.
+    delays = {"ob0": 0.12, "ob1": 0.06, "ob2": 0.01}
+    respuestas = {"ob0": "[1]", "ob1": "[2]", "ob2": "[3]"}  # each obligación "picks" its own evidencia
+
+    async def _complete_with_variable_delay(messages, temperature=0.0, max_tokens=64, **kwargs):
+        prompt = messages[-1].content
+        ob_id = next(k for k in delays if k in prompt)
+        await asyncio.sleep(delays[ob_id])
+        return _FakeResp(respuestas[ob_id])
+
+    fake = _CountingLLM("[1]")
+    fake.complete = _complete_with_variable_delay  # type: ignore[method-assign]
+
+    state = {
+        "obligaciones_extraidas": [
+            # Obligación id embedded in its own descripcion so the fake LLM can
+            # recover which obligación a given prompt belongs to.
+            {"id": "ob0", "descripcion": "ob0 realizar informes tecnicos consultoria asesoria"},
+            {"id": "ob1", "descripcion": "ob1 realizar informes tecnicos consultoria asesoria"},
+            {"id": "ob2", "descripcion": "ob2 realizar informes tecnicos consultoria asesoria"},
+        ],
+        "evidence_raw": [
+            {"id": "primera", "content": "informes tecnicos consultoria asesoria realizados"},
+            {"id": "segunda", "content": "informes tecnicos consultoria asesoria completados"},
+            {"id": "tercera", "content": "informes tecnicos consultoria asesoria entregados"},
+        ],
+    }
+
+    with patch.object(evidence_matcher, "get_llm", return_value=fake):
+        result = await evidence_matcher.evidence_matcher_node(state)
+
+    matched = result["matched_evidence"]
+    assert [e["id"] for e in matched["ob0"]] == ["primera"]
+    assert [e["id"] for e in matched["ob1"]] == ["segunda"]
+    assert [e["id"] for e in matched["ob2"]] == ["tercera"]

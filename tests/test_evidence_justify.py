@@ -6,7 +6,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # evidence_orchestrator — drive + calendar merge (extended)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -155,3 +154,101 @@ async def test_evidence_justify_near_identical_llm_output_falls_back_determinist
     assert just["justificacion"] != texto_repetido
     assert just["actividad"] != just["justificacion"]
     assert just["origen"] == "seed"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Parallelization (radicacion-sin-friccion Phase 2 slice 2.6): every obligación's
+# justificación generation must run CONCURRENTLY, not one LLM call at a time.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_evidence_justify_runs_llm_calls_concurrently_not_sequentially():
+    """5 obligaciones, each with evidencia (so each triggers a real LLM call),
+    each mocked to take 0.15s: sequential would take >= 0.75s; concurrent
+    (asyncio.gather, no bound here) should land close to one call's delay."""
+    import asyncio
+    import time as time_module
+
+    from app.agent.nodes import evidence_justify as mod
+
+    async def _slow_complete(*args, **kwargs):
+        await asyncio.sleep(0.15)
+        resp = MagicMock()
+        resp.content = "ACTIVIDAD: Actividad genérica.\nJUSTIFICACION: Justificación genérica distinta."
+        return resp
+
+    mock_llm = AsyncMock()
+    mock_llm.complete = AsyncMock(side_effect=_slow_complete)
+
+    state = {
+        "obligaciones_contexto": [{"id": f"ob{i}", "descripcion": f"Obligación número {i}"} for i in range(5)],
+        "matched_evidence": {
+            f"ob{i}": [{"source": "drive", "title": f"doc{i}.pdf", "link": f"https://drive/{i}", "date": "2024-04-10"}]
+            for i in range(5)
+        },
+    }
+
+    start = time_module.perf_counter()
+    with patch.object(mod, "get_llm", return_value=mock_llm):
+        result = await mod.evidence_justify_node(state)
+    elapsed = time_module.perf_counter() - start
+
+    assert mock_llm.complete.await_count == 5
+    assert elapsed < 0.5, f"justify calls took {elapsed:.3f}s — looks sequential, not concurrent"
+    assert len(result["justificaciones"]) == 5
+
+
+@pytest.mark.asyncio
+async def test_evidence_justify_result_order_matches_obligaciones_regardless_of_completion_order():
+    """Correctness under concurrency: obligaciones whose LLM calls complete
+    OUT OF ORDER (the first-listed obligación's call is the SLOWEST here, so
+    it finishes LAST) must still land in the same position/content mapping as
+    the sequential loop would have produced — `justificaciones[i]` always
+    corresponds to `obligaciones[i]`, never to whichever call finished first."""
+    import asyncio
+
+    from app.agent.nodes import evidence_justify as mod
+
+    # ob0's call is slowest (finishes last); ob2's is fastest (finishes first).
+    delays = {"ob0": 0.12, "ob1": 0.06, "ob2": 0.01}
+    obligacion_text = {
+        "ob0": "Primera obligación del contrato",
+        "ob1": "Segunda obligación del contrato",
+        "ob2": "Tercera obligación del contrato",
+    }
+
+    async def _complete_with_variable_delay(messages, **kwargs):
+        # The obligación's own text is embedded in the prompt (see
+        # build_actividad_justificacion_prompt) — recover which obligación
+        # this call is for by matching prompt content back to delays.
+        user_msg = next(m for m in messages if m.role == "user")
+        ob_id = next(k for k, texto in obligacion_text.items() if texto in user_msg.content)
+        await asyncio.sleep(delays[ob_id])
+        resp = MagicMock()
+        resp.content = (
+            f"ACTIVIDAD: Actividad para {ob_id}.\nJUSTIFICACION: Justificación específica para {ob_id} distinta."
+        )
+        return resp
+
+    mock_llm = AsyncMock()
+    mock_llm.complete = AsyncMock(side_effect=_complete_with_variable_delay)
+
+    state = {
+        "obligaciones_contexto": [{"id": ob_id, "descripcion": texto} for ob_id, texto in obligacion_text.items()],
+        "matched_evidence": {
+            ob_id: [
+                {"source": "drive", "title": f"{ob_id}.pdf", "link": f"https://drive/{ob_id}", "date": "2024-04-10"}
+            ]
+            for ob_id in obligacion_text
+        },
+    }
+
+    with patch.object(mod, "get_llm", return_value=mock_llm):
+        result = await mod.evidence_justify_node(state)
+
+    justificaciones = result["justificaciones"]
+    assert [j["obligacion_id"] for j in justificaciones] == ["ob0", "ob1", "ob2"]
+    for j in justificaciones:
+        assert j["obligacion_id"] in j["actividad"]
+        assert j["obligacion_id"] in j["justificacion"]
