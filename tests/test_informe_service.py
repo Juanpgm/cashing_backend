@@ -419,6 +419,93 @@ async def test_zip_evidencias_estructura(
         assert zf.read(archivo)
 
 
+async def test_zip_evidencias_assembly_runs_off_event_loop(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The final zip-write (slice 2.1, perf/phase2-async-doc-generators) must
+    not block the event loop — a slow (mocked) sync assembly must not stall a
+    concurrent coroutine."""
+    import asyncio
+    import time as time_module
+
+    user = test_user["user"]
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: _fake_storage())
+
+    def _slow_build_zip(_miembros: list[tuple[str, bytes]]) -> bytes:
+        time_module.sleep(0.2)
+        return b"fake-zip-bytes"
+
+    monkeypatch.setattr(informe_service, "_construir_zip_evidencias", _slow_build_zip)
+
+    tracker_ticks: list[float] = []
+
+    async def _tracker() -> None:
+        loop = asyncio.get_event_loop()
+        start = loop.time()
+        for _ in range(10):
+            await asyncio.sleep(0.02)
+            tracker_ticks.append(loop.time() - start)
+
+    (contenido, _filename), _ = await asyncio.gather(
+        informe_service.generar_zip_evidencias(db, user.id, cuenta.id),
+        _tracker(),
+    )
+
+    assert contenido == b"fake-zip-bytes"
+    assert tracker_ticks[-1] < 0.35, (
+        f"tracker was delayed past the offloaded assembly — got {tracker_ticks[-1]:.3f}s, expected ~0.2s"
+    )
+
+
+async def test_zip_evidencias_assembly_propagates_exception(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An exception raised inside the threaded zip-assembly call must propagate
+    to the async caller unchanged — this path has no fail-open wrapper around
+    the zip write itself."""
+    user = test_user["user"]
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: _fake_storage())
+
+    class _ZipBuildFailureError(RuntimeError):
+        pass
+
+    def _boom(_miembros: list[tuple[str, bytes]]) -> bytes:
+        raise _ZipBuildFailureError("zip assembly failed")
+
+    monkeypatch.setattr(informe_service, "_construir_zip_evidencias", _boom)
+
+    with pytest.raises(_ZipBuildFailureError, match="zip assembly failed"):
+        await informe_service.generar_zip_evidencias(db, user.id, cuenta.id)
+
+
+async def test_zip_evidencias_assembly_never_receives_db_session(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The threaded zip-assembly call must never receive the AsyncSession (or
+    any coroutine) — the member list is fully built (all downloads awaited) on
+    the async side before this call."""
+    import inspect
+
+    user = test_user["user"]
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: _fake_storage())
+
+    real_build_zip = informe_service._construir_zip_evidencias
+    captured: dict[str, object] = {}
+
+    def _spy(*args: object, **kwargs: object) -> bytes:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return real_build_zip(*args, **kwargs)
+
+    monkeypatch.setattr(informe_service, "_construir_zip_evidencias", _spy)
+
+    await informe_service.generar_zip_evidencias(db, user.id, cuenta.id)
+
+    all_values = list(captured["args"]) + list(captured["kwargs"].values())  # type: ignore[arg-type]
+    assert not any(isinstance(v, AsyncSession) for v in all_values)
+    assert not any(inspect.iscoroutine(v) for v in all_values)
+
+
 async def test_ownership_otro_usuario_falla(db: AsyncSession, cuenta: CuentaCobro) -> None:
     fake_user_id = uuid.uuid4()
     with pytest.raises(ForbiddenError):

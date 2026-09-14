@@ -1889,20 +1889,31 @@ async def generar_zip_evidencias(
             code=PACKAGE_PENDIENTE,
         )
 
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for arcname, contenido in miembros_zip:
-            zf.writestr(arcname, contenido)
+    # _construir_zip_evidencias (zipfile write + deflate compression) is
+    # CPU-bound; off the event loop like document_service.py's parse_document.
+    # miembros_zip is fully built (every download already awaited) — the
+    # thread never touches `db`.
+    contenido_zip = await asyncio.to_thread(_construir_zip_evidencias, miembros_zip)
 
     filename = f"evidencias-{contrato.numero_contrato}-{cuenta.anio}-{cuenta.mes:02d}.zip"
     await logger.ainfo(
         "zip_evidencias_generado",
         cuenta_id=str(cuenta_id),
         usuario_id=str(usuario_id),
-        size=len(buf.getvalue()),
+        size=len(contenido_zip),
         modo=modo,
         pendientes=len(pendientes_desc),
         evidencias_empacadas=evidencias_empacadas,
         evidencias_fallidas=evidencias_fallidas,
     )
-    return buf.getvalue(), filename
+    return contenido_zip, filename
+
+
+def _construir_zip_evidencias(miembros_zip: list[tuple[str, bytes]]) -> bytes:
+    """Pure sync zip assembly — no DB/async I/O. Safe to run via
+    `asyncio.to_thread` (every member's bytes are already resolved)."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for arcname, contenido in miembros_zip:
+            zf.writestr(arcname, contenido)
+    return buf.getvalue()
