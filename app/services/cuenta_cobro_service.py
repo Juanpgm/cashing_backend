@@ -14,6 +14,7 @@ from jinja2 import BaseLoader, Environment
 from sqlalchemy import ColumnElement, func, or_, select
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import update as sa_update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -404,6 +405,19 @@ async def crear_cuenta_cobro(
     # from the count of existing active cuotas, promote to posicion=primera when it's
     # the contrato's first. informe_final is NEVER inferred — only ever set explicitly
     # via `data.informe_final`. Both invariants are checked BEFORE the insert.
+    #
+    # KNOWN GAP (radicacion-sin-friccion slice 4.2 concurrency audit): unlike
+    # `(contrato_id, mes, anio)` below, `numero_cuota` and `posicion=primera` have
+    # NO backing DB constraint (verified against `models/cuenta_cobro.py` —
+    # only `uq_contrato_mes_anio` exists). Two concurrent creates for the SAME
+    # contrato (even with DIFFERENT mes/anio) can both pass these SELECT-based
+    # checks before either INSERTs, both compute numero_cuota=1/posicion=PRIMERA,
+    # and both succeed at the DB level — no IntegrityError to catch, since
+    # nothing here is unique-constrained. Fixing this for real needs a new
+    # partial unique index (e.g. on `(contrato_id) WHERE posicion='primera' AND
+    # deleted_at IS NULL`) plus a migration — a schema/design decision out of
+    # this slice's scope. Flagged here rather than silently fixed or ignored;
+    # see the slice 4.2 apply report for the investigation.
     if data.numero_cuota is not None:
         await _verificar_numero_cuota_libre(db, data.contrato_id, data.numero_cuota)
         numero_cuota = data.numero_cuota
@@ -414,17 +428,6 @@ async def crear_cuenta_cobro(
         await _verificar_conflicto_posicion(db, data.contrato_id, posicion_primera=True)
     if data.informe_final:
         await _verificar_conflicto_posicion(db, data.contrato_id, informe_final=True)
-
-    # Deduct credits
-    usuario.creditos_disponibles -= costo
-    db.add(
-        Credito(
-            usuario_id=usuario_id,
-            cantidad=-costo,
-            tipo=TipoCredito.CONSUMO,
-            referencia=f"cuenta_cobro:{data.contrato_id}:{data.anio}-{data.mes:02d}",
-        )
-    )
 
     cuenta = CuentaCobro(
         contrato_id=data.contrato_id,
@@ -437,8 +440,39 @@ async def crear_cuenta_cobro(
         informe_final=data.informe_final,
         fecha_transaccion=data.fecha_transaccion,
     )
-    db.add(cuenta)
-    await db.flush()
+
+    # Deduct credits + insert the cuenta, guarded against the TOCTOU race
+    # (radicacion-sin-friccion slice 4.2): two concurrent requests for the same
+    # (contrato_id, mes, anio) can both pass the uniqueness SELECT above before
+    # either commits — `uq_contrato_mes_anio` is the real backstop, and the
+    # loser's INSERT raises `IntegrityError` at flush() time. A PLAIN
+    # `db.rollback()` (not a nested SAVEPOINT — this is the request's only
+    # unit of work, nothing else was durably written before this point: the
+    # tombstone hard-delete above is naturally idempotent to repeat) undoes
+    # the credit deduction + `Credito` ledger row + cuenta insert TOGETHER, so
+    # the loser never ends up debited for a request that didn't actually
+    # create a cuenta. (A nested SAVEPOINT was tried first but corrupts under
+    # this test suite's SQLite `StaticPool` — two concurrently-open sessions
+    # share ONE physical connection, so their SAVEPOINT name counters collide;
+    # not a concern in production, where each request gets its own Postgres
+    # connection, but a plain rollback avoids the test-harness hazard too.)
+    try:
+        usuario.creditos_disponibles -= costo
+        db.add(
+            Credito(
+                usuario_id=usuario_id,
+                cantidad=-costo,
+                tipo=TipoCredito.CONSUMO,
+                referencia=f"cuenta_cobro:{data.contrato_id}:{data.anio}-{data.mes:02d}",
+            )
+        )
+        db.add(cuenta)
+        await db.flush()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise AlreadyExistsError(
+            "CuentaCobro", f"contrato={data.contrato_id} mes={data.mes}/{data.anio}", code=CUENTA_MES_DUPLICADA
+        ) from exc
     # `actividades` (lazy="selectin") is marked unloaded even on a brand-new,
     # just-inserted object — SQLAlchemy's selectin strategy tracks "needs a query"
     # independently of any pre-flush access, so accessing it later synchronously
