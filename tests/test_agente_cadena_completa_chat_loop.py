@@ -297,6 +297,18 @@ async def test_realistic_multi_turn_chat_loop_threads_tool_calls_to_a_real_radic
     await db.refresh(contrato)
     cuenta = (await db.execute(select(CuentaCobro).where(CuentaCobro.contrato_id == contrato.id))).scalar_one()
     assert cuenta.requisitos_modo is not None
+    # Captured once, right after the fresh fetch above, while `cuenta` is not yet
+    # expired: every later reference in this test only needs the (immutable)
+    # primary key, never re-reads `cuenta` as a live ORM object. This is
+    # deliberate (radicacion-sin-friccion slice 2.4a) — `cuenta` goes through
+    # several more `db.rollback()`s below (each one fully expiring the session,
+    # same as `usuario`/`convo`/`contrato`'s own comments explain), and nothing
+    # here re-queries or `db.refresh()`s `cuenta` itself afterward. Before this
+    # slice flipped `Contrato.cuentas_cobro` off `lazy="selectin"`, that
+    # `await db.refresh(contrato)` calls below silently ALSO re-populated this
+    # exact `cuenta` row as a side effect of the (now-removed) eager cascade —
+    # an accidental refresh this test never asked for and shouldn't rely on.
+    cuenta_id = cuenta.id
 
     # --- Turn 2: attaches only the 6 mandatory soportes — the most a real
     # user can ever attach in one message through `POST /api/v1/agent/chat`
@@ -341,7 +353,7 @@ async def test_realistic_multi_turn_chat_loop_threads_tool_calls_to_a_real_radic
     tipos_importados = {d.tipo.value for d in documentos}
     assert {tipo for tipo, _filename in _SOPORTES} <= tipos_importados
 
-    actividades = (await db.execute(select(Actividad).where(Actividad.cuenta_cobro_id == cuenta.id))).scalars().all()
+    actividades = (await db.execute(select(Actividad).where(Actividad.cuenta_cobro_id == cuenta_id))).scalars().all()
     cubiertas = [a for a in actividades if a.obligacion_id is not None]
     assert len(cubiertas) == len(_OBLIGACIONES_REALISTAS)
 
@@ -384,21 +396,21 @@ async def test_realistic_multi_turn_chat_loop_threads_tool_calls_to_a_real_radic
     # --- REAL outcome assertions after turn 3 -------------------------------
     await db.refresh(contrato)
     evidencias = (
-        (await db.execute(select(Evidencia).join(Actividad).where(Actividad.cuenta_cobro_id == cuenta.id)))
+        (await db.execute(select(Evidencia).join(Actividad).where(Actividad.cuenta_cobro_id == cuenta_id)))
         .scalars()
         .all()
     )
     assert len(evidencias) == len(_EVIDENCIAS)
 
     informes = (
-        (await db.execute(select(DocumentoFuente).where(DocumentoFuente.cuenta_cobro_id == cuenta.id))).scalars().all()
+        (await db.execute(select(DocumentoFuente).where(DocumentoFuente.cuenta_cobro_id == cuenta_id))).scalars().all()
     )
     assert {"informe_actividades", "informe_supervision"} <= {d.tipo.value for d in informes}
 
     # Stand-in for descubrir_evidencias + persistir_evidencias (see docstring)
     # — only possible now that crear_actividades_desde_obligaciones (turn 2)
     # created the Actividad rows this needs.
-    await _cover_evidencia_justificaciones(db, cuenta.id)
+    await _cover_evidencia_justificaciones(db, cuenta_id)
 
     # --- Turn 4: confirms with no new attachments — resumes from the recap at
     # `preparar_radicacion` (its newest `ok` entry is `resumen_checklist`), and
@@ -413,7 +425,7 @@ async def test_realistic_multi_turn_chat_loop_threads_tool_calls_to_a_real_radic
     assert [e.tool for e in turn4.tool_events] == ["preparar_radicacion", "radicar_cuenta"]
     assert all(e.status == "ok" for e in turn4.tool_events), [(e.tool, e.status, e.resumen) for e in turn4.tool_events]
 
-    persistida = await db.get(CuentaCobro, cuenta.id)
+    persistida = await db.get(CuentaCobro, cuenta_id)
     assert persistida is not None
     assert persistida.estado == EstadoCuentaCobro.ENVIADA
     assert persistida.fecha_envio is not None
