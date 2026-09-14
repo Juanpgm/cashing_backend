@@ -22,7 +22,7 @@ from typing import Any, Protocol
 
 import httpx
 import structlog
-from sqlalchemy import ColumnElement, or_, select
+from sqlalchemy import ColumnElement, inspect, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -297,10 +297,51 @@ async def _seed_catalogo_si_vacio(db: AsyncSession) -> None:
     await db.flush()
 
 
+# `AsyncSession.info` key for the per-session catalog cache below. Private/
+# module-prefixed to avoid clashing with any other code that also stashes data
+# on `db.info` (a plain shared dict, not a namespaced store).
+_CATALOGO_CACHE_KEY = "app.services.checklist_service:catalogo_cache"
+
+
 async def listar_catalogo(db: AsyncSession) -> list[RequisitoDocumento]:
+    """Return the full standard requisito catalog, seeding/backfilling it first.
+
+    Perf (radicacion-sin-friccion slice 2.5): cached per `AsyncSession` via
+    `db.info` — NOT process-wide (no `functools.lru_cache`/module-level
+    constant). A process-wide cache would be unsafe here: this test suite (and
+    any fresh-DB scenario) drops and recreates the schema per test WITHOUT
+    restarting the process, so a process-level cache would silently skip
+    `_seed_catalogo_si_vacio`'s backfill for every session after the first,
+    returning stale/detached rows for a DB that no longer — or not yet —
+    contains them. `RequisitoDocumento` rows are only ever written by this
+    function's own seed step (confirmed: no other code path calls
+    `db.add(RequisitoDocumento(...))`), so within a single session's lifetime
+    the underlying table cannot change out from under an already-cached
+    result — caching on `db.info` is safe and dies naturally with the session
+    (fresh per request via `get_db`, fresh per test via the `db` fixture),
+    which is also exactly why this saves real queries: several endpoints
+    (`refresh-secop`, `auto-vincular-documentos`, the checklist PATCH/generar
+    flows) call this function — directly or via `asegurar_checklist` —
+    multiple times within the SAME request.
+
+    A `db.rollback()` mid-session (e.g. `/refresh-secop`'s pass-level-exception
+    handler) does NOT clear `db.info` — but it DOES expire every persistent
+    object in the session, including our cached `RequisitoDocumento` rows.
+    Synchronously accessing an attribute on an expired instance outside of a
+    driver greenlet raises `sqlalchemy.exc.MissingGreenlet` (confirmed via a
+    real repro against this exact rollback flow) instead of gracefully
+    reloading, so the cache is validated on every read: `inspect(...).expired`
+    is a cheap, synchronous, zero-IO check, and a stale/expired cache is
+    treated as a miss and rebuilt.
+    """
+    cached = db.info.get(_CATALOGO_CACHE_KEY)
+    if cached is not None and (not cached or not inspect(cached[0]).expired):
+        return cached
     await _seed_catalogo_si_vacio(db)
     res = await db.execute(select(RequisitoDocumento).order_by(RequisitoDocumento.orden))
-    return list(res.scalars().all())
+    catalogo = list(res.scalars().all())
+    db.info[_CATALOGO_CACHE_KEY] = catalogo
+    return catalogo
 
 
 # Default mode when a cuenta has not resolved the gate yet. Treating None as
@@ -2685,8 +2726,20 @@ async def construir_checklist_completo(
     # Fetch uploaded-document candidates for this contract.
     # Load ALL docs linked to this contract (not just by tipo) so we can also
     # match by categoria (which is more semantic and reliable than tipo).
-    contrato_res = await db.execute(select(Contrato).where(Contrato.id == cuenta.contrato_id))
-    contrato = contrato_res.scalar_one()
+    #
+    # Perf (radicacion-sin-friccion slice 2.5): every production call site loads
+    # `cuenta` via `cuenta_cobro_service._get_cuenta_con_ownership`, which already
+    # `selectinload(CuentaCobro.contrato)`s it — re-querying it here was a pure
+    # redundant round-trip. Reuse it when already loaded; fall back to an explicit
+    # query when it isn't (many direct-service-call unit tests build `cuenta`
+    # without eager-loading `contrato` — accessing an unloaded relationship on a
+    # fresh session raises `sqlalchemy.exc.MissingGreenlet`, confirmed by probe, it
+    # does NOT gracefully lazy-load-with-one-query the way sync SQLAlchemy would).
+    if "contrato" not in inspect(cuenta).unloaded:
+        contrato = cuenta.contrato
+    else:
+        contrato_res = await db.execute(select(Contrato).where(Contrato.id == cuenta.contrato_id))
+        contrato = contrato_res.scalar_one()
     # SECOP docs for the contract (fuzzy-matched) — used to compute on-the-fly
     # candidates for custom requisitos, whose candidates are NOT persisted in
     # documento_checklist_candidatos (that table's FK targets the standard catalog).
