@@ -101,6 +101,42 @@ async def test_actualizar_contrato_query_count_lower_than_pre_fix_baseline(
     query_counter.assert_budget(8, label="PATCH /api/v1/contratos/{id}")
 
 
+async def test_actualizar_contrato_valor_fields_match_db_normalized_scale(
+    client: AsyncClient, db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
+) -> None:
+    """Field-scale edge case: PATCHing a monetary field with a value that has
+    fewer decimal digits than the column's NUMERIC(15, 2) scale (e.g. one
+    decimal digit) must come back DB-normalized (two decimal digits), not the
+    raw un-normalized value the caller sent. Postgres normalizes scale only on
+    a round-trip through the DB (INSERT/UPDATE + re-read) — the in-session
+    Python object never sees that normalization on its own, so the response
+    must be built from a value that was actually re-fetched from the DB."""
+    headers = test_user["headers"]
+
+    resp = await client.patch(
+        f"/api/v1/contratos/{contrato.id}",
+        headers=headers,
+        json={"valor_total": "1000000.5", "valor_adicion": "500000.1", "valor_mensual": "1234567.8"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["valor_total"] == "1000000.50"
+    assert body["valor_adicion"] == "500000.10"
+    assert body["valor_mensual"] == "1234567.80"
+
+    # `populate_existing()` forces this query to overwrite the fixture object's
+    # already-identity-mapped attributes with what's actually in the DB right
+    # now — a plain `select()` would silently return the stale pre-PATCH values
+    # cached from the fixture's own setup, proving nothing about persistence.
+    row = (
+        await db.execute(select(Contrato).where(Contrato.id == contrato.id).execution_options(populate_existing=True))
+    ).scalar_one()
+    assert str(row.valor_total) == "1000000.50"
+    assert str(row.valor_adicion) == "500000.10"
+    assert str(row.valor_mensual) == "1234567.80"
+
+
 async def test_actualizar_contrato_preserves_secop_enrichment(
     client: AsyncClient, db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
 ) -> None:
@@ -183,6 +219,31 @@ async def test_crear_cuenta_cobro_response_fields_match_persisted_row(
     assert float(row.valor) == 1_500_000.0
 
 
+async def test_crear_cuenta_cobro_valor_matches_db_normalized_scale(
+    client: AsyncClient, db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
+) -> None:
+    """Field-scale edge case: POSTing `valor` with one decimal digit must come
+    back DB-normalized to the column's NUMERIC(15, 2) scale (two decimal
+    digits), not the raw un-normalized value. Reproduces the reviewer's exact
+    probe: a fresh independent re-query of the same row must match the
+    response body exactly."""
+    headers = test_user["headers"]
+
+    resp = await client.post(
+        "/api/v1/cuentas-cobro/",
+        headers=headers,
+        json={"contrato_id": str(contrato.id), "mes": 9, "anio": 2024, "valor": "1234567.8"},
+    )
+
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["valor"] == "1234567.80"
+
+    row = (await db.execute(select(CuentaCobro).where(CuentaCobro.id == uuid.UUID(body["id"])))).scalar_one()
+    assert str(row.valor) == "1234567.80"
+    assert str(row.valor) == body["valor"]
+
+
 # ── cuenta_cobro_service: actualizar_cuenta_cobro ────────────────────────────
 
 
@@ -218,6 +279,37 @@ async def test_actualizar_cuenta_cobro_response_reflects_update(
     assert body["mes"] == 8
     assert body["anio"] == 2025
     assert body["contexto_usuario"] == "Nuevo contexto del mes"
+
+
+async def test_actualizar_cuenta_cobro_valor_matches_db_normalized_scale(
+    client: AsyncClient, db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro
+) -> None:
+    """Field-scale edge case: PATCHing `valor` with one decimal digit must come
+    back DB-normalized to the column's NUMERIC(15, 2) scale (two decimal
+    digits), reproducing the reviewer's exact probe against the update path."""
+    headers = test_user["headers"]
+
+    resp = await client.patch(
+        f"/api/v1/cuentas-cobro/{cuenta.id}",
+        headers=headers,
+        json={"valor": "1234567.8"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["valor"] == "1234567.80"
+
+    # `populate_existing()` forces this query to overwrite the fixture object's
+    # already-identity-mapped attributes with what's actually in the DB right
+    # now — a plain `select()` would silently return the stale pre-PATCH value
+    # cached from the fixture's own setup, proving nothing about persistence.
+    row = (
+        await db.execute(
+            select(CuentaCobro).where(CuentaCobro.id == cuenta.id).execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+    assert str(row.valor) == "1234567.80"
+    assert str(row.valor) == body["valor"]
 
 
 # ── cuenta_cobro_service: cambiar_estado generic (non-ENVIADA) branch ────────

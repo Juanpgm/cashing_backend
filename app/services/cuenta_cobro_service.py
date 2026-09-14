@@ -430,7 +430,7 @@ async def crear_cuenta_cobro(
         contrato_id=data.contrato_id,
         mes=data.mes,
         anio=data.anio,
-        valor=float(valor),
+        valor=valor,
         estado=EstadoCuentaCobro.BORRADOR,
         numero_cuota=numero_cuota,
         posicion=posicion,
@@ -447,7 +447,12 @@ async def crear_cuenta_cobro(
     # necessary, not the redundant full multi-relationship reload this replaces —
     # populates it correctly (it will always resolve to `[]` here; nothing has been
     # added to this brand-new cuenta yet).
-    await db.refresh(cuenta, attribute_names=["actividades"])
+    # `valor` is also refreshed here: Postgres normalizes NUMERIC(15, 2) scale
+    # only on a DB round-trip (e.g. this refresh's re-SELECT) — the in-memory
+    # `Decimal` we just assigned above keeps whatever scale the caller sent
+    # (e.g. "1234567.8"), so without this the response would silently disagree
+    # with what a fresh GET of the same row returns ("1234567.80").
+    await db.refresh(cuenta, attribute_names=["actividades", "valor"])
 
     # The checklist is NOT materialised here: the cuenta nace con requisitos_modo
     # = NULL so the post-creation gate can ask the user how to build the checklist
@@ -1854,7 +1859,7 @@ async def actualizar_cuenta_cobro(
         cuenta.anio = nuevo_anio
 
     if data.valor is not None:
-        cuenta.valor = float(data.valor)
+        cuenta.valor = data.valor
 
     if data.informe_final is not None and data.informe_final != cuenta.informe_final:
         if data.informe_final:
@@ -1880,7 +1885,10 @@ async def actualizar_cuenta_cobro(
     # expired, and a later synchronous read inside `CuentaCobroResponse.model_
     # validate` (Pydantic cannot `await`) would raise `MissingGreenlet`. One
     # targeted, awaited refresh restores just that column.
-    await db.refresh(cuenta, attribute_names=["updated_at"])
+    # `valor` rides along on the same refresh: Postgres only normalizes
+    # NUMERIC(15, 2) scale on a DB round-trip, so a value like "1234567.8" sent
+    # by the caller stays un-normalized in-memory until re-fetched here.
+    await db.refresh(cuenta, attribute_names=["updated_at", "valor"])
     await logger.ainfo(
         "cuenta_cobro_actualizada",
         cuenta_id=str(cuenta_id),

@@ -236,8 +236,6 @@ async def actualizar_contrato(
         raise ValidationError("La fecha de fin debe ser posterior a la fecha de inicio.")
 
     for field, value in updates.items():
-        if field in ("valor_total", "valor_adicion", "valor_mensual") and value is not None:
-            value = float(value)
         setattr(contrato, field, value)
 
     await db.flush()
@@ -248,7 +246,11 @@ async def actualizar_contrato(
     # (Pydantic's attribute walk cannot `await`) raises `MissingGreenlet`. One
     # targeted, awaited refresh restores just that column — genuinely necessary,
     # not the redundant multi-relationship reload this call site used to pay for.
-    await db.refresh(contrato, attribute_names=["updated_at"])
+    # The 3 monetary columns ride along on the same refresh: Postgres only
+    # normalizes NUMERIC(15, 2) scale on a DB round-trip, so a value like
+    # "1000000.5" sent by the caller stays un-normalized in-memory until
+    # re-fetched here — otherwise the response would disagree with a fresh GET.
+    await db.refresh(contrato, attribute_names=["updated_at", "valor_total", "valor_adicion", "valor_mensual"])
     # Only scalar columns were mutated above (never `.obligaciones` itself) — the
     # in-session `contrato` object (already eager-loaded by `_get_contrato_con_
     # ownership`) remains accurate after `flush()`, so a full re-SELECT is
