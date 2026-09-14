@@ -624,7 +624,9 @@ async def _tipo_informe_desde_plantilla(
             return None
         storage = _get_storage(settings.S3_BUCKET_DOCUMENTOS)
         original = await storage.download(doc_fuente.storage_key)
-        doc = Document(io.BytesIO(original))
+        # Document() parses the whole docx XML tree; off the event loop like
+        # document_service.py's parse_document.
+        doc = await asyncio.to_thread(Document, io.BytesIO(original))
         return _resolver_tipo_informe(
             cuenta,
             texto_direccion(doc, campo.get("direccion", "")),
@@ -713,7 +715,9 @@ async def _generar_docx_clonado(
         original = await storage.download(doc_fuente.storage_key)
 
         valores = await _valores_plantilla(db, cuenta, contrato)
-        doc_original = Document(io.BytesIO(original))
+        # Document() parses the whole docx XML tree; off the event loop like
+        # document_service.py's parse_document.
+        doc_original = await asyncio.to_thread(Document, io.BytesIO(original))
         for campo in campos:
             if campo.get("campo") == "computed.tipo_informe" and campo.get("modo") == "checkbox":
                 tipo = _resolver_tipo_informe(
@@ -792,7 +796,11 @@ async def _generar_docx_clonado(
                 campos=campos_blanqueados,
             )
 
-        return rellenar(original, campos, valores)
+        # rellenar (python-docx fill+save) is CPU-bound; off the event loop like
+        # document_service.py's parse_document. Everything DB-derived (valores,
+        # justificaciones, campos) is already resolved above — the thread never
+        # touches `db`.
+        return await asyncio.to_thread(rellenar, original, campos, valores)
     except Exception:
         await logger.awarning(
             "informe_clonado_fallback",
