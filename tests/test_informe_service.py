@@ -150,6 +150,90 @@ async def test_informe_actividades_genera_docx_valido(
     )
 
 
+async def test_informe_actividades_docx_build_runs_off_event_loop(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro
+) -> None:
+    """The from-scratch DOCX build (slice 2.1, perf/phase2-async-doc-generators)
+    must not block the event loop — a slow (mocked) sync builder call must not
+    stall a concurrently scheduled coroutine."""
+    import asyncio
+    import time as time_module
+
+    user = test_user["user"]
+
+    def _slow_build(*_args: object, **_kwargs: object) -> bytes:
+        time_module.sleep(0.2)
+        return b"fake-docx-bytes"
+
+    tracker_ticks: list[float] = []
+
+    async def _tracker() -> None:
+        loop = asyncio.get_event_loop()
+        start = loop.time()
+        for _ in range(10):
+            await asyncio.sleep(0.02)
+            tracker_ticks.append(loop.time() - start)
+
+    with patch(
+        "app.services.informe_service._construir_informe_actividades_docx",
+        side_effect=_slow_build,
+    ):
+        await asyncio.gather(
+            informe_service.generar_informe_actividades_docx(db, user.id, cuenta.id),
+            _tracker(),
+        )
+
+    assert tracker_ticks[-1] < 0.35, (
+        f"tracker was delayed past the offloaded build — got {tracker_ticks[-1]:.3f}s, expected ~0.2s"
+    )
+
+
+async def test_informe_actividades_docx_build_propagates_exception(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro
+) -> None:
+    """An exception raised inside the threaded DOCX-build call must propagate to
+    the async caller unchanged."""
+    user = test_user["user"]
+
+    class _DocxBuildFailureError(RuntimeError):
+        pass
+
+    with (
+        patch(
+            "app.services.informe_service._construir_informe_actividades_docx",
+            side_effect=_DocxBuildFailureError("docx build failed"),
+        ),
+        pytest.raises(_DocxBuildFailureError, match="docx build failed"),
+    ):
+        await informe_service.generar_informe_actividades_docx(db, user.id, cuenta.id)
+
+
+async def test_informe_actividades_docx_build_never_receives_db_session(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro
+) -> None:
+    """The offloaded sync builder must never be handed the AsyncSession (or any
+    coroutine) — it runs on a worker thread and touching an AsyncSession there
+    would be unsafe. All DB reads happen on the async side, before the call."""
+    import inspect
+
+    user = test_user["user"]
+    captured: dict[str, object] = {}
+
+    real_builder = informe_service._construir_informe_actividades_docx
+
+    def _spy(*args: object, **kwargs: object) -> bytes:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return real_builder(*args, **kwargs)
+
+    with patch("app.services.informe_service._construir_informe_actividades_docx", side_effect=_spy):
+        await informe_service.generar_informe_actividades_docx(db, user.id, cuenta.id)
+
+    all_values = list(captured["args"]) + list(captured["kwargs"].values())  # type: ignore[arg-type]
+    assert not any(isinstance(v, AsyncSession) for v in all_values)
+    assert not any(inspect.iscoroutine(v) for v in all_values)
+
+
 # ── es_borrador machine-readable field (slice #7, task 7.5d) ────────────────
 
 
@@ -210,6 +294,88 @@ async def test_informe_supervision_genera_docx_valido(
     assert any("Carlos Supervisor" in tx for tx in table_texts)
 
 
+async def test_informe_supervision_docx_build_runs_off_event_loop(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro
+) -> None:
+    """The from-scratch DOCX build (slice 2.1, perf/phase2-async-doc-generators)
+    must not block the event loop."""
+    import asyncio
+    import time as time_module
+
+    user = test_user["user"]
+
+    def _slow_build(*_args: object, **_kwargs: object) -> bytes:
+        time_module.sleep(0.2)
+        return b"fake-docx-bytes"
+
+    tracker_ticks: list[float] = []
+
+    async def _tracker() -> None:
+        loop = asyncio.get_event_loop()
+        start = loop.time()
+        for _ in range(10):
+            await asyncio.sleep(0.02)
+            tracker_ticks.append(loop.time() - start)
+
+    with patch(
+        "app.services.informe_service._construir_informe_supervision_docx",
+        side_effect=_slow_build,
+    ):
+        await asyncio.gather(
+            informe_service.generar_informe_supervision_docx(db, user.id, cuenta.id),
+            _tracker(),
+        )
+
+    assert tracker_ticks[-1] < 0.35, (
+        f"tracker was delayed past the offloaded build — got {tracker_ticks[-1]:.3f}s, expected ~0.2s"
+    )
+
+
+async def test_informe_supervision_docx_build_propagates_exception(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro
+) -> None:
+    """An exception raised inside the threaded DOCX-build call must propagate to
+    the async caller unchanged."""
+    user = test_user["user"]
+
+    class _DocxBuildFailureError(RuntimeError):
+        pass
+
+    with (
+        patch(
+            "app.services.informe_service._construir_informe_supervision_docx",
+            side_effect=_DocxBuildFailureError("docx build failed"),
+        ),
+        pytest.raises(_DocxBuildFailureError, match="docx build failed"),
+    ):
+        await informe_service.generar_informe_supervision_docx(db, user.id, cuenta.id)
+
+
+async def test_informe_supervision_docx_build_never_receives_db_session(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro
+) -> None:
+    """The offloaded sync builder must never be handed the AsyncSession (or any
+    coroutine)."""
+    import inspect
+
+    user = test_user["user"]
+    captured: dict[str, object] = {}
+
+    real_builder = informe_service._construir_informe_supervision_docx
+
+    def _spy(*args: object, **kwargs: object) -> bytes:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return real_builder(*args, **kwargs)
+
+    with patch("app.services.informe_service._construir_informe_supervision_docx", side_effect=_spy):
+        await informe_service.generar_informe_supervision_docx(db, user.id, cuenta.id)
+
+    all_values = list(captured["args"]) + list(captured["kwargs"].values())  # type: ignore[arg-type]
+    assert not any(isinstance(v, AsyncSession) for v in all_values)
+    assert not any(inspect.iscoroutine(v) for v in all_values)
+
+
 # ── ZIP evidencias ─────────────────────────────────────────────────────────
 
 
@@ -251,6 +417,93 @@ async def test_zip_evidencias_estructura(
         assert leemes == []
         archivo = next(n for n in names if n.startswith("01_") and n.endswith("soporte.pdf"))
         assert zf.read(archivo)
+
+
+async def test_zip_evidencias_assembly_runs_off_event_loop(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The final zip-write (slice 2.1, perf/phase2-async-doc-generators) must
+    not block the event loop — a slow (mocked) sync assembly must not stall a
+    concurrent coroutine."""
+    import asyncio
+    import time as time_module
+
+    user = test_user["user"]
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: _fake_storage())
+
+    def _slow_build_zip(_miembros: list[tuple[str, bytes]]) -> bytes:
+        time_module.sleep(0.2)
+        return b"fake-zip-bytes"
+
+    monkeypatch.setattr(informe_service, "_construir_zip_evidencias", _slow_build_zip)
+
+    tracker_ticks: list[float] = []
+
+    async def _tracker() -> None:
+        loop = asyncio.get_event_loop()
+        start = loop.time()
+        for _ in range(10):
+            await asyncio.sleep(0.02)
+            tracker_ticks.append(loop.time() - start)
+
+    (contenido, _filename), _ = await asyncio.gather(
+        informe_service.generar_zip_evidencias(db, user.id, cuenta.id),
+        _tracker(),
+    )
+
+    assert contenido == b"fake-zip-bytes"
+    assert tracker_ticks[-1] < 0.35, (
+        f"tracker was delayed past the offloaded assembly — got {tracker_ticks[-1]:.3f}s, expected ~0.2s"
+    )
+
+
+async def test_zip_evidencias_assembly_propagates_exception(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An exception raised inside the threaded zip-assembly call must propagate
+    to the async caller unchanged — this path has no fail-open wrapper around
+    the zip write itself."""
+    user = test_user["user"]
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: _fake_storage())
+
+    class _ZipBuildFailureError(RuntimeError):
+        pass
+
+    def _boom(_miembros: list[tuple[str, bytes]]) -> bytes:
+        raise _ZipBuildFailureError("zip assembly failed")
+
+    monkeypatch.setattr(informe_service, "_construir_zip_evidencias", _boom)
+
+    with pytest.raises(_ZipBuildFailureError, match="zip assembly failed"):
+        await informe_service.generar_zip_evidencias(db, user.id, cuenta.id)
+
+
+async def test_zip_evidencias_assembly_never_receives_db_session(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The threaded zip-assembly call must never receive the AsyncSession (or
+    any coroutine) — the member list is fully built (all downloads awaited) on
+    the async side before this call."""
+    import inspect
+
+    user = test_user["user"]
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: _fake_storage())
+
+    real_build_zip = informe_service._construir_zip_evidencias
+    captured: dict[str, object] = {}
+
+    def _spy(*args: object, **kwargs: object) -> bytes:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return real_build_zip(*args, **kwargs)
+
+    monkeypatch.setattr(informe_service, "_construir_zip_evidencias", _spy)
+
+    await informe_service.generar_zip_evidencias(db, user.id, cuenta.id)
+
+    all_values = list(captured["args"]) + list(captured["kwargs"].values())  # type: ignore[arg-type]
+    assert not any(isinstance(v, AsyncSession) for v in all_values)
+    assert not any(inspect.iscoroutine(v) for v in all_values)
 
 
 async def test_ownership_otro_usuario_falla(db: AsyncSession, cuenta: CuentaCobro) -> None:
@@ -1104,6 +1357,169 @@ async def test_hay_plantilla_organismo_documento_soporte_requiere_condiciones_co
     await db.commit()
 
     assert await informe_service._hay_plantilla_organismo(db, contrato, "documento_soporte") is False
+
+
+# ── generar_documento_soporte_xlsx clone-fill runs off the event loop (slice 2.1) ──
+
+
+def _build_xlsx_template() -> bytes:
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Documento Soporte"
+    ws["C2"] = "ABC-123"
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+_XLSX_CAMPOS = [
+    {
+        "direccion": "Documento Soporte!C2",
+        "etiqueta": "Contrato No.",
+        "campo": "contrato.numero_contrato",
+        "valor_ejemplo": "ABC-123",
+        "modo": "cell",
+    }
+]
+
+
+async def _make_plantilla_soporte_xlsx(db: AsyncSession, contrato: Contrato) -> PlantillaOrganismo:
+    from app.core.text_match import normalize
+    from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
+
+    doc_fuente = DocumentoFuente(
+        usuario_id=contrato.usuario_id,
+        contrato_id=contrato.id,
+        storage_key="documentos/plantilla-soporte.xlsx",
+        nombre="plantilla-soporte.xlsx",
+        tipo=TipoDocumentoFuente.INFORME_ACTIVIDADES,
+    )
+    db.add(doc_fuente)
+    await db.commit()
+    await db.refresh(doc_fuente)
+
+    plantilla = PlantillaOrganismo(
+        usuario_id=contrato.usuario_id,
+        entidad=contrato.entidad,
+        entidad_normalizada=normalize(contrato.entidad),
+        tipo_documento="documento_soporte",
+        formato="xlsx",
+        estructura_json={"clonable": True, "campos": _XLSX_CAMPOS},
+        fuente_documento_id=doc_fuente.id,
+    )
+    db.add(plantilla)
+    await db.commit()
+    await db.refresh(plantilla)
+    return plantilla
+
+
+async def test_documento_soporte_xlsx_rellenar_runs_off_event_loop(
+    db: AsyncSession,
+    test_user: dict[str, Any],
+    contrato: Contrato,
+    cuenta: CuentaCobro,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """xlsx_clone_service.rellenar_xlsx (openpyxl fill+save) must not block the
+    event loop — a slow (mocked) sync fill must not stall a concurrent
+    coroutine."""
+    import asyncio
+    import time as time_module
+
+    user = test_user["user"]
+    await _make_plantilla_soporte_xlsx(db, contrato)
+    storage = AsyncMock()
+    storage.download = AsyncMock(return_value=_build_xlsx_template())
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: storage)
+
+    def _slow_rellenar_xlsx(_xlsx_bytes: bytes, _campos: list, _valores: dict) -> bytes:
+        time_module.sleep(0.2)
+        return b"fake-filled-xlsx"
+
+    monkeypatch.setattr("app.services.xlsx_clone_service.rellenar_xlsx", _slow_rellenar_xlsx)
+
+    tracker_ticks: list[float] = []
+
+    async def _tracker() -> None:
+        loop = asyncio.get_event_loop()
+        start = loop.time()
+        for _ in range(10):
+            await asyncio.sleep(0.02)
+            tracker_ticks.append(loop.time() - start)
+
+    (contenido, _filename), _ = await asyncio.gather(
+        informe_service.generar_documento_soporte_xlsx(db, user.id, cuenta.id),
+        _tracker(),
+    )
+
+    assert contenido == b"fake-filled-xlsx"
+    assert tracker_ticks[-1] < 0.35, (
+        f"tracker was delayed past the offloaded fill — got {tracker_ticks[-1]:.3f}s, expected ~0.2s"
+    )
+
+
+async def test_documento_soporte_xlsx_rellenar_exception_propagates(
+    db: AsyncSession,
+    test_user: dict[str, Any],
+    contrato: Contrato,
+    cuenta: CuentaCobro,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exception raised inside the threaded rellenar_xlsx call must still be
+    caught by generar_documento_soporte_xlsx's existing except-block and
+    re-raised as ValidationError — behavior unchanged by the offload."""
+    from app.core.exceptions import ValidationError
+
+    user = test_user["user"]
+    await _make_plantilla_soporte_xlsx(db, contrato)
+    storage = AsyncMock()
+    storage.download = AsyncMock(return_value=_build_xlsx_template())
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: storage)
+
+    def _boom(_xlsx_bytes: bytes, _campos: list, _valores: dict) -> bytes:
+        raise RuntimeError("xlsx fill failed")
+
+    monkeypatch.setattr("app.services.xlsx_clone_service.rellenar_xlsx", _boom)
+
+    with pytest.raises(ValidationError):
+        await informe_service.generar_documento_soporte_xlsx(db, user.id, cuenta.id)
+
+
+async def test_documento_soporte_xlsx_never_hands_db_session_to_thread(
+    db: AsyncSession,
+    test_user: dict[str, Any],
+    contrato: Contrato,
+    cuenta: CuentaCobro,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The threaded rellenar_xlsx call must never receive the AsyncSession (or
+    any coroutine)."""
+    import inspect
+
+    from app.services.xlsx_clone_service import rellenar_xlsx as real_rellenar_xlsx
+
+    user = test_user["user"]
+    await _make_plantilla_soporte_xlsx(db, contrato)
+    storage = AsyncMock()
+    storage.download = AsyncMock(return_value=_build_xlsx_template())
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: storage)
+
+    captured: dict[str, object] = {}
+
+    def _spy(*args: object, **kwargs: object) -> bytes:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return real_rellenar_xlsx(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("app.services.xlsx_clone_service.rellenar_xlsx", _spy)
+
+    await informe_service.generar_documento_soporte_xlsx(db, user.id, cuenta.id)
+
+    all_values = list(captured["args"]) + list(captured["kwargs"].values())  # type: ignore[arg-type]
+    assert not any(isinstance(v, AsyncSession) for v in all_values)
+    assert not any(inspect.iscoroutine(v) for v in all_values)
 
 
 async def test_zip_documento_generado_fallo_no_hunde_paquete(

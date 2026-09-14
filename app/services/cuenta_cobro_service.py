@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import uuid
 from collections.abc import Sequence
@@ -1330,7 +1331,10 @@ async def generar_pdf(
     # Render HTML → PDF
     env = Environment(loader=BaseLoader(), autoescape=True)
     html = env.from_string(template_html).render(**context)
-    pdf_bytes = generate_pdf_from_html(html)
+    # generate_pdf_from_html (WeasyPrint) is CPU-bound; off the event loop like
+    # document_service.py's parse_document, so one PDF render can't stall other
+    # concurrent requests on this single-worker deployment.
+    pdf_bytes = await asyncio.to_thread(generate_pdf_from_html, html)
 
     # Upload to storage
     storage_key = f"pdfs/{usuario_id}/{cuenta_id}.pdf"

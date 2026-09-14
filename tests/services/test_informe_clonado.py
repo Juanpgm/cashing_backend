@@ -245,6 +245,108 @@ async def test_generador_devuelve_clon_sin_encabezado_borrador(
     assert all("BORRADOR" not in p.text for p in doc.paragraphs)
 
 
+# ── Clone-fill runs off the event loop (slice 2.1, perf/phase2-async-doc-generators) ──
+
+
+async def test_generar_docx_clonado_rellenar_runs_off_event_loop(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    contrato: Contrato,
+    cuenta_tercera: CuentaCobro,
+    plantilla_clonable: PlantillaOrganismo,
+) -> None:
+    """docx_clone_service.rellenar (python-docx fill+save) must not block the
+    event loop — a slow (mocked) sync fill must not stall a concurrent
+    coroutine."""
+    import asyncio
+    import time as time_module
+
+    await _agregar_actividad(db, contrato, cuenta_tercera)
+    storage = AsyncMock()
+    storage.download = AsyncMock(return_value=_build_template_docx())
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: storage)
+
+    def _slow_rellenar(_docx_bytes: bytes, _campos: list, _valores: dict) -> bytes:
+        time_module.sleep(0.2)
+        return b"fake-filled-docx"
+
+    monkeypatch.setattr("app.services.docx_clone_service.rellenar", _slow_rellenar)
+
+    tracker_ticks: list[float] = []
+
+    async def _tracker() -> None:
+        loop = asyncio.get_event_loop()
+        start = loop.time()
+        for _ in range(10):
+            await asyncio.sleep(0.02)
+            tracker_ticks.append(loop.time() - start)
+
+    resultado, _ = await asyncio.gather(
+        informe_service._generar_docx_clonado(db, plantilla_clonable, cuenta_tercera, contrato, [], {}),
+        _tracker(),
+    )
+
+    assert resultado == b"fake-filled-docx"
+    assert tracker_ticks[-1] < 0.35, (
+        f"tracker was delayed past the offloaded fill — got {tracker_ticks[-1]:.3f}s, expected ~0.2s"
+    )
+
+
+async def test_generar_docx_clonado_rellenar_failure_stays_fail_open(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    contrato: Contrato,
+    cuenta_tercera: CuentaCobro,
+    plantilla_clonable: PlantillaOrganismo,
+) -> None:
+    """An exception raised inside the threaded `rellenar` call must be caught by
+    the SAME fail-open `except Exception` that already wraps this function —
+    behavior unchanged by the offload: `_generar_docx_clonado` still returns
+    None (never raises) so the caller falls back to the legacy layout."""
+
+    def _boom(_docx_bytes: bytes, _campos: list, _valores: dict) -> bytes:
+        raise RuntimeError("docx fill failed")
+
+    monkeypatch.setattr("app.services.docx_clone_service.rellenar", _boom)
+
+    resultado = await informe_service._generar_docx_clonado(db, plantilla_clonable, cuenta_tercera, contrato, [], {})
+
+    assert resultado is None
+
+
+async def test_generar_docx_clonado_never_hands_db_session_to_thread(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    contrato: Contrato,
+    cuenta_tercera: CuentaCobro,
+    plantilla_clonable: PlantillaOrganismo,
+) -> None:
+    """The threaded `rellenar` call must never receive the AsyncSession (or any
+    coroutine) — all DB reads happen on the async side before the call."""
+    import inspect
+
+    storage = AsyncMock()
+    storage.download = AsyncMock(return_value=_build_template_docx())
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: storage)
+
+    from app.services.docx_clone_service import rellenar as real_rellenar
+
+    captured: dict[str, object] = {}
+
+    def _spy(*args: object, **kwargs: object) -> bytes:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return real_rellenar(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("app.services.docx_clone_service.rellenar", _spy)
+
+    await informe_service._generar_docx_clonado(db, plantilla_clonable, cuenta_tercera, contrato, [], {})
+
+    all_values = list(captured["args"]) + list(captured["kwargs"].values())  # type: ignore[arg-type]
+    assert not any(isinstance(v, AsyncSession) for v in all_values)
+    assert not any(inspect.iscoroutine(v) for v in all_values)
+
+
 # ── generar_cuenta_cobro_docx (clone-only) ──────────────────────────────────
 
 

@@ -8,6 +8,7 @@ Produces three artifacts on demand for the contractor's billing package:
 
 from __future__ import annotations
 
+import asyncio
 import calendar
 import io
 import uuid
@@ -623,7 +624,9 @@ async def _tipo_informe_desde_plantilla(
             return None
         storage = _get_storage(settings.S3_BUCKET_DOCUMENTOS)
         original = await storage.download(doc_fuente.storage_key)
-        doc = Document(io.BytesIO(original))
+        # Document() parses the whole docx XML tree; off the event loop like
+        # document_service.py's parse_document.
+        doc = await asyncio.to_thread(Document, io.BytesIO(original))
         return _resolver_tipo_informe(
             cuenta,
             texto_direccion(doc, campo.get("direccion", "")),
@@ -712,7 +715,9 @@ async def _generar_docx_clonado(
         original = await storage.download(doc_fuente.storage_key)
 
         valores = await _valores_plantilla(db, cuenta, contrato)
-        doc_original = Document(io.BytesIO(original))
+        # Document() parses the whole docx XML tree; off the event loop like
+        # document_service.py's parse_document.
+        doc_original = await asyncio.to_thread(Document, io.BytesIO(original))
         for campo in campos:
             if campo.get("campo") == "computed.tipo_informe" and campo.get("modo") == "checkbox":
                 tipo = _resolver_tipo_informe(
@@ -791,7 +796,11 @@ async def _generar_docx_clonado(
                 campos=campos_blanqueados,
             )
 
-        return rellenar(original, campos, valores)
+        # rellenar (python-docx fill+save) is CPU-bound; off the event loop like
+        # document_service.py's parse_document. Everything DB-derived (valores,
+        # justificaciones, campos) is already resolved above — the thread never
+        # touches `db`.
+        return await asyncio.to_thread(rellenar, original, campos, valores)
     except Exception:
         await logger.awarning(
             "informe_clonado_fallback",
@@ -843,6 +852,44 @@ async def generar_informe_actividades_docx(
 
     contexto_progresivo = await _construir_contexto_progresivo(db, contrato.id, cuenta)
 
+    # _construir_informe_actividades_docx is pure sync (python-docx build + save)
+    # with no DB/async I/O of its own; off the event loop like document_service.py's
+    # parse_document, so one report build can't stall other concurrent requests.
+    contenido = await asyncio.to_thread(
+        _construir_informe_actividades_docx,
+        contrato,
+        usuario,
+        cuenta,
+        layout,
+        actividades_visibles,
+        obligaciones_by_id,
+        contexto_progresivo,
+    )
+
+    await logger.ainfo(
+        "informe_actividades_generado",
+        cuenta_id=str(cuenta_id),
+        usuario_id=str(usuario_id),
+        size=len(contenido),
+    )
+    return contenido, filename
+
+
+def _construir_informe_actividades_docx(
+    contrato: Contrato,
+    usuario: Usuario,
+    cuenta: CuentaCobro,
+    layout: PlantillaOrganismo | None,
+    actividades_visibles: list[Actividad],
+    obligaciones_by_id: dict[uuid.UUID, Obligacion],
+    contexto_progresivo: str | None,
+) -> bytes:
+    """Pure sync DOCX build for the built-from-scratch activities informe.
+
+    No DB/async I/O — every argument is an already-resolved plain value, so
+    this is safe to run via `asyncio.to_thread` (never touches the caller's
+    AsyncSession from a worker thread).
+    """
     doc = Document()
     style = doc.styles["Normal"]
     style.font.name = "Calibri"
@@ -898,14 +945,7 @@ async def generar_informe_actividades_docx(
 
     buf = io.BytesIO()
     doc.save(buf)
-
-    await logger.ainfo(
-        "informe_actividades_generado",
-        cuenta_id=str(cuenta_id),
-        usuario_id=str(usuario_id),
-        size=len(buf.getvalue()),
-    )
-    return buf.getvalue(), filename
+    return buf.getvalue()
 
 
 async def generar_informe_supervision_docx(
@@ -953,6 +993,46 @@ async def generar_informe_supervision_docx(
 
     contexto_progresivo = await _construir_contexto_progresivo(db, contrato.id, cuenta)
 
+    # _construir_informe_supervision_docx is pure sync (python-docx build + save)
+    # with no DB/async I/O of its own; off the event loop like document_service.py's
+    # parse_document, so one report build can't stall other concurrent requests.
+    contenido = await asyncio.to_thread(
+        _construir_informe_supervision_docx,
+        contrato,
+        usuario,
+        cuenta,
+        layout,
+        actividades_visibles,
+        obligaciones_by_id,
+        overrides,
+        contexto_progresivo,
+    )
+
+    await logger.ainfo(
+        "informe_supervision_generado",
+        cuenta_id=str(cuenta_id),
+        usuario_id=str(usuario_id),
+        size=len(contenido),
+    )
+    return contenido, filename
+
+
+def _construir_informe_supervision_docx(
+    contrato: Contrato,
+    usuario: Usuario,
+    cuenta: CuentaCobro,
+    layout: PlantillaOrganismo | None,
+    actividades_visibles: list[Actividad],
+    obligaciones_by_id: dict[uuid.UUID, Obligacion],
+    overrides: dict[int, str],
+    contexto_progresivo: str | None,
+) -> bytes:
+    """Pure sync DOCX build for the built-from-scratch supervision informe.
+
+    No DB/async I/O — every argument is an already-resolved plain value, so
+    this is safe to run via `asyncio.to_thread` (never touches the caller's
+    AsyncSession from a worker thread).
+    """
     doc = Document()
     style = doc.styles["Normal"]
     style.font.name = "Calibri"
@@ -1016,14 +1096,7 @@ async def generar_informe_supervision_docx(
 
     buf = io.BytesIO()
     doc.save(buf)
-
-    await logger.ainfo(
-        "informe_supervision_generado",
-        cuenta_id=str(cuenta_id),
-        usuario_id=str(usuario_id),
-        size=len(buf.getvalue()),
-    )
-    return buf.getvalue(), filename
+    return buf.getvalue()
 
 
 async def generar_cuenta_cobro_docx(db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: uuid.UUID) -> tuple[bytes, str]:
@@ -1084,7 +1157,10 @@ async def generar_documento_soporte_xlsx(
         storage = _get_storage(settings.S3_BUCKET_DOCUMENTOS)
         original = await storage.download(doc_fuente.storage_key)
         valores = await _valores_plantilla(db, cuenta, contrato)
-        contenido = rellenar_xlsx(original, campos, valores)
+        # rellenar_xlsx (openpyxl fill+save) is CPU-bound; off the event loop
+        # like document_service.py's parse_document. `valores` is already
+        # resolved above — the thread never touches `db`.
+        contenido = await asyncio.to_thread(rellenar_xlsx, original, campos, valores)
     except Exception as exc:
         await logger.awarning(
             "documento_soporte_xlsx_fallo",
@@ -1813,20 +1889,31 @@ async def generar_zip_evidencias(
             code=PACKAGE_PENDIENTE,
         )
 
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for arcname, contenido in miembros_zip:
-            zf.writestr(arcname, contenido)
+    # _construir_zip_evidencias (zipfile write + deflate compression) is
+    # CPU-bound; off the event loop like document_service.py's parse_document.
+    # miembros_zip is fully built (every download already awaited) — the
+    # thread never touches `db`.
+    contenido_zip = await asyncio.to_thread(_construir_zip_evidencias, miembros_zip)
 
     filename = f"evidencias-{contrato.numero_contrato}-{cuenta.anio}-{cuenta.mes:02d}.zip"
     await logger.ainfo(
         "zip_evidencias_generado",
         cuenta_id=str(cuenta_id),
         usuario_id=str(usuario_id),
-        size=len(buf.getvalue()),
+        size=len(contenido_zip),
         modo=modo,
         pendientes=len(pendientes_desc),
         evidencias_empacadas=evidencias_empacadas,
         evidencias_fallidas=evidencias_fallidas,
     )
-    return buf.getvalue(), filename
+    return contenido_zip, filename
+
+
+def _construir_zip_evidencias(miembros_zip: list[tuple[str, bytes]]) -> bytes:
+    """Pure sync zip assembly — no DB/async I/O. Safe to run via
+    `asyncio.to_thread` (every member's bytes are already resolved)."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for arcname, contenido in miembros_zip:
+            zf.writestr(arcname, contenido)
+    return buf.getvalue()

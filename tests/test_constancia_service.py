@@ -103,9 +103,7 @@ async def test_constancia_genera_pdf_valido(db: AsyncSession) -> None:
         "app.services.constancia_service.generate_pdf_from_template",
         return_value=_FAKE_PDF,
     ):
-        pdf_bytes, filename = await constancia_service.generar_constancia_pdf(
-            db, user.id, cuenta.id
-        )
+        pdf_bytes, filename = await constancia_service.generar_constancia_pdf(db, user.id, cuenta.id)
 
     assert pdf_bytes == _FAKE_PDF
     assert filename.endswith(".pdf")
@@ -137,6 +135,67 @@ async def test_constancia_ownership_error(db: AsyncSession) -> None:
 
 
 @pytest.mark.asyncio
+async def test_constancia_pdf_runs_off_event_loop(db: AsyncSession) -> None:
+    """generate_pdf_from_template (WeasyPrint) must not block the event loop
+    (slice 2.1, perf/phase2-async-doc-generators). A slow (mocked) sync render
+    must not stall a concurrent coroutine."""
+    import asyncio
+    import time as time_module
+
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+    await _make_obligacion(db, contrato.id)
+    cuenta = await _make_cuenta(db, contrato.id)
+    await db.commit()
+
+    def _slow_render(_template_html: str, _context: dict) -> bytes:
+        time_module.sleep(0.2)
+        return _FAKE_PDF
+
+    tracker_ticks: list[float] = []
+
+    async def _tracker() -> None:
+        loop = asyncio.get_event_loop()
+        start = loop.time()
+        for _ in range(10):
+            await asyncio.sleep(0.02)
+            tracker_ticks.append(loop.time() - start)
+
+    with patch("app.services.constancia_service.generate_pdf_from_template", side_effect=_slow_render):
+        await asyncio.gather(
+            constancia_service.generar_constancia_pdf(db, user.id, cuenta.id),
+            _tracker(),
+        )
+
+    assert tracker_ticks[-1] < 0.35, (
+        f"tracker was delayed past the offloaded render — got {tracker_ticks[-1]:.3f}s, expected ~0.2s"
+    )
+
+
+@pytest.mark.asyncio
+async def test_constancia_pdf_propagates_generator_exception(db: AsyncSession) -> None:
+    """An exception raised inside the threaded generate_pdf_from_template call
+    must propagate to the async caller unchanged."""
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+    await _make_obligacion(db, contrato.id)
+    cuenta = await _make_cuenta(db, contrato.id)
+    await db.commit()
+
+    class _WeasyPrintFailureError(RuntimeError):
+        pass
+
+    with (
+        patch(
+            "app.services.constancia_service.generate_pdf_from_template",
+            side_effect=_WeasyPrintFailureError("weasyprint render failed"),
+        ),
+        pytest.raises(_WeasyPrintFailureError, match="weasyprint render failed"),
+    ):
+        await constancia_service.generar_constancia_pdf(db, user.id, cuenta.id)
+
+
+@pytest.mark.asyncio
 async def test_constancia_sin_actividades_genera_igual(db: AsyncSession) -> None:
     """A cuenta with no activities still produces a PDF (checklist-only constancia)."""
     user = await _make_user(db)
@@ -148,9 +207,7 @@ async def test_constancia_sin_actividades_genera_igual(db: AsyncSession) -> None
         "app.services.constancia_service.generate_pdf_from_template",
         return_value=_FAKE_PDF,
     ) as mock_render:
-        pdf_bytes, _ = await constancia_service.generar_constancia_pdf(
-            db, user.id, cuenta.id
-        )
+        pdf_bytes, _ = await constancia_service.generar_constancia_pdf(db, user.id, cuenta.id)
 
     assert pdf_bytes == _FAKE_PDF
     # Template was called with an empty actividades list

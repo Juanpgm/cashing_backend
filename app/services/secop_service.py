@@ -1015,6 +1015,21 @@ async def obtener_documentos_con_cobertura(
     )
 
 
+def _listar_miembros_zip(content: bytes) -> list[ArchivoInternoItem]:
+    """Pure sync zip member listing — no DB/async I/O. Safe to run via
+    `asyncio.to_thread`. Raises `zipfile.BadZipFile` unchanged for the caller's
+    existing except-clause to handle."""
+    with zipfile.ZipFile(io.BytesIO(content)) as zf:
+        return [
+            ArchivoInternoItem(
+                nombre=info.filename,
+                tamanio_bytes=info.file_size if info.file_size > 0 else None,
+                es_directorio=info.filename.endswith("/"),
+            )
+            for info in zf.infolist()
+        ]
+
+
 async def listar_archivos_comprimido(
     db: AsyncSession,
     doc_id: uuid.UUID,
@@ -1082,15 +1097,9 @@ async def listar_archivos_comprimido(
         )
 
     try:
-        with zipfile.ZipFile(io.BytesIO(content)) as zf:
-            archivos = [
-                ArchivoInternoItem(
-                    nombre=info.filename,
-                    tamanio_bytes=info.file_size if info.file_size > 0 else None,
-                    es_directorio=info.filename.endswith("/"),
-                )
-                for info in zf.infolist()
-            ]
+        # zipfile listing (central directory parse) is CPU-bound; off the event
+        # loop like document_service.py's parse_document.
+        archivos = await asyncio.to_thread(_listar_miembros_zip, content)
     except zipfile.BadZipFile:
         return ArchivoComprimidoResponse(
             doc_id=str(doc_id),

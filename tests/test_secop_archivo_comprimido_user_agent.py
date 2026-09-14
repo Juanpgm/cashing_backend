@@ -91,3 +91,67 @@ def _zip_bytes() -> bytes:
     with zipfile.ZipFile(buf, "w") as zf:
         zf.writestr("a.txt", "contenido")
     return buf.getvalue()
+
+
+# ── zip listing runs off the event loop (slice 2.1, perf/phase2-async-doc-generators) ──
+
+
+async def test_listar_archivos_comprimido_zip_listing_runs_off_event_loop(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Listing a downloaded zip's members (zipfile.ZipFile(...).infolist()) must
+    not block the event loop — a slow (mocked) sync listing must not stall a
+    concurrent coroutine."""
+    import asyncio
+    import time as time_module
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_zip_bytes())
+
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(httpx, "AsyncClient", _client_con_transport(transport))
+    doc = await _seed_zip_doc(db)
+
+    def _slow_listing(_content: bytes) -> list:
+        time_module.sleep(0.2)
+        return []
+
+    monkeypatch.setattr(secop_service, "_listar_miembros_zip", _slow_listing)
+
+    tracker_ticks: list[float] = []
+
+    async def _tracker() -> None:
+        loop = asyncio.get_event_loop()
+        start = loop.time()
+        for _ in range(10):
+            await asyncio.sleep(0.02)
+            tracker_ticks.append(loop.time() - start)
+
+    _result, _ = await asyncio.gather(
+        secop_service.listar_archivos_comprimido(db, doc.id),
+        _tracker(),
+    )
+
+    assert tracker_ticks[-1] < 0.35, (
+        f"tracker was delayed past the offloaded listing — got {tracker_ticks[-1]:.3f}s, expected ~0.2s"
+    )
+
+
+async def test_listar_archivos_comprimido_bad_zip_still_reports_friendly_error(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A genuinely-corrupt zip (zipfile.BadZipFile raised inside the threaded
+    listing call) must still surface the existing friendly error — behavior
+    unchanged by the offload."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"not a zip file")
+
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(httpx, "AsyncClient", _client_con_transport(transport))
+    doc = await _seed_zip_doc(db)
+
+    result = await secop_service.listar_archivos_comprimido(db, doc.id)
+
+    assert result.error == "El archivo no es un ZIP válido"
+    assert result.archivos == []

@@ -8,6 +8,7 @@ cryptographic signing (PAdES/pyhanko) is not applied in this version.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import date
 from pathlib import Path
@@ -32,8 +33,18 @@ logger = structlog.get_logger("service.constancia")
 _TEMPLATE_PATH = Path(__file__).parent.parent / "templates" / "constancia.html"
 
 _MESES = [
-    "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
-    "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre",
+    "Enero",
+    "Febrero",
+    "Marzo",
+    "Abril",
+    "Mayo",
+    "Junio",
+    "Julio",
+    "Agosto",
+    "Septiembre",
+    "Octubre",
+    "Noviembre",
+    "Diciembre",
 ]
 
 _ESTADO_LABELS: dict[str, str] = {
@@ -92,9 +103,7 @@ async def generar_constancia_pdf(
         raise ForbiddenError()
 
     contrato = cuenta.contrato
-    obligaciones_by_id: dict[uuid.UUID, Obligacion] = {
-        ob.id: ob for ob in contrato.obligaciones
-    }
+    obligaciones_by_id: dict[uuid.UUID, Obligacion] = {ob.id: ob for ob in contrato.obligaciones}
     actividades = sorted(cuenta.actividades, key=lambda a: a.created_at)
 
     # ── 2. Load Usuario ───────────────────────────────────────────────────────
@@ -115,9 +124,7 @@ async def generar_constancia_pdf(
     req_codigos = [row.requisito_codigo for row in checklist_rows]
     requisitos_by_codigo: dict[str, RequisitoDocumento] = {}
     if req_codigos:
-        req_result = await db.execute(
-            select(RequisitoDocumento).where(RequisitoDocumento.codigo.in_(req_codigos))
-        )
+        req_result = await db.execute(select(RequisitoDocumento).where(RequisitoDocumento.codigo.in_(req_codigos)))
         requisitos_by_codigo = {r.codigo: r for r in req_result.scalars().all()}
 
     # ── 4. Build template context ─────────────────────────────────────────────
@@ -171,12 +178,11 @@ async def generar_constancia_pdf(
 
     # ── 5. Render template → PDF ──────────────────────────────────────────────
     template_html = _TEMPLATE_PATH.read_text(encoding="utf-8")
-    pdf_bytes = generate_pdf_from_template(template_html, context)
+    # generate_pdf_from_template (WeasyPrint) is CPU-bound; off the event loop
+    # like document_service.py's parse_document (same to_thread pattern).
+    pdf_bytes = await asyncio.to_thread(generate_pdf_from_template, template_html, context)
 
-    filename = (
-        f"constancia-{contrato.numero_contrato}-"
-        f"{cuenta.anio}-{cuenta.mes:02d}.pdf"
-    )
+    filename = f"constancia-{contrato.numero_contrato}-{cuenta.anio}-{cuenta.mes:02d}.pdf"
 
     await logger.ainfo(
         "constancia_generada",
