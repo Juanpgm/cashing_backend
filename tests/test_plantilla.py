@@ -81,15 +81,15 @@ async def test_actualizar_plantilla(db: AsyncSession, test_user: dict[str, Any])
     await db.commit()
     await db.refresh(p)
 
-    result = await plantilla_service.actualizar_plantilla(
-        db, user.id, p.id, PlantillaUpdate(nombre="New")
-    )
+    result = await plantilla_service.actualizar_plantilla(db, user.id, p.id, PlantillaUpdate(nombre="New"))
     assert result.nombre == "New"
 
 
 async def test_eliminar_plantilla(db: AsyncSession, test_user: dict[str, Any]) -> None:
     user = test_user["user"]
-    p = Plantilla(usuario_id=user.id, nombre="ToDelete", tipo=TipoPlantilla.CUENTA_COBRO, contenido_html=_HTML, activa=True)
+    p = Plantilla(
+        usuario_id=user.id, nombre="ToDelete", tipo=TipoPlantilla.CUENTA_COBRO, contenido_html=_HTML, activa=True
+    )
     db.add(p)
     await db.commit()
     await db.refresh(p)
@@ -117,6 +117,84 @@ async def test_renderizar_plantilla(db: AsyncSession, test_user: dict[str, Any])
 
     req = PlantillaRenderRequest(data={"entidad": "MinTIC"})
     result = await plantilla_service.renderizar_plantilla(db, user.id, p.id, req)
+    assert "MinTIC" in result.html
+
+
+async def test_renderizar_plantilla_pdf_runs_off_event_loop(db: AsyncSession, test_user: dict[str, Any]) -> None:
+    """generate_pdf_from_html (WeasyPrint) must not block the event loop (slice
+    2.1, perf/phase2-async-doc-generators). A slow (mocked) sync render must
+    not stall a concurrent coroutine."""
+    import asyncio
+    import time as time_module
+    from unittest.mock import patch
+
+    user = test_user["user"]
+    p = Plantilla(
+        usuario_id=user.id,
+        nombre="Render Slow",
+        tipo=TipoPlantilla.CUENTA_COBRO,
+        contenido_html=_HTML,
+        activa=True,
+    )
+    db.add(p)
+    await db.commit()
+    await db.refresh(p)
+
+    def _slow_render(_html: str) -> bytes:
+        time_module.sleep(0.2)
+        return b"%PDF-fake"
+
+    tracker_ticks: list[float] = []
+
+    async def _tracker() -> None:
+        loop = asyncio.get_event_loop()
+        start = loop.time()
+        for _ in range(10):
+            await asyncio.sleep(0.02)
+            tracker_ticks.append(loop.time() - start)
+
+    from app.schemas.plantilla import PlantillaRenderRequest
+
+    req = PlantillaRenderRequest(data={"entidad": "MinTIC"})
+    with patch("app.services.plantilla_service.generate_pdf_from_html", side_effect=_slow_render):
+        await asyncio.gather(
+            plantilla_service.renderizar_plantilla(db, user.id, p.id, req),
+            _tracker(),
+        )
+
+    assert tracker_ticks[-1] < 0.35, (
+        f"tracker was delayed past the offloaded render — got {tracker_ticks[-1]:.3f}s, expected ~0.2s"
+    )
+
+
+async def test_renderizar_plantilla_pdf_failure_returns_html_only(db: AsyncSession, test_user: dict[str, Any]) -> None:
+    """Existing fail-open behavior: any exception from generate_pdf_from_html
+    (e.g. WeasyPrint unavailable) must still be caught and yield html-only —
+    the offload must not change this contract."""
+    from unittest.mock import patch
+
+    user = test_user["user"]
+    p = Plantilla(
+        usuario_id=user.id,
+        nombre="Render Fail",
+        tipo=TipoPlantilla.CUENTA_COBRO,
+        contenido_html=_HTML,
+        activa=True,
+    )
+    db.add(p)
+    await db.commit()
+    await db.refresh(p)
+
+    from app.schemas.plantilla import PlantillaRenderRequest
+
+    req = PlantillaRenderRequest(data={"entidad": "MinTIC"})
+    with patch(
+        "app.services.plantilla_service.generate_pdf_from_html",
+        side_effect=RuntimeError("weasyprint unavailable"),
+    ):
+        result = await plantilla_service.renderizar_plantilla(db, user.id, p.id, req)
+
+    assert result.pdf_b64 is None
     assert "MinTIC" in result.html
 
 

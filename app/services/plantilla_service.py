@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 
 import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent.tools.pdf_generator import generate_pdf_from_html
 from app.core.exceptions import ForbiddenError, NotFoundError
 from app.models.plantilla import Plantilla, TipoPlantilla
 from app.schemas.plantilla import (
@@ -21,9 +23,7 @@ from app.schemas.plantilla import (
 logger = structlog.get_logger("service.plantilla")
 
 
-async def _get_plantilla_owned(
-    db: AsyncSession, plantilla_id: uuid.UUID, usuario_id: uuid.UUID
-) -> Plantilla:
+async def _get_plantilla_owned(db: AsyncSession, plantilla_id: uuid.UUID, usuario_id: uuid.UUID) -> Plantilla:
     result = await db.execute(
         select(Plantilla).where(
             Plantilla.id == plantilla_id,
@@ -115,8 +115,6 @@ async def renderizar_plantilla(
     """Render a template with the provided data, optionally generate PDF."""
     from jinja2 import BaseLoader, Environment
 
-    from app.agent.tools.pdf_generator import generate_pdf_from_html
-
     p = await _get_plantilla_owned(db, plantilla_id, usuario_id)
     env = Environment(loader=BaseLoader(), autoescape=True)
     tmpl = env.from_string(p.contenido_html)
@@ -125,7 +123,10 @@ async def renderizar_plantilla(
     pdf_b64: str | None = None
     try:
         import base64
-        pdf_bytes = generate_pdf_from_html(html)
+
+        # generate_pdf_from_html (WeasyPrint) is CPU-bound; off the event loop
+        # like document_service.py's parse_document (same to_thread pattern).
+        pdf_bytes = await asyncio.to_thread(generate_pdf_from_html, html)
         pdf_b64 = base64.b64encode(pdf_bytes).decode()
     except Exception:
         # WeasyPrint not available in all envs — return HTML only

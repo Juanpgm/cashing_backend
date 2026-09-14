@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -830,6 +831,83 @@ async def test_generar_pdf_ok(db: AsyncSession) -> None:
     # Key should be persisted on the model
     await db.refresh(cuenta)
     assert cuenta.pdf_storage_key is not None
+
+
+@pytest.mark.asyncio
+async def test_generar_pdf_runs_off_event_loop(db: AsyncSession) -> None:
+    """WeasyPrint/PDF rendering must not block the event loop (slice 2.1,
+    perf/phase2-async-doc-generators): a slow (mocked) sync `generate_pdf_from_html`
+    call must not stall an unrelated concurrent coroutine. A synchronous
+    (non-offloaded) call would serialize both, doubling the observed elapsed
+    time; offloaded via `asyncio.to_thread`, the tracker coroutine keeps
+    ticking on schedule while the "slow" PDF render runs on a worker thread.
+    """
+    import time as time_module
+
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+    cuenta = await _make_cuenta(db, contrato.id)
+    await db.commit()
+
+    mock_storage = AsyncMock()
+    mock_storage.upload = AsyncMock(return_value=f"pdfs/{user.id}/{cuenta.id}.pdf")
+    mock_storage.presigned_url = AsyncMock(return_value="https://storage.example.com/presigned")
+
+    def _slow_render(_html: str) -> bytes:
+        time_module.sleep(0.2)  # blocking, CPU-thread-like work — never asyncio.sleep
+        return b"%PDF-fake"
+
+    tracker_ticks: list[float] = []
+
+    async def _tracker() -> None:
+        loop = asyncio.get_event_loop()
+        start = loop.time()
+        for _ in range(10):
+            await asyncio.sleep(0.02)
+            tracker_ticks.append(loop.time() - start)
+
+    import unittest.mock as mock
+
+    with mock.patch("app.services.cuenta_cobro_service.generate_pdf_from_html", side_effect=_slow_render):
+        await asyncio.gather(
+            cuenta_cobro_service.generar_pdf(db, user.id, cuenta.id, mock_storage),
+            _tracker(),
+        )
+
+    # The tracker's 10 ticks of 20ms each should land close to their schedule
+    # (~0.20s total) — if the PDF render blocked the loop for 0.2s, the last
+    # ticks would be pushed out well past that window instead of interleaving.
+    assert tracker_ticks[-1] < 0.35, (
+        f"tracker was delayed past the offloaded render — got {tracker_ticks[-1]:.3f}s, "
+        "expected ~0.2s if truly concurrent"
+    )
+
+
+@pytest.mark.asyncio
+async def test_generar_pdf_propagates_generator_exception(db: AsyncSession) -> None:
+    """An exception raised inside the threaded `generate_pdf_from_html` call must
+    propagate to the async caller unchanged — not be swallowed or wrapped in a
+    different exception type."""
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+    cuenta = await _make_cuenta(db, contrato.id)
+    await db.commit()
+
+    mock_storage = AsyncMock()
+
+    import unittest.mock as mock
+
+    class _WeasyPrintFailureError(RuntimeError):
+        pass
+
+    with (
+        mock.patch(
+            "app.services.cuenta_cobro_service.generate_pdf_from_html",
+            side_effect=_WeasyPrintFailureError("weasyprint render failed"),
+        ),
+        pytest.raises(_WeasyPrintFailureError, match="weasyprint render failed"),
+    ):
+        await cuenta_cobro_service.generar_pdf(db, user.id, cuenta.id, mock_storage)
 
 
 @pytest.mark.asyncio
