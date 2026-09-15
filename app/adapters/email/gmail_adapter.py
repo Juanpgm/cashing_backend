@@ -270,7 +270,12 @@ class GmailAdapter:
             raw = await self._execute_with_retry(_get)
         except GoogleHttpError as exc:
             raise ExternalServiceError("Gmail", f"Error obteniendo mensaje {message_id}: {exc}") from exc
-        return self._parse_message(raw)
+        try:
+            return self._parse_message(raw)
+        except (KeyError, TypeError, AttributeError) as exc:
+            raise ExternalServiceError(
+                "Gmail", f"Mensaje {message_id} con formato inesperado: {exc}"
+            ) from exc
 
     async def get_attachment(
         self,
@@ -290,7 +295,16 @@ class GmailAdapter:
                 .execute()
             )
 
-        result = await self._execute_with_retry(_get_att)
+        try:
+            result = await self._execute_with_retry(_get_att)
+        except GoogleHttpError as exc:
+            raise ExternalServiceError(
+                "Gmail", f"Error obteniendo adjunto {attachment_id}: {exc}"
+            ) from exc
+        except (TimeoutError, OSError) as exc:
+            raise ExternalServiceError(
+                "Gmail", f"Error de conexión obteniendo adjunto {attachment_id}: {exc}"
+            ) from exc
         data = result.get("data", "")
         return base64.urlsafe_b64decode(data + "==")
 
