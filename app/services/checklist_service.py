@@ -31,6 +31,7 @@ from app.adapters.storage import get_storage as _get_storage
 from app.core.config import settings
 from app.core.exceptions import NotFoundError, ValidationError
 from app.core.file_validation import get_safe_filename
+from app.core.http_clients import get_shared_client
 from app.core.secop_http import SECOP_BROWSER_USER_AGENT
 from app.core.text_match import keyword_score as _keyword_score
 from app.core.text_match import similar as _similar
@@ -1020,10 +1021,27 @@ async def _descargar_secop_bytes(url: str, timeout: float = _SNIFF_HTTP_TIMEOUT)
     the caller to the scan's remaining budget so worst-case wall time stays
     bounded by ``_SNIFF_PRESUPUESTO_SEGUNDOS``, not the fixed HTTP timeout.
     """
-    async with (
-        httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers={"User-Agent": _SNIFF_USER_AGENT}) as client,
-        client.stream("GET", url) as resp,
-    ):
+    # `timeout` genuinely varies per call (clamped to the scan's remaining
+    # budget by callers) — so, unlike the other SECOP shared clients, it is
+    # NOT baked into the cached client's construction kwargs (that would
+    # silently freeze every future call on this loop to whichever timeout
+    # happened to construct the client first). It is passed per-request to
+    # `.stream()` instead, which httpx applies as an override for that one
+    # call only.
+    #
+    # Uses its own "secop-sniff-download" cache key, kept separate from
+    # secop_service.py's "secop-download" even though their construction
+    # kwargs are actually identical (both follow_redirects=True + the same
+    # User-Agent, `_SNIFF_USER_AGENT is SECOP_BROWSER_USER_AGENT` — a prior
+    # version of this comment incorrectly claimed the kwargs shape differed,
+    # corrected here). The real reason for the separate pool: this path
+    # streams-and-aborts mid-download whenever a scan's size/byte budget is
+    # exceeded (see the size-cap logic below), which can leave a connection
+    # in a partially-consumed state — isolating that from the bulk,
+    # fully-consumed downloads in secop_service.py/secop_scraper_service.py
+    # keeps one pool's aborted-stream churn from affecting the other's.
+    client = get_shared_client("secop-sniff-download", follow_redirects=True, headers={"User-Agent": _SNIFF_USER_AGENT})
+    async with client.stream("GET", url, timeout=timeout) as resp:
         resp.raise_for_status()
         content_length = resp.headers.get("content-length")
         if content_length is not None and int(content_length) > _SNIFF_MAX_BYTES:

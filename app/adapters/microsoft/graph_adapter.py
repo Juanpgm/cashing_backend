@@ -34,6 +34,7 @@ from app.adapters.drive.port import DriveFile, DriveQuery
 from app.adapters.email.port import EmailMessage
 from app.core.config import settings
 from app.core.exceptions import ExternalServiceError, NotFoundError
+from app.core.http_clients import get_shared_client
 from app.models.integracion import Integracion, IntegrationProvider
 
 logger = structlog.get_logger("adapters.microsoft_graph")
@@ -254,6 +255,16 @@ class MicrosoftGraphAdapter:
             "scope": " ".join(settings.MICROSOFT_OAUTH_SCOPES),
         }
         try:
+            # Deliberately NOT `get_shared_client` (perf/phase2-8-shared-httpx-
+            # client's review round found a real issue): a shared client's
+            # cookie jar persists across calls, and this endpoint is Microsoft's
+            # OAuth token endpoint — sharing it would mean STS cookies set
+            # during one user's token exchange/refresh get sent on a
+            # DIFFERENT user's later call on the same shared client. Not an
+            # auth bypass (auth is by refresh_token/client_secret, not
+            # cookies), but genuine unwanted cross-user state with no
+            # corresponding performance win — token refresh is inherently
+            # low-frequency per user, not a hot path. Fresh client per call.
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.post(token_url, data=data)
                 resp.raise_for_status()
@@ -285,25 +296,29 @@ class MicrosoftGraphAdapter:
             headers.update(extra_headers)
 
         last_exc: Exception | None = None
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            for attempt in range(_MAX_RETRIES):
-                try:
-                    resp = await client.request(
-                        method, url, params=params, json=json_body, content=content, headers=headers
-                    )
-                    resp.raise_for_status()
-                    return resp
-                except httpx.HTTPStatusError as exc:
-                    if exc.response.status_code != 429 or attempt == _MAX_RETRIES - 1:
-                        raise ExternalServiceError(
-                            "Microsoft Graph", f"HTTP {exc.response.status_code}: {exc}"
-                        ) from exc
-                    last_exc = exc
-                    delay = _parse_retry_after(exc.response.headers.get("Retry-After"))
-                    logger.warning("graph_rate_limited_retry", attempt=attempt + 1, delay=delay, url=url)
-                    await asyncio.sleep(delay)
-                except httpx.RequestError as exc:
-                    raise ExternalServiceError("Microsoft Graph", f"Error de red: {exc}") from exc
+        # Behavior change (perf/phase2-8-shared-httpx-client): previously a
+        # fresh `httpx.AsyncClient` was constructed once per `_request` call
+        # (still shared across its own retry attempts, but not across
+        # separate `_request` calls). Now "graph-api" is shared across ALL
+        # Graph API calls within a loop, not just retries of one call — a
+        # deliberate, beneficial behavior change (more connection reuse).
+        client = get_shared_client("graph-api", timeout=15.0)
+        for attempt in range(_MAX_RETRIES):
+            try:
+                resp = await client.request(
+                    method, url, params=params, json=json_body, content=content, headers=headers
+                )
+                resp.raise_for_status()
+                return resp
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code != 429 or attempt == _MAX_RETRIES - 1:
+                    raise ExternalServiceError("Microsoft Graph", f"HTTP {exc.response.status_code}: {exc}") from exc
+                last_exc = exc
+                delay = _parse_retry_after(exc.response.headers.get("Retry-After"))
+                logger.warning("graph_rate_limited_retry", attempt=attempt + 1, delay=delay, url=url)
+                await asyncio.sleep(delay)
+            except httpx.RequestError as exc:
+                raise ExternalServiceError("Microsoft Graph", f"Error de red: {exc}") from exc
         raise ExternalServiceError("Microsoft Graph", f"Reintentos agotados: {last_exc}")
 
     async def _paginate(

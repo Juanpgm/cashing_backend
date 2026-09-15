@@ -46,7 +46,6 @@ from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-import httpx
 import structlog
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -54,6 +53,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.adapters.secop_scraper.dto import CaptchaRequiredError, ScrapedDocDTO, ScraperUnavailableError
 from app.adapters.secop_scraper.port import SecopScraperPort
 from app.agent.tools.multimodal_parser import guess_mime_type
+from app.core.http_clients import get_shared_client
 from app.core.secop_agentic_quota import enforce_scraper_quota
 from app.core.secop_http import SECOP_BROWSER_USER_AGENT
 from app.models.contrato import Contrato
@@ -289,12 +289,17 @@ async def _persistir_documento_scrapeado(
         return response, f"'{dto.nombre_archivo}' ya fue persistido previamente (mismo documento).", None
 
     try:
-        async with httpx.AsyncClient(
-            timeout=30.0, follow_redirects=True, headers={"User-Agent": SECOP_BROWSER_USER_AGENT}
-        ) as client:
-            http_response = await client.get(dto.url_descarga)
-            http_response.raise_for_status()
-            content = http_response.content
+        # Shares the "secop-download" cache key with secop_service.py's
+        # listar_archivos_comprimido — identical kwargs shape (same headers /
+        # follow_redirects, timeout applied per-request below), so both call
+        # sites reuse the same pooled connection to community.secop.gov.co
+        # within a given event loop instead of keeping two separate clients.
+        client = get_shared_client(
+            "secop-download", follow_redirects=True, headers={"User-Agent": SECOP_BROWSER_USER_AGENT}
+        )
+        http_response = await client.get(dto.url_descarga, timeout=30.0)
+        http_response.raise_for_status()
+        content = http_response.content
     except Exception as exc:
         await log.awarning("secop_scraper_download_failed", nombre_archivo=dto.nombre_archivo, error=str(exc))
         return response, f"No se pudo descargar '{dto.nombre_archivo}': SECOP rechazó la descarga (ver logs).", None

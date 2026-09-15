@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agent.tools.contract_parser import extract_obligaciones_verbatim
 from app.core.config import settings
 from app.core.exceptions import ExternalServiceError, NotFoundError, ValidationError
+from app.core.http_clients import get_shared_client
 from app.core.secop_http import SECOP_BROWSER_USER_AGENT
 from app.models.categoria_documento import CategoriaDocumento
 from app.models.contrato import Contrato
@@ -155,16 +156,23 @@ async def _query_socrata(dataset_id: str, where_clause: str, limit: int = 500) -
     Socrata throttles aggressively without an app token (see
     `SECOP_APP_TOKEN`) and transient 5xx responses happen under load. Other
     errors (4xx besides 429, connection errors) fail immediately, unchanged.
+
+    Behavior change (perf/phase2-8-shared-httpx-client): previously each
+    retry attempt constructed a brand-new `httpx.AsyncClient` (a fresh
+    TCP/TLS handshake per attempt). All attempts now share one pooled client
+    (`get_shared_client("secop-api", ...)`) fetched once before the loop —
+    retries correctly reuse the same connection pool across attempts, which
+    is fine/better (a deliberate, beneficial behavior change, not silent).
     """
     url = f"{_SECOP_BASE}/{dataset_id}.json"
     headers = {"X-App-Token": settings.SECOP_APP_TOKEN}
     params = {"$where": where_clause, "$limit": str(limit)}
+    client = get_shared_client("secop-api", timeout=30.0)
 
     for attempt in range(1, _SOCRATA_RETRY_MAX_ATTEMPTS + 1):
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.get(url, params=params, headers=headers)
-                response.raise_for_status()
+            response = await client.get(url, params=params, headers=headers)
+            response.raise_for_status()
             data: Any = response.json()
             if isinstance(data, list):
                 return data
@@ -1080,11 +1088,11 @@ async def listar_archivos_comprimido(
         )
 
     try:
-        async with httpx.AsyncClient(
-            timeout=30.0, follow_redirects=True, headers={"User-Agent": SECOP_BROWSER_USER_AGENT}
-        ) as client:
-            response = await client.get(doc.url_descarga)
-            response.raise_for_status()
+        client = get_shared_client(
+            "secop-download", follow_redirects=True, headers={"User-Agent": SECOP_BROWSER_USER_AGENT}
+        )
+        response = await client.get(doc.url_descarga, timeout=30.0)
+        response.raise_for_status()
         content = response.content
     except httpx.HTTPError as exc:
         log.warning("secop_archivo_comprimido_download_failed", doc_id=str(doc_id), error=str(exc))
