@@ -153,6 +153,50 @@ class TestPerProviderFailOpen:
         assert result.fuentes["drive"] == 0
 
     @pytest.mark.asyncio
+    async def test_drive_adapter_failure_at_the_real_seam_does_not_block_email_evidence(
+        self, db: AsyncSession, test_user: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Every other Drive-down test in this class patches `drive_fetch_node`
+        (the agent-graph node), never the real `DriveAdapter.search_files` seam
+        — so the actual adapter -> node -> service propagation path was never
+        exercised end-to-end. Review r1 finding P3c: patch the real adapter
+        method instead, proving `drive_fetch_node`'s per-query try/except
+        (app/agent/nodes/drive_fetch.py) genuinely swallows an
+        `ExternalServiceError` raised by the adapter itself, not just one
+        raised by a stand-in node."""
+        from app.adapters.drive.drive_adapter import DriveAdapter
+        from app.adapters.email.gmail_adapter import GmailAdapter
+        from app.adapters.email.port import EmailMessage
+
+        user = test_user["user"]
+        await _connect_google(db, user.id)
+
+        fake_message = EmailMessage(
+            id="m1",
+            thread_id="t1",
+            subject="Informe mensual",
+            sender="supervisor@entidad.gov.co",
+            recipients=["yo@example.com"],
+            date=None,
+            body_plain="Adjunto el informe mensual solicitado.",
+            body_html=None,
+            snippet="Adjunto el informe",
+            attachments=[],
+            labels=[],
+            headers={},
+        )
+        monkeypatch.setattr(GmailAdapter, "search_messages", AsyncMock(return_value=[fake_message]))
+        monkeypatch.setattr(
+            DriveAdapter, "search_files", AsyncMock(side_effect=ExternalServiceError("Drive", "simulated outage"))
+        )
+        monkeypatch.setattr(evidence_discovery_service, "calendar_fetch_node", _passthrough_node)
+
+        result = await evidence_discovery_service.descubrir_evidencias(db, user.id, _request())
+
+        assert result.fuentes["email"] >= 1
+        assert result.fuentes["drive"] == 0
+
+    @pytest.mark.asyncio
     async def test_calendar_down_does_not_block_drive_evidence(
         self, db: AsyncSession, test_user: dict[str, Any], monkeypatch: pytest.MonkeyPatch
     ) -> None:
