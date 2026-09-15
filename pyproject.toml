@@ -97,6 +97,12 @@ dev = [
     "pip-audit>=2,<3",
     "safety>=3,<4",
     "pre-commit>=4,<5",
+    # Type stubs for httplib2 (a google-api-python-client transitive dep that
+    # ships no py.typed marker — google.auth DOES). Review r2, finding P3-3
+    # (optional item): narrows the blanket `ignore_missing_imports` override
+    # below so httplib2.ServerNotFoundError (used in app/adapters/google_errors.py)
+    # is properly typed instead of `Any`.
+    "types-httplib2>=0.32,<1",
 ]
 
 [tool.uv]
@@ -163,7 +169,6 @@ module = [
     "magic.*",
     "jose.*",
     "passlib.*",
-    "httplib2.*",
 ]
 ignore_missing_imports = true
 

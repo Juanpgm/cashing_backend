@@ -624,6 +624,7 @@ typer==0.25.1
     # via
     #   huggingface-hub
     #   safety
+types-httplib2==0.32.0.20260720
 typing-extensions==4.15.0
     # via
     #   aiohttp

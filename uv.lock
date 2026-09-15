@@ -469,6 +469,7 @@ dev = [
     { name = "pytest-timeout" },
     { name = "ruff" },
     { name = "safety" },
+    { name = "types-httplib2" },
 ]
 
 [package.metadata]
@@ -534,6 +535,7 @@ dev = [
     { name = "pytest-timeout", specifier = ">=2.3,<3" },
     { name = "ruff", specifier = ">=0.9,<1" },
     { name = "safety", specifier = ">=3,<4" },
+    { name = "types-httplib2", specifier = ">=0.32,<1" },
 ]
 
 [[package]]
@@ -4362,6 +4364,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/e4/51/9aed62104cea109b820bbd6c14245af756112017d309da813ef107d42e7e/typer-0.25.1.tar.gz", hash = "sha256:9616eb8853a09ffeabab1698952f33c6f29ffdbceb4eaeecf571880e8d7664cc", size = 122276, upload-time = "2026-04-30T19:32:16.964Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/3f/f9/2b3ff4e56e5fa7debfaf9eb135d0da96f3e9a1d5b27222223c7296336e5f/typer-0.25.1-py3-none-any.whl", hash = "sha256:75caa44ed46a03fb2dab8808753ffacdbfea88495e74c85a28c5eefcf5f39c89", size = 58409, upload-time = "2026-04-30T19:32:18.271Z" },
+]
+
+[[package]]
+name = "types-httplib2"
+version = "0.32.0.20260720"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/98/74/d53a569942f365caa033f135012979d82f96c8b02ab8a9c5614617f12f65/types_httplib2-0.32.0.20260720.tar.gz", hash = "sha256:fdf42301174bccd6cede13dcffe130753f5c32c64b0a2b681a011504ffe6d1eb", size = 11746, upload-time = "2026-07-20T05:26:53.42Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/64/aa/9a6c889f79b97017244d9abbe9b886c196716ac6da47f0413e141871bb2b/types_httplib2-0.32.0.20260720-py3-none-any.whl", hash = "sha256:c8e838557fccd39bb08569839c7e625489c5b2db1c89ab54b6a3b808b9e9b392", size = 11466, upload-time = "2026-07-20T05:26:52.603Z" },
 ]
 
 [[package]]
