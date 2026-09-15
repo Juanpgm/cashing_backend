@@ -61,26 +61,32 @@ class _FakeStorage:
 
 
 def _mock_httpx_download(monkeypatch: pytest.MonkeyPatch, content: bytes) -> AsyncMock:
+    """Retargeted for perf/phase2-8-shared-httpx-client: the download call
+    site now fetches its client via `get_shared_client("secop-download", ...)`
+    (no more `async with httpx.AsyncClient(...)`), so this patches
+    `app.services.secop_scraper_service.get_shared_client` directly and
+    returns a plain `AsyncMock` client — no `__aenter__`/`__aexit__` needed.
+    The mocked `get_shared_client` callable itself is stashed on
+    `mock_client.get_shared_client_mock` so callers that need to inspect its
+    call kwargs (e.g. headers) can do so without depending on construction
+    order relative to unrelated httpx.AsyncClient calls elsewhere (see
+    `test_download_sends_browser_user_agent`)."""
     mock_response = MagicMock()
     mock_response.content = content
     mock_response.raise_for_status = MagicMock()
 
     mock_client = AsyncMock()
     mock_client.get.return_value = mock_response
-    mock_client_cls = MagicMock()
-    mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=None)
-    monkeypatch.setattr(httpx, "AsyncClient", mock_client_cls)
+    mock_get_shared_client = MagicMock(return_value=mock_client)
+    monkeypatch.setattr(secop_scraper_service, "get_shared_client", mock_get_shared_client)
+    mock_client.get_shared_client_mock = mock_get_shared_client
     return mock_client
 
 
 def _mock_httpx_download_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     mock_client = AsyncMock()
     mock_client.get.side_effect = httpx.RequestError("connection refused")
-    mock_client_cls = MagicMock()
-    mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=None)
-    monkeypatch.setattr(httpx, "AsyncClient", mock_client_cls)
+    monkeypatch.setattr(secop_scraper_service, "get_shared_client", MagicMock(return_value=mock_client))
 
 
 async def _seed_contrato_usuario(db: AsyncSession, user_id: uuid.UUID, numero: str = _NUMERO) -> Contrato:
@@ -256,15 +262,19 @@ class TestExplorarDocumentosAgentico:
         user_id = uuid.uuid4()
         await _seed_contrato(db)
         await _seed_contrato_usuario(db, user_id)
-        _mock_httpx_download(monkeypatch, b"contenido")
+        mock_client = _mock_httpx_download(monkeypatch, b"contenido")
 
         await secop_scraper_service.explorar_documentos_agentico(db, _OkScraper(), user_id, _NUMERO)
 
-        # `_mock_httpx_download` patches `httpx.AsyncClient` itself with the class mock;
-        # inspect its constructor call args directly (the helper returns the client
-        # instance mock, not the class). Use the FIRST call: persistence's own
-        # OCR/LLM fallback (litellm) also constructs an httpx.AsyncClient afterwards.
-        _, kwargs = httpx.AsyncClient.call_args_list[0]
+        # perf/phase2-8-shared-httpx-client: the old comment here noted this
+        # assertion needed `httpx.AsyncClient.call_args_list[0]` specifically
+        # because persistence's own OCR/LLM fallback (litellm) also constructs
+        # an httpx.AsyncClient later in the same test — that ordering
+        # assumption is now MOOT: `get_shared_client` is patched directly, so
+        # this only ever sees calls made by secop_scraper_service itself, and
+        # litellm's own (unrelated, unmanaged by get_shared_client) client
+        # construction never appears in this mock's call list at all.
+        _, kwargs = mock_client.get_shared_client_mock.call_args_list[0]
         assert kwargs["headers"]["User-Agent"] == SECOP_BROWSER_USER_AGENT
 
     async def test_multi_doc_result_warns_eviction_risk(

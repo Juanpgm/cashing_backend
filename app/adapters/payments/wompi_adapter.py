@@ -7,10 +7,10 @@ import hmac
 import uuid
 from decimal import Decimal
 
-import httpx
 import structlog
 
 from app.core.config import settings
+from app.core.http_clients import get_shared_client
 
 logger = structlog.get_logger("adapter.wompi")
 
@@ -44,29 +44,35 @@ async def crear_transaccion(
         "payment_method_types": ["CARD", "PSE", "BANCOLOMBIA_TRANSFER"],
     }
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(
-            f"{_WOMPI_API}/payment_links",
-            headers={"Authorization": f"Bearer {settings.WOMPI_PRIVATE_KEY}"},
-            json=payload,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+    client = get_shared_client("wompi-payment-link", timeout=15)
+    resp = await client.post(
+        f"{_WOMPI_API}/payment_links",
+        headers={"Authorization": f"Bearer {settings.WOMPI_PRIVATE_KEY}"},
+        json=payload,
+    )
+    resp.raise_for_status()
+    data = resp.json()
 
     logger.info("wompi_transaction_created", referencia=referencia, amount_cents=amount_in_cents)
     return {"referencia": referencia, "data": data}
 
 
 async def consultar_transaccion(referencia: str) -> dict:  # type: ignore[type-arg]
-    """Fetch a Wompi transaction by reference and return status."""
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(
-            f"{_WOMPI_API}/transactions",
-            headers={"Authorization": f"Bearer {settings.WOMPI_PRIVATE_KEY}"},
-            params={"reference": referencia},
-        )
-        resp.raise_for_status()
-        return resp.json()
+    """Fetch a Wompi transaction by reference and return status.
+
+    Dead code as of perf/phase2-8-shared-httpx-client (never called anywhere
+    in the codebase) — converted for consistency with `crear_transaccion`,
+    kept its own "wompi-transaction" cache key since its timeout (10s) differs
+    from `crear_transaccion`'s (15s).
+    """
+    client = get_shared_client("wompi-transaction", timeout=10)
+    resp = await client.get(
+        f"{_WOMPI_API}/transactions",
+        headers={"Authorization": f"Bearer {settings.WOMPI_PRIVATE_KEY}"},
+        params={"reference": referencia},
+    )
+    resp.raise_for_status()
+    return resp.json()
 
 
 def verificar_firma_webhook(payload_bytes: bytes, timestamp: str, checksum: str) -> bool:

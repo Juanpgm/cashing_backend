@@ -14,6 +14,7 @@ from app.adapters.secop_scraper.dto import (
     ScrapeResult,
     ScraperUnavailableError,
 )
+from app.core.http_clients import get_shared_client
 
 log = structlog.get_logger("secop_scraper.http_adapter")
 
@@ -43,8 +44,15 @@ class SecopScraperHttpAdapter:
         headers = {"X-Internal-Token": self._token}
 
         try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                resp = await client.post(url, json=payload, headers=headers)
+            # `self._timeout` is baked into the shared client's construction
+            # kwargs (not passed per-request): the single production call
+            # site (`app/adapters/secop_scraper/__init__.py`) never overrides
+            # it, so it is effectively a fixed constant in practice — see
+            # `get_shared_client`'s "Footgun" docstring section for why this
+            # would be unsafe if a second, differently-timed instance shared
+            # this same "secop-scraper-proxy" name.
+            client = get_shared_client("secop-scraper-proxy", timeout=self._timeout)
+            resp = await client.post(url, json=payload, headers=headers)
         except httpx.HTTPError as exc:
             await log.aerror("scraper.http_failed", error=str(exc), notice_uid=notice_uid)
             raise ScraperUnavailableError(f"Cannot reach scraper service: {exc}") from exc
@@ -63,9 +71,7 @@ class SecopScraperHttpAdapter:
                 message=detail.get("message") or "Captcha required by SECOP II",
             )
         if resp.status_code >= 400:
-            raise ScraperUnavailableError(
-                f"Scraper service returned {resp.status_code}: {resp.text[:200]}"
-            )
+            raise ScraperUnavailableError(f"Scraper service returned {resp.status_code}: {resp.text[:200]}")
 
         data = resp.json()
         docs = [_to_dto(d) for d in data.get("docs", [])]

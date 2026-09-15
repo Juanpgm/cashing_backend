@@ -133,6 +133,14 @@ async def exchange_code(code: str, code_verifier: str) -> dict[str, Any]:
     }
 
     try:
+        # Deliberately NOT `get_shared_client` — see `graph_adapter.
+        # _refresh_access_token`'s identical comment (perf/phase2-8-shared-
+        # httpx-client's review round): a shared client's cookie jar would
+        # persist Microsoft STS cookies across DIFFERENT users' token
+        # exchanges, and this endpoint is inherently low-frequency per user,
+        # so there's no real performance case for sharing it anyway. Fresh
+        # client per exchange, reused only within this one call (for the
+        # `_fetch_account_email` follow-up request below).
         async with httpx.AsyncClient(timeout=10.0) as http_client:
             token_resp = await http_client.post(token_url, data=data)
             token_resp.raise_for_status()

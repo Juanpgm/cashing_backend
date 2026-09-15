@@ -121,6 +121,14 @@ class TestIsFresh:
 
 
 class TestQuerySocrata:
+    """Retargeted for perf/phase2-8-shared-httpx-client: `_query_socrata` now
+    fetches its client via `get_shared_client("secop-api", ...)` once before
+    the retry loop (no more `async with httpx.AsyncClient(...)`), so these
+    tests patch `app.services.secop_service.get_shared_client` directly
+    (returning a plain `AsyncMock` client, no `__aenter__`/`__aexit__` needed)
+    instead of the old `httpx.AsyncClient` constructor + context-manager
+    mocking."""
+
     @pytest.mark.asyncio
     async def test_returns_list_on_success(self) -> None:
         from app.services.secop_service import _query_socrata
@@ -129,11 +137,10 @@ class TestQuerySocrata:
         mock_response.json.return_value = [{"id_contrato": "ABC"}]
         mock_response.raise_for_status = MagicMock()
 
-        with patch("httpx.AsyncClient") as mock_client_cls:
+        with patch("app.services.secop_service.get_shared_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_client.get.return_value = mock_response
-            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=None)
+            mock_get_client.return_value = mock_client
 
             result = await _query_socrata("jbjy-vk9h", "cedula='12345'")
 
@@ -147,11 +154,10 @@ class TestQuerySocrata:
         mock_response.json.return_value = {"results": [{"id_contrato": "XYZ"}]}
         mock_response.raise_for_status = MagicMock()
 
-        with patch("httpx.AsyncClient") as mock_client_cls:
+        with patch("app.services.secop_service.get_shared_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_client.get.return_value = mock_response
-            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=None)
+            mock_get_client.return_value = mock_client
 
             result = await _query_socrata("jbjy-vk9h", "cedula='12345'")
 
@@ -165,11 +171,10 @@ class TestQuerySocrata:
         mock_resp = MagicMock()
         mock_resp.status_code = 500
 
-        with patch("httpx.AsyncClient") as mock_client_cls:
+        with patch("app.services.secop_service.get_shared_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_client.get.side_effect = httpx.HTTPStatusError("error", request=mock_request, response=mock_resp)
-            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=None)
+            mock_get_client.return_value = mock_client
 
             with pytest.raises(ExternalServiceError):
                 await _query_socrata("jbjy-vk9h", "cedula='12345'")
@@ -178,18 +183,21 @@ class TestQuerySocrata:
     async def test_raises_external_service_error_on_request_error(self) -> None:
         from app.services.secop_service import _query_socrata
 
-        with patch("httpx.AsyncClient") as mock_client_cls:
+        with patch("app.services.secop_service.get_shared_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_client.get.side_effect = httpx.RequestError("connection refused")
-            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=None)
+            mock_get_client.return_value = mock_client
 
             with pytest.raises(ExternalServiceError):
                 await _query_socrata("jbjy-vk9h", "cedula='12345'")
 
     @pytest.mark.asyncio
     async def test_retries_on_429_then_succeeds(self) -> None:
-        """429 on the first attempt, 200 on the second — retry recovers with no error."""
+        """429 on the first attempt, 200 on the second — retry recovers with no
+        error. The retry loop now reuses the SAME shared client instance
+        across attempts (see secop_service.py's behavior-change comment) —
+        `mock_get_client` must be called only ONCE (client fetched before the
+        loop) while `mock_client.get` is called twice (once per attempt)."""
         from app.services.secop_service import _query_socrata
 
         mock_request = MagicMock()
@@ -202,17 +210,17 @@ class TestQuerySocrata:
         resp_200.raise_for_status = MagicMock()
         resp_200.json.return_value = [{"id_contrato": "OK"}]
 
-        with patch("httpx.AsyncClient") as mock_client_cls:
+        with patch("app.services.secop_service.get_shared_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_client.get.side_effect = [resp_429, resp_200]
-            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=None)
+            mock_get_client.return_value = mock_client
 
             with patch("app.services.secop_service.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
                 result = await _query_socrata("jbjy-vk9h", "cedula='12345'")
 
         assert result == [{"id_contrato": "OK"}]
         assert mock_client.get.call_count == 2
+        mock_get_client.assert_called_once()
         mock_sleep.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -225,11 +233,10 @@ class TestQuerySocrata:
         resp_500.status_code = 500
         resp_500.raise_for_status.side_effect = httpx.HTTPStatusError("500", request=mock_request, response=resp_500)
 
-        with patch("httpx.AsyncClient") as mock_client_cls:
+        with patch("app.services.secop_service.get_shared_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_client.get.return_value = resp_500
-            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=None)
+            mock_get_client.return_value = mock_client
 
             with (
                 patch("app.services.secop_service.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
