@@ -27,7 +27,7 @@ import httplib2
 import pytest
 from app.adapters.email.gmail_adapter import GmailAdapter
 from app.core.exceptions import ExternalServiceError
-from google.auth.exceptions import RefreshError
+from google.auth.exceptions import RefreshError, TransportError
 from googleapiclient.errors import HttpError as GoogleHttpError
 
 
@@ -119,13 +119,19 @@ class TestGetAttachmentFailures:
         """RefreshError can be raised lazily inside `.execute()` by the
         underlying transport auto-refreshing an expired token — not just in
         `get_credentials`'s explicit `creds.refresh(...)` call. Review r1
-        finding P2b."""
+        finding P2b. Review r2 finding P2-1: a revoked/expired grant is a
+        PERMANENT auth failure, not a transient transport outage — it must
+        carry the same reconnect message/code as the explicit-refresh path,
+        not the generic "no está disponible" transport message."""
         service = MagicMock()
         service.users().messages().attachments().get().execute.side_effect = RefreshError("token expired")
         adapter = _adapter_with_service(service)
 
-        with pytest.raises(ExternalServiceError):
+        with pytest.raises(ExternalServiceError) as exc_info:
             await adapter.get_attachment(uuid.uuid4(), "msg1", "att1")
+
+        assert exc_info.value.code == "GOOGLE_REAUTH_REQUIRED"
+        assert "reconectá" in str(exc_info.value).lower()
 
     @pytest.mark.asyncio
     async def test_429_still_retries_then_succeeds(self) -> None:
@@ -159,6 +165,19 @@ class TestGetAttachmentFailures:
         result = await adapter.get_attachment(uuid.uuid4(), "msg1", "att1")
 
         assert result == b""
+
+    @pytest.mark.asyncio
+    async def test_explicit_null_data_is_wrapped_not_raw_type_error(self) -> None:
+        """Review r2, finding P3-2: `result.get("data", "")` only defaults on a
+        MISSING key — Gmail explicitly returning `{"data": null}` bypasses that
+        default entirely, so `data + "=="` crashes with a raw `TypeError`
+        (`NoneType + str`) instead of the domain `ExternalServiceError`."""
+        service = MagicMock()
+        service.users().messages().attachments().get().execute.return_value = {"data": None}
+        adapter = _adapter_with_service(service)
+
+        with pytest.raises(ExternalServiceError):
+            await adapter.get_attachment(uuid.uuid4(), "msg1", "att1")
 
     @pytest.mark.asyncio
     async def test_invalid_base64_data_is_wrapped_not_raw_binascii_error(self) -> None:
@@ -282,12 +301,17 @@ class TestFetchMessageMalformedPayload:
 
     @pytest.mark.asyncio
     async def test_lazy_token_refresh_failure_during_fetch_is_wrapped(self) -> None:
+        """Review r2 finding P2-1: must classify as reconnect-required, not a
+        transient transport outage."""
         service = MagicMock()
         service.users().messages().get().execute.side_effect = RefreshError("token expired")
         adapter = _adapter_with_service(service)
 
-        with pytest.raises(ExternalServiceError):
+        with pytest.raises(ExternalServiceError) as exc_info:
             await adapter.get_message(uuid.uuid4(), "m1")
+
+        assert exc_info.value.code == "GOOGLE_REAUTH_REQUIRED"
+        assert "reconectá" in str(exc_info.value).lower()
 
 
 class TestSearchMessagesAndSendMessageFailureMatrix:
@@ -364,12 +388,17 @@ class TestSearchMessagesAndSendMessageFailureMatrix:
 
     @pytest.mark.asyncio
     async def test_search_lazy_token_refresh_failure_is_wrapped(self) -> None:
+        """Review r2 finding P2-1: must classify as reconnect-required, not a
+        transient transport outage."""
         service = MagicMock()
         service.users().messages().list().execute.side_effect = RefreshError("token expired")
         adapter = _adapter_with_service(service)
 
-        with pytest.raises(ExternalServiceError):
+        with pytest.raises(ExternalServiceError) as exc_info:
             await adapter.search_messages(uuid.uuid4(), "q")
+
+        assert exc_info.value.code == "GOOGLE_REAUTH_REQUIRED"
+        assert "reconectá" in str(exc_info.value).lower()
 
     @pytest.mark.asyncio
     async def test_send_dns_failure_is_wrapped(self) -> None:
@@ -382,12 +411,17 @@ class TestSearchMessagesAndSendMessageFailureMatrix:
 
     @pytest.mark.asyncio
     async def test_send_lazy_token_refresh_failure_is_wrapped(self) -> None:
+        """Review r2 finding P2-1: must classify as reconnect-required, not a
+        transient transport outage."""
         service = MagicMock()
         service.users().messages().send().execute.side_effect = RefreshError("token expired")
         adapter = _adapter_with_service(service)
 
-        with pytest.raises(ExternalServiceError):
+        with pytest.raises(ExternalServiceError) as exc_info:
             await adapter.send_message(uuid.uuid4(), ["a@b.com"], "subj", "<p>hi</p>")
+
+        assert exc_info.value.code == "GOOGLE_REAUTH_REQUIRED"
+        assert "reconectá" in str(exc_info.value).lower()
 
 
 class TestSearchMessagesPerMessageTolerance:
@@ -473,9 +507,21 @@ class TestSearchMessagesPerMessageTolerance:
         service.users().messages().get.side_effect = _get
         adapter = _adapter_with_service(service)
 
-        result = await adapter.search_messages(uuid.uuid4(), "q")
+        with patch("app.adapters.email.gmail_adapter.logger.warning") as mock_warning:
+            result = await adapter.search_messages(uuid.uuid4(), "q")
 
         assert result == []
+        # Review r2, finding P3-3: an "all malformed" batch is otherwise
+        # indistinguishable from a genuinely empty search result — a
+        # systematic Gmail payload-shape change would silently look like "no
+        # evidence found" instead of an alertable anomaly. Each individual
+        # skip is already logged (asserted elsewhere in this class); this
+        # asserts the AGGREGATE warning fires too, with the batch size.
+        aggregate_calls = [
+            call for call in mock_warning.call_args_list if call.args[0] == "gmail_search_all_messages_malformed"
+        ]
+        assert len(aggregate_calls) == 1
+        assert aggregate_calls[0].kwargs.get("count") == 2
 
 
 class TestUserFacingMessageDoesNotLeakRawSdkText:
@@ -512,6 +558,31 @@ class TestUserFacingMessageDoesNotLeakRawSdkText:
 
     @pytest.mark.asyncio
     async def test_transport_error_message_does_not_leak_raw_exception_text(self) -> None:
+        """Uses `TransportError`, not `RefreshError` — since review r2 finding
+        P2-1, `RefreshError` is no longer classified as a transport condition
+        (it gets the dedicated reconnect message/code instead, asserted in
+        `TestReauthRequiredDoesNotLeakRawExceptionText` below)."""
+        service = MagicMock()
+        service.users().messages().list().execute.side_effect = TransportError(
+            "refresh failed for internal-service-account@project.iam.gserviceaccount.com"
+        )
+        adapter = _adapter_with_service(service)
+
+        with pytest.raises(ExternalServiceError) as exc_info:
+            await adapter.search_messages(uuid.uuid4(), "q")
+
+        detail = str(exc_info.value)
+        assert "internal-service-account" not in detail
+        assert "TransportError" in detail
+
+
+class TestReauthRequiredDoesNotLeakRawExceptionText:
+    """Review r2 finding P2-1: `RefreshError` now raises a dedicated,
+    fully-canned reconnect message — verify it never echoes the raw
+    exception text either."""
+
+    @pytest.mark.asyncio
+    async def test_refresh_error_message_does_not_leak_raw_exception_text(self) -> None:
         service = MagicMock()
         service.users().messages().list().execute.side_effect = RefreshError(
             "refresh failed for internal-service-account@project.iam.gserviceaccount.com"
@@ -523,7 +594,86 @@ class TestUserFacingMessageDoesNotLeakRawSdkText:
 
         detail = str(exc_info.value)
         assert "internal-service-account" not in detail
-        assert "RefreshError" in detail
+        assert exc_info.value.code == "GOOGLE_REAUTH_REQUIRED"
+
+
+class TestHttpErrorStatusAndHint:
+    """Review r2, finding P2-2: P3a's redaction correctly stripped `str(exc)`,
+    but `include_exc_type=False` (mandatory — GoogleHttpError's class name IS
+    "HttpError") also flattened every HTTP status into one identical message,
+    so a 403-insufficient-scope looked exactly like a 503 outage. Each status
+    now carries the numeric code plus a short, class-specific Spanish hint,
+    still without leaking raw SDK text (the leak tests above stay green
+    unchanged)."""
+
+    @pytest.mark.asyncio
+    async def test_401_carries_status_and_permission_hint(self) -> None:
+        service = MagicMock()
+        service.users().messages().list().execute.side_effect = _http_error(401, "unauthorized")
+        adapter = _adapter_with_service(service)
+
+        with pytest.raises(ExternalServiceError) as exc_info:
+            await adapter.search_messages(uuid.uuid4(), "q")
+
+        detail = str(exc_info.value)
+        assert "401" in detail
+        assert "permisos" in detail.lower()
+        assert "http" not in detail.lower()
+
+    @pytest.mark.asyncio
+    async def test_403_carries_status_and_permission_hint(self) -> None:
+        service = MagicMock()
+        service.users().messages().attachments().get().execute.side_effect = _http_error(403, "forbidden")
+        adapter = _adapter_with_service(service)
+
+        with patch("asyncio.sleep", new=AsyncMock()), pytest.raises(ExternalServiceError) as exc_info:
+            await adapter.get_attachment(uuid.uuid4(), "msg1", "att1")
+
+        detail = str(exc_info.value)
+        assert "403" in detail
+        assert "permisos" in detail.lower()
+        assert "http" not in detail.lower()
+
+    @pytest.mark.asyncio
+    async def test_404_carries_status_and_not_found_hint(self) -> None:
+        service = MagicMock()
+        service.users().messages().get().execute.side_effect = _http_error(404, "not found")
+        adapter = _adapter_with_service(service)
+
+        with pytest.raises(ExternalServiceError) as exc_info:
+            await adapter.get_message(uuid.uuid4(), "m1")
+
+        detail = str(exc_info.value)
+        assert "404" in detail
+        assert "no existe" in detail.lower()
+        assert "http" not in detail.lower()
+
+    @pytest.mark.asyncio
+    async def test_429_retries_exhausted_carries_retry_hint(self) -> None:
+        service = MagicMock()
+        service.users().messages().list().execute.side_effect = _http_error(429, "rateLimitExceeded")
+        adapter = _adapter_with_service(service)
+
+        with patch("asyncio.sleep", new=AsyncMock()), pytest.raises(ExternalServiceError) as exc_info:
+            await adapter.search_messages(uuid.uuid4(), "q")
+
+        detail = str(exc_info.value)
+        assert "429" in detail
+        assert "reintentá" in detail.lower()
+        assert "http" not in detail.lower()
+
+    @pytest.mark.asyncio
+    async def test_5xx_carries_status_code(self) -> None:
+        service = MagicMock()
+        service.users().messages().list().execute.side_effect = _http_error(503, "unavailable")
+        adapter = _adapter_with_service(service)
+
+        with pytest.raises(ExternalServiceError) as exc_info:
+            await adapter.search_messages(uuid.uuid4(), "q")
+
+        detail = str(exc_info.value)
+        assert "503" in detail
+        assert "http" not in detail.lower()
 
 
 class TestEmailSearchRouteFailureHandling:

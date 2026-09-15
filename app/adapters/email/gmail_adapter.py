@@ -26,7 +26,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.email.port import EmailAttachment, EmailMessage
-from app.adapters.google_errors import GOOGLE_TRANSPORT_ERRORS, raise_external_service_error
+from app.adapters.google_errors import (
+    GOOGLE_TRANSPORT_ERRORS,
+    raise_external_service_error,
+    raise_google_http_error,
+    raise_google_reauth_required,
+)
 from app.core.config import settings
 from app.core.exceptions import ExternalServiceError, NotFoundError, ValidationError
 from app.models.integracion import Integracion, IntegrationProvider
@@ -187,7 +192,15 @@ class GmailAdapter:
             loop = asyncio.get_running_loop()
             try:
                 await loop.run_in_executor(None, lambda: creds.refresh(Request()))
-            except (RefreshError, TransportError) as exc:
+            except RefreshError as exc:
+                raise_google_reauth_required(
+                    logger,
+                    "Google OAuth",
+                    exc,
+                    "gmail_token_refresh_failed",
+                    user_id=str(usuario_id),
+                )
+            except TransportError as exc:
                 raise_external_service_error(
                     logger,
                     "Google OAuth",
@@ -248,14 +261,15 @@ class GmailAdapter:
         try:
             result = await self._execute_with_retry(_search)
         except GoogleHttpError as exc:
-            raise_external_service_error(
+            raise_google_http_error(
                 logger,
                 "Gmail",
                 "Gmail no está disponible en este momento",
                 exc,
                 "gmail_search_http_failed",
-                include_exc_type=False,
             )
+        except RefreshError as exc:
+            raise_google_reauth_required(logger, "Gmail", exc, "gmail_search_reauth_required")
         except GOOGLE_TRANSPORT_ERRORS as exc:
             raise_external_service_error(
                 logger, "Gmail", "Gmail no está disponible en este momento", exc, "gmail_search_transport_failed"
@@ -285,7 +299,17 @@ class GmailAdapter:
 
         tasks = [_bounded_fetch(msg["id"]) for msg in raw_messages]
         results = await asyncio.gather(*tasks)
-        return [message for message in results if message is not None]
+        messages = [message for message in results if message is not None]
+        if raw_messages and not messages:
+            # Every single message in the batch was malformed. Each individual
+            # skip is already logged (with its message_id) by `_bounded_fetch`
+            # above, but an "all malformed" batch is indistinguishable from a
+            # genuinely empty search result to a caller that only sees `[]` —
+            # a systematic Gmail payload-shape change would silently look like
+            # "no evidence found" instead of an alertable anomaly (review r2,
+            # finding P3-3).
+            logger.warning("gmail_search_all_messages_malformed", count=len(raw_messages))
+        return messages
 
     async def get_message(self, usuario_id: uuid.UUID, message_id: str) -> EmailMessage:
         creds = await self.get_credentials(usuario_id)
@@ -319,14 +343,17 @@ class GmailAdapter:
         try:
             raw = await self._execute_with_retry(_get)
         except GoogleHttpError as exc:
-            raise_external_service_error(
+            raise_google_http_error(
                 logger,
                 "Gmail",
                 "No se pudo obtener el mensaje de Gmail",
                 exc,
                 "gmail_fetch_message_http_failed",
                 message_id=message_id,
-                include_exc_type=False,
+            )
+        except RefreshError as exc:
+            raise_google_reauth_required(
+                logger, "Gmail", exc, "gmail_fetch_message_reauth_required", message_id=message_id
             )
         except GOOGLE_TRANSPORT_ERRORS as exc:
             raise_external_service_error(
@@ -367,7 +394,7 @@ class GmailAdapter:
         try:
             result = await self._execute_with_retry(_get_att)
         except GoogleHttpError as exc:
-            raise_external_service_error(
+            raise_google_http_error(
                 logger,
                 "Gmail",
                 "No se pudo obtener el adjunto de Gmail",
@@ -375,7 +402,15 @@ class GmailAdapter:
                 "gmail_get_attachment_http_failed",
                 message_id=message_id,
                 attachment_id=attachment_id,
-                include_exc_type=False,
+            )
+        except RefreshError as exc:
+            raise_google_reauth_required(
+                logger,
+                "Gmail",
+                exc,
+                "gmail_get_attachment_reauth_required",
+                message_id=message_id,
+                attachment_id=attachment_id,
             )
         except GOOGLE_TRANSPORT_ERRORS as exc:
             raise_external_service_error(
@@ -390,10 +425,14 @@ class GmailAdapter:
         data = result.get("data", "")
         try:
             return base64.urlsafe_b64decode(data + "==")
-        except ValueError as exc:
-            # binascii.Error (a ValueError subclass) on malformed base64 `data` —
-            # previously outside every try/except (radicacion-sin-friccion phase
-            # 4.3 review, finding P2a).
+        except (ValueError, TypeError) as exc:
+            # ValueError: binascii.Error (a ValueError subclass) on malformed
+            # base64 `data` — previously outside every try/except
+            # (radicacion-sin-friccion phase 4.3 review, finding P2a).
+            # TypeError: Gmail explicitly returning `{"data": null}` — the
+            # `.get("data", "")` default only fires on a MISSING key, so a
+            # present-but-null value reaches `None + "=="` unguarded (review
+            # r2, finding P3-2).
             raise_external_service_error(
                 logger,
                 "Gmail",
@@ -443,14 +482,15 @@ class GmailAdapter:
         try:
             result = await self._execute_with_retry(_send)
         except GoogleHttpError as exc:
-            raise_external_service_error(
+            raise_google_http_error(
                 logger,
                 "Gmail",
                 "No se pudo enviar el correo por Gmail",
                 exc,
                 "gmail_send_http_failed",
-                include_exc_type=False,
             )
+        except RefreshError as exc:
+            raise_google_reauth_required(logger, "Gmail", exc, "gmail_send_reauth_required")
         except GOOGLE_TRANSPORT_ERRORS as exc:
             raise_external_service_error(
                 logger, "Gmail", "No se pudo enviar el correo por Gmail", exc, "gmail_send_transport_failed"
