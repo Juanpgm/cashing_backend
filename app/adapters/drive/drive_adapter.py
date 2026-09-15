@@ -74,12 +74,16 @@ class DriveAdapter:
         failure modes to the domain `ExternalServiceError` (502) contract:
 
         - `GoogleHttpError` — 4xx/5xx from the API itself.
+        - `google.auth.exceptions.RefreshError` — a lazy token refresh inside
+          `.execute()` failed (revoked/expired grant): caught FIRST and mapped
+          to `GOOGLE_REAUTH_REQUIRED` with the reconnect message — this is a
+          permanent auth condition, never a transient outage.
         - `GOOGLE_TRANSPORT_ERRORS` (`app.adapters.google_errors`) — raw socket
           errors (`OSError`/`TimeoutError`), DNS failures
-          (`httplib2.ServerNotFoundError`), and auth/transport failures during
-          a lazy token refresh inside `.execute()`
-          (`google.auth.exceptions.TransportError`/`RefreshError`) — none of
-          which `run_in_executor` would otherwise wrap.
+          (`httplib2.ServerNotFoundError`), and network failures during a lazy
+          token refresh (`google.auth.exceptions.TransportError`) — none of
+          which `run_in_executor` would otherwise wrap. `RefreshError` is
+          deliberately NOT in that tuple.
 
         This does NOT cover every conceivable failure (e.g. a bug in `fn`
         itself raises unwrapped, by design) — see radicacion-sin-friccion

@@ -379,6 +379,15 @@ class TestReauthRequiredDoesNotLeakRawExceptionText:
         assert "internal-service-account" not in detail
         assert exc_info.value.code == "GOOGLE_REAUTH_REQUIRED"
 
+    def test_refresh_error_is_not_a_transport_error(self) -> None:
+        """Review r3: every call site catches `RefreshError` BEFORE the
+        transport tuple, so re-adding it to the tuple would be invisible to
+        the behavioral tests — pin the invariant directly."""
+        from app.adapters.google_errors import GOOGLE_TRANSPORT_ERRORS
+
+        assert RefreshError not in GOOGLE_TRANSPORT_ERRORS
+        assert not any(issubclass(RefreshError, cls) for cls in GOOGLE_TRANSPORT_ERRORS)
+
 
 class TestHttpErrorStatusAndHint:
     """Review r2, finding P2-2: `_run`'s shared `GoogleHttpError` branch used
