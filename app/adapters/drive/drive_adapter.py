@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import TypeVar
 
 import structlog
+from google.auth.exceptions import RefreshError
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError as GoogleHttpError
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
@@ -18,7 +19,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.drive.port import DriveFile, DriveQuery
 from app.adapters.email.gmail_adapter import GmailAdapter
-from app.adapters.google_errors import GOOGLE_TRANSPORT_ERRORS, raise_external_service_error
+from app.adapters.google_errors import (
+    GOOGLE_TRANSPORT_ERRORS,
+    raise_external_service_error,
+    raise_google_http_error,
+    raise_google_reauth_required,
+)
 from app.core.exceptions import ExternalServiceError
 
 logger = structlog.get_logger("adapters.drive")
@@ -83,20 +89,21 @@ class DriveAdapter:
         try:
             return await loop.run_in_executor(None, fn)
         except GoogleHttpError as exc:
-            # include_exc_type=False: GoogleHttpError's class name is literally
-            # "HttpError" — appending it would reintroduce the raw-SDK-text leak
-            # this closes (review r1, finding P3a). `context` (developer-authored,
-            # e.g. "Error subiendo archivo 'x.pdf'") is safe to log but the raw
-            # `str(exc)` (full request URI, incl. `q=` search terms) is not.
-            raise_external_service_error(
+            # `context` (developer-authored, e.g. "Error subiendo archivo
+            # 'x.pdf'") is safe to log but the raw `str(exc)` (full request
+            # URI, incl. `q=` search terms) is not — see
+            # `raise_google_http_error`'s own docstring for why it never
+            # appends the exception's class name either.
+            raise_google_http_error(
                 logger,
                 "Drive",
                 "No se pudo completar la operación en Drive",
                 exc,
                 "drive_operation_http_failed",
                 context=context,
-                include_exc_type=False,
             )
+        except RefreshError as exc:
+            raise_google_reauth_required(logger, "Drive", exc, "drive_operation_reauth_required", context=context)
         except GOOGLE_TRANSPORT_ERRORS as exc:
             raise_external_service_error(
                 logger,
@@ -143,7 +150,16 @@ class DriveAdapter:
         # malformed payload must still be traceable by its id — logging only
         # after `_parse_file` (which can raise) previously left zero trace
         # that the upload itself actually succeeded (review r1, finding P3b).
-        logger.info("drive_file_uploaded", file_id=raw.get("id"), name=name, user_id=str(usuario_id))
+        # `isinstance` guard: `raw.get(...)` on a non-dict response (e.g. a
+        # list) raises a raw AttributeError instead of the domain
+        # ExternalServiceError `_parse_file` below would otherwise wrap it
+        # into (review r2, finding P3-1).
+        logger.info(
+            "drive_file_uploaded",
+            file_id=raw.get("id") if isinstance(raw, dict) else None,
+            name=name,
+            user_id=str(usuario_id),
+        )
         return self._parse_file(raw)
 
     # ── Folder Management ────────────────────────────────────────────────────
@@ -376,13 +392,19 @@ class DriveAdapter:
                 parents=raw.get("parents", []),
             )
         except (KeyError, TypeError, ValueError) as exc:
+            # `raw.get("id")` guarded by `isinstance`: a non-dict `raw` (e.g. a
+            # list) raises `TypeError` above (caught), but `raw.get(...)` on
+            # that same non-dict `raw` — unguarded — would raise a raw
+            # `AttributeError` right here inside the except handler, escaping
+            # this very function that exists to prevent a raw exception from
+            # reaching the caller (review r2, finding P3-1).
             raise_external_service_error(
                 logger,
                 "Drive",
                 "El archivo de Drive tiene un formato inesperado",
                 exc,
                 "drive_file_parse_failed_detail",
-                file_id=raw.get("id"),
+                file_id=raw.get("id") if isinstance(raw, dict) else None,
             )
 
     def _parse_files_tolerant(self, raw_files: list[dict]) -> list[DriveFile]:  # type: ignore[type-arg]

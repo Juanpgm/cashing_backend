@@ -25,7 +25,7 @@ import httplib2
 import pytest
 from app.adapters.drive.drive_adapter import DriveAdapter
 from app.core.exceptions import ExternalServiceError
-from google.auth.exceptions import RefreshError
+from google.auth.exceptions import RefreshError, TransportError
 from googleapiclient.errors import HttpError as GoogleHttpError
 
 
@@ -103,17 +103,37 @@ class TestUploadFileFailures:
 
     @pytest.mark.asyncio
     async def test_lazy_token_refresh_failure_is_wrapped(self) -> None:
+        """Review r2 finding P2-1: a revoked/expired grant is a PERMANENT auth
+        failure, not a transient transport outage — must carry the reconnect
+        message/code, not the generic "no se pudo completar" transport
+        message."""
         service = MagicMock()
         service.files().create().execute.side_effect = RefreshError("token expired")
+        adapter = _make_adapter(service)
+
+        with pytest.raises(ExternalServiceError) as exc_info:
+            await adapter.upload_file(uuid.uuid4(), "a.pdf", b"x", "application/pdf")
+
+        assert exc_info.value.code == "GOOGLE_REAUTH_REQUIRED"
+        assert "reconectá" in str(exc_info.value).lower()
+
+    @pytest.mark.asyncio
+    async def test_malformed_response_missing_id_is_wrapped(self) -> None:
+        service = MagicMock()
+        service.files().create().execute.return_value = {"name": "a.pdf"}  # no "id"
         adapter = _make_adapter(service)
 
         with pytest.raises(ExternalServiceError):
             await adapter.upload_file(uuid.uuid4(), "a.pdf", b"x", "application/pdf")
 
     @pytest.mark.asyncio
-    async def test_malformed_response_missing_id_is_wrapped(self) -> None:
+    async def test_non_dict_response_is_wrapped_not_raw_attribute_error(self) -> None:
+        """Review r2, finding P3-1: the `drive_file_uploaded` log call did
+        `raw.get("id")` unguarded — a non-dict API response (e.g. a list)
+        crashes with a raw `AttributeError` (500) instead of the domain
+        `ExternalServiceError` (502)."""
         service = MagicMock()
-        service.files().create().execute.return_value = {"name": "a.pdf"}  # no "id"
+        service.files().create().execute.return_value = ["unexpected", "list", "response"]
         adapter = _make_adapter(service)
 
         with pytest.raises(ExternalServiceError):
@@ -322,6 +342,30 @@ class TestUserFacingMessageDoesNotLeakRawSdkText:
 
     @pytest.mark.asyncio
     async def test_transport_error_message_does_not_leak_raw_exception_text(self) -> None:
+        """Uses `TransportError`, not `RefreshError` — since review r2 finding
+        P2-1, `RefreshError` is no longer classified as a transport condition
+        (see `TestReauthRequiredDoesNotLeakRawExceptionText` below)."""
+        service = MagicMock()
+        service.files().create().execute.side_effect = TransportError(
+            "refresh failed for internal-service-account@project.iam.gserviceaccount.com"
+        )
+        adapter = _make_adapter(service)
+
+        with pytest.raises(ExternalServiceError) as exc_info:
+            await adapter.upload_file(uuid.uuid4(), "a.pdf", b"x", "application/pdf")
+
+        detail = str(exc_info.value)
+        assert "internal-service-account" not in detail
+        assert "TransportError" in detail
+
+
+class TestReauthRequiredDoesNotLeakRawExceptionText:
+    """Review r2 finding P2-1: `RefreshError` now raises a dedicated,
+    fully-canned reconnect message — verify it never echoes the raw
+    exception text either."""
+
+    @pytest.mark.asyncio
+    async def test_refresh_error_message_does_not_leak_raw_exception_text(self) -> None:
         service = MagicMock()
         service.files().create().execute.side_effect = RefreshError(
             "refresh failed for internal-service-account@project.iam.gserviceaccount.com"
@@ -333,7 +377,85 @@ class TestUserFacingMessageDoesNotLeakRawSdkText:
 
         detail = str(exc_info.value)
         assert "internal-service-account" not in detail
-        assert "RefreshError" in detail
+        assert exc_info.value.code == "GOOGLE_REAUTH_REQUIRED"
+
+
+class TestHttpErrorStatusAndHint:
+    """Review r2, finding P2-2: `_run`'s shared `GoogleHttpError` branch used
+    to collapse every 4xx/5xx into one identical message — a
+    403-insufficient-scope (e.g. an account that consented before
+    `drive.readonly` was added) looked exactly like a plain outage. Each
+    status now carries the numeric code plus a short, class-specific Spanish
+    hint, still without leaking raw SDK text."""
+
+    @pytest.mark.asyncio
+    async def test_401_carries_status_and_permission_hint(self) -> None:
+        service = MagicMock()
+        service.files().list().execute.side_effect = _http_error(401, "unauthorized")
+        adapter = _make_adapter(service)
+
+        with pytest.raises(ExternalServiceError) as exc_info:
+            await adapter.list_files(uuid.uuid4(), "folder1")
+
+        detail = str(exc_info.value)
+        assert "401" in detail
+        assert "permisos" in detail.lower()
+        assert "http" not in detail.lower()
+
+    @pytest.mark.asyncio
+    async def test_403_carries_status_and_permission_hint(self) -> None:
+        service = MagicMock()
+        service.files().list().execute.side_effect = _http_error(403, "forbidden")
+        adapter = _make_adapter(service)
+
+        with pytest.raises(ExternalServiceError) as exc_info:
+            await adapter._find_folder(uuid.uuid4(), "Contrato-001", None)
+
+        detail = str(exc_info.value)
+        assert "403" in detail
+        assert "permisos" in detail.lower()
+        assert "http" not in detail.lower()
+
+    @pytest.mark.asyncio
+    async def test_404_carries_status_and_not_found_hint(self) -> None:
+        service = MagicMock()
+        service.files().get().execute.side_effect = _http_error(404, "not found")
+        adapter = _make_adapter(service)
+
+        with pytest.raises(ExternalServiceError) as exc_info:
+            await adapter.get_file(uuid.uuid4(), "f1")
+
+        detail = str(exc_info.value)
+        assert "404" in detail
+        assert "no existe" in detail.lower()
+        assert "http" not in detail.lower()
+
+    @pytest.mark.asyncio
+    async def test_429_carries_retry_hint(self) -> None:
+        service = MagicMock()
+        service.files().list().execute.side_effect = _http_error(429, "rateLimitExceeded")
+        adapter = _make_adapter(service)
+
+        with pytest.raises(ExternalServiceError) as exc_info:
+            await adapter.list_files(uuid.uuid4(), "folder1")
+
+        detail = str(exc_info.value)
+        assert "429" in detail
+        assert "reintentá" in detail.lower()
+        assert "http" not in detail.lower()
+
+    @pytest.mark.asyncio
+    async def test_5xx_carries_status_code(self) -> None:
+        service = MagicMock()
+        service.files().list().execute.side_effect = _http_error(503, "unavailable")
+        adapter = _make_adapter(service)
+
+        with pytest.raises(ExternalServiceError) as exc_info:
+            await adapter.list_files(uuid.uuid4(), "folder1")
+
+        detail = str(exc_info.value)
+        assert "503" in detail
+        assert "http" not in detail.lower()
 
 
 class TestGetFileFailures:
@@ -359,6 +481,21 @@ class TestGetFileFailures:
     async def test_malformed_response_missing_id_is_wrapped(self) -> None:
         service = MagicMock()
         service.files().get().execute.return_value = {"name": "sin-id.pdf"}
+        adapter = _make_adapter(service)
+
+        with pytest.raises(ExternalServiceError):
+            await adapter.get_file(uuid.uuid4(), "f1")
+
+    @pytest.mark.asyncio
+    async def test_non_dict_response_is_wrapped_not_raw_attribute_error(self) -> None:
+        """Review r2, finding P3-1: `_parse_file`'s own `except` handler logs
+        `file_id=raw.get("id")` unguarded — a non-dict `raw` (e.g. a list)
+        raises `TypeError` inside the `try` (correctly caught), but then
+        `raw.get("id")` inside the `except` handler itself raises a raw
+        `AttributeError` (500) instead of the domain `ExternalServiceError`
+        (502)."""
+        service = MagicMock()
+        service.files().get().execute.return_value = ["not", "a", "dict"]
         adapter = _make_adapter(service)
 
         with pytest.raises(ExternalServiceError):
