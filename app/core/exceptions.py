@@ -53,6 +53,15 @@ PENDING_TOOL_CALL_NOT_FOUND = "PENDING_TOOL_CALL_NOT_FOUND"
 # /paquete/regenerar` call lost the per-cuenta lock to an already in-flight run
 # (sync OR async) — see `app.services.paquete_job_service._upsert_job`.
 PAQUETE_GENERACION_EN_CURSO = "PAQUETE_GENERACION_EN_CURSO"
+# A Google OAuth grant was revoked, or its refresh token expired/rotated, while
+# `Integracion.expires_at` was still in the future — the LAZY auto-refresh
+# inside a Google API call's `.execute()` (not the explicit `creds.refresh(...)`
+# in `GmailAdapter.get_credentials`) failed with
+# `google.auth.exceptions.RefreshError`. Distinct from a transient transport
+# failure (DNS blip, timeout): retrying does nothing until the user
+# reconnects their account — see `app.adapters.google_errors` (radicacion-sin-
+# friccion phase 4.3 review r2, finding P2-1).
+GOOGLE_REAUTH_REQUIRED = "GOOGLE_REAUTH_REQUIRED"
 
 
 class DomainError(Exception):
