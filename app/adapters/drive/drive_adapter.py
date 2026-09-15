@@ -6,7 +6,9 @@ import asyncio
 import io
 import re
 import uuid
+from collections.abc import Callable
 from datetime import datetime
+from typing import TypeVar
 
 import structlog
 from googleapiclient.discovery import build
@@ -21,6 +23,8 @@ from app.core.exceptions import ExternalServiceError
 logger = structlog.get_logger("adapters.drive")
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
+
+_T = TypeVar("_T")
 
 
 class DriveAdapter:
@@ -37,6 +41,23 @@ class DriveAdapter:
     def _build_service(self, creds):  # type: ignore[no-untyped-def]
         return build("drive", "v3", credentials=creds, cache_discovery=False)
 
+    async def _run(self, fn: Callable[[], _T], context: str) -> _T:
+        """Run a blocking Drive API call in the executor, mapping every failure
+        mode to the domain `ExternalServiceError` (502) contract.
+
+        Covers both `GoogleHttpError` (4xx/5xx from the API itself) and raw
+        transport errors (`TimeoutError`/`OSError`) that `run_in_executor`
+        would otherwise let escape unwrapped — the same gap `search_files`
+        used to have alone before this slice extended it to every method.
+        """
+        loop = asyncio.get_running_loop()
+        try:
+            return await loop.run_in_executor(None, fn)
+        except GoogleHttpError as exc:
+            raise ExternalServiceError("Drive", f"{context}: {exc}") from exc
+        except (TimeoutError, OSError) as exc:
+            raise ExternalServiceError("Drive", f"{context} (error de conexión): {exc}") from exc
+
     # ── Upload ───────────────────────────────────────────────────────────────
 
     async def upload_file(
@@ -49,7 +70,6 @@ class DriveAdapter:
     ) -> DriveFile:
         creds = await self._auth.get_credentials(usuario_id)
         service = self._build_service(creds)
-        loop = asyncio.get_running_loop()
 
         metadata: dict[str, object] = {"name": name}
         if folder_id:
@@ -69,9 +89,10 @@ class DriveAdapter:
                 .execute()
             )
 
-        raw = await loop.run_in_executor(None, _upload)
-        logger.info("drive_file_uploaded", file_id=raw["id"], name=name, user_id=str(usuario_id))
-        return self._parse_file(raw)
+        raw = await self._run(_upload, f"Error subiendo archivo '{name}'")
+        file = self._parse_file(raw)
+        logger.info("drive_file_uploaded", file_id=file.id, name=name, user_id=str(usuario_id))
+        return file
 
     # ── Folder Management ────────────────────────────────────────────────────
 
@@ -98,7 +119,6 @@ class DriveAdapter:
     ) -> str | None:
         creds = await self._auth.get_credentials(usuario_id)
         service = self._build_service(creds)
-        loop = asyncio.get_running_loop()
 
         # Escape single quotes in name for Drive query
         safe_name = name.replace("'", "\\'")
@@ -109,7 +129,7 @@ class DriveAdapter:
         def _search() -> dict:  # type: ignore[type-arg]
             return service.files().list(q=query, fields="files(id,name)").execute()
 
-        result = await loop.run_in_executor(None, _search)
+        result = await self._run(_search, f"Error buscando carpeta '{name}'")
         files = result.get("files", [])
         return files[0]["id"] if files else None
 
@@ -121,7 +141,6 @@ class DriveAdapter:
     ) -> str:
         creds = await self._auth.get_credentials(usuario_id)
         service = self._build_service(creds)
-        loop = asyncio.get_running_loop()
 
         metadata: dict[str, object] = {"name": name, "mimeType": FOLDER_MIME}
         if parent_id:
@@ -130,7 +149,7 @@ class DriveAdapter:
         def _create() -> dict:  # type: ignore[type-arg]
             return service.files().create(body=metadata, fields="id").execute()
 
-        result = await loop.run_in_executor(None, _create)
+        result = await self._run(_create, f"Error creando carpeta '{name}'")
         logger.info("drive_folder_created", name=name, folder_id=result["id"])
         return result["id"]
 
@@ -144,7 +163,6 @@ class DriveAdapter:
     ) -> list[DriveFile]:
         creds = await self._auth.get_credentials(usuario_id)
         service = self._build_service(creds)
-        loop = asyncio.get_running_loop()
 
         q = f"'{folder_id}' in parents and trashed=false"
         if query:
@@ -160,8 +178,8 @@ class DriveAdapter:
                 .execute()
             )
 
-        result = await loop.run_in_executor(None, _list)
-        return [self._parse_file(f) for f in result.get("files", [])]
+        result = await self._run(_list, f"Error listando archivos de la carpeta '{folder_id}'")
+        return self._parse_files_tolerant(result.get("files", []))
 
     async def search_files(
         self,
@@ -176,7 +194,6 @@ class DriveAdapter:
         """
         creds = await self._auth.get_credentials(usuario_id)
         service = self._build_service(creds)
-        loop = asyncio.get_running_loop()
 
         q = "trashed=false"
         translated = self._translate_query(query)
@@ -195,11 +212,8 @@ class DriveAdapter:
                 .execute()
             )
 
-        try:
-            result = await loop.run_in_executor(None, _search)
-        except GoogleHttpError as exc:
-            raise ExternalServiceError("Drive", f"Error buscando archivos: {exc}") from exc
-        files = [self._parse_file(f) for f in result.get("files", [])]
+        result = await self._run(_search, "Error buscando archivos")
+        files = self._parse_files_tolerant(result.get("files", []))
         logger.info("drive_search", user_id=str(usuario_id), query=query.keywords, count=len(files))
         return files
 
@@ -226,7 +240,6 @@ class DriveAdapter:
     async def get_file(self, usuario_id: uuid.UUID, file_id: str) -> DriveFile:
         creds = await self._auth.get_credentials(usuario_id)
         service = self._build_service(creds)
-        loop = asyncio.get_running_loop()
 
         def _get() -> dict:  # type: ignore[type-arg]
             return (
@@ -238,12 +251,12 @@ class DriveAdapter:
                 .execute()
             )
 
-        return self._parse_file(await loop.run_in_executor(None, _get))
+        raw = await self._run(_get, f"Error obteniendo archivo '{file_id}'")
+        return self._parse_file(raw)
 
     async def download_file(self, usuario_id: uuid.UUID, file_id: str) -> bytes:
         creds = await self._auth.get_credentials(usuario_id)
         service = self._build_service(creds)
-        loop = asyncio.get_running_loop()
 
         def _download() -> bytes:
             request = service.files().get_media(fileId=file_id)
@@ -254,7 +267,7 @@ class DriveAdapter:
                 _, done = downloader.next_chunk()
             return buffer.getvalue()
 
-        return await loop.run_in_executor(None, _download)
+        return await self._run(_download, f"Error descargando archivo '{file_id}'")
 
     # ── Sharing ──────────────────────────────────────────────────────────────
 
@@ -266,7 +279,6 @@ class DriveAdapter:
     ) -> str:
         creds = await self._auth.get_credentials(usuario_id)
         service = self._build_service(creds)
-        loop = asyncio.get_running_loop()
 
         def _share() -> str:
             service.permissions().create(
@@ -275,19 +287,18 @@ class DriveAdapter:
             ).execute()
             return service.files().get(fileId=file_id, fields="webViewLink").execute()["webViewLink"]
 
-        link = await loop.run_in_executor(None, _share)
+        link = await self._run(_share, f"Error compartiendo archivo '{file_id}'")
         logger.info("drive_file_shared", file_id=file_id, role=role)
         return link
 
     async def delete_file(self, usuario_id: uuid.UUID, file_id: str) -> None:
         creds = await self._auth.get_credentials(usuario_id)
         service = self._build_service(creds)
-        loop = asyncio.get_running_loop()
 
         def _trash() -> None:
             service.files().update(fileId=file_id, body={"trashed": True}).execute()
 
-        await loop.run_in_executor(None, _trash)
+        await self._run(_trash, f"Error eliminando archivo '{file_id}'")
         logger.info("drive_file_trashed", file_id=file_id)
 
     # ── Parsing ──────────────────────────────────────────────────────────────
@@ -296,17 +307,33 @@ class DriveAdapter:
         def _parse_dt(val: str) -> datetime:
             return datetime.fromisoformat(val.replace("Z", "+00:00"))
 
-        return DriveFile(
-            id=raw["id"],
-            name=raw.get("name", ""),
-            mime_type=raw.get("mimeType", ""),
-            size_bytes=int(raw.get("size", 0)),
-            created_at=_parse_dt(raw.get("createdTime", "2000-01-01T00:00:00Z")),
-            modified_at=_parse_dt(raw.get("modifiedTime", "2000-01-01T00:00:00Z")),
-            web_view_link=raw.get("webViewLink", ""),
-            download_link=raw.get("webContentLink"),
-            parents=raw.get("parents", []),
-        )
+        try:
+            return DriveFile(
+                id=raw["id"],
+                name=raw.get("name", ""),
+                mime_type=raw.get("mimeType", ""),
+                size_bytes=int(raw.get("size", 0)),
+                created_at=_parse_dt(raw.get("createdTime", "2000-01-01T00:00:00Z")),
+                modified_at=_parse_dt(raw.get("modifiedTime", "2000-01-01T00:00:00Z")),
+                web_view_link=raw.get("webViewLink", ""),
+                download_link=raw.get("webContentLink"),
+                parents=raw.get("parents", []),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ExternalServiceError("Drive", f"Archivo con formato inesperado: {exc}") from exc
+
+    def _parse_files_tolerant(self, raw_files: list[dict]) -> list[DriveFile]:  # type: ignore[type-arg]
+        """Parse a list of raw Drive file resources, skipping (and logging) any
+        malformed item instead of dropping the whole result set — mirrors
+        `GoogleCalendarAdapter.search_events`'s per-item tolerance."""
+        files: list[DriveFile] = []
+        for raw in raw_files:
+            try:
+                files.append(self._parse_file(raw))
+            except ExternalServiceError as exc:
+                logger.warning("drive_file_parse_failed", file_id=raw.get("id"), error=str(exc))
+                continue
+        return files
 
 
 # ── Helper utilities ─────────────────────────────────────────────────────────
