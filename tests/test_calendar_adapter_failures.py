@@ -17,7 +17,7 @@ import httplib2
 import pytest
 from app.adapters.calendar.calendar_adapter import GoogleCalendarAdapter
 from app.core.exceptions import ExternalServiceError
-from google.auth.exceptions import RefreshError
+from google.auth.exceptions import RefreshError, TransportError
 from googleapiclient.errors import HttpError as GoogleHttpError
 
 
@@ -109,12 +109,19 @@ class TestGetEventFailures:
 
     @pytest.mark.asyncio
     async def test_lazy_token_refresh_failure_is_wrapped(self) -> None:
+        """Review r2 finding P2-1: a revoked/expired grant is a PERMANENT auth
+        failure, not a transient transport outage — must carry the reconnect
+        message/code, not the generic "no se pudo obtener" transport
+        message."""
         service = MagicMock()
         service.events().get().execute.side_effect = RefreshError("token expired")
         adapter = _make_adapter(service)
 
-        with pytest.raises(ExternalServiceError):
+        with pytest.raises(ExternalServiceError) as exc_info:
             await adapter.get_event(uuid.uuid4(), "ev1")
+
+        assert exc_info.value.code == "GOOGLE_REAUTH_REQUIRED"
+        assert "reconectá" in str(exc_info.value).lower()
 
     @pytest.mark.asyncio
     async def test_malformed_response_is_wrapped_not_raw(self) -> None:
@@ -178,6 +185,30 @@ class TestUserFacingMessageDoesNotLeakRawSdkText:
 
     @pytest.mark.asyncio
     async def test_transport_error_message_does_not_leak_raw_exception_text(self) -> None:
+        """Uses `TransportError`, not `RefreshError` — since review r2 finding
+        P2-1, `RefreshError` is no longer classified as a transport condition
+        (see `TestReauthRequiredDoesNotLeakRawExceptionText` below)."""
+        service = MagicMock()
+        service.events().list().execute.side_effect = TransportError(
+            "refresh failed for internal-service-account@project.iam.gserviceaccount.com"
+        )
+        adapter = _make_adapter(service)
+
+        with pytest.raises(ExternalServiceError) as exc_info:
+            await adapter.search_events(uuid.uuid4(), "2024-01-01T00:00:00Z", "2024-02-01T00:00:00Z")
+
+        detail = str(exc_info.value)
+        assert "internal-service-account" not in detail
+        assert "TransportError" in detail
+
+
+class TestReauthRequiredDoesNotLeakRawExceptionText:
+    """Review r2 finding P2-1: `RefreshError` now raises a dedicated,
+    fully-canned reconnect message — verify it never echoes the raw
+    exception text either."""
+
+    @pytest.mark.asyncio
+    async def test_refresh_error_message_does_not_leak_raw_exception_text(self) -> None:
         service = MagicMock()
         service.events().list().execute.side_effect = RefreshError(
             "refresh failed for internal-service-account@project.iam.gserviceaccount.com"
@@ -189,7 +220,83 @@ class TestUserFacingMessageDoesNotLeakRawSdkText:
 
         detail = str(exc_info.value)
         assert "internal-service-account" not in detail
-        assert "RefreshError" in detail
+        assert exc_info.value.code == "GOOGLE_REAUTH_REQUIRED"
+
+
+class TestHttpErrorStatusAndHint:
+    """Review r2, finding P2-2: `GoogleHttpError` branches used to collapse
+    every 4xx/5xx into one identical message. Each status now carries the
+    numeric code plus a short, class-specific Spanish hint, still without
+    leaking raw SDK text."""
+
+    @pytest.mark.asyncio
+    async def test_401_carries_status_and_permission_hint(self) -> None:
+        service = MagicMock()
+        service.events().get().execute.side_effect = _http_error(401, "unauthorized")
+        adapter = _make_adapter(service)
+
+        with pytest.raises(ExternalServiceError) as exc_info:
+            await adapter.get_event(uuid.uuid4(), "ev1")
+
+        detail = str(exc_info.value)
+        assert "401" in detail
+        assert "permisos" in detail.lower()
+        assert "http" not in detail.lower()
+
+    @pytest.mark.asyncio
+    async def test_403_carries_status_and_permission_hint(self) -> None:
+        service = MagicMock()
+        service.events().get().execute.side_effect = _http_error(403, "forbidden")
+        adapter = _make_adapter(service)
+
+        with pytest.raises(ExternalServiceError) as exc_info:
+            await adapter.get_event(uuid.uuid4(), "ev1")
+
+        detail = str(exc_info.value)
+        assert "403" in detail
+        assert "permisos" in detail.lower()
+        assert "http" not in detail.lower()
+
+    @pytest.mark.asyncio
+    async def test_404_carries_status_and_not_found_hint(self) -> None:
+        service = MagicMock()
+        service.events().get().execute.side_effect = _http_error(404, "not found")
+        adapter = _make_adapter(service)
+
+        with pytest.raises(ExternalServiceError) as exc_info:
+            await adapter.get_event(uuid.uuid4(), "ev1")
+
+        detail = str(exc_info.value)
+        assert "404" in detail
+        assert "no existe" in detail.lower()
+        assert "http" not in detail.lower()
+
+    @pytest.mark.asyncio
+    async def test_429_carries_retry_hint(self) -> None:
+        service = MagicMock()
+        service.events().list().execute.side_effect = _http_error(429, "rateLimitExceeded")
+        adapter = _make_adapter(service)
+
+        with pytest.raises(ExternalServiceError) as exc_info:
+            await adapter.search_events(uuid.uuid4(), "2024-01-01T00:00:00Z", "2024-02-01T00:00:00Z")
+
+        detail = str(exc_info.value)
+        assert "429" in detail
+        assert "reintentá" in detail.lower()
+        assert "http" not in detail.lower()
+
+    @pytest.mark.asyncio
+    async def test_5xx_carries_status_code(self) -> None:
+        service = MagicMock()
+        service.events().get().execute.side_effect = _http_error(500, "boom")
+        adapter = _make_adapter(service)
+
+        with pytest.raises(ExternalServiceError) as exc_info:
+            await adapter.get_event(uuid.uuid4(), "ev1")
+
+        detail = str(exc_info.value)
+        assert "500" in detail
+        assert "http" not in detail.lower()
 
 
 class TestSearchEventsFailureMatrixRegression:
@@ -219,12 +326,17 @@ class TestSearchEventsFailureMatrixRegression:
 
     @pytest.mark.asyncio
     async def test_lazy_token_refresh_failure_is_wrapped(self) -> None:
+        """Review r2 finding P2-1: must classify as reconnect-required, not a
+        transient transport outage."""
         service = MagicMock()
         service.events().list().execute.side_effect = RefreshError("token expired")
         adapter = _make_adapter(service)
 
-        with pytest.raises(ExternalServiceError):
+        with pytest.raises(ExternalServiceError) as exc_info:
             await adapter.search_events(uuid.uuid4(), "2024-01-01T00:00:00Z", "2024-02-01T00:00:00Z")
+
+        assert exc_info.value.code == "GOOGLE_REAUTH_REQUIRED"
+        assert "reconectá" in str(exc_info.value).lower()
 
     @pytest.mark.asyncio
     async def test_401_is_wrapped(self) -> None:
