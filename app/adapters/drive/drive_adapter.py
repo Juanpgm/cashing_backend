@@ -6,9 +6,12 @@ import asyncio
 import io
 import re
 import uuid
+from collections.abc import Callable
 from datetime import datetime
+from typing import TypeVar
 
 import structlog
+from google.auth.exceptions import RefreshError
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError as GoogleHttpError
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
@@ -16,11 +19,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.drive.port import DriveFile, DriveQuery
 from app.adapters.email.gmail_adapter import GmailAdapter
+from app.adapters.google_errors import (
+    GOOGLE_TRANSPORT_ERRORS,
+    raise_external_service_error,
+    raise_google_http_error,
+    raise_google_reauth_required,
+)
 from app.core.exceptions import ExternalServiceError
 
 logger = structlog.get_logger("adapters.drive")
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
+
+_T = TypeVar("_T")
 
 
 class DriveAdapter:
@@ -37,6 +48,76 @@ class DriveAdapter:
     def _build_service(self, creds):  # type: ignore[no-untyped-def]
         return build("drive", "v3", credentials=creds, cache_discovery=False)
 
+    def _require_key(self, raw: dict, key: str, context: str) -> str:  # type: ignore[type-arg]
+        """Extract `raw[key]`, mapping a malformed/partial Drive response to
+        `ExternalServiceError` instead of a raw `KeyError`/`TypeError` escaping
+        past the API boundary. Used for the handful of bare indexings that
+        weren't already routed through `_parse_file` (review r1, finding P3b):
+        `_find_folder`'s `files[0]["id"]`, `_create_folder`'s `result["id"]`,
+        and `_share`'s `["webViewLink"]`.
+        """
+        try:
+            return raw[key]
+        except (KeyError, TypeError) as exc:
+            raise_external_service_error(
+                logger,
+                "Drive",
+                "No se pudo completar la operación en Drive",
+                exc,
+                "drive_missing_expected_key",
+                context=context,
+                key=key,
+            )
+
+    async def _run(self, fn: Callable[[], _T], context: str) -> _T:
+        """Run a blocking Drive API call in the executor, mapping the known
+        failure modes to the domain `ExternalServiceError` (502) contract:
+
+        - `GoogleHttpError` — 4xx/5xx from the API itself.
+        - `google.auth.exceptions.RefreshError` — a lazy token refresh inside
+          `.execute()` failed (revoked/expired grant): caught FIRST and mapped
+          to `GOOGLE_REAUTH_REQUIRED` with the reconnect message — this is a
+          permanent auth condition, never a transient outage.
+        - `GOOGLE_TRANSPORT_ERRORS` (`app.adapters.google_errors`) — raw socket
+          errors (`OSError`/`TimeoutError`), DNS failures
+          (`httplib2.ServerNotFoundError`), and network failures during a lazy
+          token refresh (`google.auth.exceptions.TransportError`) — none of
+          which `run_in_executor` would otherwise wrap. `RefreshError` is
+          deliberately NOT in that tuple.
+
+        This does NOT cover every conceivable failure (e.g. a bug in `fn`
+        itself raises unwrapped, by design) — see radicacion-sin-friccion
+        phase 4.3 review r1, finding P2b, for the transport gap this closed.
+        """
+        loop = asyncio.get_running_loop()
+        try:
+            return await loop.run_in_executor(None, fn)
+        except GoogleHttpError as exc:
+            # `context` (developer-authored, e.g. "Error subiendo archivo
+            # 'x.pdf'") is safe to log but the raw `str(exc)` (full request
+            # URI, incl. `q=` search terms) is not — see
+            # `raise_google_http_error`'s own docstring for why it never
+            # appends the exception's class name either.
+            raise_google_http_error(
+                logger,
+                "Drive",
+                "No se pudo completar la operación en Drive",
+                exc,
+                "drive_operation_http_failed",
+                context=context,
+            )
+        except RefreshError as exc:
+            raise_google_reauth_required(logger, "Drive", exc, "drive_operation_reauth_required", context=context)
+        except GOOGLE_TRANSPORT_ERRORS as exc:
+            raise_external_service_error(
+                logger,
+                "Drive",
+                "No se pudo completar la operación en Drive",
+                exc,
+                "drive_operation_transport_failed",
+                context=context,
+            )
+
     # ── Upload ───────────────────────────────────────────────────────────────
 
     async def upload_file(
@@ -49,7 +130,6 @@ class DriveAdapter:
     ) -> DriveFile:
         creds = await self._auth.get_credentials(usuario_id)
         service = self._build_service(creds)
-        loop = asyncio.get_running_loop()
 
         metadata: dict[str, object] = {"name": name}
         if folder_id:
@@ -69,8 +149,21 @@ class DriveAdapter:
                 .execute()
             )
 
-        raw = await loop.run_in_executor(None, _upload)
-        logger.info("drive_file_uploaded", file_id=raw["id"], name=name, user_id=str(usuario_id))
+        raw = await self._run(_upload, f"Error subiendo archivo '{name}'")
+        # Log BEFORE parsing: a file that landed in Drive but returned a
+        # malformed payload must still be traceable by its id — logging only
+        # after `_parse_file` (which can raise) previously left zero trace
+        # that the upload itself actually succeeded (review r1, finding P3b).
+        # `isinstance` guard: `raw.get(...)` on a non-dict response (e.g. a
+        # list) raises a raw AttributeError instead of the domain
+        # ExternalServiceError `_parse_file` below would otherwise wrap it
+        # into (review r2, finding P3-1).
+        logger.info(
+            "drive_file_uploaded",
+            file_id=raw.get("id") if isinstance(raw, dict) else None,
+            name=name,
+            user_id=str(usuario_id),
+        )
         return self._parse_file(raw)
 
     # ── Folder Management ────────────────────────────────────────────────────
@@ -98,7 +191,6 @@ class DriveAdapter:
     ) -> str | None:
         creds = await self._auth.get_credentials(usuario_id)
         service = self._build_service(creds)
-        loop = asyncio.get_running_loop()
 
         # Escape single quotes in name for Drive query
         safe_name = name.replace("'", "\\'")
@@ -109,9 +201,11 @@ class DriveAdapter:
         def _search() -> dict:  # type: ignore[type-arg]
             return service.files().list(q=query, fields="files(id,name)").execute()
 
-        result = await loop.run_in_executor(None, _search)
+        result = await self._run(_search, f"Error buscando carpeta '{name}'")
         files = result.get("files", [])
-        return files[0]["id"] if files else None
+        if not files:
+            return None
+        return self._require_key(files[0], "id", f"Error buscando carpeta '{name}'")
 
     async def _create_folder(
         self,
@@ -121,7 +215,6 @@ class DriveAdapter:
     ) -> str:
         creds = await self._auth.get_credentials(usuario_id)
         service = self._build_service(creds)
-        loop = asyncio.get_running_loop()
 
         metadata: dict[str, object] = {"name": name, "mimeType": FOLDER_MIME}
         if parent_id:
@@ -130,9 +223,10 @@ class DriveAdapter:
         def _create() -> dict:  # type: ignore[type-arg]
             return service.files().create(body=metadata, fields="id").execute()
 
-        result = await loop.run_in_executor(None, _create)
-        logger.info("drive_folder_created", name=name, folder_id=result["id"])
-        return result["id"]
+        result = await self._run(_create, f"Error creando carpeta '{name}'")
+        folder_id = self._require_key(result, "id", f"Error creando carpeta '{name}'")
+        logger.info("drive_folder_created", name=name, folder_id=folder_id)
+        return folder_id
 
     # ── List / Get ───────────────────────────────────────────────────────────
 
@@ -144,7 +238,6 @@ class DriveAdapter:
     ) -> list[DriveFile]:
         creds = await self._auth.get_credentials(usuario_id)
         service = self._build_service(creds)
-        loop = asyncio.get_running_loop()
 
         q = f"'{folder_id}' in parents and trashed=false"
         if query:
@@ -160,8 +253,8 @@ class DriveAdapter:
                 .execute()
             )
 
-        result = await loop.run_in_executor(None, _list)
-        return [self._parse_file(f) for f in result.get("files", [])]
+        result = await self._run(_list, f"Error listando archivos de la carpeta '{folder_id}'")
+        return self._parse_files_tolerant(result.get("files", []))
 
     async def search_files(
         self,
@@ -176,7 +269,6 @@ class DriveAdapter:
         """
         creds = await self._auth.get_credentials(usuario_id)
         service = self._build_service(creds)
-        loop = asyncio.get_running_loop()
 
         q = "trashed=false"
         translated = self._translate_query(query)
@@ -195,11 +287,8 @@ class DriveAdapter:
                 .execute()
             )
 
-        try:
-            result = await loop.run_in_executor(None, _search)
-        except GoogleHttpError as exc:
-            raise ExternalServiceError("Drive", f"Error buscando archivos: {exc}") from exc
-        files = [self._parse_file(f) for f in result.get("files", [])]
+        result = await self._run(_search, "Error buscando archivos")
+        files = self._parse_files_tolerant(result.get("files", []))
         logger.info("drive_search", user_id=str(usuario_id), query=query.keywords, count=len(files))
         return files
 
@@ -226,7 +315,6 @@ class DriveAdapter:
     async def get_file(self, usuario_id: uuid.UUID, file_id: str) -> DriveFile:
         creds = await self._auth.get_credentials(usuario_id)
         service = self._build_service(creds)
-        loop = asyncio.get_running_loop()
 
         def _get() -> dict:  # type: ignore[type-arg]
             return (
@@ -238,12 +326,12 @@ class DriveAdapter:
                 .execute()
             )
 
-        return self._parse_file(await loop.run_in_executor(None, _get))
+        raw = await self._run(_get, f"Error obteniendo archivo '{file_id}'")
+        return self._parse_file(raw)
 
     async def download_file(self, usuario_id: uuid.UUID, file_id: str) -> bytes:
         creds = await self._auth.get_credentials(usuario_id)
         service = self._build_service(creds)
-        loop = asyncio.get_running_loop()
 
         def _download() -> bytes:
             request = service.files().get_media(fileId=file_id)
@@ -254,7 +342,7 @@ class DriveAdapter:
                 _, done = downloader.next_chunk()
             return buffer.getvalue()
 
-        return await loop.run_in_executor(None, _download)
+        return await self._run(_download, f"Error descargando archivo '{file_id}'")
 
     # ── Sharing ──────────────────────────────────────────────────────────────
 
@@ -266,28 +354,27 @@ class DriveAdapter:
     ) -> str:
         creds = await self._auth.get_credentials(usuario_id)
         service = self._build_service(creds)
-        loop = asyncio.get_running_loop()
 
-        def _share() -> str:
+        def _share() -> dict:  # type: ignore[type-arg]
             service.permissions().create(
                 fileId=file_id,
                 body={"type": "anyone", "role": role},
             ).execute()
-            return service.files().get(fileId=file_id, fields="webViewLink").execute()["webViewLink"]
+            return service.files().get(fileId=file_id, fields="webViewLink").execute()
 
-        link = await loop.run_in_executor(None, _share)
+        raw = await self._run(_share, f"Error compartiendo archivo '{file_id}'")
+        link = self._require_key(raw, "webViewLink", f"Error compartiendo archivo '{file_id}'")
         logger.info("drive_file_shared", file_id=file_id, role=role)
         return link
 
     async def delete_file(self, usuario_id: uuid.UUID, file_id: str) -> None:
         creds = await self._auth.get_credentials(usuario_id)
         service = self._build_service(creds)
-        loop = asyncio.get_running_loop()
 
         def _trash() -> None:
             service.files().update(fileId=file_id, body={"trashed": True}).execute()
 
-        await loop.run_in_executor(None, _trash)
+        await self._run(_trash, f"Error eliminando archivo '{file_id}'")
         logger.info("drive_file_trashed", file_id=file_id)
 
     # ── Parsing ──────────────────────────────────────────────────────────────
@@ -296,17 +383,46 @@ class DriveAdapter:
         def _parse_dt(val: str) -> datetime:
             return datetime.fromisoformat(val.replace("Z", "+00:00"))
 
-        return DriveFile(
-            id=raw["id"],
-            name=raw.get("name", ""),
-            mime_type=raw.get("mimeType", ""),
-            size_bytes=int(raw.get("size", 0)),
-            created_at=_parse_dt(raw.get("createdTime", "2000-01-01T00:00:00Z")),
-            modified_at=_parse_dt(raw.get("modifiedTime", "2000-01-01T00:00:00Z")),
-            web_view_link=raw.get("webViewLink", ""),
-            download_link=raw.get("webContentLink"),
-            parents=raw.get("parents", []),
-        )
+        try:
+            return DriveFile(
+                id=raw["id"],
+                name=raw.get("name", ""),
+                mime_type=raw.get("mimeType", ""),
+                size_bytes=int(raw.get("size", 0)),
+                created_at=_parse_dt(raw.get("createdTime", "2000-01-01T00:00:00Z")),
+                modified_at=_parse_dt(raw.get("modifiedTime", "2000-01-01T00:00:00Z")),
+                web_view_link=raw.get("webViewLink", ""),
+                download_link=raw.get("webContentLink"),
+                parents=raw.get("parents", []),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            # `raw.get("id")` guarded by `isinstance`: a non-dict `raw` (e.g. a
+            # list) raises `TypeError` above (caught), but `raw.get(...)` on
+            # that same non-dict `raw` — unguarded — would raise a raw
+            # `AttributeError` right here inside the except handler, escaping
+            # this very function that exists to prevent a raw exception from
+            # reaching the caller (review r2, finding P3-1).
+            raise_external_service_error(
+                logger,
+                "Drive",
+                "El archivo de Drive tiene un formato inesperado",
+                exc,
+                "drive_file_parse_failed_detail",
+                file_id=raw.get("id") if isinstance(raw, dict) else None,
+            )
+
+    def _parse_files_tolerant(self, raw_files: list[dict]) -> list[DriveFile]:  # type: ignore[type-arg]
+        """Parse a list of raw Drive file resources, skipping (and logging) any
+        malformed item instead of dropping the whole result set — mirrors
+        `GoogleCalendarAdapter.search_events`'s per-item tolerance."""
+        files: list[DriveFile] = []
+        for raw in raw_files:
+            try:
+                files.append(self._parse_file(raw))
+            except ExternalServiceError as exc:
+                logger.warning("drive_file_parse_failed", file_id=raw.get("id"), error=str(exc))
+                continue
+        return files
 
 
 # ── Helper utilities ─────────────────────────────────────────────────────────
