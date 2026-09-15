@@ -39,6 +39,7 @@ from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
 from app.models.evidencia import Evidencia
 from app.models.obligacion import Obligacion, TipoObligacion
+from app.services import paquete_job_service
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -412,3 +413,46 @@ async def test_query_budget_subir_evidencias_cuenta(
     data = resp.json()
     assert len(data["resultados"]) == 3
     query_counter.assert_budget(41, label="POST /cuentas-cobro/{id}/evidencias/subir")
+
+
+async def test_query_budget_paquete_regenerar_async_enqueue_only(
+    client: AsyncClient,
+    escenario_completo: dict[str, Any],
+    query_counter: QueryCounter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POST /api/v1/cuentas-cobro/{id}/paquete/regenerar-async — the ENQUEUE/
+    upsert-lock path only (radicacion-sin-friccion, Phase 2 slice 2.7), NOT
+    the background pipeline run itself (that scales with document/evidencia
+    count and is exercised by its own tests in `test_paquete_job_service.py`,
+    not budgeted here).
+
+    Unlike this file's other endpoint budgets, the actual background run
+    (`_ejecutar_generacion_paquete_background`) is stubbed to a no-op —
+    `httpx.AsyncClient` over `ASGITransport` runs `BackgroundTasks` to
+    completion as part of the awaited request/response cycle (same as every
+    other budget here), so leaving it un-stubbed would fold the pipeline's own
+    (much larger, checklist+coherence+2-LLM-calls+zip-assembly-scaled) query
+    count into this number, defeating the point of isolating the enqueue path.
+
+    First budget pinned for this endpoint — measured directly against this
+    exact scenario on SQLite, 2026-09-14 (real count, not an audit estimate):
+    1 token blacklist check + 1 usuario load (auth), `_get_cuenta_con_
+    contrato_vivo`'s `_get_cuenta_con_ownership` (cuenta + contrato eager
+    load, which cascades into actividades/obligaciones/evidencias selectin
+    loads per the mapper's own eager-load config — 5 queries), plus
+    `_upsert_job`'s first-ever-trigger insert path (1 SELECT + 1 INSERT +
+    1 refresh SELECT, no lock re-SELECT needed since there's no existing row
+    yet) = 10 total.
+    """
+    cuenta = escenario_completo["cuenta"]
+    headers = escenario_completo["headers"]
+
+    spy = AsyncMock(return_value=None)
+    monkeypatch.setattr(paquete_job_service, "_ejecutar_generacion_paquete_background", spy)
+
+    query_counter.reset()
+    resp = await client.post(f"/api/v1/cuentas-cobro/{cuenta.id}/paquete/regenerar-async", headers=headers)
+
+    assert resp.status_code == 202, resp.text
+    query_counter.assert_budget(10, label="POST /cuentas-cobro/{id}/paquete/regenerar-async (enqueue only)")

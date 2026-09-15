@@ -51,6 +51,7 @@ from app.schemas.google_workspace import (
     EvidenciasAutoResponse,
 )
 from app.schemas.paquete import PaqueteInfoResponse
+from app.schemas.paquete_job import PaqueteJobResponse
 from app.schemas.plantilla_organismo import FormatoValoresResponse
 from app.schemas.radicacion_prep import PreparaRadicacionResponse
 from app.schemas.stepper_state import StepperStateResponse
@@ -64,6 +65,7 @@ from app.services import (
     evidence_persist_service,
     evidencia_service,
     informe_service,
+    paquete_job_service,
     paquete_service,
     pdf_signature_service,
     stepper_state_service,
@@ -170,6 +172,47 @@ async def regenerar_paquete(
         advertencias_coherencia=[FindingOut(**asdict(f)) for f in resultado.advertencias_coherencia],
         es_borrador=resultado.es_borrador,
     )
+
+
+@router.post(
+    "/{cuenta_id}/paquete/regenerar-async",
+    response_model=PaqueteJobResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def regenerar_paquete_async(
+    cuenta_id: uuid.UUID,
+    user: CurrentUser,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+) -> PaqueteJobResponse:
+    """(Re)triggers background package generation — poll-based job, additive
+    alongside the pre-existing synchronous `POST /paquete/regenerar`
+    (radicacion-sin-friccion, Phase 2 slice 2.7 — see `paquete_job_service`'s
+    module docstring for the Option A/B design decision and the shared
+    per-cuenta lock both endpoints go through).
+
+    Idempotent and retry-safe: also the way to retry a `failed` job, mirroring
+    `POST /evidencias/clasificar`'s contract exactly. A fresh in-flight job
+    (triggered by THIS endpoint, `POST /paquete/regenerar`, or both) makes
+    this call a no-op — poll `GET /paquete/job` for its outcome.
+    """
+    job = await paquete_job_service.encolar_generacion_paquete(db, background_tasks, user.id, cuenta_id)
+    return PaqueteJobResponse.model_validate(job)
+
+
+@router.get(
+    "/{cuenta_id}/paquete/job",
+    response_model=PaqueteJobResponse,
+)
+async def obtener_paquete_job(
+    cuenta_id: uuid.UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> PaqueteJobResponse:
+    """Poll the current/last package-generation job state (radicacion-sin-
+    friccion, Phase 2 slice 2.7). `status: "pending"` with every result field
+    `null` when no job has ever been triggered for this cuenta."""
+    return await paquete_job_service.obtener_estado_paquete_job(db, user.id, cuenta_id)
 
 
 @router.get("/{cuenta_id}/paquete/descargar", response_class=Response)

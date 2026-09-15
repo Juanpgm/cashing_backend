@@ -8,6 +8,8 @@ registered in `EXCEPTION_STATUS_MAP`.
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
 from app.core.exceptions import (
     EXCEPTION_STATUS_MAP,
@@ -19,6 +21,7 @@ from app.core.exceptions import (
     InsufficientCreditsError,
     InviteRequiredError,
     NotFoundError,
+    PaqueteGenerationInProgressError,
     RateLimitExceededError,
     UnauthorizedError,
     ValidationError,
@@ -34,6 +37,8 @@ def _instantiate(exc_cls: type[DomainError]) -> DomainError:
     """
     if exc_cls is ChecklistLinkError:
         return ChecklistLinkError(requisito_codigo="REQ-1", reason="test reason")
+    if exc_cls is PaqueteGenerationInProgressError:
+        return PaqueteGenerationInProgressError(uuid.uuid4())
     return exc_cls()
 
 
@@ -64,6 +69,7 @@ def test_regression_exact_status_codes_pinned() -> None:
         domain_to_http(ChecklistLinkError(requisito_codigo="REQ-1", reason="x")).status_code
         == status.HTTP_502_BAD_GATEWAY
     )
+    assert domain_to_http(PaqueteGenerationInProgressError(uuid.uuid4())).status_code == status.HTTP_409_CONFLICT
 
 
 # --- MRO walk: unmapped subclass inherits its mapped parent's status ---

@@ -24,6 +24,7 @@ from app.models.integracion import Integracion  # noqa: F401
 from app.models.invite_code import InviteCode  # noqa: F401
 from app.models.obligacion import Obligacion  # noqa: F401
 from app.models.pago import Pago  # noqa: F401
+from app.models.paquete_job import PaqueteJob  # noqa: F401
 from app.models.plantilla import Plantilla  # noqa: F401
 from app.models.plantilla_organismo import PlantillaOrganismo  # noqa: F401
 from app.models.preferencia_usuario import PreferenciaUsuario  # noqa: F401

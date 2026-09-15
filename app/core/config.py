@@ -423,6 +423,20 @@ class Settings(BaseSettings):
     # avoids duplicate concurrent runs).
     EVIDENCE_JOB_STALE_SECONDS: int = 120
 
+    # Same staleness idiom as EVIDENCE_JOB_STALE_SECONDS, for the package-
+    # generation job (radicacion-sin-friccion, Phase 2 slice 2.7): a
+    # `pending`/`running` PaqueteJob with no progress for this long is treated
+    # as crashed/orphaned and reset on the next trigger instead of blocking it
+    # forever. A separate setting (not reused) because package generation runs
+    # a heavier pipeline (2 LLM calls + zip assembly) than classification and
+    # needs a longer tuning window in production: the frontend's own
+    # `PAQUETE_REGENERAR_TIMEOUT_MS` (cashing-frontend/lib/paquete-api.ts)
+    # already independently established this pipeline's real worst-case
+    # duration at 300s, so this window must be at least that long — otherwise
+    # a slow-but-still-running job would be falsely declared stale and reset
+    # out from under itself before it ever had a chance to finish.
+    PAQUETE_JOB_STALE_SECONDS: int = 300
+
     # Confidence buckets for the blended (keyword+cosine) evidence<->obligación
     # score (evidence-obligation-links: Qualitative confidence levels). alta
     # auto-confirms the link; media/baja persist as proposed (see
