@@ -26,7 +26,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.email.port import EmailAttachment, EmailMessage
-from app.adapters.google_errors import GOOGLE_TRANSPORT_ERRORS
+from app.adapters.google_errors import GOOGLE_TRANSPORT_ERRORS, raise_external_service_error
 from app.core.config import settings
 from app.core.exceptions import ExternalServiceError, NotFoundError, ValidationError
 from app.models.integracion import Integracion, IntegrationProvider
@@ -188,10 +188,14 @@ class GmailAdapter:
             try:
                 await loop.run_in_executor(None, lambda: creds.refresh(Request()))
             except (RefreshError, TransportError) as exc:
-                raise ExternalServiceError(
+                raise_external_service_error(
+                    logger,
                     "Google OAuth",
-                    f"Token vencido — reconectá tu cuenta de Google en /integraciones: {exc}",
-                ) from exc
+                    "Token vencido — reconectá tu cuenta de Google en /integraciones",
+                    exc,
+                    "gmail_token_refresh_failed",
+                    user_id=str(usuario_id),
+                )
             record.access_token_encrypted = self._fernet.encrypt(creds.token.encode()).decode()
             record.expires_at = datetime.now(UTC) + timedelta(seconds=3600)
             await self._db.commit()
@@ -244,9 +248,18 @@ class GmailAdapter:
         try:
             result = await self._execute_with_retry(_search)
         except GoogleHttpError as exc:
-            raise ExternalServiceError("Gmail", f"Error buscando correos: {exc}") from exc
+            raise_external_service_error(
+                logger,
+                "Gmail",
+                "Gmail no está disponible en este momento",
+                exc,
+                "gmail_search_http_failed",
+                include_exc_type=False,
+            )
         except GOOGLE_TRANSPORT_ERRORS as exc:
-            raise ExternalServiceError("Gmail", f"Error de conexión buscando correos: {exc}") from exc
+            raise_external_service_error(
+                logger, "Gmail", "Gmail no está disponible en este momento", exc, "gmail_search_transport_failed"
+            )
         raw_messages = result.get("messages", [])
 
         if not raw_messages:
@@ -281,7 +294,10 @@ class GmailAdapter:
         except _MalformedMessagePayloadError as exc:
             # get_message's public contract (unlike search_messages's batch fan-out)
             # is to raise on a malformed payload — preserved by re-wrapping here.
-            raise ExternalServiceError("Gmail", str(exc)) from exc
+            # The marker's own str(exc) (logged below) carries the raw parse-error
+            # detail; the client-facing detail stays generic (review r1, finding P3a).
+            logger.warning("gmail_message_malformed_get", message_id=message_id, error=str(exc))
+            raise ExternalServiceError("Gmail", "El mensaje de Gmail tiene un formato inesperado") from exc
 
     async def _fetch_message(self, creds: Credentials, message_id: str) -> EmailMessage:
         """Fetch and parse a single message.
@@ -303,9 +319,24 @@ class GmailAdapter:
         try:
             raw = await self._execute_with_retry(_get)
         except GoogleHttpError as exc:
-            raise ExternalServiceError("Gmail", f"Error obteniendo mensaje {message_id}: {exc}") from exc
+            raise_external_service_error(
+                logger,
+                "Gmail",
+                "No se pudo obtener el mensaje de Gmail",
+                exc,
+                "gmail_fetch_message_http_failed",
+                message_id=message_id,
+                include_exc_type=False,
+            )
         except GOOGLE_TRANSPORT_ERRORS as exc:
-            raise ExternalServiceError("Gmail", f"Error de conexión obteniendo mensaje {message_id}: {exc}") from exc
+            raise_external_service_error(
+                logger,
+                "Gmail",
+                "No se pudo obtener el mensaje de Gmail",
+                exc,
+                "gmail_fetch_message_transport_failed",
+                message_id=message_id,
+            )
         try:
             return self._parse_message(raw)
         except (KeyError, TypeError, AttributeError, ValueError) as exc:
@@ -336,9 +367,26 @@ class GmailAdapter:
         try:
             result = await self._execute_with_retry(_get_att)
         except GoogleHttpError as exc:
-            raise ExternalServiceError("Gmail", f"Error obteniendo adjunto {attachment_id}: {exc}") from exc
+            raise_external_service_error(
+                logger,
+                "Gmail",
+                "No se pudo obtener el adjunto de Gmail",
+                exc,
+                "gmail_get_attachment_http_failed",
+                message_id=message_id,
+                attachment_id=attachment_id,
+                include_exc_type=False,
+            )
         except GOOGLE_TRANSPORT_ERRORS as exc:
-            raise ExternalServiceError("Gmail", f"Error de conexión obteniendo adjunto {attachment_id}: {exc}") from exc
+            raise_external_service_error(
+                logger,
+                "Gmail",
+                "No se pudo obtener el adjunto de Gmail",
+                exc,
+                "gmail_get_attachment_transport_failed",
+                message_id=message_id,
+                attachment_id=attachment_id,
+            )
         data = result.get("data", "")
         try:
             return base64.urlsafe_b64decode(data + "==")
@@ -346,9 +394,15 @@ class GmailAdapter:
             # binascii.Error (a ValueError subclass) on malformed base64 `data` —
             # previously outside every try/except (radicacion-sin-friccion phase
             # 4.3 review, finding P2a).
-            raise ExternalServiceError(
-                "Gmail", f"Adjunto {attachment_id} con formato inesperado: {exc}"
-            ) from exc
+            raise_external_service_error(
+                logger,
+                "Gmail",
+                "El adjunto de Gmail tiene un formato inesperado",
+                exc,
+                "gmail_get_attachment_malformed",
+                message_id=message_id,
+                attachment_id=attachment_id,
+            )
 
     # ── Send ─────────────────────────────────────────────────────────────────
 
@@ -389,9 +443,18 @@ class GmailAdapter:
         try:
             result = await self._execute_with_retry(_send)
         except GoogleHttpError as exc:
-            raise ExternalServiceError("Gmail", f"Error enviando correo: {exc}") from exc
+            raise_external_service_error(
+                logger,
+                "Gmail",
+                "No se pudo enviar el correo por Gmail",
+                exc,
+                "gmail_send_http_failed",
+                include_exc_type=False,
+            )
         except GOOGLE_TRANSPORT_ERRORS as exc:
-            raise ExternalServiceError("Gmail", f"Error de conexión enviando correo: {exc}") from exc
+            raise_external_service_error(
+                logger, "Gmail", "No se pudo enviar el correo por Gmail", exc, "gmail_send_transport_failed"
+            )
         logger.info("email_sent", user_id=str(usuario_id), to=to, subject=subject)
         return result["id"]
 

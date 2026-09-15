@@ -31,12 +31,12 @@ from google.auth.exceptions import RefreshError
 from googleapiclient.errors import HttpError as GoogleHttpError
 
 
-def _http_error(status: int, message: str = "error") -> GoogleHttpError:
+def _http_error(status: int, message: str = "error", uri: str | None = None) -> GoogleHttpError:
     resp = MagicMock()
     resp.status = status
     resp.reason = message
     content = json.dumps({"error": {"message": message, "code": status}}).encode()
-    return GoogleHttpError(resp=resp, content=content)
+    return GoogleHttpError(resp=resp, content=content, uri=uri)
 
 
 def _make_adapter() -> GmailAdapter:
@@ -415,12 +415,13 @@ class TestSearchMessagesPerMessageTolerance:
             "messages": [{"id": "m1"}, {"id": "m2"}, {"id": "m3"}]
         }
 
-        def _get(userId: str, id: str, format: str) -> MagicMock:  # noqa: A002
+        def _get(**kwargs: str) -> MagicMock:
+            requested_id = kwargs["id"]
             mock = MagicMock()
-            if id == "m2":
+            if requested_id == "m2":
                 mock.execute.return_value = {"id": "m2"}  # missing "payload" -> malformed
             else:
-                mock.execute.return_value = self._raw_message(id)
+                mock.execute.return_value = self._raw_message(requested_id)
             return mock
 
         service.users().messages().get.side_effect = _get
@@ -444,12 +445,13 @@ class TestSearchMessagesPerMessageTolerance:
             "messages": [{"id": "m1"}, {"id": "m2"}, {"id": "m3"}]
         }
 
-        def _get(userId: str, id: str, format: str) -> MagicMock:  # noqa: A002
+        def _get(**kwargs: str) -> MagicMock:
+            requested_id = kwargs["id"]
             mock = MagicMock()
-            if id == "m2":
+            if requested_id == "m2":
                 mock.execute.side_effect = _http_error(503, "unavailable")
             else:
-                mock.execute.return_value = self._raw_message(id)
+                mock.execute.return_value = self._raw_message(requested_id)
             return mock
 
         service.users().messages().get.side_effect = _get
@@ -463,9 +465,9 @@ class TestSearchMessagesPerMessageTolerance:
         service = MagicMock()
         service.users().messages().list().execute.return_value = {"messages": [{"id": "m1"}, {"id": "m2"}]}
 
-        def _get(userId: str, id: str, format: str) -> MagicMock:  # noqa: A002
+        def _get(**kwargs: str) -> MagicMock:
             mock = MagicMock()
-            mock.execute.return_value = {"id": id}  # missing "payload" always
+            mock.execute.return_value = {"id": kwargs["id"]}  # missing "payload" always
             return mock
 
         service.users().messages().get.side_effect = _get
@@ -474,6 +476,54 @@ class TestSearchMessagesPerMessageTolerance:
         result = await adapter.search_messages(uuid.uuid4(), "q")
 
         assert result == []
+
+
+class TestUserFacingMessageDoesNotLeakRawSdkText:
+    """`str(GoogleHttpError)` includes the FULL request URI — Gmail search
+    `q=` terms — and `domain_error_handler` returns `ExternalServiceError.detail`
+    to the client VERBATIM, no redaction. Review r1 finding P3a: the
+    client-facing detail must carry a generic message plus at most the
+    exception's class name; the raw text goes to structlog only."""
+
+    @pytest.mark.asyncio
+    async def test_http_error_message_does_not_leak_search_query_or_uri(self) -> None:
+        service = MagicMock()
+        sensitive_query = "contrato-CTR-2024-secreto-001"
+        service.users().messages().list().execute.side_effect = _http_error(
+            500,
+            "boom",
+            uri=f"https://gmail.googleapis.com/gmail/v1/users/me/messages?q={sensitive_query}&maxResults=20",
+        )
+        adapter = _adapter_with_service(service)
+
+        with pytest.raises(ExternalServiceError) as exc_info:
+            await adapter.search_messages(uuid.uuid4(), sensitive_query)
+
+        detail = str(exc_info.value)
+        assert "http" not in detail.lower()
+        assert "googleapis" not in detail.lower()
+        assert "q=" not in detail
+        assert sensitive_query not in detail
+        # NOT `type(exc).__name__` here on purpose: GoogleHttpError's class name
+        # is literally "HttpError", which would reintroduce the "http" substring
+        # this test forbids — see google_errors.raise_external_service_error's
+        # include_exc_type=False for GoogleHttpError call sites.
+        assert "no está disponible" in detail  # sanity: generic message present, not garbled
+
+    @pytest.mark.asyncio
+    async def test_transport_error_message_does_not_leak_raw_exception_text(self) -> None:
+        service = MagicMock()
+        service.users().messages().list().execute.side_effect = RefreshError(
+            "refresh failed for internal-service-account@project.iam.gserviceaccount.com"
+        )
+        adapter = _adapter_with_service(service)
+
+        with pytest.raises(ExternalServiceError) as exc_info:
+            await adapter.search_messages(uuid.uuid4(), "q")
+
+        detail = str(exc_info.value)
+        assert "internal-service-account" not in detail
+        assert "RefreshError" in detail
 
 
 class TestEmailSearchRouteFailureHandling:

@@ -19,8 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.calendar.port import CalendarAttendee, CalendarEvent
 from app.adapters.email.gmail_adapter import GmailAdapter
-from app.adapters.google_errors import GOOGLE_TRANSPORT_ERRORS
-from app.core.exceptions import ExternalServiceError
+from app.adapters.google_errors import GOOGLE_TRANSPORT_ERRORS, raise_external_service_error
 
 logger = structlog.get_logger("adapters.calendar")
 
@@ -108,9 +107,25 @@ class GoogleCalendarAdapter:
         try:
             result = await loop.run_in_executor(None, _list)
         except GoogleHttpError as exc:
-            raise ExternalServiceError("Calendar", f"Error consultando eventos: {exc}") from exc
+            # include_exc_type=False: GoogleHttpError's class name is literally
+            # "HttpError" — appending it would reintroduce the raw-SDK-text leak
+            # this closes (review r1, finding P3a).
+            raise_external_service_error(
+                logger,
+                "Calendar",
+                "Google Calendar no está disponible en este momento",
+                exc,
+                "calendar_search_http_failed",
+                include_exc_type=False,
+            )
         except GOOGLE_TRANSPORT_ERRORS as exc:
-            raise ExternalServiceError("Calendar", f"Error de conexión consultando eventos: {exc}") from exc
+            raise_external_service_error(
+                logger,
+                "Calendar",
+                "Google Calendar no está disponible en este momento",
+                exc,
+                "calendar_search_transport_failed",
+            )
         raw_items: list[dict[str, Any]] = result.get("items", [])
         events: list[CalendarEvent] = []
         for item in raw_items:
@@ -144,11 +159,33 @@ class GoogleCalendarAdapter:
         try:
             raw = await loop.run_in_executor(None, _get)
         except GoogleHttpError as exc:
-            raise ExternalServiceError("Calendar", f"Error obteniendo evento {event_id}: {exc}") from exc
+            raise_external_service_error(
+                logger,
+                "Calendar",
+                "No se pudo obtener el evento de Google Calendar",
+                exc,
+                "calendar_get_event_http_failed",
+                event_id=event_id,
+                include_exc_type=False,
+            )
         except GOOGLE_TRANSPORT_ERRORS as exc:
-            raise ExternalServiceError("Calendar", f"Error de conexión obteniendo evento {event_id}: {exc}") from exc
+            raise_external_service_error(
+                logger,
+                "Calendar",
+                "No se pudo obtener el evento de Google Calendar",
+                exc,
+                "calendar_get_event_transport_failed",
+                event_id=event_id,
+            )
 
         try:
             return _parse_event(raw)
         except (ValueError, KeyError, TypeError) as exc:
-            raise ExternalServiceError("Calendar", f"Evento {event_id} con formato inesperado: {exc}") from exc
+            raise_external_service_error(
+                logger,
+                "Calendar",
+                "El evento de Google Calendar tiene un formato inesperado",
+                exc,
+                "calendar_get_event_malformed",
+                event_id=event_id,
+            )

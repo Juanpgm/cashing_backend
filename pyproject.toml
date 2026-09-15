@@ -163,6 +163,7 @@ module = [
     "magic.*",
     "jose.*",
     "passlib.*",
+    "httplib2.*",
 ]
 ignore_missing_imports = true
 

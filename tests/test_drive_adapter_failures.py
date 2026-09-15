@@ -29,12 +29,12 @@ from google.auth.exceptions import RefreshError
 from googleapiclient.errors import HttpError as GoogleHttpError
 
 
-def _http_error(status: int, message: str = "error") -> GoogleHttpError:
+def _http_error(status: int, message: str = "error", uri: str | None = None) -> GoogleHttpError:
     resp = MagicMock()
     resp.status = status
     resp.reason = message
     content = json.dumps({"error": {"message": message, "code": status}}).encode()
-    return GoogleHttpError(resp=resp, content=content)
+    return GoogleHttpError(resp=resp, content=content, uri=uri)
 
 
 def _make_adapter(service: MagicMock) -> DriveAdapter:
@@ -241,6 +241,54 @@ class TestSearchFilesFailureMatrix:
         result = await adapter.search_files(uuid.uuid4(), DriveQuery(keywords=[]))
 
         assert len(result) == 1
+
+
+class TestUserFacingMessageDoesNotLeakRawSdkText:
+    """`str(GoogleHttpError)` includes the FULL request URI — Drive search
+    `q=` clauses with folder names / contract numbers — and
+    `domain_error_handler` returns `ExternalServiceError.detail` to the client
+    VERBATIM, no redaction. Review r1 finding P3a."""
+
+    @pytest.mark.asyncio
+    async def test_http_error_message_does_not_leak_search_query_or_uri(self) -> None:
+        from app.adapters.drive.port import DriveQuery
+
+        service = MagicMock()
+        sensitive_term = "Contrato-CTR-2024-secreto-001"
+        service.files().list().execute.side_effect = _http_error(
+            500,
+            "boom",
+            uri=f"https://www.googleapis.com/drive/v3/files?q=name+contains+'{sensitive_term}'",
+        )
+        adapter = _make_adapter(service)
+
+        with pytest.raises(ExternalServiceError) as exc_info:
+            await adapter.search_files(uuid.uuid4(), DriveQuery(keywords=[sensitive_term]))
+
+        detail = str(exc_info.value)
+        assert "http" not in detail.lower()
+        assert "googleapis" not in detail.lower()
+        assert "q=" not in detail
+        assert sensitive_term not in detail
+        # NOT the exception class name here on purpose: GoogleHttpError's class
+        # name is literally "HttpError", which would reintroduce the "http"
+        # substring this test forbids.
+        assert "No se pudo completar la operación en Drive" in detail
+
+    @pytest.mark.asyncio
+    async def test_transport_error_message_does_not_leak_raw_exception_text(self) -> None:
+        service = MagicMock()
+        service.files().create().execute.side_effect = RefreshError(
+            "refresh failed for internal-service-account@project.iam.gserviceaccount.com"
+        )
+        adapter = _make_adapter(service)
+
+        with pytest.raises(ExternalServiceError) as exc_info:
+            await adapter.upload_file(uuid.uuid4(), "a.pdf", b"x", "application/pdf")
+
+        detail = str(exc_info.value)
+        assert "internal-service-account" not in detail
+        assert "RefreshError" in detail
 
 
 class TestGetFileFailures:

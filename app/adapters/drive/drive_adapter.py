@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.drive.port import DriveFile, DriveQuery
 from app.adapters.email.gmail_adapter import GmailAdapter
-from app.adapters.google_errors import GOOGLE_TRANSPORT_ERRORS
+from app.adapters.google_errors import GOOGLE_TRANSPORT_ERRORS, raise_external_service_error
 from app.core.exceptions import ExternalServiceError
 
 logger = structlog.get_logger("adapters.drive")
@@ -62,9 +62,29 @@ class DriveAdapter:
         try:
             return await loop.run_in_executor(None, fn)
         except GoogleHttpError as exc:
-            raise ExternalServiceError("Drive", f"{context}: {exc}") from exc
+            # include_exc_type=False: GoogleHttpError's class name is literally
+            # "HttpError" — appending it would reintroduce the raw-SDK-text leak
+            # this closes (review r1, finding P3a). `context` (developer-authored,
+            # e.g. "Error subiendo archivo 'x.pdf'") is safe to log but the raw
+            # `str(exc)` (full request URI, incl. `q=` search terms) is not.
+            raise_external_service_error(
+                logger,
+                "Drive",
+                "No se pudo completar la operación en Drive",
+                exc,
+                "drive_operation_http_failed",
+                context=context,
+                include_exc_type=False,
+            )
         except GOOGLE_TRANSPORT_ERRORS as exc:
-            raise ExternalServiceError("Drive", f"{context} (error de conexión): {exc}") from exc
+            raise_external_service_error(
+                logger,
+                "Drive",
+                "No se pudo completar la operación en Drive",
+                exc,
+                "drive_operation_transport_failed",
+                context=context,
+            )
 
     # ── Upload ───────────────────────────────────────────────────────────────
 
@@ -328,7 +348,14 @@ class DriveAdapter:
                 parents=raw.get("parents", []),
             )
         except (KeyError, TypeError, ValueError) as exc:
-            raise ExternalServiceError("Drive", f"Archivo con formato inesperado: {exc}") from exc
+            raise_external_service_error(
+                logger,
+                "Drive",
+                "El archivo de Drive tiene un formato inesperado",
+                exc,
+                "drive_file_parse_failed_detail",
+                file_id=raw.get("id"),
+            )
 
     def _parse_files_tolerant(self, raw_files: list[dict]) -> list[DriveFile]:  # type: ignore[type-arg]
         """Parse a list of raw Drive file resources, skipping (and logging) any

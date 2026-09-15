@@ -26,8 +26,13 @@ relies on.
 
 from __future__ import annotations
 
+from typing import NoReturn
+
 import httplib2
+import structlog
 from google.auth.exceptions import RefreshError, TransportError
+
+from app.core.exceptions import ExternalServiceError
 
 GOOGLE_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (
     OSError,
@@ -36,3 +41,36 @@ GOOGLE_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (
     TransportError,
     RefreshError,
 )
+
+
+def raise_external_service_error(
+    logger: structlog.BoundLogger,
+    service: str,
+    user_message: str,
+    exc: BaseException,
+    event: str,
+    *,
+    include_exc_type: bool = True,
+    **log_context: object,
+) -> NoReturn:
+    """Log the raw exception via structlog, then raise `ExternalServiceError`
+    with a generic, safe client-facing detail.
+
+    `str(exc)` for a `googleapiclient.errors.HttpError` includes the FULL
+    request URI — e.g. Gmail/Drive search `q=` terms, folder names, contract
+    numbers — and `domain_error_handler` (`app.main`) returns
+    `ExternalServiceError.detail` to the client VERBATIM, with no redaction
+    (unlike the generic 500 path in `app.core.error_response`). The raw text
+    is therefore logged here for diagnosis, never included in the raised
+    exception's detail — which carries at most the exception's class name.
+
+    `include_exc_type=False` for `GoogleHttpError`: its own class name is
+    "HttpError", and the finding's own leak check forbids the substring
+    "http" appearing anywhere in the client-facing detail (case-insensitive),
+    so appending it would reintroduce the very leak this closes.
+
+    Found in radicacion-sin-friccion phase 4.3 review r1 (finding P3a).
+    """
+    logger.warning(event, error=str(exc), exc_type=type(exc).__name__, **log_context)
+    detail = f"{user_message} ({type(exc).__name__})" if include_exc_type else user_message
+    raise ExternalServiceError(service, detail) from exc

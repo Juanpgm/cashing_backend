@@ -21,12 +21,12 @@ from google.auth.exceptions import RefreshError
 from googleapiclient.errors import HttpError as GoogleHttpError
 
 
-def _http_error(status: int, message: str = "error") -> GoogleHttpError:
+def _http_error(status: int, message: str = "error", uri: str | None = None) -> GoogleHttpError:
     resp = MagicMock()
     resp.status = status
     resp.reason = message
     content = json.dumps({"error": {"message": message, "code": status}}).encode()
-    return GoogleHttpError(resp=resp, content=content)
+    return GoogleHttpError(resp=resp, content=content, uri=uri)
 
 
 def _make_adapter(service: MagicMock) -> GoogleCalendarAdapter:
@@ -145,6 +145,51 @@ class TestGetEventFailures:
 
         assert result.id == "ev1"
         assert result.summary == "Reunión"
+
+
+class TestUserFacingMessageDoesNotLeakRawSdkText:
+    """`str(GoogleHttpError)` includes the FULL request URI — Calendar search
+    `q=` terms — and `domain_error_handler` returns `ExternalServiceError.detail`
+    to the client VERBATIM, no redaction. Review r1 finding P3a."""
+
+    @pytest.mark.asyncio
+    async def test_http_error_message_does_not_leak_search_query_or_uri(self) -> None:
+        service = MagicMock()
+        sensitive_query = "reunion-confidencial-cliente-x"
+        service.events().list().execute.side_effect = _http_error(
+            500,
+            "boom",
+            uri=f"https://www.googleapis.com/calendar/v3/calendars/primary/events?q={sensitive_query}",
+        )
+        adapter = _make_adapter(service)
+
+        with pytest.raises(ExternalServiceError) as exc_info:
+            await adapter.search_events(uuid.uuid4(), "2024-01-01T00:00:00Z", "2024-02-01T00:00:00Z", q=sensitive_query)
+
+        detail = str(exc_info.value)
+        assert "http" not in detail.lower()
+        assert "googleapis" not in detail.lower()
+        assert "q=" not in detail
+        assert sensitive_query not in detail
+        # NOT the exception class name here on purpose: GoogleHttpError's class
+        # name is literally "HttpError", which would reintroduce the "http"
+        # substring this test forbids.
+        assert "Google Calendar no está disponible" in detail
+
+    @pytest.mark.asyncio
+    async def test_transport_error_message_does_not_leak_raw_exception_text(self) -> None:
+        service = MagicMock()
+        service.events().list().execute.side_effect = RefreshError(
+            "refresh failed for internal-service-account@project.iam.gserviceaccount.com"
+        )
+        adapter = _make_adapter(service)
+
+        with pytest.raises(ExternalServiceError) as exc_info:
+            await adapter.search_events(uuid.uuid4(), "2024-01-01T00:00:00Z", "2024-02-01T00:00:00Z")
+
+        detail = str(exc_info.value)
+        assert "internal-service-account" not in detail
+        assert "RefreshError" in detail
 
 
 class TestSearchEventsFailureMatrixRegression:
