@@ -31,6 +31,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+import structlog
 from app.agent.state import AgentState
 from app.core.exceptions import NO_PROVIDER_CONNECTED, ExternalServiceError
 from app.models.integracion import IntegrationProvider
@@ -163,7 +164,14 @@ class TestPerProviderFailOpen:
         method instead, proving `drive_fetch_node`'s per-query try/except
         (app/agent/nodes/drive_fetch.py) genuinely swallows an
         `ExternalServiceError` raised by the adapter itself, not just one
-        raised by a stand-in node."""
+        raised by a stand-in node.
+
+        Review r2 finding P3-3: the `fuentes` assertions alone can't
+        distinguish "the Drive failure was swallowed" from "Drive genuinely
+        returned zero files" — both produce `drive == 0`. Also assert the
+        failure was actually LOGGED (`drive_query_failed`,
+        app/agent/nodes/drive_fetch.py:135), which only fires on the
+        swallow-and-continue path."""
         from app.adapters.drive.drive_adapter import DriveAdapter
         from app.adapters.email.gmail_adapter import GmailAdapter
         from app.adapters.email.port import EmailMessage
@@ -191,10 +199,13 @@ class TestPerProviderFailOpen:
         )
         monkeypatch.setattr(evidence_discovery_service, "calendar_fetch_node", _passthrough_node)
 
-        result = await evidence_discovery_service.descubrir_evidencias(db, user.id, _request())
+        with structlog.testing.capture_logs() as captured:
+            result = await evidence_discovery_service.descubrir_evidencias(db, user.id, _request())
 
         assert result.fuentes["email"] >= 1
         assert result.fuentes["drive"] == 0
+        drive_failure_logs = [e for e in captured if e.get("event") == "drive_query_failed"]
+        assert drive_failure_logs, "expected the Drive adapter failure to be logged"
 
     @pytest.mark.asyncio
     async def test_calendar_down_does_not_block_drive_evidence(
