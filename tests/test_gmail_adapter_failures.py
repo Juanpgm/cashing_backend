@@ -131,6 +131,24 @@ class TestGetAttachmentFailures:
 
         assert result == b""
 
+    @pytest.mark.asyncio
+    async def test_invalid_base64_data_is_wrapped_not_raw_binascii_error(self) -> None:
+        """`data` present but not valid base64 must raise the domain
+        `ExternalServiceError` (502), never a raw `binascii.Error` (500) —
+        see radicacion-sin-friccion phase 4.3 review, finding P2a."""
+        service = MagicMock()
+        # "A" is a single valid base64-alphabet char: appending the code's own
+        # "==" padding yields "A==" (3 chars), which is not a multiple of 4 —
+        # `binascii.Error: number of data characters (1) cannot be 1 more than
+        # a multiple of 4`. Characters outside the alphabet (e.g. "!") are
+        # silently *discarded* by `urlsafe_b64decode(validate=False)`, so they
+        # do NOT reproduce the bug — this is the genuinely malformed case.
+        service.users().messages().attachments().get().execute.return_value = {"data": "A"}
+        adapter = _adapter_with_service(service)
+
+        with pytest.raises(ExternalServiceError):
+            await adapter.get_attachment(uuid.uuid4(), "msg1", "att1")
+
 
 class TestFetchMessageMalformedPayload:
     """`_fetch_message` used to call `_parse_message(raw)` OUTSIDE the try/except
@@ -188,6 +206,30 @@ class TestFetchMessageMalformedPayload:
 
         assert result.id == "m1"
         assert result.snippet == "hola"
+
+    @pytest.mark.asyncio
+    async def test_invalid_base64_body_is_wrapped_not_raw_binascii_error(self) -> None:
+        """A message body part with `data` that is not valid base64 must raise
+        the domain `ExternalServiceError`, never a raw `binascii.Error` — see
+        radicacion-sin-friccion phase 4.3 review, finding P2a. Mirrors Drive
+        `_parse_file` / Calendar `_parse_event`, which already guard `ValueError`."""
+        service = MagicMock()
+        # See TestGetAttachmentFailures.test_invalid_base64_data_is_wrapped_...
+        # for why "A" (not "!!!...!!!") is the genuinely malformed value.
+        service.users().messages().get().execute.return_value = {
+            "id": "m1",
+            "threadId": "t1",
+            "payload": {
+                "headers": [],
+                "mimeType": "text/plain",
+                "body": {"data": "A"},
+                "parts": [],
+            },
+        }
+        adapter = _adapter_with_service(service)
+
+        with pytest.raises(ExternalServiceError):
+            await adapter.get_message(uuid.uuid4(), "m1")
 
     @pytest.mark.asyncio
     async def test_http_error_during_fetch_still_wrapped(self) -> None:

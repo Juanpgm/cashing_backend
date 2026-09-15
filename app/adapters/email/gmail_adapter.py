@@ -272,7 +272,11 @@ class GmailAdapter:
             raise ExternalServiceError("Gmail", f"Error obteniendo mensaje {message_id}: {exc}") from exc
         try:
             return self._parse_message(raw)
-        except (KeyError, TypeError, AttributeError) as exc:
+        except (KeyError, TypeError, AttributeError, ValueError) as exc:
+            # ValueError covers binascii.Error from a malformed base64 `body.data`
+            # in `_extract_body` — mirrors Drive `_parse_file` / Calendar
+            # `_parse_event`, which already guard ValueError (radicacion-sin-friccion
+            # phase 4.3 review, finding P2a).
             raise ExternalServiceError("Gmail", f"Mensaje {message_id} con formato inesperado: {exc}") from exc
 
     async def get_attachment(
@@ -300,7 +304,15 @@ class GmailAdapter:
         except (TimeoutError, OSError) as exc:
             raise ExternalServiceError("Gmail", f"Error de conexión obteniendo adjunto {attachment_id}: {exc}") from exc
         data = result.get("data", "")
-        return base64.urlsafe_b64decode(data + "==")
+        try:
+            return base64.urlsafe_b64decode(data + "==")
+        except ValueError as exc:
+            # binascii.Error (a ValueError subclass) on malformed base64 `data` —
+            # previously outside every try/except (radicacion-sin-friccion phase
+            # 4.3 review, finding P2a).
+            raise ExternalServiceError(
+                "Gmail", f"Adjunto {attachment_id} con formato inesperado: {exc}"
+            ) from exc
 
     # ── Send ─────────────────────────────────────────────────────────────────
 
