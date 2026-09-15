@@ -130,6 +130,30 @@ class TestUploadFileFailures:
         assert result.id == "f1"
         assert result.name == "informe.pdf"
 
+    @pytest.mark.asyncio
+    async def test_file_that_landed_but_parses_malformed_is_still_logged_with_its_id(self) -> None:
+        """Review r1 finding P3b: `drive_file_uploaded` used to log AFTER
+        `_parse_file`, so a file that DID land in Drive but returned a
+        malformed payload (e.g. a corrupt `size`) logged NOTHING at all —
+        losing the only trace that the upload itself actually succeeded."""
+        service = MagicMock()
+        service.files().create().execute.return_value = {
+            "id": "f-landed-but-malformed",
+            "name": "a.pdf",
+            "size": "not-a-number",  # int(...) inside _parse_file raises ValueError
+        }
+        adapter = _make_adapter(service)
+
+        with (
+            patch("app.adapters.drive.drive_adapter.logger.info") as mock_info,
+            pytest.raises(ExternalServiceError),
+        ):
+            await adapter.upload_file(uuid.uuid4(), "a.pdf", b"x", "application/pdf")
+
+        upload_logs = [call for call in mock_info.call_args_list if call.args[0] == "drive_file_uploaded"]
+        assert len(upload_logs) == 1
+        assert upload_logs[0].kwargs.get("file_id") == "f-landed-but-malformed"
+
 
 class TestFindAndCreateFolderFailures:
     @pytest.mark.asyncio
@@ -163,6 +187,27 @@ class TestFindAndCreateFolderFailures:
     async def test_create_folder_transport_timeout_is_wrapped(self) -> None:
         service = MagicMock()
         service.files().create().execute.side_effect = TimeoutError("timed out")
+        adapter = _make_adapter(service)
+
+        with pytest.raises(ExternalServiceError):
+            await adapter._create_folder(uuid.uuid4(), "Contrato-001", None)
+
+    @pytest.mark.asyncio
+    async def test_find_folder_malformed_item_missing_id_is_wrapped(self) -> None:
+        """Review r1 finding P3b: `files[0]["id"]` was a bare index outside
+        every try/except — a malformed/partial file resource raised a raw
+        `KeyError` (500) instead of `ExternalServiceError` (502)."""
+        service = MagicMock()
+        service.files().list().execute.return_value = {"files": [{"name": "sin-id"}]}  # no "id"
+        adapter = _make_adapter(service)
+
+        with pytest.raises(ExternalServiceError):
+            await adapter._find_folder(uuid.uuid4(), "Contrato-001", None)
+
+    @pytest.mark.asyncio
+    async def test_create_folder_malformed_response_missing_id_is_wrapped(self) -> None:
+        service = MagicMock()
+        service.files().create().execute.return_value = {}  # no "id"
         adapter = _make_adapter(service)
 
         with pytest.raises(ExternalServiceError):
@@ -354,6 +399,19 @@ class TestMakeShareableFailures:
     async def test_transport_os_error_is_wrapped(self) -> None:
         service = MagicMock()
         service.permissions().create().execute.side_effect = OSError("connection reset")
+        adapter = _make_adapter(service)
+
+        with pytest.raises(ExternalServiceError):
+            await adapter.make_shareable(uuid.uuid4(), "f1")
+
+    @pytest.mark.asyncio
+    async def test_malformed_response_missing_web_view_link_is_wrapped(self) -> None:
+        """Review r1 finding P3b: `["webViewLink"]` was a bare index outside
+        every try/except — a malformed response raised a raw `KeyError` (500)
+        instead of `ExternalServiceError` (502)."""
+        service = MagicMock()
+        service.permissions().create().execute.return_value = {}
+        service.files().get().execute.return_value = {}  # no "webViewLink"
         adapter = _make_adapter(service)
 
         with pytest.raises(ExternalServiceError):

@@ -42,6 +42,27 @@ class DriveAdapter:
     def _build_service(self, creds):  # type: ignore[no-untyped-def]
         return build("drive", "v3", credentials=creds, cache_discovery=False)
 
+    def _require_key(self, raw: dict, key: str, context: str) -> str:  # type: ignore[type-arg]
+        """Extract `raw[key]`, mapping a malformed/partial Drive response to
+        `ExternalServiceError` instead of a raw `KeyError`/`TypeError` escaping
+        past the API boundary. Used for the handful of bare indexings that
+        weren't already routed through `_parse_file` (review r1, finding P3b):
+        `_find_folder`'s `files[0]["id"]`, `_create_folder`'s `result["id"]`,
+        and `_share`'s `["webViewLink"]`.
+        """
+        try:
+            return raw[key]
+        except (KeyError, TypeError) as exc:
+            raise_external_service_error(
+                logger,
+                "Drive",
+                "No se pudo completar la operación en Drive",
+                exc,
+                "drive_missing_expected_key",
+                context=context,
+                key=key,
+            )
+
     async def _run(self, fn: Callable[[], _T], context: str) -> _T:
         """Run a blocking Drive API call in the executor, mapping the known
         failure modes to the domain `ExternalServiceError` (502) contract:
@@ -118,9 +139,12 @@ class DriveAdapter:
             )
 
         raw = await self._run(_upload, f"Error subiendo archivo '{name}'")
-        file = self._parse_file(raw)
-        logger.info("drive_file_uploaded", file_id=file.id, name=name, user_id=str(usuario_id))
-        return file
+        # Log BEFORE parsing: a file that landed in Drive but returned a
+        # malformed payload must still be traceable by its id — logging only
+        # after `_parse_file` (which can raise) previously left zero trace
+        # that the upload itself actually succeeded (review r1, finding P3b).
+        logger.info("drive_file_uploaded", file_id=raw.get("id"), name=name, user_id=str(usuario_id))
+        return self._parse_file(raw)
 
     # ── Folder Management ────────────────────────────────────────────────────
 
@@ -159,7 +183,9 @@ class DriveAdapter:
 
         result = await self._run(_search, f"Error buscando carpeta '{name}'")
         files = result.get("files", [])
-        return files[0]["id"] if files else None
+        if not files:
+            return None
+        return self._require_key(files[0], "id", f"Error buscando carpeta '{name}'")
 
     async def _create_folder(
         self,
@@ -178,8 +204,9 @@ class DriveAdapter:
             return service.files().create(body=metadata, fields="id").execute()
 
         result = await self._run(_create, f"Error creando carpeta '{name}'")
-        logger.info("drive_folder_created", name=name, folder_id=result["id"])
-        return result["id"]
+        folder_id = self._require_key(result, "id", f"Error creando carpeta '{name}'")
+        logger.info("drive_folder_created", name=name, folder_id=folder_id)
+        return folder_id
 
     # ── List / Get ───────────────────────────────────────────────────────────
 
@@ -308,14 +335,15 @@ class DriveAdapter:
         creds = await self._auth.get_credentials(usuario_id)
         service = self._build_service(creds)
 
-        def _share() -> str:
+        def _share() -> dict:  # type: ignore[type-arg]
             service.permissions().create(
                 fileId=file_id,
                 body={"type": "anyone", "role": role},
             ).execute()
-            return service.files().get(fileId=file_id, fields="webViewLink").execute()["webViewLink"]
+            return service.files().get(fileId=file_id, fields="webViewLink").execute()
 
-        link = await self._run(_share, f"Error compartiendo archivo '{file_id}'")
+        raw = await self._run(_share, f"Error compartiendo archivo '{file_id}'")
+        link = self._require_key(raw, "webViewLink", f"Error compartiendo archivo '{file_id}'")
         logger.info("drive_file_shared", file_id=file_id, role=role)
         return link
 
