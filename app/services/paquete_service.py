@@ -27,7 +27,7 @@ from app.core.config import settings
 from app.core.exceptions import NotFoundError
 from app.models.cuenta_cobro import CuentaCobro
 from app.schemas.paquete import ObligacionEstadoOut, PaqueteInfoResponse
-from app.services import cuenta_cobro_service, informe_service, radicacion_prep_service
+from app.services import cuenta_cobro_service, informe_service
 from app.services.radicacion_prep_service import RadicacionPrepResultado
 
 
@@ -124,7 +124,22 @@ async def regenerar_paquete(db: AsyncSession, usuario_id: uuid.UUID, cuenta_id: 
     `preparar_radicacion`.
 
     B7 Fix 4: pre-checks contrato aliveness (see `_get_cuenta_con_contrato_
-    vivo`) before delegating, so a soft-deleted contract's cuota cannot be
-    regenerated/packaged."""
-    await _get_cuenta_con_contrato_vivo(db, usuario_id, cuenta_id)
-    return await radicacion_prep_service.preparar_radicacion(db, usuario_id, cuenta_id)
+    vivo`) — now performed INSIDE `paquete_job_service.generar_paquete_bajo_
+    lock` itself (not duplicated here, to avoid a redundant second query),
+    so a soft-deleted contract's cuota still cannot be regenerated/packaged.
+
+    radicacion-sin-friccion Phase 2 slice 2.7: delegates through `paquete_job_
+    service.generar_paquete_bajo_lock` instead of calling `preparar_radicacion`
+    directly — same per-cuenta lock the new `POST /paquete/regenerar-async`
+    path shares (see that module's docstring for the Option A/B design
+    decision). The response shape returned to callers of THIS function is
+    unchanged; only a genuine concurrent-overlap call now raises
+    `PaqueteGenerationInProgressError` (409) instead of silently duplicating
+    the whole expensive pipeline. Local import: `paquete_job_service` imports
+    THIS module at module level, so importing it back at module level here
+    would be circular — deferred to call time instead (same idiom as
+    `evidence_classification_service._ejecutar_clasificacion`'s local import
+    of `evidencia_service`)."""
+    from app.services import paquete_job_service
+
+    return await paquete_job_service.generar_paquete_bajo_lock(db, usuario_id, cuenta_id)

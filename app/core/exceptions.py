@@ -1,5 +1,7 @@
 """Domain exceptions with HTTP status code mapping."""
 
+import uuid
+
 from fastapi import HTTPException, status
 
 # --- Structured error codes ---
@@ -46,6 +48,11 @@ EVIDENCE_HANDLE_NOT_FOUND = "EVIDENCE_HANDLE_NOT_FOUND"
 # with a `call_id` that is unknown, expired, or belongs to another user's session
 # (see `app.services.agent_tool_approval`).
 PENDING_TOOL_CALL_NOT_FOUND = "PENDING_TOOL_CALL_NOT_FOUND"
+# Package generation as a poll-based background job, per-cuenta lock
+# (radicacion-sin-friccion, Phase 2 slice 2.7): a synchronous `POST
+# /paquete/regenerar` call lost the per-cuenta lock to an already in-flight run
+# (sync OR async) — see `app.services.paquete_job_service._upsert_job`.
+PAQUETE_GENERACION_EN_CURSO = "PAQUETE_GENERACION_EN_CURSO"
 
 
 class DomainError(Exception):
@@ -198,6 +205,39 @@ class ChecklistLinkError(DomainError):
         super().__init__(detail, code=CHECKLIST_LINK_FAILED)
 
 
+class PaqueteGenerationInProgressError(DomainError):
+    """A synchronous `POST /paquete/regenerar` call lost the per-cuenta job
+    lock to an already in-flight run (radicacion-sin-friccion, Phase 2 slice
+    2.7 — see `app.services.paquete_job_service`'s module docstring for the
+    Option A/B design decision this implements).
+
+    Deliberately does NOT silently run the expensive pipeline a second time in
+    parallel (checklist + coherence + 2 LLM calls + zip + upload), and
+    deliberately does NOT block-and-wait for the in-flight run inside this
+    request either (a bounded wait-loop would add real latency/complexity for
+    a genuinely rare interleaving). Fails fast with a clear, actionable 409
+    instead: the caller can poll `GET /paquete/job` for the in-flight run's
+    outcome, or simply retry `POST /paquete/regenerar` once it's done."""
+
+    def __init__(self, cuenta_id: uuid.UUID) -> None:
+        # No raw `cuenta_id` or internal endpoint path in the message — every
+        # sibling DomainError in this file speaks to the end user in plain
+        # Spanish (see `ChecklistLinkError` just above); this one originally
+        # didn't (flagged by review), so it's kept consistent with the rest.
+        #
+        # Byte-identical to `PAQUETE_GENERACION_EN_CURSO`'s entry in the
+        # frontend's `CODE_MESSAGES` (components/stepper/step-messages.ts) —
+        # deliberately, not by coincidence (round-2 review follow-up): that
+        # screen's existing dedup guard only suppresses this `detail` as a
+        # redundant second line when it equals the already-rendered
+        # translated message; a punctuation mismatch between the two would
+        # make the guard miss and stack two near-identical sentences.
+        super().__init__(
+            "Ya hay una generación de paquete en curso — esperá unos segundos y volvé a intentar.",
+            code=PAQUETE_GENERACION_EN_CURSO,
+        )
+
+
 _ATRIBUTO_DOCUMENTO_PERSISTIDO = "_documento_persistido"
 
 
@@ -232,6 +272,7 @@ EXCEPTION_STATUS_MAP: dict[type[DomainError], int] = {
     ExternalServiceError: status.HTTP_502_BAD_GATEWAY,
     InviteRequiredError: status.HTTP_403_FORBIDDEN,
     ChecklistLinkError: status.HTTP_502_BAD_GATEWAY,
+    PaqueteGenerationInProgressError: status.HTTP_409_CONFLICT,
 }
 
 
