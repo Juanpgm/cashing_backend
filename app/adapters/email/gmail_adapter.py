@@ -26,6 +26,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.email.port import EmailAttachment, EmailMessage
+from app.adapters.google_errors import GOOGLE_TRANSPORT_ERRORS
 from app.core.config import settings
 from app.core.exceptions import ExternalServiceError, NotFoundError, ValidationError
 from app.models.integracion import Integracion, IntegrationProvider
@@ -235,6 +236,8 @@ class GmailAdapter:
             result = await self._execute_with_retry(_search)
         except GoogleHttpError as exc:
             raise ExternalServiceError("Gmail", f"Error buscando correos: {exc}") from exc
+        except GOOGLE_TRANSPORT_ERRORS as exc:
+            raise ExternalServiceError("Gmail", f"Error de conexión buscando correos: {exc}") from exc
         raw_messages = result.get("messages", [])
 
         if not raw_messages:
@@ -270,6 +273,8 @@ class GmailAdapter:
             raw = await self._execute_with_retry(_get)
         except GoogleHttpError as exc:
             raise ExternalServiceError("Gmail", f"Error obteniendo mensaje {message_id}: {exc}") from exc
+        except GOOGLE_TRANSPORT_ERRORS as exc:
+            raise ExternalServiceError("Gmail", f"Error de conexión obteniendo mensaje {message_id}: {exc}") from exc
         try:
             return self._parse_message(raw)
         except (KeyError, TypeError, AttributeError, ValueError) as exc:
@@ -301,7 +306,7 @@ class GmailAdapter:
             result = await self._execute_with_retry(_get_att)
         except GoogleHttpError as exc:
             raise ExternalServiceError("Gmail", f"Error obteniendo adjunto {attachment_id}: {exc}") from exc
-        except (TimeoutError, OSError) as exc:
+        except GOOGLE_TRANSPORT_ERRORS as exc:
             raise ExternalServiceError("Gmail", f"Error de conexión obteniendo adjunto {attachment_id}: {exc}") from exc
         data = result.get("data", "")
         try:
@@ -354,6 +359,8 @@ class GmailAdapter:
             result = await self._execute_with_retry(_send)
         except GoogleHttpError as exc:
             raise ExternalServiceError("Gmail", f"Error enviando correo: {exc}") from exc
+        except GOOGLE_TRANSPORT_ERRORS as exc:
+            raise ExternalServiceError("Gmail", f"Error de conexión enviando correo: {exc}") from exc
         logger.info("email_sent", user_id=str(usuario_id), to=to, subject=subject)
         return result["id"]
 

@@ -9,11 +9,12 @@ methods that previously leaked raw exceptions at the API boundary:
   try/except, so a malformed payload (missing `payload`/`id`) raised a raw
   `KeyError` instead of the domain `ExternalServiceError` (bug — fixed here).
 - `search_messages` / `send_message` already wrap `GoogleHttpError` — those
-  are re-verified here, plus one characterization test documenting the known,
-  intentionally-unfixed gap: raw transport errors (`TimeoutError`/`OSError`)
-  are neither retried nor mapped for those two methods (see
-  `GmailAdapter._execute_with_retry` — only 429 `GoogleHttpError` is retried;
-  widening that is a design change out of scope for this slice).
+  are re-verified here.
+- `search_messages`, `send_message`, `get_attachment`, and `_fetch_message`'s
+  HTTP call now ALSO wrap the shared `GOOGLE_TRANSPORT_ERRORS` tuple
+  (`app.adapters.google_errors`): DNS failures (`httplib2.ServerNotFoundError`)
+  and lazy token-refresh failures (`google.auth.exceptions.RefreshError`/
+  `TransportError`) previously escaped as a raw 500 (review r1, finding P2b).
 """
 
 from __future__ import annotations
@@ -22,9 +23,11 @@ import json
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httplib2
 import pytest
 from app.adapters.email.gmail_adapter import GmailAdapter
 from app.core.exceptions import ExternalServiceError
+from google.auth.exceptions import RefreshError
 from googleapiclient.errors import HttpError as GoogleHttpError
 
 
@@ -93,6 +96,32 @@ class TestGetAttachmentFailures:
     async def test_transport_os_error_is_wrapped_as_external_service_error(self) -> None:
         service = MagicMock()
         service.users().messages().attachments().get().execute.side_effect = OSError("connection reset")
+        adapter = _adapter_with_service(service)
+
+        with pytest.raises(ExternalServiceError):
+            await adapter.get_attachment(uuid.uuid4(), "msg1", "att1")
+
+    @pytest.mark.asyncio
+    async def test_dns_failure_is_wrapped_as_external_service_error(self) -> None:
+        """httplib2.ServerNotFoundError is NOT an OSError subclass — review r1
+        finding P2b."""
+        service = MagicMock()
+        service.users().messages().attachments().get().execute.side_effect = httplib2.ServerNotFoundError(
+            "Unable to find the server"
+        )
+        adapter = _adapter_with_service(service)
+
+        with pytest.raises(ExternalServiceError):
+            await adapter.get_attachment(uuid.uuid4(), "msg1", "att1")
+
+    @pytest.mark.asyncio
+    async def test_lazy_token_refresh_failure_is_wrapped_as_external_service_error(self) -> None:
+        """RefreshError can be raised lazily inside `.execute()` by the
+        underlying transport auto-refreshing an expired token — not just in
+        `get_credentials`'s explicit `creds.refresh(...)` call. Review r1
+        finding P2b."""
+        service = MagicMock()
+        service.users().messages().attachments().get().execute.side_effect = RefreshError("token expired")
         adapter = _adapter_with_service(service)
 
         with pytest.raises(ExternalServiceError):
@@ -242,6 +271,24 @@ class TestFetchMessageMalformedPayload:
         with pytest.raises(ExternalServiceError):
             await adapter.get_message(uuid.uuid4(), "m1")
 
+    @pytest.mark.asyncio
+    async def test_dns_failure_during_fetch_is_wrapped(self) -> None:
+        service = MagicMock()
+        service.users().messages().get().execute.side_effect = httplib2.ServerNotFoundError("Unable to find server")
+        adapter = _adapter_with_service(service)
+
+        with pytest.raises(ExternalServiceError):
+            await adapter.get_message(uuid.uuid4(), "m1")
+
+    @pytest.mark.asyncio
+    async def test_lazy_token_refresh_failure_during_fetch_is_wrapped(self) -> None:
+        service = MagicMock()
+        service.users().messages().get().execute.side_effect = RefreshError("token expired")
+        adapter = _adapter_with_service(service)
+
+        with pytest.raises(ExternalServiceError):
+            await adapter.get_message(uuid.uuid4(), "m1")
+
 
 class TestSearchMessagesAndSendMessageFailureMatrix:
     """Re-verifies the existing GoogleHttpError wrapping on the two other
@@ -295,19 +342,52 @@ class TestSearchMessagesAndSendMessageFailureMatrix:
             await adapter.send_message(uuid.uuid4(), ["a@b.com"], "subj", "<p>hi</p>")
 
     @pytest.mark.asyncio
-    async def test_known_gap_search_transport_timeout_still_leaks_raw(self) -> None:
-        """Characterization test, not a fix: `search_messages` only catches
-        `GoogleHttpError`. A raw transport error (`TimeoutError`) is neither
-        retried nor mapped — matches the documented gap in
-        `_execute_with_retry`. Widening the 429-only retry/wrap to transport
-        errors here is a design change out of scope for this slice (see
-        report's Deviations section)."""
+    async def test_search_transport_timeout_is_wrapped(self) -> None:
+        """Previously a documented gap (`search_messages` only caught
+        `GoogleHttpError`) — fixed in review r1 finding P2b via the shared
+        `GOOGLE_TRANSPORT_ERRORS` tuple."""
         service = MagicMock()
         service.users().messages().list().execute.side_effect = TimeoutError("socket timed out")
         adapter = _adapter_with_service(service)
 
-        with pytest.raises(TimeoutError):
+        with pytest.raises(ExternalServiceError):
             await adapter.search_messages(uuid.uuid4(), "q")
+
+    @pytest.mark.asyncio
+    async def test_search_dns_failure_is_wrapped(self) -> None:
+        service = MagicMock()
+        service.users().messages().list().execute.side_effect = httplib2.ServerNotFoundError("Unable to find server")
+        adapter = _adapter_with_service(service)
+
+        with pytest.raises(ExternalServiceError):
+            await adapter.search_messages(uuid.uuid4(), "q")
+
+    @pytest.mark.asyncio
+    async def test_search_lazy_token_refresh_failure_is_wrapped(self) -> None:
+        service = MagicMock()
+        service.users().messages().list().execute.side_effect = RefreshError("token expired")
+        adapter = _adapter_with_service(service)
+
+        with pytest.raises(ExternalServiceError):
+            await adapter.search_messages(uuid.uuid4(), "q")
+
+    @pytest.mark.asyncio
+    async def test_send_dns_failure_is_wrapped(self) -> None:
+        service = MagicMock()
+        service.users().messages().send().execute.side_effect = httplib2.ServerNotFoundError("Unable to find server")
+        adapter = _adapter_with_service(service)
+
+        with pytest.raises(ExternalServiceError):
+            await adapter.send_message(uuid.uuid4(), ["a@b.com"], "subj", "<p>hi</p>")
+
+    @pytest.mark.asyncio
+    async def test_send_lazy_token_refresh_failure_is_wrapped(self) -> None:
+        service = MagicMock()
+        service.users().messages().send().execute.side_effect = RefreshError("token expired")
+        adapter = _adapter_with_service(service)
+
+        with pytest.raises(ExternalServiceError):
+            await adapter.send_message(uuid.uuid4(), ["a@b.com"], "subj", "<p>hi</p>")
 
 
 class TestEmailSearchRouteFailureHandling:
@@ -341,13 +421,15 @@ class TestEmailSearchRouteFailureHandling:
 
     @pytest.mark.asyncio
     async def test_unwrapped_transport_error_still_returns_structured_500_not_a_hang(self, client, test_user) -> None:
-        """Even an exception the adapter does NOT wrap (the documented
-        search_messages transport-error gap) must still surface as a
-        structured JSON 500 through the route's own `except Exception`
-        catch-all, never a hang or a bare unhandled-exception page."""
+        """Safety net, not a characterization of a known gap: `search_messages`
+        now wraps `TimeoutError` itself (review r1 finding P2b), but this test
+        mocks the adapter METHOD directly to simulate an exception type the
+        adapter does not (or does not yet) wrap — the route's own
+        `except Exception` catch-all must still surface a structured JSON 500,
+        never a hang or a bare unhandled-exception page."""
         with patch(
             "app.adapters.email.gmail_adapter.GmailAdapter.search_messages",
-            AsyncMock(side_effect=TimeoutError("socket timed out")),
+            AsyncMock(side_effect=RuntimeError("totally unmapped failure")),
         ):
             resp = await client.post(
                 "/api/v1/integraciones/email/search",

@@ -13,9 +13,11 @@ import json
 import uuid
 from unittest.mock import MagicMock
 
+import httplib2
 import pytest
 from app.adapters.calendar.calendar_adapter import GoogleCalendarAdapter
 from app.core.exceptions import ExternalServiceError
+from google.auth.exceptions import RefreshError
 from googleapiclient.errors import HttpError as GoogleHttpError
 
 
@@ -95,6 +97,26 @@ class TestGetEventFailures:
             await adapter.get_event(uuid.uuid4(), "ev1")
 
     @pytest.mark.asyncio
+    async def test_dns_failure_is_wrapped(self) -> None:
+        """httplib2.ServerNotFoundError is NOT an OSError subclass — review r1
+        finding P2b."""
+        service = MagicMock()
+        service.events().get().execute.side_effect = httplib2.ServerNotFoundError("Unable to find server")
+        adapter = _make_adapter(service)
+
+        with pytest.raises(ExternalServiceError):
+            await adapter.get_event(uuid.uuid4(), "ev1")
+
+    @pytest.mark.asyncio
+    async def test_lazy_token_refresh_failure_is_wrapped(self) -> None:
+        service = MagicMock()
+        service.events().get().execute.side_effect = RefreshError("token expired")
+        adapter = _make_adapter(service)
+
+        with pytest.raises(ExternalServiceError):
+            await adapter.get_event(uuid.uuid4(), "ev1")
+
+    @pytest.mark.asyncio
     async def test_malformed_response_is_wrapped_not_raw(self) -> None:
         """A malformed dateTime string must not raise a raw ValueError from
         `datetime.fromisoformat` inside `_parse_event`."""
@@ -131,13 +153,32 @@ class TestSearchEventsFailureMatrixRegression:
 
     @pytest.mark.asyncio
     async def test_transport_timeout_is_wrapped(self) -> None:
+        """Previously a documented gap (`search_events` only caught
+        `GoogleHttpError`, symmetric to Gmail's `search_messages`) — fixed in
+        review r1 finding P2b via the shared `GOOGLE_TRANSPORT_ERRORS` tuple."""
         service = MagicMock()
         service.events().list().execute.side_effect = TimeoutError("timed out")
         adapter = _make_adapter(service)
 
-        # search_events only catches GoogleHttpError today — this documents the
-        # existing (unfixed, out of scope) gap symmetric to Gmail's search_messages.
-        with pytest.raises(TimeoutError):
+        with pytest.raises(ExternalServiceError):
+            await adapter.search_events(uuid.uuid4(), "2024-01-01T00:00:00Z", "2024-02-01T00:00:00Z")
+
+    @pytest.mark.asyncio
+    async def test_dns_failure_is_wrapped(self) -> None:
+        service = MagicMock()
+        service.events().list().execute.side_effect = httplib2.ServerNotFoundError("Unable to find server")
+        adapter = _make_adapter(service)
+
+        with pytest.raises(ExternalServiceError):
+            await adapter.search_events(uuid.uuid4(), "2024-01-01T00:00:00Z", "2024-02-01T00:00:00Z")
+
+    @pytest.mark.asyncio
+    async def test_lazy_token_refresh_failure_is_wrapped(self) -> None:
+        service = MagicMock()
+        service.events().list().execute.side_effect = RefreshError("token expired")
+        adapter = _make_adapter(service)
+
+        with pytest.raises(ExternalServiceError):
             await adapter.search_events(uuid.uuid4(), "2024-01-01T00:00:00Z", "2024-02-01T00:00:00Z")
 
     @pytest.mark.asyncio

@@ -21,9 +21,11 @@ import uuid
 from datetime import date
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httplib2
 import pytest
 from app.adapters.drive.drive_adapter import DriveAdapter
 from app.core.exceptions import ExternalServiceError
+from google.auth.exceptions import RefreshError
 from googleapiclient.errors import HttpError as GoogleHttpError
 
 
@@ -82,6 +84,27 @@ class TestUploadFileFailures:
     async def test_transport_timeout_is_wrapped(self) -> None:
         service = MagicMock()
         service.files().create().execute.side_effect = TimeoutError("socket timed out")
+        adapter = _make_adapter(service)
+
+        with pytest.raises(ExternalServiceError):
+            await adapter.upload_file(uuid.uuid4(), "a.pdf", b"x", "application/pdf")
+
+    @pytest.mark.asyncio
+    async def test_dns_failure_is_wrapped(self) -> None:
+        """httplib2.ServerNotFoundError is NOT an OSError subclass — review r1
+        finding P2b. `_run` is shared by every DriveAdapter method; verified
+        here via upload_file as the representative seam."""
+        service = MagicMock()
+        service.files().create().execute.side_effect = httplib2.ServerNotFoundError("Unable to find server")
+        adapter = _make_adapter(service)
+
+        with pytest.raises(ExternalServiceError):
+            await adapter.upload_file(uuid.uuid4(), "a.pdf", b"x", "application/pdf")
+
+    @pytest.mark.asyncio
+    async def test_lazy_token_refresh_failure_is_wrapped(self) -> None:
+        service = MagicMock()
+        service.files().create().execute.side_effect = RefreshError("token expired")
         adapter = _make_adapter(service)
 
         with pytest.raises(ExternalServiceError):
@@ -403,6 +426,36 @@ class TestDriveUploadRouteFailureHandling:
         just that the route forwards an already-domain-typed exception."""
         service = MagicMock()
         service.files().list().execute.side_effect = _http_error(500, "boom")
+
+        with (
+            patch(
+                "app.adapters.storage.s3_adapter.S3StorageAdapter.download",
+                AsyncMock(return_value=b"%PDF-1.4 fake pdf bytes"),
+            ),
+            patch(
+                "app.adapters.drive.drive_adapter.DriveAdapter._build_service",
+                MagicMock(return_value=service),
+            ),
+        ):
+            resp = await client.post(
+                "/api/v1/integraciones/drive/upload",
+                json={"cuenta_cobro_id": str(_cuenta_lista_para_subir.id)},
+                headers=test_user["headers"],
+            )
+
+        assert resp.status_code == 502
+        assert "detail" in resp.json()
+
+    @pytest.mark.asyncio
+    async def test_dns_failure_after_fix_returns_structured_502(
+        self, client, test_user, _cuenta_lista_para_subir
+    ) -> None:
+        """Same as above but for a DNS failure (`httplib2.ServerNotFoundError`)
+        — review r1 finding P2b: this class is NOT an `OSError` subclass, so it
+        needed its own coverage through the full route -> adapter -> `_run`
+        path, not just a unit-level `_run` mock."""
+        service = MagicMock()
+        service.files().list().execute.side_effect = httplib2.ServerNotFoundError("Unable to find server")
 
         with (
             patch(

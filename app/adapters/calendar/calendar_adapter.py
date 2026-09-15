@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.calendar.port import CalendarAttendee, CalendarEvent
 from app.adapters.email.gmail_adapter import GmailAdapter
+from app.adapters.google_errors import GOOGLE_TRANSPORT_ERRORS
 from app.core.exceptions import ExternalServiceError
 
 logger = structlog.get_logger("adapters.calendar")
@@ -108,6 +109,8 @@ class GoogleCalendarAdapter:
             result = await loop.run_in_executor(None, _list)
         except GoogleHttpError as exc:
             raise ExternalServiceError("Calendar", f"Error consultando eventos: {exc}") from exc
+        except GOOGLE_TRANSPORT_ERRORS as exc:
+            raise ExternalServiceError("Calendar", f"Error de conexión consultando eventos: {exc}") from exc
         raw_items: list[dict[str, Any]] = result.get("items", [])
         events: list[CalendarEvent] = []
         for item in raw_items:
@@ -142,7 +145,7 @@ class GoogleCalendarAdapter:
             raw = await loop.run_in_executor(None, _get)
         except GoogleHttpError as exc:
             raise ExternalServiceError("Calendar", f"Error obteniendo evento {event_id}: {exc}") from exc
-        except (TimeoutError, OSError) as exc:
+        except GOOGLE_TRANSPORT_ERRORS as exc:
             raise ExternalServiceError("Calendar", f"Error de conexión obteniendo evento {event_id}: {exc}") from exc
 
         try:

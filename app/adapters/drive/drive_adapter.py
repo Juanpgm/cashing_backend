@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.drive.port import DriveFile, DriveQuery
 from app.adapters.email.gmail_adapter import GmailAdapter
+from app.adapters.google_errors import GOOGLE_TRANSPORT_ERRORS
 from app.core.exceptions import ExternalServiceError
 
 logger = structlog.get_logger("adapters.drive")
@@ -42,20 +43,27 @@ class DriveAdapter:
         return build("drive", "v3", credentials=creds, cache_discovery=False)
 
     async def _run(self, fn: Callable[[], _T], context: str) -> _T:
-        """Run a blocking Drive API call in the executor, mapping every failure
-        mode to the domain `ExternalServiceError` (502) contract.
+        """Run a blocking Drive API call in the executor, mapping the known
+        failure modes to the domain `ExternalServiceError` (502) contract:
 
-        Covers both `GoogleHttpError` (4xx/5xx from the API itself) and raw
-        transport errors (`TimeoutError`/`OSError`) that `run_in_executor`
-        would otherwise let escape unwrapped — the same gap `search_files`
-        used to have alone before this slice extended it to every method.
+        - `GoogleHttpError` — 4xx/5xx from the API itself.
+        - `GOOGLE_TRANSPORT_ERRORS` (`app.adapters.google_errors`) — raw socket
+          errors (`OSError`/`TimeoutError`), DNS failures
+          (`httplib2.ServerNotFoundError`), and auth/transport failures during
+          a lazy token refresh inside `.execute()`
+          (`google.auth.exceptions.TransportError`/`RefreshError`) — none of
+          which `run_in_executor` would otherwise wrap.
+
+        This does NOT cover every conceivable failure (e.g. a bug in `fn`
+        itself raises unwrapped, by design) — see radicacion-sin-friccion
+        phase 4.3 review r1, finding P2b, for the transport gap this closed.
         """
         loop = asyncio.get_running_loop()
         try:
             return await loop.run_in_executor(None, fn)
         except GoogleHttpError as exc:
             raise ExternalServiceError("Drive", f"{context}: {exc}") from exc
-        except (TimeoutError, OSError) as exc:
+        except GOOGLE_TRANSPORT_ERRORS as exc:
             raise ExternalServiceError("Drive", f"{context} (error de conexión): {exc}") from exc
 
     # ── Upload ───────────────────────────────────────────────────────────────
