@@ -138,5 +138,14 @@ class GoogleCalendarAdapter:
         def _get() -> dict:  # type: ignore[type-arg]
             return service.events().get(calendarId=calendar_id, eventId=event_id).execute()
 
-        raw = await loop.run_in_executor(None, _get)
-        return _parse_event(raw)
+        try:
+            raw = await loop.run_in_executor(None, _get)
+        except GoogleHttpError as exc:
+            raise ExternalServiceError("Calendar", f"Error obteniendo evento {event_id}: {exc}") from exc
+        except (TimeoutError, OSError) as exc:
+            raise ExternalServiceError("Calendar", f"Error de conexión obteniendo evento {event_id}: {exc}") from exc
+
+        try:
+            return _parse_event(raw)
+        except (ValueError, KeyError, TypeError) as exc:
+            raise ExternalServiceError("Calendar", f"Evento {event_id} con formato inesperado: {exc}") from exc
