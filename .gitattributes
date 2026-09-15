@@ -1,5 +1,6 @@
 # Shell scripts must keep LF endings so they run under bash in Linux containers
 # and on GCP — CRLF would break the shebang / inject stray \r into commands.
 *.sh text eol=lf
+.githooks/* text eol=lf
 *.pdf binary
 *.docx binary
