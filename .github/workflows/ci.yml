@@ -1,8 +1,12 @@
 name: CI
 #
-# Local pre-merge gate mirroring this file's pytest+coverage and lint steps:
-# scripts/pre-merge.ps1 (see CLAUDE.md's "Before merging" note). Keep both in
-# sync when changing the commands below.
+# DORMANT: this workflow is currently billing-locked on this GitHub account
+# (every run fails to start) and does not execute on push/PR. The official
+# pre-merge gate until billing is restored is scripts/pre-merge.ps1, enforced
+# locally via the .githooks/pre-push git hook (`make hooks` installs it; see
+# CLAUDE.md's "Before merging" note). Keep pre-merge.ps1 in sync with this
+# file's pytest+coverage and lint steps below — do not delete this workflow,
+# it should resume working the moment billing is restored.
 
 on:
   push:

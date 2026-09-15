@@ -52,7 +52,10 @@ function Fail-Gate {
 
 # --- git state -------------------------------------------------------------
 $shortSha = (git rev-parse --short HEAD).Trim()
-$dirty = if ((git status --porcelain) -ne "") { "yes" } else { "no" }
+# `git status --porcelain` yields $null on a clean tree, and `$null -ne ""` is
+# $true in PowerShell — the previous comparison reported dirty=yes always.
+$porcelain = (git status --porcelain | Out-String)
+$dirty = if ([string]::IsNullOrWhiteSpace($porcelain)) { "no" } else { "yes" }
 
 # --- 1. pytest + coverage (mirrors ci.yml's "pytest" job exactly) ----------
 Write-Host ">> running pytest + coverage (mirrors CI)..." -ForegroundColor Cyan

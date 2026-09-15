@@ -1,0 +1,46 @@
+#!/bin/sh
+# pre-push: enforce the local pre-merge gate (scripts/pre-merge.ps1).
+#
+# Why this exists: GitHub Actions is currently billing-locked on this
+# account, so .github/workflows/ci.yml cannot run on push/PR. Until billing
+# is restored, scripts/pre-merge.ps1 (which mirrors ci.yml's pytest+coverage
+# and ruff/mypy steps) is the official pre-merge gate, and this hook is what
+# enforces it locally before code leaves the machine.
+#
+# Install:
+#   make hooks
+#   (equivalent to: git config core.hooksPath .githooks)
+#
+# Escape hatches (use sparingly, and say why in the PR):
+#   SKIP_GATE=1 git push            # skip the gate for this push only
+#   git push --no-verify            # bypass all hooks — emergencies only
+#
+# Git invokes this script via sh (Git Bash's sh on Windows, /bin/sh elsewhere).
+
+if [ "$SKIP_GATE" = "1" ]; then
+    echo "pre-push: SKIP_GATE=1, gate skipped"
+    exit 0
+fi
+
+if command -v pwsh >/dev/null 2>&1; then
+    PWSH_BIN=pwsh
+elif command -v powershell >/dev/null 2>&1; then
+    PWSH_BIN=powershell
+else
+    echo "pre-push: no PowerShell interpreter found on PATH (tried 'pwsh' and 'powershell')." >&2
+    echo "pre-push: install PowerShell, or bypass with SKIP_GATE=1 / git push --no-verify (emergencies only)." >&2
+    exit 1
+fi
+
+repo_root=$(git rev-parse --show-toplevel) || exit 1
+cd "$repo_root" || exit 1
+
+"$PWSH_BIN" -NoProfile -ExecutionPolicy Bypass -File scripts/pre-merge.ps1
+gate_exit=$?
+
+if [ "$gate_exit" -ne 0 ]; then
+    echo "pre-push: gate failed, push refused (use SKIP_GATE=1 or git push --no-verify only for emergencies)"
+    exit "$gate_exit"
+fi
+
+exit 0
