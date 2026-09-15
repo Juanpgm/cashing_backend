@@ -961,8 +961,14 @@ async def generar_actividades_agente(
     try:
         resp = await llm.complete(messages, temperature=0.3, max_tokens=8192)
     except Exception as exc:
+        # The raw exception text (LLM SDK error, may echo request internals) is
+        # logged for diagnosis via structlog, but never interpolated into the
+        # user-facing 422 detail — see radicacion-sin-friccion phase 4.3.
         await logger.aerror("generar_actividades_error", cuenta_id=str(cuenta_id), error=str(exc))
-        raise ValidationError(f"Error al generar actividades con el agente: {exc}") from exc
+        raise ValidationError(
+            "Error al generar actividades con el agente. Intenta nuevamente o usa "
+            "POST /actividades/desde-texto para ingresarlas manualmente."
+        ) from exc
 
     actividades_data = _parse_actividades_llm(resp.content, list(obligaciones))
 
