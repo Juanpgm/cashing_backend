@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import json
 import uuid
-from unittest.mock import MagicMock
+from datetime import date
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from app.adapters.drive.drive_adapter import DriveAdapter
@@ -306,3 +307,118 @@ class TestDeleteFileFailures:
 
         with pytest.raises(ExternalServiceError):
             await adapter.delete_file(uuid.uuid4(), "f1")
+
+
+class TestDriveTestRouteFailureHandling:
+    """GET /integraciones/drive/test already has a blanket
+    `except Exception -> HTTPException(500, ...)` around the service call —
+    proves a (now-wrapped, per this slice) adapter failure surfaces as a
+    structured JSON error, never a hang or a bare traceback."""
+
+    @pytest.mark.asyncio
+    async def test_search_files_error_returns_structured_502(self, client, test_user) -> None:
+        with patch(
+            "app.adapters.drive.drive_adapter.DriveAdapter.search_files",
+            AsyncMock(side_effect=ExternalServiceError("Drive", "Error buscando archivos: boom")),
+        ):
+            resp = await client.get(
+                "/api/v1/integraciones/drive/test",
+                headers=test_user["headers"],
+            )
+
+        assert resp.status_code == 502
+        assert "detail" in resp.json()
+
+    @pytest.mark.asyncio
+    async def test_credentials_not_found_returns_structured_404(self, client, test_user) -> None:
+        resp = await client.get(
+            "/api/v1/integraciones/drive/test",
+            headers=test_user["headers"],
+        )
+
+        assert resp.status_code == 404
+        assert "detail" in resp.json()
+
+
+class TestDriveUploadRouteFailureHandling:
+    """POST /integraciones/drive/upload — unlike drive/test, this route has
+    NO route-level `except Exception` catch-all; it relies entirely on the
+    global `DomainError` handler in `app.main`. Before fix B (this slice),
+    `DriveAdapter.upload_file`/`get_or_create_folder` leaked raw
+    `GoogleHttpError`/transport exceptions, which are NOT `DomainError` —
+    those would have surfaced as a bare 500 with no structured `code`. After
+    fix B, they are `ExternalServiceError` and map to 502 through that
+    handler."""
+
+    @pytest.fixture
+    async def _cuenta_lista_para_subir(self, db, test_user):  # type: ignore[no-untyped-def]
+        from app.models.contrato import Contrato
+        from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
+        from app.models.integracion import IntegrationProvider
+        from app.services import integration_service
+
+        user = test_user["user"]
+        await integration_service.store_credentials(
+            db,
+            user.id,
+            IntegrationProvider.GOOGLE,
+            access_token="access-token",
+            refresh_token="refresh-token",
+            scopes=["https://www.googleapis.com/auth/drive.file"],
+        )
+        contrato = Contrato(
+            usuario_id=user.id,
+            numero_contrato="CTR-DRIVE-UPLOAD-001",
+            objeto="Servicios profesionales",
+            valor_total=12_000_000,
+            valor_mensual=1_000_000,
+            fecha_inicio=date(2024, 1, 1),
+            fecha_fin=date(2024, 12, 31),
+            entidad="Alcaldía",
+        )
+        db.add(contrato)
+        await db.commit()
+        await db.refresh(contrato)
+
+        cuenta = CuentaCobro(
+            contrato_id=contrato.id,
+            mes=5,
+            anio=2024,
+            estado=EstadoCuentaCobro.BORRADOR,
+            valor=contrato.valor_mensual,
+            pdf_storage_key="pdfs/fake/cuenta.pdf",
+        )
+        db.add(cuenta)
+        await db.commit()
+        await db.refresh(cuenta)
+        return cuenta
+
+    @pytest.mark.asyncio
+    async def test_drive_error_after_fix_returns_structured_502(
+        self, client, test_user, _cuenta_lista_para_subir
+    ) -> None:
+        """Exercises the REAL (fixed) `_find_folder`/`_create_folder` code path
+        — only the low-level googleapiclient service call is mocked, so this
+        proves fix B's wrapping end-to-end through the HTTP boundary, not
+        just that the route forwards an already-domain-typed exception."""
+        service = MagicMock()
+        service.files().list().execute.side_effect = _http_error(500, "boom")
+
+        with (
+            patch(
+                "app.adapters.storage.s3_adapter.S3StorageAdapter.download",
+                AsyncMock(return_value=b"%PDF-1.4 fake pdf bytes"),
+            ),
+            patch(
+                "app.adapters.drive.drive_adapter.DriveAdapter._build_service",
+                MagicMock(return_value=service),
+            ),
+        ):
+            resp = await client.post(
+                "/api/v1/integraciones/drive/upload",
+                json={"cuenta_cobro_id": str(_cuenta_lista_para_subir.id)},
+                headers=test_user["headers"],
+            )
+
+        assert resp.status_code == 502
+        assert "detail" in resp.json()

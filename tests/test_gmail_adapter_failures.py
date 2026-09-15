@@ -266,3 +266,65 @@ class TestSearchMessagesAndSendMessageFailureMatrix:
 
         with pytest.raises(TimeoutError):
             await adapter.search_messages(uuid.uuid4(), "q")
+
+
+class TestEmailSearchRouteFailureHandling:
+    """POST /integraciones/email/search — the route already has a blanket
+    `except (HTTPException, DomainError): raise` / `except Exception ->
+    HTTPException(500, ...)` around the service call. This proves an adapter
+    failure surfaces as a structured JSON error response, never a hang or a
+    bare traceback."""
+
+    @pytest.mark.asyncio
+    async def test_adapter_error_returns_structured_json_error_not_a_hang(self, client, test_user) -> None:
+        """search_messages already wraps GoogleHttpError as ExternalServiceError
+        (its own contract, unchanged by this slice) — mocking at that seam
+        (rather than the raw googleapiclient call, which search_messages'
+        wrapping would immediately re-wrap anyway) verifies the route
+        propagates the domain exception to the global DomainError handler
+        instead of hanging or leaking a raw traceback."""
+        with patch(
+            "app.adapters.email.gmail_adapter.GmailAdapter.search_messages",
+            AsyncMock(side_effect=ExternalServiceError("Gmail", "Error buscando correos: boom")),
+        ):
+            resp = await client.post(
+                "/api/v1/integraciones/email/search",
+                json={"query": "subject:acta"},
+                headers=test_user["headers"],
+            )
+
+        assert resp.status_code == 502
+        body = resp.json()
+        assert "detail" in body
+
+    @pytest.mark.asyncio
+    async def test_unwrapped_transport_error_still_returns_structured_500_not_a_hang(self, client, test_user) -> None:
+        """Even an exception the adapter does NOT wrap (the documented
+        search_messages transport-error gap) must still surface as a
+        structured JSON 500 through the route's own `except Exception`
+        catch-all, never a hang or a bare unhandled-exception page."""
+        with patch(
+            "app.adapters.email.gmail_adapter.GmailAdapter.search_messages",
+            AsyncMock(side_effect=TimeoutError("socket timed out")),
+        ):
+            resp = await client.post(
+                "/api/v1/integraciones/email/search",
+                json={"query": "subject:acta"},
+                headers=test_user["headers"],
+            )
+
+        assert resp.status_code == 500
+        assert "detail" in resp.json()
+
+    @pytest.mark.asyncio
+    async def test_credentials_not_found_returns_structured_404_not_a_hang(self, client, test_user) -> None:
+        """No Google account connected at all — get_credentials raises
+        NotFoundError, a DomainError the route re-raises unchanged."""
+        resp = await client.post(
+            "/api/v1/integraciones/email/search",
+            json={"query": "subject:acta"},
+            headers=test_user["headers"],
+        )
+
+        assert resp.status_code == 404
+        assert "detail" in resp.json()
