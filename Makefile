@@ -1,9 +1,19 @@
-.PHONY: setup lock run dev up down migrate test test-pg lint security clean start-local kill-local
+.PHONY: setup hooks lock run dev up down migrate test test-pg lint security clean start-local kill-local
 
 # Setup — installs runtime + dev deps from pyproject.toml via the uv.lock (single source of truth)
-setup:
+setup: hooks
 	uv sync
+	# NOTE: pre-commit hooks were never actually installed on this machine;
+	# `make hooks` sets core.hooksPath to .githooks, which supersedes .git/hooks
+	# (where `pre-commit install` would otherwise write) as the official gate.
 	uv run pre-commit install
+
+# Install the versioned git hooks (.githooks/) — currently just pre-push, which
+# enforces scripts/pre-merge.ps1 as the official gate while GitHub Actions is
+# billing-locked. See .githooks/pre-push for escape hatches.
+hooks:
+	git config core.hooksPath .githooks
+	@echo "core.hooksPath set to .githooks (pre-push gate installed)"
 
 # Regenerate the lockfile + the GENERATED requirements*.txt consumed by Docker/Railway.
 # Run this after editing dependencies in pyproject.toml — the ONLY place deps are declared by hand.
