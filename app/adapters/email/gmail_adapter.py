@@ -98,6 +98,15 @@ def _decode_part_body(raw: bytes, declared_charset: str | None) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
+class _MalformedMessagePayloadError(Exception):
+    """Internal marker: `_fetch_message`'s parse step failed on a malformed
+    Gmail payload (missing/invalid fields, bad base64 body). NOT part of the
+    domain exception hierarchy — `get_message` wraps it as `ExternalServiceError`
+    (its existing public contract), while `search_messages`'s per-item fan-out
+    catches it separately to skip-and-log just that one message instead of
+    losing the whole batch (review r1, finding P2c)."""
+
+
 def _is_rate_limit_error(exc: GoogleHttpError) -> bool:
     """True if a Gmail HttpError is a rate-limit / concurrency error (HTTP 429)."""
     status = getattr(getattr(exc, "resp", None), "status", None)
@@ -246,16 +255,33 @@ class GmailAdapter:
         # Bound the fan-out so Gmail's per-user concurrency limit is never exceeded.
         semaphore = asyncio.Semaphore(_GMAIL_MAX_CONCURRENCY)
 
-        async def _bounded_fetch(message_id: str) -> EmailMessage:
+        async def _bounded_fetch(message_id: str) -> EmailMessage | None:
             async with semaphore:
-                return await self._fetch_message(creds, message_id)
+                try:
+                    return await self._fetch_message(creds, message_id)
+                except _MalformedMessagePayloadError as exc:
+                    # Per-item tolerance, mirroring Drive `_parse_files_tolerant` /
+                    # Calendar `search_events`: a single malformed message must not
+                    # drop the whole batch. A genuine transport/HTTP failure (still
+                    # `ExternalServiceError`, but NOT this internal marker type) is
+                    # deliberately NOT caught here — it propagates and surfaces, since
+                    # it is not safe to silently treat as "no evidence found" (review
+                    # r1, finding P2c).
+                    logger.warning("gmail_message_malformed", message_id=message_id, error=str(exc))
+                    return None
 
         tasks = [_bounded_fetch(msg["id"]) for msg in raw_messages]
-        return list(await asyncio.gather(*tasks))
+        results = await asyncio.gather(*tasks)
+        return [message for message in results if message is not None]
 
     async def get_message(self, usuario_id: uuid.UUID, message_id: str) -> EmailMessage:
         creds = await self.get_credentials(usuario_id)
-        return await self._fetch_message(creds, message_id)
+        try:
+            return await self._fetch_message(creds, message_id)
+        except _MalformedMessagePayloadError as exc:
+            # get_message's public contract (unlike search_messages's batch fan-out)
+            # is to raise on a malformed payload — preserved by re-wrapping here.
+            raise ExternalServiceError("Gmail", str(exc)) from exc
 
     async def _fetch_message(self, creds: Credentials, message_id: str) -> EmailMessage:
         """Fetch and parse a single message.
@@ -263,6 +289,11 @@ class GmailAdapter:
         Builds its OWN Gmail service (and thus its own httplib2.Http socket) so it is
         safe to call concurrently from multiple executor threads. Reuses the shared,
         already-refreshed credentials — only the cheap, thread-local service is rebuilt.
+
+        Raises `ExternalServiceError` directly for HTTP/transport failures, but a
+        malformed-payload parse failure raises the internal `_MalformedMessagePayloadError`
+        marker instead — `get_message` and `search_messages` each decide separately
+        how to handle that (raise vs. skip-and-log; see review r1, finding P2c).
         """
         service = self._build_service(creds)
 
@@ -282,7 +313,7 @@ class GmailAdapter:
             # in `_extract_body` — mirrors Drive `_parse_file` / Calendar
             # `_parse_event`, which already guard ValueError (radicacion-sin-friccion
             # phase 4.3 review, finding P2a).
-            raise ExternalServiceError("Gmail", f"Mensaje {message_id} con formato inesperado: {exc}") from exc
+            raise _MalformedMessagePayloadError(f"Mensaje {message_id} con formato inesperado: {exc}") from exc
 
     async def get_attachment(
         self,

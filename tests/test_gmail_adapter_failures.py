@@ -390,6 +390,92 @@ class TestSearchMessagesAndSendMessageFailureMatrix:
             await adapter.send_message(uuid.uuid4(), ["a@b.com"], "subj", "<p>hi</p>")
 
 
+class TestSearchMessagesPerMessageTolerance:
+    """`search_messages` used to abort the WHOLE search when a single message
+    in the batch was malformed: `asyncio.gather(*tasks)` had no per-item
+    tolerance, and `_fetch_message` raised `ExternalServiceError` for a
+    malformed payload same as for a transport/HTTP failure — so one bad
+    message silently zeroed an entire evidence-discovery batch. Review r1
+    finding P2c: a malformed message is now skipped-and-logged, while a
+    genuine transport/HTTP failure of any single fetch still surfaces."""
+
+    def _raw_message(self, message_id: str) -> dict:  # type: ignore[type-arg]
+        return {
+            "id": message_id,
+            "threadId": "t1",
+            "payload": {"headers": [], "body": {}, "parts": []},
+            "snippet": "ok",
+            "labelIds": [],
+        }
+
+    @pytest.mark.asyncio
+    async def test_one_malformed_message_is_skipped_and_logged_rest_returned(self) -> None:
+        service = MagicMock()
+        service.users().messages().list().execute.return_value = {
+            "messages": [{"id": "m1"}, {"id": "m2"}, {"id": "m3"}]
+        }
+
+        def _get(userId: str, id: str, format: str) -> MagicMock:  # noqa: A002
+            mock = MagicMock()
+            if id == "m2":
+                mock.execute.return_value = {"id": "m2"}  # missing "payload" -> malformed
+            else:
+                mock.execute.return_value = self._raw_message(id)
+            return mock
+
+        service.users().messages().get.side_effect = _get
+        adapter = _adapter_with_service(service)
+
+        with patch("app.adapters.email.gmail_adapter.logger.warning") as mock_warning:
+            result = await adapter.search_messages(uuid.uuid4(), "q")
+
+        assert {m.id for m in result} == {"m1", "m3"}
+        logged_events = [call.args[0] for call in mock_warning.call_args_list]
+        assert "gmail_message_malformed" in logged_events
+        malformed_call = next(call for call in mock_warning.call_args_list if call.args[0] == "gmail_message_malformed")
+        assert malformed_call.kwargs.get("message_id") == "m2"
+
+    @pytest.mark.asyncio
+    async def test_one_transport_failure_still_raises_external_service_error(self) -> None:
+        """Transport/HTTP failures are NOT silently hidden — only genuinely
+        malformed payloads are skip-and-logged."""
+        service = MagicMock()
+        service.users().messages().list().execute.return_value = {
+            "messages": [{"id": "m1"}, {"id": "m2"}, {"id": "m3"}]
+        }
+
+        def _get(userId: str, id: str, format: str) -> MagicMock:  # noqa: A002
+            mock = MagicMock()
+            if id == "m2":
+                mock.execute.side_effect = _http_error(503, "unavailable")
+            else:
+                mock.execute.return_value = self._raw_message(id)
+            return mock
+
+        service.users().messages().get.side_effect = _get
+        adapter = _adapter_with_service(service)
+
+        with pytest.raises(ExternalServiceError):
+            await adapter.search_messages(uuid.uuid4(), "q")
+
+    @pytest.mark.asyncio
+    async def test_all_messages_malformed_returns_empty_list_no_exception(self) -> None:
+        service = MagicMock()
+        service.users().messages().list().execute.return_value = {"messages": [{"id": "m1"}, {"id": "m2"}]}
+
+        def _get(userId: str, id: str, format: str) -> MagicMock:  # noqa: A002
+            mock = MagicMock()
+            mock.execute.return_value = {"id": id}  # missing "payload" always
+            return mock
+
+        service.users().messages().get.side_effect = _get
+        adapter = _adapter_with_service(service)
+
+        result = await adapter.search_messages(uuid.uuid4(), "q")
+
+        assert result == []
+
+
 class TestEmailSearchRouteFailureHandling:
     """POST /integraciones/email/search — the route already has a blanket
     `except (HTTPException, DomainError): raise` / `except Exception ->
