@@ -2460,3 +2460,32 @@ async def test_formato_valores_ds_requerido_consecutivo_nulo_emite_aviso_no_fata
 
     assert valores is not None
     assert "El Documento Soporte requiere el consecutivo DS; queda en blanco hasta que lo cargues." in avisos
+
+
+async def test_zip_no_declara_ya_radicada_una_fila_marcada_no_aplica(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """checklist/primera-cuota-2026-09-16, round 4, finding #7 (SUGGESTION): the
+    root LEEME asserted "ya radicados en la cuota 1" for a requisito the
+    contractor had explicitly marked NO_APLICA on THIS cuota — a factual claim
+    about a prior filing that contradicts the user's own recorded decision, in
+    the package handed to the supervisor. A human decision counts as content, so
+    the code no longer enters the omission set."""
+    from app.models.documento_cuenta_cobro import DocumentoCuentaCobro, EstadoRequisito
+
+    user = test_user["user"]
+    assert cuenta.posicion == PosicionCuota.RECURRENTE
+    db.add(
+        DocumentoCuentaCobro(cuenta_cobro_id=cuenta.id, requisito_codigo="CEDULA", estado=EstadoRequisito.NO_APLICA)
+    )
+    await db.commit()
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: _fake_storage())
+
+    content, _filename = await informe_service.generar_zip_evidencias(db, user.id, cuenta.id)
+
+    with zipfile.ZipFile(io.BytesIO(content)) as zf:
+        root = zf.read("LEEME.txt").decode("utf-8")
+    omitidos = next((ln for ln in root.splitlines() if "ya radicados en la cuota 1" in ln), "")
+    assert omitidos, "the omission line should still exist for the genuinely empty codes"
+    assert "CEDULA" not in omitidos
+    assert "RUT" in omitidos

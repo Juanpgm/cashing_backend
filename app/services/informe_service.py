@@ -1718,6 +1718,14 @@ async def generar_zip_evidencias(
             # upload) was never "already radicated with cuota 1" — keep it out
             # of the omission set so both the package AND the LEEME disclosure
             # line stay consistent with what actually ships.
+            #
+            # Round 4, finding #7: this is also why an explicit NO_APLICA /
+            # CUMPLIDO_MANUAL decision counts as content in
+            # `_fila_tiene_contenido`. The LEEME line below states the omitted
+            # documents were "ya radicados en la cuota 1" — a claim about a
+            # prior filing. Asserting that about a requisito the contractor
+            # just declared inapplicable on THIS cuota contradicts their own
+            # recorded decision, in the package handed to the supervisor.
             fila = filas_por_codigo.get(req.codigo)
             if fila is not None and checklist_service._fila_tiene_contenido(fila):
                 continue

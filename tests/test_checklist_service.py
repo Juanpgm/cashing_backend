@@ -1222,14 +1222,18 @@ async def test_auto_vincular_self_heal_deriva_el_estado_del_vinculo_secop_restan
 
 
 @pytest.mark.parametrize("estado", [EstadoRequisito.NO_APLICA, EstadoRequisito.CUMPLIDO_MANUAL])
-async def test_construir_checklist_completo_oculta_fila_legacy_sin_artefacto(
+async def test_construir_checklist_completo_conserva_fila_con_decision_manual(
     db: AsyncSession, contrato: Contrato, estado: EstadoRequisito
 ) -> None:
-    """checklist/primera-cuota-2026-09-16, round 3, finding #6 (WARNING): "has
-    content" must mean a real artifact, not merely a non-PENDIENTE estado.
-    `marcar_no_aplica`/`marcar_cumplido_manual` set estado with no document at
-    all, so treating any non-PENDIENTE row as content-carrying kept the most
-    common legacy shape visible forever and rule 1 never took effect for it."""
+    """checklist/primera-cuota-2026-09-16, round 3 finding #6 CORRECTED by round
+    4 findings #2/#3: "has content" means a real artifact OR an explicit human
+    decision. Round 3 hid an artifact-free NO_APLICA/CUMPLIDO_MANUAL row on the
+    premise that it could only be legacy data; `DELETE /documentos/{id}` builds
+    exactly that shape at runtime (see
+    `test_fila_con_estado_manual_sobrevive_al_borrado_de_su_documento`), and the
+    constancia handed to the supervisor prints those estados by name. The row
+    stays visible and flagged `heredado`, so it still contributes nothing to the
+    radicar gate — visibility, not arithmetic, is what is restored."""
     await _make_cuenta(db, contrato, mes=1)
     cuenta2 = await _make_cuenta(db, contrato, mes=2)
     db.add(DocumentoCuentaCobro(cuenta_cobro_id=cuenta2.id, requisito_codigo="CEDULA", estado=estado))
@@ -1237,9 +1241,12 @@ async def test_construir_checklist_completo_oculta_fila_legacy_sin_artefacto(
 
     payload = await checklist_service.construir_checklist_completo(db, cuenta2)
 
-    assert "CEDULA" not in {i["requisito"]["codigo"] for i in payload["items"]}
+    item = next((i for i in payload["items"] if i["requisito"]["codigo"] == "CEDULA"), None)
+    assert item is not None
+    assert item["heredado"] is True
+    assert "CEDULA" not in payload["resumen"]["lista_pendientes"]
     visibles = {f.requisito_codigo for f in await checklist_service.listar_filas_visibles(db, cuenta2)}
-    assert "CEDULA" not in visibles
+    assert "CEDULA" in visibles
 
 
 async def test_construir_checklist_completo_conserva_fila_legacy_con_solo_un_vinculo(
@@ -1860,3 +1867,93 @@ async def test_desvincular_legacy_sin_argumentos_remueve_todo(
     payload = await checklist_service.construir_checklist_completo(db, cuenta)
     item = next(i for i in payload["items"] if i["requisito"]["codigo"] == "RPC")
     assert item["documentos_fuente"] == []
+
+
+# ── checklist/primera-cuota-2026-09-16, round 4, findings #2/#3: an explicit
+# human decision (CUMPLIDO_MANUAL / NO_APLICA) IS content. Round 3 redefined
+# content as "a real artifact" on the premise that an artifact-free manual
+# estado is a LEGACY shape; it is not — `DELETE /documentos/{id}` produces it at
+# runtime, because `desvincular` deliberately preserves a manual override when
+# the last link goes away. ──
+
+
+async def test_fila_con_estado_manual_sobrevive_al_borrado_de_su_documento(
+    db: AsyncSession, contrato: Contrato, test_user: dict[str, Any]
+) -> None:
+    """Runtime reproduction, no hand-built legacy row: on a later cuota the
+    CONTRATO row materializes (rule 2, no shared contract document yet), the
+    user links a document and marks the requisito cumplido manually, a SECOND
+    shared contract document appears, and the first one is deleted through
+    `DELETE /documentos/{id}`. CONTRATO then stops applying, and the row — whose
+    only remaining content is the user's own decision — must not vanish from
+    every reader."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.services import document_service
+
+    user = test_user["user"]
+    db.add(
+        Obligacion(contrato_id=contrato.id, descripcion="Obligación contractual", tipo=TipoObligacion.GENERAL, orden=1)
+    )
+    await _make_cuenta(db, contrato, mes=1)
+    cuenta2 = await _make_cuenta(db, contrato, mes=2)
+    await checklist_service.asegurar_checklist(db, cuenta2)
+    await db.commit()
+
+    def _doc(nombre: str) -> DocumentoFuente:
+        return DocumentoFuente(
+            usuario_id=user.id,
+            contrato_id=contrato.id,
+            cuenta_cobro_id=None,
+            storage_key=f"k/{nombre}",
+            nombre=nombre,
+            tipo=TipoDocumentoFuente.CONTRATO,
+        )
+
+    doc_a = _doc("contrato-a.pdf")
+    db.add(doc_a)
+    await db.commit()
+    await checklist_service.vincular_documento_fuente(db, cuenta2.id, "CONTRATO", doc_a.id)
+    await checklist_service.marcar_cumplido_manual(db, cuenta2.id, "CONTRATO")
+    db.add(_doc("contrato-b.pdf"))
+    await db.commit()
+
+    fake = AsyncMock()
+    fake.delete = AsyncMock()
+    with patch("app.services.document_service._get_storage", return_value=fake):
+        await document_service.eliminar_documento(db, user.id, doc_a.id)
+
+    fila = (
+        await db.execute(
+            select(DocumentoCuentaCobro).where(
+                DocumentoCuentaCobro.cuenta_cobro_id == cuenta2.id,
+                DocumentoCuentaCobro.requisito_codigo == "CONTRATO",
+            )
+        )
+    ).scalar_one()
+    assert fila.estado == EstadoRequisito.CUMPLIDO_MANUAL
+    assert fila.documento_fuente_id is None
+
+    payload = await checklist_service.construir_checklist_completo(db, cuenta2)
+    item = next((i for i in payload["items"] if i["requisito"]["codigo"] == "CONTRATO"), None)
+    assert item is not None, "the user's manual decision must survive deleting the document"
+    assert item["heredado"] is True
+    assert "CONTRATO" not in payload["resumen"]["lista_pendientes"]
+    visibles = {f.requisito_codigo for f in await checklist_service.listar_filas_visibles(db, cuenta2)}
+    assert "CONTRATO" in visibles
+
+
+async def test_fila_pendiente_sin_artefacto_sigue_oculta(db: AsyncSession, contrato: Contrato) -> None:
+    """The other half of the round-4 rule: only a HUMAN-set estado counts as
+    content. A PENDIENTE placeholder with no artifact is still an empty legacy
+    row and stays hidden (round 3, finding #6 — unchanged)."""
+    await _make_cuenta(db, contrato, mes=1)
+    cuenta2 = await _make_cuenta(db, contrato, mes=2)
+    db.add(
+        DocumentoCuentaCobro(cuenta_cobro_id=cuenta2.id, requisito_codigo="CEDULA", estado=EstadoRequisito.PENDIENTE)
+    )
+    await db.commit()
+
+    payload = await checklist_service.construir_checklist_completo(db, cuenta2)
+
+    assert "CEDULA" not in {i["requisito"]["codigo"] for i in payload["items"]}

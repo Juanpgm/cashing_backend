@@ -585,10 +585,14 @@ def requisito_aplica_a_cuenta(req: RequisitoDocumento | _CustomLike, ctx: Checkl
     return True
 
 
+_ESTADOS_DECISION_HUMANA = frozenset({EstadoRequisito.CUMPLIDO_MANUAL, EstadoRequisito.NO_APLICA})
+
+
 def _fila_tiene_contenido(fila: DocumentoCuentaCobro) -> bool:
-    """Whether `fila` carries a real ARTIFACT — a linked `DocumentoFuente` or
-    `SecopDocumento`, held either in a primary slot or in a
-    `DocumentoRequisitoVinculo` — as opposed to being an empty placeholder.
+    """Whether `fila` carries real CONTENT — a linked `DocumentoFuente` or
+    `SecopDocumento` (in a primary slot or in a `DocumentoRequisitoVinculo`), or
+    an explicit human decision (`CUMPLIDO_MANUAL`/`NO_APLICA`) — as opposed to
+    being an empty placeholder.
 
     Rows with content must never disappear once materialized: the read-time
     filter and the radicación package only hide EMPTY rows (checklist/primera-
@@ -596,25 +600,41 @@ def _fila_tiene_contenido(fila: DocumentoCuentaCobro) -> bool:
     row self-defeats the moment its document is uploaded, and a legacy CEDULA/
     RUT/RPC/CDP row silently drops a real document from every reader.
 
-    Round 3, findings #5/#6 — two corrections to the round-2 shape:
+    Round 3, finding #5 — the primary slot alone is NOT sufficient:
+    `auto_vincular_documentos_fuente`'s tier self-heal can leave a row whose
+    primary slot is empty while a real vinculo survives, and that document must
+    not vanish.
 
-    - estado is NOT content. This used to short-circuit True on any
-      non-PENDIENTE estado, but `marcar_no_aplica`/`marcar_cumplido_manual` set
-      estado with no document whatsoever, so the most common legacy shape (an
-      old CEDULA/RUT row someone marked "no aplica") was classified as content
-      and rule 1 never took effect for it. A deliberate NO_APLICA decision on a
-      requisito this cuota is not being asked for is not a reason to keep
-      showing it.
-    - the primary slot alone is NOT sufficient. `auto_vincular_documentos_
-      fuente`'s tier self-heal can leave a row whose primary slot is empty
-      while a real vinculo survives, and that document must not vanish.
+    Round 3 finding #6 also dropped estado from the definition entirely, on the
+    premise that an artifact-free `CUMPLIDO_MANUAL`/`NO_APLICA` row could only
+    be legacy data. Round 4, findings #2/#3 corrected that in BOTH directions:
 
-    `fila.vinculos` must therefore be eager-loaded by every caller (a lazy load
-    on an AsyncSession raises MissingGreenlet) — see `_filtrar_filas_visibles`'s
-    callers and `informe_service.generar_zip_evidencias`.
+    - A bare estado is still not content — a PENDIENTE placeholder with no
+      artifact stays an empty row, so rule 1 takes effect for the legacy
+      CEDULA/RUT/RPC/CDP population round 3 was after.
+    - But `CUMPLIDO_MANUAL`/`NO_APLICA` are not estados the system derives, they
+      are decisions a person recorded (optionally with `observaciones`), and
+      `DELETE /documentos/{id}` reaches the artifact-free shape at RUNTIME:
+      `desvincular` deliberately preserves a manual override when the last link
+      goes away. Treating those rows as empty made the decision disappear from
+      the checklist, from `listar_filas_visibles`, and therefore from the
+      constancia PDF — which is regenerated live on every request and prints
+      those estados by name, so yesterday's certificate silently lost rows.
+
+    A row kept by the human-decision branch is still flagged `heredado` by
+    `_filtrar_filas_visibles`, so it stays out of `pendientes` and cannot affect
+    the radicar gate: this restores visibility, never arithmetic.
+
+    `fila.vinculos` must therefore be eager-loaded by every caller (`vinculos`
+    is `lazy="raise"`, so a lazy load raises `sqlalchemy.exc.InvalidRequest
+    Error`) — see `_filtrar_filas_visibles`'s callers and
+    `informe_service.generar_zip_evidencias`.
     """
     return (
-        fila.documento_fuente_id is not None or fila.secop_documento_id is not None or bool(fila.vinculos)
+        fila.documento_fuente_id is not None
+        or fila.secop_documento_id is not None
+        or bool(fila.vinculos)
+        or fila.estado in _ESTADOS_DECISION_HUMANA
     )
 
 

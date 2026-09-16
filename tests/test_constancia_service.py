@@ -276,3 +276,67 @@ async def test_constancia_oculta_filas_legacy_primera_cuota_en_cuenta_recurrente
     call_context = mock_render.call_args[0][1]
     etiquetas = {item["etiqueta"] for item in call_context["checklist_items"]}
     assert not (etiquetas & etiquetas_ocultas)
+
+
+@pytest.mark.asyncio
+async def test_constancia_de_cuenta_cerrada_conserva_una_fila_cumplida_manualmente(db: AsyncSession) -> None:
+    """checklist/primera-cuota-2026-09-16, round 4, finding #3 (WARNING): the
+    constancia is regenerated live on every `GET /{id}/constancia.pdf` — there is
+    no stored snapshot — so a read-time visibility rule that drops a row silently
+    rewrites a certificate already handed to a supervisor. A CUMPLIDO_MANUAL row
+    on a settled cuota renders "Marcado cumplido" and must keep rendering it
+    across re-renders, even after the requisito stopped applying."""
+    from app.models.cuenta_cobro import PosicionCuota
+    from app.models.documento_cuenta_cobro import DocumentoCuentaCobro, EstadoRequisito
+    from app.services import checklist_service
+
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+    db.add(
+        CuentaCobro(
+            contrato_id=contrato.id,
+            mes=1,
+            anio=2024,
+            valor=3_000_000,
+            estado=EstadoCuentaCobro.APROBADA,
+            numero_cuota=1,
+            posicion=PosicionCuota.PRIMERA,
+        )
+    )
+    await db.flush()
+    cuenta = CuentaCobro(
+        contrato_id=contrato.id,
+        mes=2,
+        anio=2024,
+        valor=3_000_000,
+        estado=EstadoCuentaCobro.APROBADA,
+        numero_cuota=2,
+        posicion=PosicionCuota.RECURRENTE,
+    )
+    db.add(cuenta)
+    await db.flush()
+    db.add(
+        DocumentoCuentaCobro(
+            cuenta_cobro_id=cuenta.id,
+            requisito_codigo="CEDULA",
+            estado=EstadoRequisito.CUMPLIDO_MANUAL,
+            observaciones="Ya reposa en la carpeta del contrato",
+        )
+    )
+    await db.commit()
+
+    catalogo = await checklist_service.listar_catalogo(db)
+    etiqueta_cedula = next(r.etiqueta for r in catalogo if r.codigo == "CEDULA")
+
+    etiquetas_por_render = []
+    for _ in range(2):
+        with patch(
+            "app.services.constancia_service.generate_pdf_from_template",
+            return_value=_FAKE_PDF,
+        ) as mock_render:
+            await constancia_service.generar_constancia_pdf(db, user.id, cuenta.id)
+        contexto = mock_render.call_args[0][1]
+        etiquetas_por_render.append({item["etiqueta"] for item in contexto["checklist_items"]})
+
+    assert etiqueta_cedula in etiquetas_por_render[0]
+    assert etiquetas_por_render[0] == etiquetas_por_render[1]
