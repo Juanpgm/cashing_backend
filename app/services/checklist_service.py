@@ -23,6 +23,7 @@ from typing import Any, Protocol
 import httpx
 import structlog
 from sqlalchemy import ColumnElement, inspect, or_, select
+from sqlalchemy import true as sa_true
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -2659,10 +2660,20 @@ async def auto_vincular_documentos_fuente(
         pool_ids = ids_contrato if es_nivel_contrato(req_codigo) else ids_cuenta
         if fila.documento_fuente_id in pool_ids:
             continue
+        # Drop EVERY out-of-pool vinculo, not just the one matching the primary
+        # slot (round 4, finding #4). Clearing only the primary left any other
+        # wrong-tier link untouched, and the `documento_fuente_id is None`
+        # short-circuit above then made the row unreachable by this self-heal
+        # forever — a permanent orphan that, because vinculos count as content,
+        # kept rendering the very document the tier rule had just rejected.
+        # SECOP-only vinculos (documento_fuente_id IS NULL) are not tiered and
+        # must survive, so they are excluded explicitly rather than by a
+        # NULL-unsafe NOT IN.
         await db.execute(
             DocumentoRequisitoVinculo.__table__.delete().where(
                 DocumentoRequisitoVinculo.documento_cuenta_cobro_id == fila.id,
-                DocumentoRequisitoVinculo.documento_fuente_id == fila.documento_fuente_id,
+                DocumentoRequisitoVinculo.documento_fuente_id.is_not(None),
+                DocumentoRequisitoVinculo.documento_fuente_id.notin_(pool_ids) if pool_ids else sa_true(),
             )
         )
         # Promote the oldest surviving IN-POOL vinculo into the primary slot

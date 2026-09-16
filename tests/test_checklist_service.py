@@ -1957,3 +1957,123 @@ async def test_fila_pendiente_sin_artefacto_sigue_oculta(db: AsyncSession, contr
     payload = await checklist_service.construir_checklist_completo(db, cuenta2)
 
     assert "CEDULA" not in {i["requisito"]["codigo"] for i in payload["items"]}
+
+
+async def test_self_heal_borra_todo_vinculo_fuera_del_pool_no_solo_el_primario(
+    db: AsyncSession, contrato: Contrato, test_user: dict[str, Any]
+) -> None:
+    """checklist/primera-cuota-2026-09-16, round 4, finding #4 (WARNING): the
+    tier self-heal deleted only the vinculo matching the row's PRIMARY slot, so
+    any other wrong-tier vinculo survived — and once the primary slot is empty
+    line `if fila.documento_fuente_id is None: continue` means the self-heal can
+    never revisit the row, making the orphan permanent. Combined with vinculos
+    counting as content, that orphan alone kept a rejected, wrong-tier document
+    rendering on a cuota where the requisito does not apply."""
+    user = test_user["user"]
+    await _make_cuenta(db, contrato, mes=1)
+    cuenta2 = await _make_cuenta(db, contrato, mes=2)
+
+    # CEDULA is nivel-contrato, so its pool is the SHARED (cuenta_cobro_id IS
+    # NULL) documents — both of these, scoped to the cuenta, are out of it.
+    docs = []
+    for nombre in ("cedula-mal-tier-1.pdf", "cedula-mal-tier-2.pdf"):
+        d = DocumentoFuente(
+            usuario_id=user.id,
+            contrato_id=contrato.id,
+            cuenta_cobro_id=cuenta2.id,
+            storage_key=f"k/{nombre}",
+            nombre=nombre,
+            tipo=TipoDocumentoFuente.CEDULA,
+        )
+        db.add(d)
+        docs.append(d)
+    await db.flush()
+    fila = DocumentoCuentaCobro(
+        cuenta_cobro_id=cuenta2.id,
+        requisito_codigo="CEDULA",
+        estado=EstadoRequisito.CARGADO,
+        documento_fuente_id=docs[0].id,
+    )
+    db.add(fila)
+    await db.flush()
+    for d in docs:
+        db.add(DocumentoRequisitoVinculo(documento_cuenta_cobro_id=fila.id, documento_fuente_id=d.id))
+    await db.commit()
+
+    await checklist_service.auto_vincular_documentos_fuente(db, cuenta2)
+    await db.commit()
+
+    restantes = (
+        (
+            await db.execute(
+                select(DocumentoRequisitoVinculo).where(
+                    DocumentoRequisitoVinculo.documento_cuenta_cobro_id == fila.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert restantes == [], "every out-of-pool vinculo must go, not just the primary one"
+
+    payload = await checklist_service.construir_checklist_completo(db, cuenta2)
+    assert "CEDULA" not in {i["requisito"]["codigo"] for i in payload["items"]}
+
+
+async def test_self_heal_conserva_los_vinculos_que_si_estan_en_el_pool(
+    db: AsyncSession, contrato: Contrato, test_user: dict[str, Any]
+) -> None:
+    """Control for the cleanup above: the self-heal must remove only wrong-tier
+    links. A correctly-tiered vinculo is still promoted into the primary slot
+    (round 3, finding #5) and keeps the row alive."""
+    user = test_user["user"]
+    cuenta1 = await _make_cuenta(db, contrato, mes=1)
+
+    malo = DocumentoFuente(
+        usuario_id=user.id,
+        contrato_id=contrato.id,
+        cuenta_cobro_id=cuenta1.id,
+        storage_key="k/cedula-mal.pdf",
+        nombre="cedula-mal.pdf",
+        tipo=TipoDocumentoFuente.CEDULA,
+    )
+    bueno = DocumentoFuente(
+        usuario_id=user.id,
+        contrato_id=contrato.id,
+        cuenta_cobro_id=None,
+        storage_key="k/cedula-bien.pdf",
+        nombre="cedula-bien.pdf",
+        tipo=TipoDocumentoFuente.CEDULA,
+    )
+    db.add_all([malo, bueno])
+    await db.flush()
+    fila = DocumentoCuentaCobro(
+        cuenta_cobro_id=cuenta1.id,
+        requisito_codigo="CEDULA",
+        estado=EstadoRequisito.CARGADO,
+        documento_fuente_id=malo.id,
+    )
+    db.add(fila)
+    await db.flush()
+    db.add(DocumentoRequisitoVinculo(documento_cuenta_cobro_id=fila.id, documento_fuente_id=malo.id))
+    db.add(DocumentoRequisitoVinculo(documento_cuenta_cobro_id=fila.id, documento_fuente_id=bueno.id))
+    await db.commit()
+
+    await checklist_service.auto_vincular_documentos_fuente(db, cuenta1)
+    await db.commit()
+    await db.refresh(fila)
+
+    assert fila.documento_fuente_id == bueno.id
+    assert fila.estado == EstadoRequisito.CARGADO
+    restantes = (
+        (
+            await db.execute(
+                select(DocumentoRequisitoVinculo.documento_fuente_id).where(
+                    DocumentoRequisitoVinculo.documento_cuenta_cobro_id == fila.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert set(restantes) == {bueno.id}
