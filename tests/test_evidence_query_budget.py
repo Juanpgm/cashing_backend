@@ -49,6 +49,37 @@ EXPANDED = {
 # document, and the last-pair / bare-first-segment forms are noise magnets.
 UNMATCHABLE_VARIANTS = ["4161 010 26 1 027 2025", "41610102610272025", "027-2025", "027.2025", "4161"]
 
+# 20 obligaciones with a DISTINCT leading verb each (routine for a Colombian
+# CPS contract) — needed for the ceiling regressions below: reusing near-
+# identical descriptions collapses to a handful of queries via round_robin's
+# cross-group dedup and never actually exercises the budget.
+_DISTINCT_VERBS = [
+    "auditar",
+    "certificar",
+    "diagnosticar",
+    "evaluar",
+    "fiscalizar",
+    "inspeccionar",
+    "monitorear",
+    "planificar",
+    "coordinar",
+    "ejecutar",
+    "revisar",
+    "validar",
+    "implementar",
+    "gestionar",
+    "desarrollar",
+    "elaborar",
+    "sistematizar",
+    "verificar",
+    "articular",
+    "promover",
+]
+MANY_OBLIGACIONES = [
+    {"id": f"ob{i}", "descripcion": f"{verbo.capitalize()} procesos territoriales comunitarios anuales"}
+    for i, verbo in enumerate(_DISTINCT_VERBS)
+]
+
 
 # ── Gmail ─────────────────────────────────────────────────────────────────────
 
@@ -151,6 +182,54 @@ async def test_gmail_expanded_phrases_reach_the_provider():
     assert hits >= 3, f"expected most expanded phrases to be queried, got {hits}/5 — fired: {captured}"
 
 
+@pytest.mark.asyncio
+async def test_gmail_total_queries_never_exceed_the_configured_ceiling():
+    """WARNING regression: `obligacion_budget = max(remaining, MIN_PER_OB *
+    n_groups)` let the per-obligación floor REQUIREMENT alone decide the
+    total once obligaciones outnumbered the budget — with 20 obligaciones
+    (routine for a Colombian CPS contract) that meant up to 40
+    obligación-side queries alone, regardless of EVIDENCE_MAX_GMAIL_QUERIES.
+    The per-obligación floor may still legitimately push a BOUNDED amount
+    past the nominal ceiling (never starve an obligación entirely — an
+    intentional round-2 decision), but the overrun must now be capped at
+    `EVIDENCE_MAX_CONTRACT_QUERIES` instead of scaling with obligación count."""
+    from app.core.config import settings
+    from app.services import evidence_discovery_service as eds
+
+    many_obligaciones = MANY_OBLIGACIONES
+    captured: list[str] = []
+
+    async def _fake_search(usuario_id, query, max_results):
+        captured.append(query)
+        return []
+
+    adapter = MagicMock()
+    adapter.search_messages = AsyncMock(side_effect=_fake_search)
+
+    with patch.object(eds, "GmailAdapter", return_value=adapter):
+        await eds._gather_email_evidence(
+            MagicMock(),
+            uuid.uuid4(),
+            many_obligaciones,
+            "2025-09-01",
+            "2025-09-30",
+            None,
+            ENTIDAD,
+            numero_contrato=DAGMA_NUMERO,
+        )
+
+    bound = settings.EVIDENCE_MAX_GMAIL_QUERIES + settings.EVIDENCE_MAX_CONTRACT_QUERIES
+    assert len(captured) <= bound, (
+        f"fired {len(captured)} Gmail queries for 20 obligaciones, bounded overrun ceiling is {bound} "
+        f"(nominal {settings.EVIDENCE_MAX_GMAIL_QUERIES} + at most {settings.EVIDENCE_MAX_CONTRACT_QUERIES} contract slots)"
+    )
+    # Every obligación must still contribute at least one query — starving an
+    # obligación entirely would be worse than the bounded overrun above.
+    blob = " ".join(captured).lower()
+    for verbo in _DISTINCT_VERBS:
+        assert verbo in blob, f"obligación keyword '{verbo}' starved out entirely — fired: {captured}"
+
+
 # ── Drive ─────────────────────────────────────────────────────────────────────
 
 
@@ -239,6 +318,40 @@ async def test_drive_queries_the_contract_number_once_not_once_per_obligacion():
     assert terms.count(DAGMA_NUMERO) == 1, f"contract number queried {terms.count(DAGMA_NUMERO)}x — fired: {terms}"
 
 
+@pytest.mark.asyncio
+async def test_drive_total_queries_never_exceed_the_configured_ceiling():
+    """Same shape as the Gmail ceiling regression: with many obligaciones the
+    per-obligación floor REQUIREMENT must be capped instead of scaling the
+    fired query count with obligación count. A bounded overrun (at most
+    EVIDENCE_MAX_CONTRACT_QUERIES, on top of the always-included generic
+    terms) is still acceptable — starving an obligación entirely is not."""
+    from app.agent.nodes import drive_fetch as mod
+    from app.core.config import settings
+
+    adapter = MagicMock()
+    adapter.search_files = AsyncMock(return_value=[])
+
+    many_obligaciones = MANY_OBLIGACIONES
+    state = {
+        "user_id": uuid.uuid4(),
+        "_db": MagicMock(),
+        "contrato_contexto": {
+            "fecha_inicio": "2025-09-01",
+            "fecha_fin": "2025-09-30",
+            "numero_contrato": DAGMA_NUMERO,
+            "entidad": ENTIDAD,
+        },
+        "obligaciones_contexto": many_obligaciones,
+    }
+
+    with patch.object(mod, "DriveAdapter", return_value=adapter):
+        await mod.drive_fetch_node(state)
+
+    fired = adapter.search_files.call_count
+    bound = settings.EVIDENCE_MAX_QUERIES_TOTAL + settings.EVIDENCE_MAX_CONTRACT_QUERIES
+    assert fired <= bound, f"fired {fired} Drive queries for 20 obligaciones, bounded overrun ceiling is {bound}"
+
+
 # ── Calendar ──────────────────────────────────────────────────────────────────
 
 
@@ -269,6 +382,22 @@ def test_calendar_terms_keep_the_raw_contract_number():
 
     terms = _calendar_terms({"numero_contrato": DAGMA_NUMERO, "entidad": ENTIDAD}, OBLIGACIONES, EXPANDED)
     assert DAGMA_NUMERO in terms
+
+
+def test_calendar_terms_never_exceed_the_configured_ceiling():
+    """Same shape as the Gmail/Drive ceiling regression: many obligaciones must
+    cap the per-obligación floor REQUIREMENT rather than scale the produced
+    term count past EVIDENCE_MAX_CALENDAR_TERMS. A bounded overrun (at most
+    EVIDENCE_MAX_CONTRACT_QUERIES) is still acceptable."""
+    from app.agent.nodes.calendar_fetch import _calendar_terms
+    from app.core.config import settings
+
+    many_obligaciones = MANY_OBLIGACIONES
+    terms = _calendar_terms({"numero_contrato": DAGMA_NUMERO, "entidad": ENTIDAD}, many_obligaciones, {})
+    bound = settings.EVIDENCE_MAX_CALENDAR_TERMS + settings.EVIDENCE_MAX_CONTRACT_QUERIES
+    assert len(terms) <= bound, (
+        f"produced {len(terms)} Calendar terms for 20 obligaciones, bounded overrun ceiling is {bound}"
+    )
 
 
 # ── The shared helpers ────────────────────────────────────────────────────────

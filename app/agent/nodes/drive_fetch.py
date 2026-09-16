@@ -159,10 +159,29 @@ async def drive_fetch_node(state: AgentState, provider: IntegrationProvider = In
         groups = [_obligacion_group(state.get("user_input", ""))]
     groups = [g for g in groups if g]
 
-    obligacion_budget = max(
-        settings.EVIDENCE_MAX_QUERIES_TOTAL - len(contract_terms) - len(_GENERIC_TERMS),
-        settings.EVIDENCE_MIN_QUERIES_PER_OBLIGACION * len(groups),
-    )
+    # Round-3 fix (confirmed WARNING, same shape as the Gmail ceiling
+    # regression): `obligacion_budget = max(remaining, MIN_PER_OB * n_groups)`
+    # let the per-obligación FLOOR REQUIREMENT alone decide the total once
+    # obligaciones outnumbered the budget. The floor is still honoured ON TOP
+    # of the nominal budget for a contract with few obligaciones (unchanged,
+    # intentional round-2 behavior), but the floor REQUIREMENT itself is now
+    # capped at the nominal (pre-contract) budget, bounding the worst-case
+    # overrun to `len(contract_terms)` no matter how many obligaciones exist.
+    nominal_budget = max(settings.EVIDENCE_MAX_QUERIES_TOTAL - len(_GENERIC_TERMS), 0)
+    remaining_after_contract = max(nominal_budget - len(contract_terms), 0)
+    if groups:
+        floor_needed = settings.EVIDENCE_MIN_QUERIES_PER_OBLIGACION * len(groups)
+        capped_floor = min(floor_needed, nominal_budget)
+        if capped_floor < floor_needed:
+            logger.info(
+                "drive_query_budget_floor_capped",
+                requested=floor_needed,
+                capped_to=capped_floor,
+                n_obligaciones=len(groups),
+            )
+        obligacion_budget = max(remaining_after_contract, capped_floor)
+    else:
+        obligacion_budget = 0
 
     # Generic evidence terms ALWAYS run and are never truncated (evidencias/
     # discovery-fix root cause #4) — they are the contract-agnostic recall net.

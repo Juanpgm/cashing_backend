@@ -103,10 +103,29 @@ def _calendar_terms(
         if group:
             groups.append(group)
 
-    budget = max(
-        settings.EVIDENCE_MAX_CALENDAR_TERMS - len(contract_terms),
-        settings.EVIDENCE_MIN_QUERIES_PER_OBLIGACION * len(groups),
-    )
+    # Round-3 fix (confirmed WARNING, same shape as the Gmail/Drive ceiling
+    # regression): `budget = max(remaining, MIN_PER_OB * n_groups)` let the
+    # per-obligación FLOOR REQUIREMENT alone decide the total once obligaciones
+    # outnumbered EVIDENCE_MAX_CALENDAR_TERMS. The floor is still honoured ON
+    # TOP of the nominal budget for a contract with few obligaciones
+    # (unchanged, intentional round-2 behavior), but the floor REQUIREMENT
+    # itself is now capped at the nominal budget, bounding the worst-case
+    # overrun to `len(contract_terms)` regardless of obligación count.
+    nominal_budget = settings.EVIDENCE_MAX_CALENDAR_TERMS
+    remaining_after_contract = max(nominal_budget - len(contract_terms), 0)
+    if groups:
+        floor_needed = settings.EVIDENCE_MIN_QUERIES_PER_OBLIGACION * len(groups)
+        capped_floor = min(floor_needed, nominal_budget)
+        if capped_floor < floor_needed:
+            logger.info(
+                "calendar_query_budget_floor_capped",
+                requested=floor_needed,
+                capped_to=capped_floor,
+                n_obligaciones=len(groups),
+            )
+        budget = max(remaining_after_contract, capped_floor)
+    else:
+        budget = 0
     terms = [*contract_terms, *round_robin(groups, budget)]
     return list(dict.fromkeys(t for t in terms if t))
 

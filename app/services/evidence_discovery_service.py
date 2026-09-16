@@ -345,10 +345,33 @@ async def _gather_email_evidence(
         if group:
             obligacion_groups.append(group)
 
-    obligacion_budget = max(
-        query_budget - len(contract_queries),
-        settings.EVIDENCE_MIN_QUERIES_PER_OBLIGACION * len(obligacion_groups),
-    )
+    # Round-3 fix (confirmed WARNING): `obligacion_budget = max(remaining,
+    # MIN_PER_OB * n_groups)` let the per-obligación FLOOR REQUIREMENT alone
+    # decide the total once obligaciones outnumbered the budget — e.g. a
+    # 20-obligación contract demanded 40 obligación-side queries regardless of
+    # `query_budget`, and the ceiling was then re-widened to
+    # `max(query_budget, len(unique_queries))` to match, making
+    # EVIDENCE_MAX_GMAIL_QUERIES purely advisory. The per-obligación floor is
+    # still honoured ON TOP of the ceiling for a contract with few obligaciones
+    # (unchanged, intentional round-2 behavior — starving an obligación
+    # entirely is worse than a small overrun), but the floor REQUIREMENT
+    # itself is now capped at the nominal budget, so the worst-case overrun is
+    # bounded by `len(contract_queries)` no matter how many obligaciones exist.
+    remaining_after_contract = max(query_budget - len(contract_queries), 0)
+    if obligacion_groups:
+        floor_needed = settings.EVIDENCE_MIN_QUERIES_PER_OBLIGACION * len(obligacion_groups)
+        capped_floor = min(floor_needed, query_budget)
+        if capped_floor < floor_needed:
+            logger.info(
+                "email_query_budget_floor_capped",
+                requested=floor_needed,
+                capped_to=capped_floor,
+                n_obligaciones=len(obligacion_groups),
+                provider=provider.value,
+            )
+        obligacion_budget = max(remaining_after_contract, capped_floor)
+    else:
+        obligacion_budget = 0
     queries: list[str] = [*contract_queries, *round_robin(obligacion_groups, obligacion_budget)]
 
     seen_q: set[str] = set()
@@ -358,9 +381,9 @@ async def _gather_email_evidence(
             seen_q.add(q)
             unique_queries.append(q)
 
-    # The per-obligación floor may legitimately push past the nominal budget for
-    # a contract with many obligaciones — honouring the floor is the point of
-    # this allocation, so the effective ceiling is whichever is larger.
+    # The per-obligación floor may legitimately push a BOUNDED amount past the
+    # nominal budget (see cap above) — honouring it is the point of this
+    # allocation, so the effective ceiling is whichever is larger.
     query_budget = max(query_budget, len(unique_queries))
     numero_variants = contract_number_variants(numero_contrato)
     supervisor_domain = (supervisor_email or "").split("@")[-1].strip().lower() or None if supervisor_email else None
