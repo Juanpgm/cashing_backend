@@ -524,21 +524,36 @@ def requisito_aplica_a_cuenta(req: RequisitoDocumento | _CustomLike, ctx: Checkl
 
 
 def _fila_tiene_contenido(fila: DocumentoCuentaCobro) -> bool:
-    """Whether `fila` already carries user-provided content (a linked document,
-    via either the primary slot or a `DocumentoRequisitoVinculo` — the primary
-    slot is always kept in sync with the first/preferred link, so checking it
-    alone is sufficient without eager-loading `vinculos`) — as opposed to being
-    an untouched PENDIENTE placeholder.
+    """Whether `fila` carries a real ARTIFACT — a linked `DocumentoFuente` or
+    `SecopDocumento`, held either in a primary slot or in a
+    `DocumentoRequisitoVinculo` — as opposed to being an empty placeholder.
 
     Rows with content must never disappear once materialized: the read-time
     filter and the radicación package only hide EMPTY rows (checklist/primera-
     cuota-2026-09-16, round 2, findings #1/#3) — otherwise a reappeared CONTRATO
     row self-defeats the moment its document is uploaded, and a legacy CEDULA/
     RUT/RPC/CDP row silently drops a real document from every reader.
+
+    Round 3, findings #5/#6 — two corrections to the round-2 shape:
+
+    - estado is NOT content. This used to short-circuit True on any
+      non-PENDIENTE estado, but `marcar_no_aplica`/`marcar_cumplido_manual` set
+      estado with no document whatsoever, so the most common legacy shape (an
+      old CEDULA/RUT row someone marked "no aplica") was classified as content
+      and rule 1 never took effect for it. A deliberate NO_APLICA decision on a
+      requisito this cuota is not being asked for is not a reason to keep
+      showing it.
+    - the primary slot alone is NOT sufficient. `auto_vincular_documentos_
+      fuente`'s tier self-heal can leave a row whose primary slot is empty
+      while a real vinculo survives, and that document must not vanish.
+
+    `fila.vinculos` must therefore be eager-loaded by every caller (a lazy load
+    on an AsyncSession raises MissingGreenlet) — see `_filtrar_filas_visibles`'s
+    callers and `informe_service.generar_zip_evidencias`.
     """
-    if fila.estado != EstadoRequisito.PENDIENTE:
-        return True
-    return fila.documento_fuente_id is not None or fila.secop_documento_id is not None
+    return (
+        fila.documento_fuente_id is not None or fila.secop_documento_id is not None or bool(fila.vinculos)
+    )
 
 
 def _aplica_con_mapeo(
@@ -2946,7 +2961,13 @@ async def listar_filas_visibles(db: AsyncSession, cuenta: CuentaCobro) -> list[D
     """
     catalogo = await listar_catalogo(db)
     cat_by_codigo = {c.codigo: c for c in catalogo}
-    res = await db.execute(select(DocumentoCuentaCobro).where(DocumentoCuentaCobro.cuenta_cobro_id == cuenta.id))
+    # `vinculos` is eager-loaded because `_fila_tiene_contenido` reads it (round
+    # 3, finding #5) — lazy-loading it here would raise MissingGreenlet.
+    res = await db.execute(
+        select(DocumentoCuentaCobro)
+        .options(selectinload(DocumentoCuentaCobro.vinculos))
+        .where(DocumentoCuentaCobro.cuenta_cobro_id == cuenta.id)
+    )
     filas_todas = list(res.scalars().all())
     ctx = await _construir_checklist_aplica_ctx(db, cuenta)
     mapeos = _mapeos_por_codigo(await listar_requisitos_cuenta(db, cuenta.id))

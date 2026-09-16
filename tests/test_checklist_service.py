@@ -14,6 +14,7 @@ from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro, PosicionCuot
 from app.models.documento_cuenta_cobro import (
     DocumentoChecklistCandidato,
     DocumentoCuentaCobro,
+    DocumentoRequisitoVinculo,
     EstadoRequisito,
 )
 from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
@@ -1078,6 +1079,71 @@ async def test_construir_checklist_completo_conserva_fila_legacy_con_documento(
     cedula_item = next(i for i in payload["items"] if i["requisito"]["codigo"] == "CEDULA")
     assert cedula_item["heredado"] is True
     assert "CEDULA" not in payload["resumen"]["lista_pendientes"]
+
+
+@pytest.mark.parametrize("estado", [EstadoRequisito.NO_APLICA, EstadoRequisito.CUMPLIDO_MANUAL])
+async def test_construir_checklist_completo_oculta_fila_legacy_sin_artefacto(
+    db: AsyncSession, contrato: Contrato, estado: EstadoRequisito
+) -> None:
+    """checklist/primera-cuota-2026-09-16, round 3, finding #6 (WARNING): "has
+    content" must mean a real artifact, not merely a non-PENDIENTE estado.
+    `marcar_no_aplica`/`marcar_cumplido_manual` set estado with no document at
+    all, so treating any non-PENDIENTE row as content-carrying kept the most
+    common legacy shape visible forever and rule 1 never took effect for it."""
+    await _make_cuenta(db, contrato, mes=1)
+    cuenta2 = await _make_cuenta(db, contrato, mes=2)
+    db.add(DocumentoCuentaCobro(cuenta_cobro_id=cuenta2.id, requisito_codigo="CEDULA", estado=estado))
+    await db.commit()
+
+    payload = await checklist_service.construir_checklist_completo(db, cuenta2)
+
+    assert "CEDULA" not in {i["requisito"]["codigo"] for i in payload["items"]}
+    visibles = {f.requisito_codigo for f in await checklist_service.listar_filas_visibles(db, cuenta2)}
+    assert "CEDULA" not in visibles
+
+
+async def test_construir_checklist_completo_conserva_fila_legacy_con_solo_un_vinculo(
+    db: AsyncSession, contrato: Contrato, test_user: dict[str, Any]
+) -> None:
+    """checklist/primera-cuota-2026-09-16, round 3, finding #5 (WARNING): a row
+    whose primary slot is empty but that still holds a `DocumentoRequisito
+    Vinculo` carries a real document — `auto_vincular_documentos_fuente`'s
+    tier self-heal can leave exactly that shape — so it must count as content
+    and stay visible instead of silently dropping the linked document from
+    every reader."""
+    user = test_user["user"]
+    await _make_cuenta(db, contrato, mes=1)
+    cuenta2 = await _make_cuenta(db, contrato, mes=2)
+
+    doc = DocumentoFuente(
+        usuario_id=user.id,
+        contrato_id=contrato.id,
+        cuenta_cobro_id=None,
+        storage_key="k/cedula-vinculo",
+        nombre="cedula.pdf",
+        tipo=TipoDocumentoFuente.CEDULA,
+    )
+    db.add(doc)
+    await db.flush()
+    fila = DocumentoCuentaCobro(
+        cuenta_cobro_id=cuenta2.id,
+        requisito_codigo="CEDULA",
+        estado=EstadoRequisito.PENDIENTE,
+        documento_fuente_id=None,
+    )
+    db.add(fila)
+    await db.flush()
+    db.add(DocumentoRequisitoVinculo(documento_cuenta_cobro_id=fila.id, documento_fuente_id=doc.id))
+    await db.commit()
+
+    payload = await checklist_service.construir_checklist_completo(db, cuenta2)
+
+    cedula_item = next((i for i in payload["items"] if i["requisito"]["codigo"] == "CEDULA"), None)
+    assert cedula_item is not None
+    assert cedula_item["heredado"] is True
+    assert "CEDULA" not in payload["resumen"]["lista_pendientes"]
+    visibles = {f.requisito_codigo for f in await checklist_service.listar_filas_visibles(db, cuenta2)}
+    assert "CEDULA" in visibles
 
 
 async def test_construir_checklist_completo_fila_heredada_pendiente_no_bloquea_la_radicacion(

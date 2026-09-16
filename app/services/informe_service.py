@@ -1686,11 +1686,15 @@ async def generar_zip_evidencias(
         # the package and made the LEEME claim it was "ya radicado en la cuota 1"
         # while the checklist was still asking the user for it.
         mapeos = checklist_service._mapeos_por_codigo(await checklist_service.listar_requisitos_cuenta(db, cuenta.id))
+        # `vinculos` is eager-loaded because `_fila_tiene_contenido` reads it
+        # (round 3, finding #5) — lazy-loading it raises MissingGreenlet.
         filas_por_codigo = {
             f.requisito_codigo: f
             for f in (
                 await db.execute(
-                    select(DocumentoCuentaCobro).where(DocumentoCuentaCobro.cuenta_cobro_id == cuenta.id)
+                    select(DocumentoCuentaCobro)
+                    .options(selectinload(DocumentoCuentaCobro.vinculos))
+                    .where(DocumentoCuentaCobro.cuenta_cobro_id == cuenta.id)
                 )
             )
             .scalars()
