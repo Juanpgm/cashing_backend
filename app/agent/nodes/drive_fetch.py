@@ -204,6 +204,10 @@ async def drive_fetch_node(state: AgentState, provider: IntegrationProvider = In
                         "date": f.modified_at.isoformat() if f.modified_at else "",
                         "file_id": f.id,
                         "mime_type": f.mime_type,
+                        # Carried for cross-provider dedup: the same document in
+                        # Drive and OneDrive has different file ids, so identity
+                        # is (name, size, mime) — see evidence_dedup.
+                        "size": f.size_bytes,
                         "provider": provider.value,
                     }
     except Exception as exc:
