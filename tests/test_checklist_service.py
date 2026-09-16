@@ -820,6 +820,88 @@ async def test_computar_resumen_custom_etiqueta_blank_falls_back_to_bare_codigo(
     assert resumen["lista_pendientes_desc"] == ["CUSTOM_SIN_ETIQUETA"]
 
 
+# ── construir_checklist_completo: read-time filter of legacy rows (WU3) ─────
+# checklist/primera-cuota-2026-09-16: `asegurar_checklist` now refuses to
+# MATERIALIZE new CEDULA/RUT/RPC/CDP/CONTRATO rows on a later cuenta (rule 1/2),
+# but a row created before this fix shipped still sits in the DB. These tests
+# insert such a "legacy" row directly (bypassing asegurar_checklist) and assert
+# `construir_checklist_completo` hides it anyway, with no data migration.
+
+
+async def test_construir_checklist_completo_hides_legacy_identity_rows_on_later_cuenta(
+    db: AsyncSession, contrato: Contrato
+) -> None:
+    await _make_cuenta(db, contrato, mes=1)
+    cuenta2 = await _make_cuenta(db, contrato, mes=2)
+
+    # Simulate rows materialized before this fix: a direct insert, not via
+    # asegurar_checklist (which would now correctly skip these codes).
+    for codigo in ("CEDULA", "RUT", "RPC", "CDP"):
+        db.add(
+            DocumentoCuentaCobro(
+                cuenta_cobro_id=cuenta2.id,
+                requisito_codigo=codigo,
+                estado=EstadoRequisito.PENDIENTE,
+            )
+        )
+    await db.commit()
+
+    payload = await checklist_service.construir_checklist_completo(db, cuenta2)
+
+    codigos_items = {i["requisito"]["codigo"] for i in payload["items"]}
+    assert not codigos_items & {"CEDULA", "RUT", "RPC", "CDP"}
+    assert not set(payload["resumen"]["lista_pendientes"]) & {"CEDULA", "RUT", "RPC", "CDP"}
+
+
+async def test_construir_checklist_completo_hides_legacy_contrato_row_when_no_exception(
+    db: AsyncSession, contrato: Contrato, test_user: dict[str, Any]
+) -> None:
+    """A legacy CONTRATO row also hides on a later cuenta once a shared document
+    AND at least one Obligacion exist (no reappearance exception applies)."""
+    user = test_user["user"]
+    await _make_cuenta(db, contrato, mes=1)
+
+    db.add(
+        DocumentoFuente(
+            usuario_id=user.id,
+            contrato_id=contrato.id,
+            cuenta_cobro_id=None,
+            storage_key="k/contrato",
+            nombre="contrato.pdf",
+            tipo=TipoDocumentoFuente.CONTRATO,
+        )
+    )
+    db.add(Obligacion(contrato_id=contrato.id, descripcion="Obligación 1", tipo=TipoObligacion.GENERAL, orden=1))
+    await db.commit()
+
+    cuenta2 = await _make_cuenta(db, contrato, mes=2)
+    db.add(
+        DocumentoCuentaCobro(
+            cuenta_cobro_id=cuenta2.id,
+            requisito_codigo="CONTRATO",
+            estado=EstadoRequisito.PENDIENTE,
+        )
+    )
+    await db.commit()
+
+    payload = await checklist_service.construir_checklist_completo(db, cuenta2)
+
+    codigos_items = {i["requisito"]["codigo"] for i in payload["items"]}
+    assert "CONTRATO" not in codigos_items
+    assert "CONTRATO" not in payload["resumen"]["lista_pendientes"]
+
+
+async def test_construir_checklist_completo_first_cuenta_unaffected(db: AsyncSession, contrato: Contrato) -> None:
+    """Regression guard: the first cuenta's own checklist response is untouched
+    by the read-time filter — every standard row still shows up."""
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+
+    payload = await checklist_service.construir_checklist_completo(db, cuenta)
+
+    codigos_items = {i["requisito"]["codigo"] for i in payload["items"]}
+    assert {"CEDULA", "RUT", "RPC", "CDP", "CONTRATO"} <= codigos_items
+
+
 # ── 1:N document links per requisito ────────────────────────────────────────
 
 

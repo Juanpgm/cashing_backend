@@ -2796,7 +2796,23 @@ async def construir_checklist_completo(
         )
         .where(DocumentoCuentaCobro.cuenta_cobro_id == cuenta.id)
     )
-    filas = list(rows_res.scalars().all())
+    filas_todas = list(rows_res.scalars().all())
+
+    # Read-time filter (checklist/primera-cuota-2026-09-16, rule 1/2 — WU3):
+    # hides CEDULA/RUT/RPC/CDP/CONTRATO rows that were materialized on a
+    # non-first cuenta BEFORE this rule existed, so pre-existing data
+    # disappears from every reader (items, resumen, the radicar gate) without
+    # a data migration. Custom rows are untouched here — their
+    # `solo_primera_cuenta` gating already happens correctly at materialization
+    # time in `asegurar_checklist` (rule 3), so no old bug to retroactively fix.
+    ctx = await _construir_checklist_aplica_ctx(db, cuenta)
+    filas = [
+        f
+        for f in filas_todas
+        if f.requisito_codigo is None
+        or f.requisito_codigo not in cat_by_codigo
+        or requisito_aplica_a_cuenta(cat_by_codigo[f.requisito_codigo], cuenta, ctx)
+    ]
 
     # EVIDENCIAS is derived state: no evidencia-attachment path updates its
     # persisted row, so derive its effective estado from actual coverage —
