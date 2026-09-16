@@ -2565,17 +2565,40 @@ async def auto_vincular_documentos_fuente(
         if fila.documento_fuente_id is None:
             continue
         pool_ids = ids_contrato if es_nivel_contrato(req_codigo) else ids_cuenta
-        if fila.documento_fuente_id not in pool_ids:
-            await db.execute(
-                DocumentoRequisitoVinculo.__table__.delete().where(
-                    DocumentoRequisitoVinculo.documento_cuenta_cobro_id == fila.id,
-                    DocumentoRequisitoVinculo.documento_fuente_id == fila.documento_fuente_id,
-                )
+        if fila.documento_fuente_id in pool_ids:
+            continue
+        await db.execute(
+            DocumentoRequisitoVinculo.__table__.delete().where(
+                DocumentoRequisitoVinculo.documento_cuenta_cobro_id == fila.id,
+                DocumentoRequisitoVinculo.documento_fuente_id == fila.documento_fuente_id,
             )
-            fila.documento_fuente_id = None
-            fila.confianza_deteccion = None
-            fila.estado = EstadoRequisito.PENDIENTE
-            reparados += 1
+        )
+        # Promote the oldest surviving IN-POOL vinculo into the primary slot
+        # instead of clearing it (round 3, finding #5) — the same rule
+        # `desvincular` applies when the primary link is removed. Clearing it
+        # left the row holding a perfectly valid, correctly-tiered document
+        # while reading as empty, so it vanished from every reader; the
+        # candidate pass below then tried to re-link that same document and
+        # violated `uq_docreqvinc_docccobro_fuente`.
+        reemplazo = (
+            await db.execute(
+                select(DocumentoRequisitoVinculo.documento_fuente_id)
+                .where(
+                    DocumentoRequisitoVinculo.documento_cuenta_cobro_id == fila.id,
+                    DocumentoRequisitoVinculo.documento_fuente_id.in_(pool_ids),
+                )
+                .order_by(DocumentoRequisitoVinculo.created_at, DocumentoRequisitoVinculo.id)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        fila.documento_fuente_id = reemplazo
+        fila.confianza_deteccion = None
+        # Derived, never hard-coded: a surviving SECOP link must keep the row
+        # DETECTADO rather than being silently downgraded to PENDIENTE (round 3,
+        # finding #3) — `_estado_segun_vinculos` is the single derivation every
+        # other estado writer already uses.
+        fila.estado = _estado_segun_vinculos(fila)
+        reparados += 1
 
     if not docs_cuenta and not docs_contrato:
         if reparados:

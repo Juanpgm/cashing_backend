@@ -1053,10 +1053,14 @@ async def test_construir_checklist_completo_conserva_fila_legacy_con_documento(
     await _make_cuenta(db, contrato, mes=1)
     cuenta2 = await _make_cuenta(db, contrato, mes=2)
 
+    # cuenta_cobro_id=None: CEDULA is a nivel-contrato requisito, so a REALISTIC
+    # legacy row points at the shared contract-level document (round 3, finding
+    # #5 — the round-2 fixture used a cuenta-scoped doc, a tier mismatch the app
+    # itself self-heals away, which made the test pass for the wrong reason).
     doc = DocumentoFuente(
         usuario_id=user.id,
         contrato_id=contrato.id,
-        cuenta_cobro_id=cuenta2.id,
+        cuenta_cobro_id=None,
         storage_key="k/cedula",
         nombre="cedula.pdf",
         tipo=TipoDocumentoFuente.CEDULA,
@@ -1070,15 +1074,125 @@ async def test_construir_checklist_completo_conserva_fila_legacy_con_documento(
         documento_fuente_id=doc.id,
     )
     db.add(fila)
+    await db.flush()
+    db.add(DocumentoRequisitoVinculo(documento_cuenta_cobro_id=fila.id, documento_fuente_id=doc.id))
     await db.commit()
 
-    payload = await checklist_service.construir_checklist_completo(db, cuenta2)
+    # The auto-link pass runs on this row before it is read back, so the
+    # guarantee is asserted against post-self-heal state, not a snapshot.
+    payload = await checklist_service.construir_checklist_completo(db, cuenta2, auto_vincular=True)
 
     codigos_items = {i["requisito"]["codigo"] for i in payload["items"]}
     assert "CEDULA" in codigos_items
     cedula_item = next(i for i in payload["items"] if i["requisito"]["codigo"] == "CEDULA")
     assert cedula_item["heredado"] is True
     assert "CEDULA" not in payload["resumen"]["lista_pendientes"]
+
+
+async def test_auto_vincular_self_heal_promueve_el_vinculo_del_tier_correcto(
+    db: AsyncSession, contrato: Contrato, test_user: dict[str, Any]
+) -> None:
+    """checklist/primera-cuota-2026-09-16, round 3, finding #5 (WARNING): the
+    tier self-heal deleted the vinculo matching the out-of-tier primary and then
+    cleared the row to PENDIENTE — even when a perfectly valid, correctly-tiered
+    vinculo was still attached. The row then read as empty and disappeared from
+    every reader together with a document that is still linked. Promote the
+    oldest surviving in-pool vinculo instead, exactly like `desvincular` does."""
+    user = test_user["user"]
+    await _make_cuenta(db, contrato, mes=1)
+    cuenta2 = await _make_cuenta(db, contrato, mes=2)
+
+    doc_malo = DocumentoFuente(
+        usuario_id=user.id,
+        contrato_id=contrato.id,
+        cuenta_cobro_id=cuenta2.id,  # cuenta-scoped → out of tier for nivel-contrato CEDULA
+        storage_key="k/cedula-mala",
+        nombre="cedula-vieja.pdf",
+        tipo=TipoDocumentoFuente.CEDULA,
+    )
+    doc_bueno = DocumentoFuente(
+        usuario_id=user.id,
+        contrato_id=contrato.id,
+        cuenta_cobro_id=None,  # shared contract-level → correct tier
+        storage_key="k/cedula-buena",
+        nombre="cedula.pdf",
+        tipo=TipoDocumentoFuente.CEDULA,
+    )
+    db.add_all([doc_malo, doc_bueno])
+    await db.flush()
+    fila = DocumentoCuentaCobro(
+        cuenta_cobro_id=cuenta2.id,
+        requisito_codigo="CEDULA",
+        estado=EstadoRequisito.CARGADO,
+        documento_fuente_id=doc_malo.id,
+    )
+    db.add(fila)
+    await db.flush()
+    db.add_all(
+        [
+            DocumentoRequisitoVinculo(documento_cuenta_cobro_id=fila.id, documento_fuente_id=doc_malo.id),
+            DocumentoRequisitoVinculo(documento_cuenta_cobro_id=fila.id, documento_fuente_id=doc_bueno.id),
+        ]
+    )
+    await db.commit()
+
+    await checklist_service.auto_vincular_documentos_fuente(db, cuenta2)
+    await db.commit()
+    await db.refresh(fila)
+
+    assert fila.documento_fuente_id == doc_bueno.id
+    assert fila.estado == EstadoRequisito.CARGADO
+    visibles = {f.requisito_codigo for f in await checklist_service.listar_filas_visibles(db, cuenta2)}
+    assert "CEDULA" in visibles
+
+
+async def test_auto_vincular_self_heal_deriva_el_estado_del_vinculo_secop_restante(
+    db: AsyncSession, contrato: Contrato, test_user: dict[str, Any]
+) -> None:
+    """checklist/primera-cuota-2026-09-16, round 3, finding #3 (WARNING): the
+    self-heal hard-coded estado=PENDIENTE, contradicting `_estado_segun_vinculos`
+    — the single derivation every other estado writer uses. A row whose SECOP
+    link survives the repair must read DETECTADO, not PENDIENTE."""
+    user = test_user["user"]
+    cuenta1 = await _make_cuenta(db, contrato, mes=1)
+
+    sdoc = SecopDocumento(
+        id_documento_secop="DOC-SELFHEAL",
+        numero_contrato=contrato.numero_contrato,
+        nombre_archivo="cedula.pdf",
+        descripcion="Cédula",
+        datos_raw={},
+    )
+    doc_malo = DocumentoFuente(
+        usuario_id=user.id,
+        contrato_id=contrato.id,
+        cuenta_cobro_id=cuenta1.id,  # out of tier for nivel-contrato CEDULA
+        storage_key="k/cedula-mala",
+        nombre="cedula-vieja.pdf",
+        tipo=TipoDocumentoFuente.CEDULA,
+    )
+    db.add_all([sdoc, doc_malo])
+    await db.flush()
+    fila = DocumentoCuentaCobro(
+        cuenta_cobro_id=cuenta1.id,
+        requisito_codigo="CEDULA",
+        estado=EstadoRequisito.CARGADO,
+        documento_fuente_id=doc_malo.id,
+        secop_documento_id=sdoc.id,
+    )
+    db.add(fila)
+    await db.flush()
+    db.add(DocumentoRequisitoVinculo(documento_cuenta_cobro_id=fila.id, documento_fuente_id=doc_malo.id))
+    db.add(DocumentoRequisitoVinculo(documento_cuenta_cobro_id=fila.id, secop_documento_id=sdoc.id))
+    await db.commit()
+
+    await checklist_service.auto_vincular_documentos_fuente(db, cuenta1)
+    await db.commit()
+    await db.refresh(fila)
+
+    assert fila.documento_fuente_id is None
+    assert fila.secop_documento_id == sdoc.id
+    assert fila.estado == EstadoRequisito.DETECTADO
 
 
 @pytest.mark.parametrize("estado", [EstadoRequisito.NO_APLICA, EstadoRequisito.CUMPLIDO_MANUAL])
