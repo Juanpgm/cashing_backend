@@ -531,6 +531,16 @@ async def descubrir_evidencias(
             contrato_contexto["entidad"] = contrato.entidad
         if contrato.objeto:
             contrato_contexto["objeto"] = contrato.objeto
+    # Round-3 fix (confirmed WARNING): `evidence_filter_node` reads
+    # `contrato_ctx.get("supervisor_email")` to derive `supervisor_domain` (the
+    # layer-2 rescue for a supervisor writing from a non-institutional
+    # domain), but this key was never written into `contrato_contexto` — it
+    # was ONLY ever passed to the query builders (`_gather_email_evidence`).
+    # That made the key `None` on every production call, silently reverting
+    # the layer-1 rescue one layer later. Also feeds `contract_header`'s
+    # "Supervisor: <email>" line for the LLM noise-classification prompt.
+    if req.supervisor_email:
+        contrato_contexto["supervisor_email"] = req.supervisor_email
 
     # Contexto libre del usuario ("qué hice este mes") — cargado aquí (antes de
     # la expansión semántica) porque alimenta AMBAS cosas: expand_search_terms

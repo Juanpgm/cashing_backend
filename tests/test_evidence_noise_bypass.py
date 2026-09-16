@@ -154,6 +154,32 @@ def test_work_noise_rubric_mentions_the_contract_number_and_entidad_domain():
     assert "entidad" in lowered
 
 
+def test_contract_header_emits_the_supervisor_email_the_rubric_asks_the_model_to_match():
+    """WARNING regression: the rubric tells the model to match the sender's
+    domain against "la Entidad contratante o su supervisión/interventoría",
+    but `contract_header` never rendered a supervisor field — the model was
+    left to guess a domain it could not see. Now `supervisor_email` (already
+    threaded into `contrato_contexto` by `descubrir_evidencias`) reaches the
+    shared header used by the noise-classification prompt."""
+    from app.agent.prompts.contract_terms import contract_header
+
+    header = contract_header(
+        {
+            "numero_contrato": "4161.0.32.1-2024",
+            "entidad": "Alcaldia de Santiago de Cali - DAGMA",
+            "supervisor_email": "ana.perez@interventoria-consorcio.com",
+        }
+    )
+    assert "ana.perez@interventoria-consorcio.com" in header
+
+
+def test_contract_header_omits_the_supervisor_line_when_absent():
+    from app.agent.prompts.contract_terms import contract_header
+
+    header = contract_header({"numero_contrato": "4161.0.32.1-2024"})
+    assert "Supervisor:" not in header
+
+
 @pytest.mark.asyncio
 async def test_filter_node_passes_sender_into_the_llm_batch(monkeypatch):
     from app.agent.nodes import evidence_filter as mod

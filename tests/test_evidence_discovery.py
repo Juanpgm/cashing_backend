@@ -1509,3 +1509,83 @@ async def test_descubrir_evidencias_local_only_false_still_requires_provider_gat
         pytest.raises(ExternalServiceError),
     ):
         await eds.descubrir_evidencias(MagicMock(), uuid.uuid4(), req, local_only=False)
+
+
+@pytest.mark.asyncio
+async def test_descubrir_evidencias_writes_supervisor_email_into_contrato_contexto() -> None:
+    """WARNING regression: `evidence_filter_node` reads
+    `contrato_ctx.get("supervisor_email")` to derive `supervisor_domain` (the
+    layer-2 rescue for a supervisor writing from a non-institutional domain),
+    but `descubrir_evidencias` never wrote that key into `contrato_contexto` —
+    so the key was `None` on every production call and the layer-1 rescue at
+    the service pre-filter was silently reverted one layer later. Verified by
+    inspecting the actual state `evidence_filter_node` receives."""
+    from app.agent.nodes import evidence_filter as filter_mod
+    from app.services import evidence_discovery_service as eds
+
+    req = EvidenceDiscoveryRequest(
+        obligaciones=[{"id": "ob1", "descripcion": "Entregar informe mensual de actividades del contrato"}],
+        fecha_inicio="2024-04-01",
+        fecha_fin="2024-04-30",
+        supervisor_email="supervisor@interventoria-consorcio.com",
+    )
+
+    gmail = MagicMock()
+    gmail.search_messages = AsyncMock(return_value=[])
+    drive_adapter = MagicMock()
+    drive_adapter.search_files = AsyncMock(return_value=[])
+    cal_adapter = MagicMock()
+    cal_adapter.search_events = AsyncMock(return_value=[])
+
+    captured_state: dict = {}
+    real_filter_node = filter_mod.evidence_filter_node
+
+    async def _spy(state):
+        captured_state.update(state)
+        return await real_filter_node(state)
+
+    only_google, only_google_statuses = _patch_only_google_connected(eds)
+    with (
+        only_google,
+        only_google_statuses,
+        patch.object(eds, "GmailAdapter", return_value=gmail),
+        patch("app.agent.nodes.drive_fetch.DriveAdapter", return_value=drive_adapter),
+        patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", return_value=cal_adapter),
+        patch.object(eds, "evidence_filter_node", side_effect=_spy),
+    ):
+        await eds.descubrir_evidencias(MagicMock(), uuid.uuid4(), req)
+
+    assert captured_state.get("contrato_contexto", {}).get("supervisor_email") == (
+        "supervisor@interventoria-consorcio.com"
+    )
+
+
+@pytest.mark.asyncio
+async def test_service_prefilter_and_filter_node_reach_identical_verdicts_for_supervisor_mail() -> None:
+    """Regression for the layer-1/layer-2 divergence: a supervisor writing from
+    a non-institutional domain with an auto-prefix address must be KEPT by
+    both the service pre-filter (`score_non_personal_email`) and
+    `evidence_filter_node`'s heuristic layer, given the same
+    `contrato_contexto`."""
+    from app.agent.nodes.evidence_filter import _heuristic_is_noise
+    from app.agent.prompts.evidence_filter import score_non_personal_email
+
+    numero_variants = ["4161.010.26.1.027.2025"]
+    supervisor_email = "supervisor@interventoria-consorcio.com"
+    supervisor_domain = supervisor_email.split("@")[-1]
+    sender = "notificaciones@interventoria-consorcio.com"
+    subject = "Seguimiento contrato - entrega de informe"
+
+    service_score, _reason = score_non_personal_email(
+        sender, subject, [], {}, supervisor_domain=supervisor_domain, contains_contract_number=False
+    )
+    item = {
+        "source": "email",
+        "title": subject,
+        "content": "adjunto seguimiento",
+        "metadata": {"sender": sender, "labels": [], "headers": {}},
+    }
+    node_is_noise = _heuristic_is_noise(item, numero_variants=numero_variants, supervisor_domain=supervisor_domain)
+
+    assert service_score < 3, "service pre-filter dropped legitimate supervisor mail"
+    assert node_is_noise is False, "evidence_filter_node reversed the service pre-filter's supervisor rescue"

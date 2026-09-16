@@ -177,6 +177,16 @@ def contract_header(contexto: dict[str, object] | None) -> str:
     if isinstance(entidad, str) and entidad.strip():
         lines.append(f"Entidad: {entidad.strip()}")
 
+    # Round-3 fix (confirmed WARNING): the noise-classification rubric asks
+    # the model to match the sender's domain against "la Entidad contratante o
+    # su supervisión/interventoría", but no field carried the supervisor's
+    # address — the model was left to guess. `supervisor_email` is a
+    # documented `EvidenceDiscoveryRequest` field, already threaded into
+    # `contrato_contexto` (see `descubrir_evidencias`).
+    supervisor_email = contexto.get("supervisor_email")
+    if isinstance(supervisor_email, str) and supervisor_email.strip():
+        lines.append(f"Supervisor: {supervisor_email.strip()}")
+
     objeto = contexto.get("objeto")
     if isinstance(objeto, str) and objeto.strip():
         objeto_str = objeto.strip()
