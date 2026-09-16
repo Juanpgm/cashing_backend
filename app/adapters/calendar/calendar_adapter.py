@@ -30,6 +30,21 @@ from app.adapters.google_errors import (
 logger = structlog.get_logger("adapters.calendar")
 
 
+def _extract_hangout_link(raw: dict[str, Any]) -> str:
+    """Google hangoutLink, or the first "video" entryPoint in conferenceData
+    when hangoutLink itself is absent — Meet links used to never surface
+    because only htmlLink was ever captured (evidencias/discovery-fix root
+    cause #5)."""
+    hangout = raw.get("hangoutLink") or ""
+    if hangout:
+        return str(hangout)
+    conference = raw.get("conferenceData") or {}
+    for entry_point in conference.get("entryPoints") or []:
+        if entry_point.get("entryPointType") == "video" and entry_point.get("uri"):
+            return str(entry_point["uri"])
+    return ""
+
+
 def _parse_event(raw: dict[str, Any]) -> CalendarEvent:
     """Map a raw Google Calendar event resource to the neutral `CalendarEvent`."""
     start = raw.get("start") or {}
@@ -63,6 +78,7 @@ def _parse_event(raw: dict[str, Any]) -> CalendarEvent:
         attendees=attendees,
         organizer_email=organizer.get("email"),
         event_type=raw.get("eventType") or "default",
+        hangout_link=_extract_hangout_link(raw),
     )
 
 

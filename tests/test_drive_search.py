@@ -127,6 +127,47 @@ async def test_search_files_escapes_quote_and_backslash_in_keyword():
 
 
 @pytest.mark.asyncio
+async def test_search_files_includes_shared_drives_params():
+    """Files living in a Shared Drive (common for entity-provisioned Workspace
+    accounts) are invisible to search_files without these three params —
+    evidencias/discovery-fix root cause #4."""
+    from app.adapters.drive.drive_adapter import DriveAdapter
+
+    service = _fake_drive_service([])
+    adapter = DriveAdapter(db=MagicMock())
+    adapter._auth.get_credentials = AsyncMock(return_value=MagicMock())
+
+    with patch.object(adapter, "_build_service", return_value=service):
+        await adapter.search_files(uuid.uuid4(), DriveQuery(keywords=["informe"]))
+
+    _, kwargs = service.files.return_value.list.call_args
+    assert kwargs["includeItemsFromAllDrives"] is True
+    assert kwargs["supportsAllDrives"] is True
+    assert kwargs["corpora"] == "allDrives"
+
+
+@pytest.mark.asyncio
+async def test_search_files_date_from_matches_created_or_modified():
+    """A file created (not modified) after date_from must still match — the old
+    modifiedTime-only clause missed files uploaded once and never touched again."""
+    from app.adapters.drive.drive_adapter import DriveAdapter
+
+    service = _fake_drive_service([])
+    adapter = DriveAdapter(db=MagicMock())
+    adapter._auth.get_credentials = AsyncMock(return_value=MagicMock())
+
+    query = DriveQuery(keywords=["informe"], date_from=datetime(2024, 4, 1))
+    with patch.object(adapter, "_build_service", return_value=service):
+        await adapter.search_files(uuid.uuid4(), query)
+
+    _, kwargs = service.files.return_value.list.call_args
+    q = kwargs["q"]
+    assert "createdTime >= '2024-04-01T00:00:00'" in q
+    assert "modifiedTime >= '2024-04-01T00:00:00'" in q
+    assert " or " in q
+
+
+@pytest.mark.asyncio
 async def test_search_files_no_keywords_omits_name_clause():
     """An empty keyword list (e.g. the 'most recent files' probe) adds no name/fullText clause."""
     from app.adapters.drive.drive_adapter import DriveAdapter

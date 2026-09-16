@@ -15,6 +15,7 @@ import structlog
 from app.adapters.calendar.calendar_adapter import GoogleCalendarAdapter
 from app.adapters.calendar.port import CalendarEvent
 from app.adapters.microsoft.graph_adapter import MicrosoftGraphAdapter
+from app.agent.prompts.contract_terms import contract_number_variants
 from app.agent.prompts.email_evidence import _extract_keywords
 from app.agent.state import AgentState
 from app.core.config import settings
@@ -49,6 +50,12 @@ def _build_calendar_query(obligaciones: list[dict]) -> str | None:
     obligaciones, esto combina keywords de cada obligación (no solo las primeras
     3) y solo capa el TOTAL de términos combinados (MAX_TERMS_TOTAL), tras
     deduplicar, para no producir una query desmesuradamente larga.
+
+    Kept for backward compatibility (still exported/tested); superseded by
+    `_calendar_terms` for the actual per-term fan-out `calendar_fetch_node`
+    now does (root cause #5, evidencias/discovery-fix): joining every keyword
+    into ONE query made Google AND them together, matching nothing once more
+    than 1-2 terms combined.
     """
     keywords: list[str] = []
     for ob in obligaciones:
@@ -56,6 +63,24 @@ def _build_calendar_query(obligaciones: list[dict]) -> str | None:
         keywords.extend(_extract_keywords(desc)[:2])
     unique = list(dict.fromkeys(keywords))[:MAX_TERMS_TOTAL]
     return " ".join(unique) if unique else None
+
+
+def _calendar_terms(contrato: dict, obligaciones: list[dict]) -> list[str]:
+    """One short term per Calendar API call — contract-number variants and
+    entidad first (strongest signals), then obligación keywords, bounded by
+    `EVIDENCE_MAX_CALENDAR_TERMS`."""
+    terms: list[str] = list(contract_number_variants(contrato.get("numero_contrato")))
+
+    entidad = contrato.get("entidad")
+    if entidad and len(str(entidad).strip()) > 3:
+        terms.append(str(entidad).strip())
+
+    for ob in obligaciones:
+        desc = ob.get("descripcion") or ""
+        terms.extend(_extract_keywords(desc)[:2])
+
+    unique = list(dict.fromkeys(t for t in terms if t))
+    return unique[: settings.EVIDENCE_MAX_CALENDAR_TERMS]
 
 
 def _extract_event_metadata(event: CalendarEvent) -> dict:
@@ -75,6 +100,25 @@ def _extract_event_metadata(event: CalendarEvent) -> dict:
     }
 
 
+def _event_content(ev: CalendarEvent) -> str:
+    """Fold summary + description + location + attendee emails into one text
+    blob for keyword/LLM scoring — location and attendees were previously
+    discarded entirely (evidencias/discovery-fix root cause #5)."""
+    parts = [ev.summary or "(evento sin título)", ev.description or ""]
+    if ev.location:
+        parts.append(f"Lugar: {ev.location}")
+    attendee_emails = ", ".join(a.email for a in ev.attendees if a.email)
+    if attendee_emails:
+        parts.append(f"Asistentes: {attendee_emails}")
+    return ". ".join(p for p in parts if p).strip()
+
+
+def _event_link(ev: CalendarEvent) -> str:
+    """Prefer the Meet URL when present — a Meet link is stronger contractual
+    evidence (a real meeting happened) than the bare Calendar event page."""
+    return ev.hangout_link or ev.html_link
+
+
 async def calendar_fetch_node(
     state: AgentState, provider: IntegrationProvider = IntegrationProvider.GOOGLE
 ) -> AgentState:
@@ -87,6 +131,14 @@ async def calendar_fetch_node(
     are APPENDED to any `calendar_evidencias` already in `state` — so calling this
     once per connected provider (evidence_discovery_service.descubrir_evidencias)
     merges every provider's events instead of the last call clobbering the rest.
+
+    Fires ONE short query per term (contract-number variants, entidad,
+    obligación keywords — see `_calendar_terms`) instead of ANDing every term
+    into a single query, which matched nothing once more than 1-2 terms
+    combined (root cause #5, evidencias/discovery-fix). Results are merged by
+    event id across terms. A term with no results/an error is skipped —
+    isolated per-term the same way drive_fetch_node isolates per-query
+    failures — so one bad term never drops evidence another term found.
     """
     existing: list[dict] = state.get("calendar_evidencias") or []
 
@@ -102,37 +154,58 @@ async def calendar_fetch_node(
         return {**state, "calendar_evidencias": existing}
 
     obligaciones = state.get("obligaciones_contexto") or []
-    q = _build_calendar_query(obligaciones)
+    terms = _calendar_terms(contrato, obligaciones)
+    queries: list[str | None] = list(terms) if terms else [None]
 
     adapter = GoogleCalendarAdapter(db) if provider == IntegrationProvider.GOOGLE else MicrosoftGraphAdapter(db)
-    try:
-        events = await adapter.search_events(user_id, time_min, time_max, max_results=settings.EVIDENCE_MAX_EVENTS, q=q)
-    except Exception as exc:
-        await logger.aerror("calendar_fetch_error", error=str(exc), user_id=str(user_id), provider=provider.value)
+
+    events_by_id: dict[str, CalendarEvent] = {}
+    any_call_succeeded = False
+    last_error: Exception | None = None
+    for q in queries:
+        try:
+            events = await adapter.search_events(
+                user_id, time_min, time_max, max_results=settings.EVIDENCE_MAX_EVENTS, q=q
+            )
+        except Exception as exc:
+            last_error = exc
+            await logger.awarning(
+                "calendar_query_failed", query=q, error=str(exc), user_id=str(user_id), provider=provider.value
+            )
+            continue
+        any_call_succeeded = True
+        for ev in events:
+            events_by_id.setdefault(ev.id, ev)
+
+    if not any_call_succeeded and last_error is not None:
+        await logger.aerror(
+            "calendar_fetch_error", error=str(last_error), user_id=str(user_id), provider=provider.value
+        )
         return {
             **state,
             "calendar_evidencias": existing,
-            "error": f"Error leyendo Calendar ({provider.value}): {exc}. Verifica que tu cuenta esté conectada.",
+            "error": f"Error leyendo Calendar ({provider.value}): {last_error}. Verifica que tu cuenta esté conectada.",
         }
 
-    calendar_evidencias = []
-    for ev in events:
-        summary = ev.summary or "(evento sin título)"
-        description = ev.description or ""
-        calendar_evidencias.append(
-            {
-                "source": "calendar",
-                "title": summary,
-                "content": f"{summary}. {description}".strip(),
-                "link": ev.html_link,
-                "date": _event_start(ev),
-                "event_id": ev.id,
-                "metadata": _extract_event_metadata(ev),
-                "provider": provider.value,
-            }
-        )
+    calendar_evidencias = [
+        {
+            "source": "calendar",
+            "title": ev.summary or "(evento sin título)",
+            "content": _event_content(ev),
+            "link": _event_link(ev),
+            "date": _event_start(ev),
+            "event_id": ev.id,
+            "metadata": _extract_event_metadata(ev),
+            "provider": provider.value,
+        }
+        for ev in events_by_id.values()
+    ]
 
     await logger.ainfo(
-        "calendar_fetch_complete", user_id=str(user_id), events=len(calendar_evidencias), q=q, provider=provider.value
+        "calendar_fetch_complete",
+        user_id=str(user_id),
+        events=len(calendar_evidencias),
+        terms=terms,
+        provider=provider.value,
     )
     return {**state, "calendar_evidencias": existing + calendar_evidencias}

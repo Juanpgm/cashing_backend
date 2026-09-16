@@ -14,6 +14,7 @@ import structlog
 from app.adapters.drive.drive_adapter import DriveAdapter
 from app.adapters.drive.port import DriveQuery
 from app.adapters.microsoft.graph_adapter import MicrosoftGraphAdapter
+from app.agent.prompts.contract_terms import contract_number_variants
 from app.agent.prompts.email_evidence import _extract_keywords
 from app.agent.state import AgentState
 from app.core.config import settings
@@ -23,7 +24,6 @@ logger = structlog.get_logger("agent.nodes.drive_fetch")
 
 # Términos genéricos de evidencia documental en la función pública.
 _GENERIC_TERMS = ("informe", "acta", "entrega", "soporte", "reporte")
-MAX_FILES_PER_QUERY = 10
 
 
 def _to_drive_datetime(date_str: str, end_of_day: bool = False) -> datetime | None:
@@ -39,17 +39,23 @@ def build_drive_queries(
     descripcion: str,
     fecha_inicio: str,
     fecha_fin: str,
+    extra_terms: list[str] | None = None,
 ) -> list[DriveQuery]:
     """Construye `DriveQuery` para buscar evidencia de una obligación en Drive.
 
     Args:
         descripcion: Texto de la obligación.
         fecha_inicio / fecha_fin: YYYY-MM-DD del período a cubrir.
+        extra_terms: términos de mayor prioridad que las keywords de la
+            obligación (p.ej. variantes del número de contrato) — se listan
+            PRIMERO, antes de las keywords propias de la obligación.
 
     Returns:
-        Una `DriveQuery` por keyword extraída (hasta 3) más una por término
-        genérico — misma granularidad que las queries crudas pre-refactor, para
-        preservar el truncado `EVIDENCE_QUERIES_PER_OBLIGACION` sin cambios.
+        `extra_terms` + una `DriveQuery` por keyword extraída (hasta 3) + una
+        por término genérico — en ese orden. `drive_fetch_node` es quien
+        decide qué parte del resultado cae bajo `EVIDENCE_QUERIES_PER_OBLIGACION`
+        (los términos genéricos SIEMPRE se incluyen, nunca se truncan — ver su
+        docstring).
     """
     date_from = _to_drive_datetime(fecha_inicio)
     date_to = _to_drive_datetime(fecha_fin, end_of_day=True)
@@ -60,10 +66,18 @@ def build_drive_queries(
             date_from=date_from,
             date_to=date_to,
             exclude_folders=True,
-            max_results=MAX_FILES_PER_QUERY,
+            max_results=settings.EVIDENCE_DRIVE_PAGE_SIZE,
         )
 
-    queries = [_query(kw.replace("'", "")) for kw in _extract_keywords(descripcion)[:3]]
+    priority_terms = list(extra_terms or [])
+    seen: set[str] = set(priority_terms)
+    for kw in _extract_keywords(descripcion)[:3]:
+        term = kw.replace("'", "")
+        if term not in seen:
+            seen.add(term)
+            priority_terms.append(term)
+
+    queries = [_query(term) for term in priority_terms]
     queries.extend(_query(term) for term in _GENERIC_TERMS)
     return queries
 
@@ -92,21 +106,31 @@ async def drive_fetch_node(state: AgentState, provider: IntegrationProvider = In
     obligaciones = state.get("obligaciones_contexto") or []
     fecha_inicio = str(contrato.get("fecha_inicio", ""))
     fecha_fin = str(contrato.get("fecha_fin", ""))
+    numero_variants = contract_number_variants(contrato.get("numero_contrato"))
 
     # Construir queries: por obligación si existen, si no genéricas.
     max_obligaciones = settings.EVIDENCE_MAX_OBLIGACIONES_QUERIES
     obligaciones_para_query = obligaciones if max_obligaciones <= 0 else obligaciones[:max_obligaciones]
 
+    n_generic = len(_GENERIC_TERMS)
+
+    def _split_priority_and_generic(descripcion: str) -> list[DriveQuery]:
+        """Cap the priority section (contract-number variants + obligación
+        keywords) by EVIDENCE_QUERIES_PER_OBLIGACION, but ALWAYS keep every
+        generic-term query — they used to be sliced away entirely once an
+        obligación yielded >= N keywords (evidencias/discovery-fix root
+        cause #4, pinned by test_drive_fetch_generic_terms_always_included...).
+        """
+        all_queries = build_drive_queries(descripcion, fecha_inicio, fecha_fin, extra_terms=numero_variants)
+        priority, generic = all_queries[:-n_generic], all_queries[-n_generic:]
+        return priority[: settings.EVIDENCE_QUERIES_PER_OBLIGACION] + generic
+
     queries: list[DriveQuery] = []
     if obligaciones:
         for oblig in obligaciones_para_query:
-            queries.extend(
-                build_drive_queries(str(oblig.get("descripcion", "")), fecha_inicio, fecha_fin)[
-                    : settings.EVIDENCE_QUERIES_PER_OBLIGACION
-                ]
-            )
+            queries.extend(_split_priority_and_generic(str(oblig.get("descripcion", ""))))
     else:
-        queries = build_drive_queries(state.get("user_input", ""), fecha_inicio, fecha_fin)
+        queries = _split_priority_and_generic(state.get("user_input", ""))
 
     # Deduplicar queries preservando orden (DriveQuery no es hasheable: se usa
     # una tupla normalizada de sus campos como clave).

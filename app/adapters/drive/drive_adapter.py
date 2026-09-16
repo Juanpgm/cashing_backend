@@ -283,6 +283,12 @@ class DriveAdapter:
                     pageSize=query.max_results,
                     orderBy="modifiedTime desc",
                     fields="files(id,name,mimeType,size,createdTime,modifiedTime,webViewLink,webContentLink,parents)",
+                    # Files living in a Shared Drive (common for entity-provisioned
+                    # Workspace accounts) are otherwise invisible to this search
+                    # entirely — evidencias/discovery-fix root cause #4.
+                    includeItemsFromAllDrives=True,
+                    supportsAllDrives=True,
+                    corpora="allDrives",
                 )
                 .execute()
             )
@@ -302,7 +308,12 @@ class DriveAdapter:
             or_clause = " or ".join(f"name contains '{kw}' or fullText contains '{kw}'" for kw in safe_terms)
             parts.append(f"({or_clause})")
         if query.date_from:
-            parts.append(f"modifiedTime >= '{query.date_from.isoformat()}'")
+            # OR createdTime/modifiedTime: a file uploaded once and never
+            # touched again only ever satisfies createdTime — the old
+            # modifiedTime-only clause silently missed it (evidencias/
+            # discovery-fix root cause #4).
+            from_iso = query.date_from.isoformat()
+            parts.append(f"(createdTime >= '{from_iso}' or modifiedTime >= '{from_iso}')")
         if query.date_to:
             parts.append(f"modifiedTime <= '{query.date_to.isoformat()}'")
         if query.exclude_folders:

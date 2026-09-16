@@ -75,16 +75,14 @@ async def test_drive_fetch_dedupes_files_across_queries():
 
 
 @pytest.mark.asyncio
-async def test_drive_fetch_truncation_keeps_keyword_queries_over_generic_terms(monkeypatch):
-    """`drive_fetch_node`'s truncation only behaves correctly because keyword-derived
-    queries are listed before generic-term ones in `build_drive_queries` — pin that order
-    so a future reordering there breaks this test instead of silently degrading evidence.
-    """
+async def test_drive_fetch_generic_terms_always_included_even_when_budget_is_tight(monkeypatch):
+    """Generic evidence terms (informe/acta/entrega/soporte/reporte) must ALWAYS
+    run, even when EVIDENCE_QUERIES_PER_OBLIGACION only allows one keyword-derived
+    query — they used to be sliced away entirely once an obligación yielded >= N
+    keywords (evidencias/discovery-fix root cause #4)."""
     from app.agent.nodes import drive_fetch as mod
     from app.agent.nodes.drive_fetch import _GENERIC_TERMS
 
-    # Fewer slots than the 3 keyword + 5 generic queries build_drive_queries can produce
-    # for a single obligación, so the slice at the drive_fetch_node call site is exercised.
     monkeypatch.setattr(mod.settings, "EVIDENCE_QUERIES_PER_OBLIGACION", 1)
 
     mock_adapter = MagicMock()
@@ -100,9 +98,64 @@ async def test_drive_fetch_truncation_keeps_keyword_queries_over_generic_terms(m
     with patch.object(mod, "DriveAdapter", return_value=mock_adapter):
         await mod.drive_fetch_node(state)
 
-    called_keywords = [call.args[1].keywords[0] for call in mock_adapter.search_files.call_args_list]
-    assert len(called_keywords) == 1
-    assert called_keywords[0] not in _GENERIC_TERMS
+    called_terms = [call.args[1].keywords[0] for call in mock_adapter.search_files.call_args_list]
+    non_generic = [t for t in called_terms if t not in _GENERIC_TERMS]
+    assert len(non_generic) == 1  # capped by the setting
+    for term in _GENERIC_TERMS:
+        assert term in called_terms  # never sliced away
+
+
+@pytest.mark.asyncio
+async def test_drive_fetch_queries_contract_number_variants_first(monkeypatch):
+    """When contrato_contexto carries numero_contrato, its variants must be
+    queried — and ordered ahead of the obligación's own keywords."""
+    from app.agent.nodes import drive_fetch as mod
+
+    monkeypatch.setattr(mod.settings, "EVIDENCE_QUERIES_PER_OBLIGACION", 1)
+
+    mock_adapter = MagicMock()
+    mock_adapter.search_files = AsyncMock(return_value=[])
+
+    state = {
+        "user_id": uuid.uuid4(),
+        "_db": MagicMock(),
+        "contrato_contexto": {
+            "fecha_inicio": "2024-04-01",
+            "fecha_fin": "2024-04-30",
+            "numero_contrato": "4161.010.26.1.027.2025",
+        },
+        "obligaciones_contexto": [{"id": "ob1", "descripcion": "Entregar informe mensual de actividades"}],
+    }
+
+    with patch.object(mod, "DriveAdapter", return_value=mock_adapter):
+        await mod.drive_fetch_node(state)
+
+    called_terms = [call.args[1].keywords[0] for call in mock_adapter.search_files.call_args_list]
+    # The single keyword-budget slot went to the contract number, not the obligación keyword.
+    assert called_terms[0] == "4161.010.26.1.027.2025"
+
+
+@pytest.mark.asyncio
+async def test_drive_fetch_uses_settings_page_size(monkeypatch):
+    from app.agent.nodes import drive_fetch as mod
+
+    monkeypatch.setattr(mod.settings, "EVIDENCE_DRIVE_PAGE_SIZE", 33)
+
+    mock_adapter = MagicMock()
+    mock_adapter.search_files = AsyncMock(return_value=[])
+
+    state = {
+        "user_id": uuid.uuid4(),
+        "_db": MagicMock(),
+        "contrato_contexto": {"fecha_inicio": "2024-04-01", "fecha_fin": "2024-04-30"},
+        "obligaciones_contexto": [{"id": "ob1", "descripcion": "Entregar informe mensual de actividades"}],
+    }
+
+    with patch.object(mod, "DriveAdapter", return_value=mock_adapter):
+        await mod.drive_fetch_node(state)
+
+    max_results = [call.args[1].max_results for call in mock_adapter.search_files.call_args_list]
+    assert all(n == 33 for n in max_results)
 
 
 @pytest.mark.asyncio
@@ -288,7 +341,7 @@ async def test_calendar_fetch_marks_allday_events():
 
 @pytest.mark.asyncio
 async def test_calendar_fetch_passes_keyword_query():
-    """El node construye una query q desde las obligaciones y la pasa al adapter."""
+    """El node dispara una query por término contra el adapter."""
     from app.agent.nodes import calendar_fetch as mod
 
     mock_adapter = MagicMock()
@@ -304,9 +357,74 @@ async def test_calendar_fetch_passes_keyword_query():
     with patch.object(mod, "GoogleCalendarAdapter", return_value=mock_adapter):
         await mod.calendar_fetch_node(state)
 
+    assert mock_adapter.search_events.await_count >= 1
     call_kwargs = mock_adapter.search_events.call_args.kwargs
     assert "q" in call_kwargs
     assert call_kwargs["q"] is not None  # se construyó una query de keywords
+
+
+@pytest.mark.asyncio
+async def test_calendar_fetch_fires_one_query_per_term_and_merges_by_id():
+    """Root cause #5 (evidencias/discovery-fix): joining ALL keywords into ONE
+    AND-of-everything query matched nothing once more than 1-2 terms combined.
+    Now one short query per term is fired, merging results by event id."""
+    from app.agent.nodes import calendar_fetch as mod
+
+    call_queries: list[str | None] = []
+
+    async def _fake_search(usuario_id, time_min, time_max, calendar_id="primary", max_results=50, q=None):
+        call_queries.append(q)
+        # Same event returned for every term — must be merged, not duplicated.
+        return [CalendarEvent(id="ev1", summary="Reunión de seguimiento", html_link="https://calendar.google.com/ev1")]
+
+    mock_adapter = MagicMock()
+    mock_adapter.search_events = AsyncMock(side_effect=_fake_search)
+
+    state = {
+        "user_id": uuid.uuid4(),
+        "_db": MagicMock(),
+        "contrato_contexto": {
+            "fecha_inicio": "2024-04-01",
+            "fecha_fin": "2024-04-30",
+            "numero_contrato": "4161.010.26.1.027.2025",
+            "entidad": "DAGMA",
+        },
+        "obligaciones_contexto": [{"id": "ob1", "descripcion": "Asistir a reuniones de seguimiento del proyecto"}],
+    }
+
+    with patch.object(mod, "GoogleCalendarAdapter", return_value=mock_adapter):
+        result = await mod.calendar_fetch_node(state)
+
+    assert mock_adapter.search_events.await_count > 1  # more than one term-scoped call
+    assert len(result["calendar_evidencias"]) == 1  # merged by event id, not duplicated
+    assert any(q and "4161" in q for q in call_queries)  # contract number was one of the terms
+
+
+@pytest.mark.asyncio
+async def test_calendar_fetch_bounds_term_count_by_setting(monkeypatch):
+    from app.agent.nodes import calendar_fetch as mod
+
+    monkeypatch.setattr(mod.settings, "EVIDENCE_MAX_CALENDAR_TERMS", 2)
+
+    mock_adapter = MagicMock()
+    mock_adapter.search_events = AsyncMock(return_value=[])
+
+    state = {
+        "user_id": uuid.uuid4(),
+        "_db": MagicMock(),
+        "contrato_contexto": {
+            "fecha_inicio": "2024-04-01",
+            "fecha_fin": "2024-04-30",
+            "numero_contrato": "4161.010.26.1.027.2025",
+            "entidad": "DAGMA",
+        },
+        "obligaciones_contexto": [{"id": "ob1", "descripcion": "Asistir a reuniones de seguimiento del proyecto"}],
+    }
+
+    with patch.object(mod, "GoogleCalendarAdapter", return_value=mock_adapter):
+        await mod.calendar_fetch_node(state)
+
+    assert mock_adapter.search_events.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -315,6 +433,66 @@ async def test_calendar_fetch_no_dates_returns_empty():
 
     result = await calendar_fetch_node({"user_id": uuid.uuid4(), "_db": MagicMock(), "contrato_contexto": {}})
     assert result["calendar_evidencias"] == []
+
+
+@pytest.mark.asyncio
+async def test_calendar_fetch_prefers_hangout_link_and_includes_location_attendees():
+    """Meet links never surfaced before (only html_link was captured) — root
+    cause #5. `link` must prefer the Meet URL when present, and location +
+    attendee emails must be folded into `content` for scoring."""
+    from app.agent.nodes import calendar_fetch as mod
+
+    events = [
+        CalendarEvent(
+            id="ev1",
+            summary="Reunión de seguimiento",
+            description="Revisión de avances",
+            html_link="https://calendar.google.com/event?eid=ev1",
+            location="Sala virtual",
+            hangout_link="https://meet.google.com/abc-defg-hij",
+            start=datetime.fromisoformat("2024-04-15T09:00:00-05:00"),
+            attendees=[CalendarAttendee(email="supervisor@entidad.gov.co", is_self=False)],
+        ),
+    ]
+    mock_adapter = MagicMock()
+    mock_adapter.search_events = AsyncMock(return_value=events)
+
+    state = {
+        "user_id": uuid.uuid4(),
+        "_db": MagicMock(),
+        "contrato_contexto": {"fecha_inicio": "2024-04-01", "fecha_fin": "2024-04-30"},
+        "obligaciones_contexto": [{"id": "ob1", "descripcion": "Asistir a reuniones de seguimiento"}],
+    }
+
+    with patch.object(mod, "GoogleCalendarAdapter", return_value=mock_adapter):
+        result = await mod.calendar_fetch_node(state)
+
+    ev = result["calendar_evidencias"][0]
+    assert ev["link"] == "https://meet.google.com/abc-defg-hij"
+    assert "supervisor@entidad.gov.co" in ev["content"]
+    assert "Sala virtual" in ev["content"]
+
+
+@pytest.mark.asyncio
+async def test_calendar_fetch_falls_back_to_html_link_without_meet():
+    from app.agent.nodes import calendar_fetch as mod
+
+    events = [
+        CalendarEvent(id="ev1", summary="Reunión presencial", html_link="https://calendar.google.com/event?eid=ev1"),
+    ]
+    mock_adapter = MagicMock()
+    mock_adapter.search_events = AsyncMock(return_value=events)
+
+    state = {
+        "user_id": uuid.uuid4(),
+        "_db": MagicMock(),
+        "contrato_contexto": {"fecha_inicio": "2024-04-01", "fecha_fin": "2024-04-30"},
+    }
+
+    with patch.object(mod, "GoogleCalendarAdapter", return_value=mock_adapter):
+        result = await mod.calendar_fetch_node(state)
+
+    assert result["calendar_evidencias"][0]["link"] == "https://calendar.google.com/event?eid=ev1"
 
 
 @pytest.mark.asyncio
@@ -375,6 +553,46 @@ def test_declined_rsvp_is_noise_end_to_end():
     metadata = _extract_event_metadata(event)
 
     assert is_noise_calendar(event.summary, metadata) is True
+
+
+def test_parse_event_extracts_hangout_link():
+    from app.adapters.calendar.calendar_adapter import _parse_event
+
+    raw_event = {
+        "id": "ev-meet",
+        "summary": "Reunión de seguimiento",
+        "start": {"dateTime": "2024-04-15T09:00:00-05:00"},
+        "hangoutLink": "https://meet.google.com/abc-defg-hij",
+    }
+
+    event = _parse_event(raw_event)
+    assert event.hangout_link == "https://meet.google.com/abc-defg-hij"
+
+
+def test_parse_event_extracts_meet_link_from_conference_data_when_no_hangout_link():
+    from app.adapters.calendar.calendar_adapter import _parse_event
+
+    raw_event = {
+        "id": "ev-conf",
+        "summary": "Reunión de seguimiento",
+        "start": {"dateTime": "2024-04-15T09:00:00-05:00"},
+        "conferenceData": {
+            "entryPoints": [
+                {"entryPointType": "phone", "uri": "tel:+1234"},
+                {"entryPointType": "video", "uri": "https://meet.google.com/xyz-uvwq-rst"},
+            ]
+        },
+    }
+
+    event = _parse_event(raw_event)
+    assert event.hangout_link == "https://meet.google.com/xyz-uvwq-rst"
+
+
+def test_parse_event_no_meet_link_defaults_empty():
+    from app.adapters.calendar.calendar_adapter import _parse_event
+
+    event = _parse_event({"id": "ev-plain", "summary": "Reunión presencial"})
+    assert event.hangout_link == ""
 
 
 def test_accepted_rsvp_is_not_noise_end_to_end():
