@@ -1080,6 +1080,36 @@ async def test_construir_checklist_completo_conserva_fila_legacy_con_documento(
     assert "CEDULA" not in payload["resumen"]["lista_pendientes"]
 
 
+async def test_construir_checklist_completo_muestra_custom_mapeado_a_codigo_de_primera_cuota(
+    db: AsyncSession, contrato: Contrato
+) -> None:
+    """checklist/primera-cuota-2026-09-16, round 3, finding #1 (CRITICAL): a
+    custom requisito explicitly mapped to a standard code rule 1 hides
+    (`mapea_a_estandar='RUT'`, own `solo_primera_cuenta=False`) materializes as
+    the standard RUT row — but the read-time filter applied the plain catalog
+    rule, so the row was invisible in EVERY reader (items, resumen, the radicar
+    gate, the constancia seam). Materialized == visible: the mapping must be
+    threaded into the visibility filter too, and the row is a genuine current-
+    cuota requisito, NOT `heredado`."""
+    await _make_cuenta_custom(db, contrato, mes=1)
+    cuenta2 = await _make_cuenta_custom(db, contrato, mes=2)
+    await _make_requisito_custom(
+        db, cuenta2, "RUT_ACTUALIZADO", "RUT actualizado", mapea_a_estandar="RUT", solo_primera_cuenta=False
+    )
+
+    payload = await checklist_service.construir_checklist_completo(db, cuenta2)
+    await db.commit()
+
+    rut_item = next((i for i in payload["items"] if i["requisito"]["codigo"] == "RUT"), None)
+    assert rut_item is not None
+    assert rut_item["heredado"] is False
+    # obligatorio + pendiente + genuinely applies → it must block the radicar gate.
+    assert "RUT" in payload["resumen"]["lista_pendientes"]
+
+    visibles = {f.requisito_codigo for f in await checklist_service.listar_filas_visibles(db, cuenta2)}
+    assert "RUT" in visibles
+
+
 async def test_construir_checklist_completo_contrato_reaparecido_no_desaparece_al_subir_documento(
     db: AsyncSession, contrato: Contrato, test_user: dict[str, Any]
 ) -> None:

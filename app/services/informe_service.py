@@ -1679,6 +1679,13 @@ async def generar_zip_evidencias(
     if not checklist_service._is_first_cuenta(cuenta):
         catalogo = await checklist_service.listar_catalogo(db)
         ctx = await checklist_service._construir_checklist_aplica_ctx(db, cuenta)
+        # Round 3, finding #1: the package must apply the SAME applicability rule
+        # the checklist materializes and displays with — a custom requisito
+        # explicitly mapped to a standard code (`mapea_a_estandar`) is persisted
+        # as that standard row, so ignoring the mapping here both dropped it from
+        # the package and made the LEEME claim it was "ya radicado en la cuota 1"
+        # while the checklist was still asking the user for it.
+        mapeos = checklist_service._mapeos_por_codigo(await checklist_service.listar_requisitos_cuenta(db, cuenta.id))
         filas_por_codigo = {
             f.requisito_codigo: f
             for f in (
@@ -1693,8 +1700,13 @@ async def generar_zip_evidencias(
         for req in catalogo:
             if not req.solo_primera_cuenta:
                 continue
-            if checklist_service.requisito_aplica_a_cuenta(req, ctx):
-                continue  # applies normally on THIS cuenta (nivel-contrato exempt, or CONTRATO rule 2 reappearance)
+            if checklist_service._aplica_con_mapeo(req, ctx, mapeos):
+                # Applies normally on THIS cuenta — nivel-contrato exempt
+                # (FICHA_TECNICA/ACTA_INICIO stay visible on every cuota by
+                # design), CONTRATO's rule-2 reappearance, or an explicit custom
+                # mapping. The package mirrors the checklist: whatever the
+                # checklist asks the user for on this cuota ships with it.
+                continue
             # Round 2, findings #1/#3: a row materialized for THIS cuenta that
             # already carries real content (e.g. CONTRATO reappeared then got
             # its document uploaded — self-defeating the very exception that

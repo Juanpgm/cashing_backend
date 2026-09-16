@@ -1927,6 +1927,58 @@ async def test_zip_incluye_contrato_reaparecido_luego_satisfecho_en_cuota_no_pri
     assert "CONTRATO" not in root
 
 
+def _linea_omision(root: str) -> str:
+    """The LEEME's "Documentos de primera cuota omitidos" line, or "" when the
+    package omitted nothing. A bare `codigo in root` is a weak oracle — the root
+    LEEME can carry the same substring from unrelated lines."""
+    for linea in root.splitlines():
+        if linea.startswith("Documentos de primera cuota omitidos"):
+            return linea
+    return ""
+
+
+async def test_zip_no_declara_omitido_un_custom_mapeado_a_codigo_de_primera_cuota(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """checklist/primera-cuota-2026-09-16, round 3, finding #1 (CRITICAL): the
+    package assembly applied the plain catalog rule too, so a RUT explicitly
+    declared for THIS cuota by a custom mapping was listed in the LEEME as
+    "ya radicado en la cuota 1" — a false statement about a requisito the user
+    is still being asked for."""
+    from app.models.requisito_cuenta import RequisitoCuenta
+    from app.services import checklist_service
+
+    user = test_user["user"]
+    assert cuenta.posicion == PosicionCuota.RECURRENTE
+    cuenta.requisitos_modo = "augment"
+    db.add(
+        RequisitoCuenta(
+            cuenta_cobro_id=cuenta.id,
+            codigo="RUT_ACTUALIZADO",
+            etiqueta="RUT actualizado",
+            obligatorio=True,
+            solo_primera_cuenta=False,
+            keywords_deteccion=[],
+            orden=500,
+            origen="inferido",
+            activo=True,
+            mapea_a_estandar="RUT",
+        )
+    )
+    await db.commit()
+    await checklist_service.asegurar_checklist(db, cuenta)
+    await db.commit()
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: _fake_storage())
+
+    content, _filename = await informe_service.generar_zip_evidencias(db, user.id, cuenta.id)
+
+    with zipfile.ZipFile(io.BytesIO(content)) as zf:
+        root = zf.read("LEEME.txt").decode("utf-8")
+    assert "RUT" not in _linea_omision(root)
+    # Control: a code with no custom mapping is still omitted normally.
+    assert "CEDULA" in _linea_omision(root)
+
+
 # ── Adaptive generation (billing-resilience-templates, slice #6) ───────────
 #
 # Per-organism layout selection, always-draft header, progressive narrative,

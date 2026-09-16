@@ -644,7 +644,7 @@ async def asegurar_checklist(
     codigos_estandar = (
         _codigos_estandar_a_crear(modo, catalogo, custom) if modo != "estandar" else {req.codigo for req in catalogo}
     )
-    mapeos_por_codigo: dict[str, _CustomLike] = {c.mapea_a_estandar: c for c in custom if c.mapea_a_estandar}
+    mapeos_por_codigo = _mapeos_por_codigo(custom)
 
     creadas: list[DocumentoCuentaCobro] = []
 
@@ -2873,6 +2873,7 @@ def _filtrar_filas_visibles(
     filas_todas: list[DocumentoCuentaCobro],
     cat_by_codigo: dict[str, RequisitoDocumento],
     ctx: ChecklistAplicaCtx,
+    mapeos_por_codigo: dict[str, _CustomLike],
 ) -> tuple[list[DocumentoCuentaCobro], set[uuid.UUID]]:
     """Read-time visibility filter shared by `construir_checklist_completo` and
     `listar_filas_visibles` (checklist/primera-cuota-2026-09-16, round 2,
@@ -2886,9 +2887,17 @@ def _filtrar_filas_visibles(
     CEDULA/RUT/RPC/CDP row never drops a real document from every reader.
     Returns `(filas_visibles, heredado_ids)` — `heredado_ids` are rows kept
     ONLY because of content, so callers can flag them and keep them out of
-    `pendientes`. Custom rows always pass through untouched — their
-    `solo_primera_cuenta` gating already happens correctly at materialization
-    time in `asegurar_checklist`.
+    `pendientes`. Custom rows (`requisito_cuenta_id`) always pass through
+    untouched — their `solo_primera_cuenta` gating already happens correctly at
+    materialization time in `asegurar_checklist`.
+
+    `mapeos_por_codigo` ({standard codigo -> custom item mapped to it}) is the
+    SAME map `asegurar_checklist` materializes with, and must be threaded in by
+    every caller (round 3, finding #1): a custom requisito mapped to a standard
+    code is persisted AS that standard row, so applying the plain catalog rule
+    here hid a row the write path had deliberately created — materialized but
+    invisible in every reader, and wrongly flagged `heredado` (hence out of
+    `pendientes`) the moment it acquired a document.
     """
     visibles: list[DocumentoCuentaCobro] = []
     heredado_ids: set[uuid.UUID] = set()
@@ -2896,13 +2905,20 @@ def _filtrar_filas_visibles(
         if f.requisito_codigo is None or f.requisito_codigo not in cat_by_codigo:
             visibles.append(f)
             continue
-        if requisito_aplica_a_cuenta(cat_by_codigo[f.requisito_codigo], ctx):
+        if _aplica_con_mapeo(cat_by_codigo[f.requisito_codigo], ctx, mapeos_por_codigo):
             visibles.append(f)
             continue
         if _fila_tiene_contenido(f):
             visibles.append(f)
             heredado_ids.add(f.id)
     return visibles, heredado_ids
+
+
+def _mapeos_por_codigo(custom: Sequence[_CustomLike]) -> dict[str, _CustomLike]:
+    """{standard codigo -> the custom item explicitly mapped to it}. Single
+    helper so the write path (`asegurar_checklist`) and every read path
+    (`_filtrar_filas_visibles`, the radicación package) build it identically."""
+    return {c.mapea_a_estandar: c for c in custom if c.mapea_a_estandar}
 
 
 async def listar_filas_visibles(db: AsyncSession, cuenta: CuentaCobro) -> list[DocumentoCuentaCobro]:
@@ -2921,7 +2937,8 @@ async def listar_filas_visibles(db: AsyncSession, cuenta: CuentaCobro) -> list[D
     res = await db.execute(select(DocumentoCuentaCobro).where(DocumentoCuentaCobro.cuenta_cobro_id == cuenta.id))
     filas_todas = list(res.scalars().all())
     ctx = await _construir_checklist_aplica_ctx(db, cuenta)
-    filas, _heredado_ids = _filtrar_filas_visibles(filas_todas, cat_by_codigo, ctx)
+    mapeos = _mapeos_por_codigo(await listar_requisitos_cuenta(db, cuenta.id))
+    filas, _heredado_ids = _filtrar_filas_visibles(filas_todas, cat_by_codigo, ctx, mapeos)
     return filas
 
 
@@ -2979,7 +2996,9 @@ async def construir_checklist_completo(
     # (flagged `heredado`). Custom rows are untouched here — their
     # `solo_primera_cuenta` gating already happens correctly at materialization
     # time in `asegurar_checklist` (rule 3), so no old bug to retroactively fix.
-    filas, heredado_ids = _filtrar_filas_visibles(filas_todas, cat_by_codigo, ctx)
+    filas, heredado_ids = _filtrar_filas_visibles(
+        filas_todas, cat_by_codigo, ctx, _mapeos_por_codigo(custom_list)
+    )
 
     # EVIDENCIAS is derived state: no evidencia-attachment path updates its
     # persisted row, so derive its effective estado from actual coverage —
