@@ -76,6 +76,43 @@ def test_noise_prose_stays_below_the_llm_failure_fallback_bar():
     assert _keyword_score(ob, noise) < _FALLBACK_ACCEPT_THRESHOLD
 
 
+async def test_llm_failure_fallback_uses_keyword_score_not_the_cosine_blended_score():
+    """CRITICAL regression, end-to-end: `_fallback_flags`'s 0.30 bar is
+    documented as keyword overlap, but production fed it the cosine-blended
+    score (`_score` returns `max(keyword, cosine)`). Cosine similarity between
+    two arbitrary Spanish texts is routinely well above 0.30, so on ANY
+    relevance-LLM failure the whole TOP_N slate was accepted with ZERO keyword
+    support whenever embeddings succeeded. Here the obligación and the evidence
+    share no vocabulary at all (`_keyword_score` == 0.0), embeddings are faked
+    to a high cosine, and `complete()` always raises — nothing must match."""
+    from unittest.mock import patch
+
+    from app.agent.nodes import evidence_matcher
+
+    ob_text = "Elaborar informes mensuales de seguimiento a los proyectos asignados"
+    ev_text = "Tu factura de Netflix esta disponible, revisa tu metodo de pago"
+    assert evidence_matcher._keyword_score(ob_text, ev_text) == 0.0
+
+    class _FailingCompleteHighCosineLLM:
+        async def complete(self, messages, **kwargs):
+            raise RuntimeError("provider 503")
+
+        async def embed(self, texts, *, model=None):
+            # Near-parallel vectors -> cosine ~1.0, exactly what real sentence
+            # embeddings of unrelated Spanish text routinely produce.
+            return [[1.0, 0.01] for _ in texts]
+
+    fake = _FailingCompleteHighCosineLLM()
+    state = {
+        "obligaciones_extraidas": [{"id": "ob1", "descripcion": ob_text}],
+        "evidence_raw": [{"id": f"n{i}", "content": ev_text} for i in range(20)],
+    }
+    with patch("app.agent.nodes.evidence_matcher.get_llm", return_value=fake):
+        result = await evidence_matcher.evidence_matcher_node(state)
+
+    assert result["matched_evidence"]["ob1"] == []
+
+
 # ── Contract-number detection ─────────────────────────────────────────────────
 
 
@@ -238,6 +275,54 @@ async def test_genuine_semantic_match_is_not_crowded_out_by_number_bearing_noise
     assert "seguimiento mensual de los proyectos" in fake.batches[0], (
         "the genuine semantic match was crowded out of the LLM slate by number-bearing noise"
     )
+
+
+@pytest.mark.asyncio
+async def test_score_zero_number_bearing_noise_never_displaces_a_higher_scoring_candidate(monkeypatch):
+    """WARNING regression: the 3 reserved number-bearing slots had no score
+    floor at all, so 3 score-0.0 invoices (bare contract-number mention, no
+    semantic overlap) evicted 3 genuinely relevant candidates ranked #6-#8 by
+    score. A priority-1 (bare mention) item with score 0.0 must never reserve
+    a slot that a strictly-higher-scoring candidate would otherwise take."""
+    from app.agent.nodes import evidence_matcher as mod
+
+    fake = _CountingLLM()
+    monkeypatch.setattr(mod, "get_llm", lambda *a, **k: fake)
+
+    ob_keywords = ["informes", "mensuales", "seguimiento", "proyectos", "elaborar"]
+    # 10 DISTINCT semantic candidates (a unique marker keeps them
+    # distinguishable in the rendered prompt) with descending keyword overlap:
+    # counts=[5,5,4,4,3,3,2,2,1,1] -> scores [1.0,1.0,.8,.8,.6,.6,.4,.4,.2,.2].
+    word_counts = [5, 5, 4, 4, 3, 3, 2, 2, 1, 1]
+    semantic = [
+        {
+            "id": f"s{i}",
+            "source": "email",
+            "content": " ".join([*ob_keywords[:n], f"marcador{i}"]),
+        }
+        for i, n in enumerate(word_counts)
+    ]
+    # 3 score-0.0 invoices that only carry the bare contract number.
+    invoices = [
+        {"id": f"inv{i}", "source": "email", "content": f"factura numero {DAGMA_NUMERO} de servicios varios {i}"}
+        for i in range(3)
+    ]
+
+    state = {
+        "obligaciones_extraidas": [{"id": "ob1", "descripcion": OBLIGACION}],
+        "evidence_raw": [*semantic, *invoices],
+        "contrato_contexto": {"numero_contrato": DAGMA_NUMERO},
+    }
+
+    await mod.evidence_matcher_node(state)
+
+    assert fake.calls == 1
+    slate = fake.batches[0]
+    # Top 8 semantic candidates by score (all > 0) must survive — the invoices
+    # carry zero keyword overlap with OBLIGACION and must never displace them.
+    for i in range(8):
+        marker = f"marcador{i}"
+        assert marker in slate, f"a positive-scoring semantic candidate ({marker}) was crowded out"
 
 
 @pytest.mark.asyncio

@@ -419,11 +419,24 @@ def _extract_json_array(raw: str) -> list[object] | None:
     `re.search(r"\\[.*\\]", DOTALL)` is greedy across the WHOLE response, so a
     reasoning preamble mentioning "[1]", a trailing "Nota [1]: ..." or a
     max_tokens-truncated array all defeated it. This walks bracket depth from
-    each candidate opening bracket and, failing that, salvages the complete
-    objects from a truncated array rather than discarding the verdict entirely.
+    EVERY candidate opening bracket (not just the first) and, failing a clean
+    parse, salvages the complete objects from a truncated array rather than
+    discarding the verdict entirely.
+
+    Round-2 REGRESSION fix (confirmed CRITICAL): taking the FIRST balanced
+    array meant a reasoning preamble like "los items [2, 3] parecen
+    relevantes" — routine output from a reasoning model such as
+    `groq/openai/gpt-oss-20b` — was returned instead of the real structured
+    verdict that follows it, silently INVERTING the model's answer. Every
+    balanced array in the text is now collected, and an array whose items are
+    OBJECTS (the structured `{"idx", "relevante", ...}` contract) is always
+    preferred over a bare list of ints, taking the LAST such array so a
+    trailing "Nota [1]: ..." bracket doesn't win either. A bare int array is
+    only trusted when no object array exists anywhere in the response.
     """
     text = re.sub(r"```(?:json)?|```", "", raw).strip()
 
+    candidates: list[list[object]] = []
     for start in (m.start() for m in re.finditer(r"\[", text)):
         depth = 0
         in_string = False
@@ -448,16 +461,23 @@ def _extract_json_array(raw: str) -> list[object] | None:
                     try:
                         parsed = json.loads(text[start : pos + 1])
                     except (ValueError, TypeError):
-                        break
-                    if isinstance(parsed, list):
-                        return parsed
+                        pass
+                    else:
+                        if isinstance(parsed, list):
+                            candidates.append(parsed)
                     break
         else:
             # Ran off the end with brackets still open: the array was truncated.
             salvaged = _salvage_truncated_array(text[start:])
             if salvaged is not None:
-                return salvaged
-    return None
+                candidates.append(salvaged)
+
+    if not candidates:
+        return None
+    object_candidates = [c for c in candidates if any(isinstance(item, dict) for item in c)]
+    if object_candidates:
+        return object_candidates[-1]
+    return candidates[-1]
 
 
 def _salvage_truncated_array(fragment: str) -> list[object] | None:
@@ -600,15 +620,19 @@ async def _match_una_obligacion(
     large contrato doesn't fire dozens of simultaneous provider calls.
     """
 
-    def _score(idx: int, ev: dict) -> float:
-        """PURE similarity — no contract-number bonus. The reported value feeds
-        `confidence_bucket`, so it must stay a similarity measure; the number
-        signal is applied as a reserved slot in the ranking instead."""
+    def _score(idx: int, ev: dict) -> tuple[float, float]:
+        """Returns (keyword_score, blended_score) — PURE similarity, no
+        contract-number bonus. `blended_score` feeds `confidence_bucket`, so it
+        must stay a similarity measure; the number signal is applied as a
+        reserved slot in the ranking instead. `keyword_score` is kept SEPARATE
+        (round-2 CRITICAL fix): the LLM-failure fallback bar
+        (`_FALLBACK_ACCEPT_THRESHOLD`) is documented as keyword overlap, so it
+        must never be compared against the cosine-inflated blended value."""
         kw = _keyword_score(ob_text, ev.get("content", ""))
         cos = None
         if ob_vec is not None and ev_embeddings is not None:
             cos = _cosine_similarity(ob_vec, ev_embeddings[idx])
-        return min(1.0, _blended_score(kw, cos))
+        return kw, min(1.0, _blended_score(kw, cos))
 
     # Step 0: score everything on its OWN semantic merit, and record the
     # contract-number signal separately as a RESERVATION priority rather than
@@ -628,7 +652,7 @@ async def _match_una_obligacion(
     # score stays a pure similarity measure (it feeds `confidence_bucket`), and
     # the LLM still decides relevance.
     scores_dict: dict[str, float] = {}
-    scored_all: list[tuple[dict, float, int]] = []
+    scored_all: list[tuple[dict, float, int, float]] = []
     for idx, ev in enumerate(evidence_raw):
         if _has_strong_contract_number(ev, numero_variants or []):
             priority = 2 if _is_informe_like_document(ev) else 1
@@ -636,7 +660,8 @@ async def _match_una_obligacion(
             priority = 1
         else:
             priority = 0
-        scored_all.append((ev, _score(idx, ev), priority))
+        kw_score, blended = _score(idx, ev)
+        scored_all.append((ev, blended, priority, kw_score))
 
     # Step 1: RANK-based selection, never threshold-based.
     #
@@ -651,8 +676,15 @@ async def _match_una_obligacion(
     reserved_n = min(settings.EVIDENCE_NUMBER_RESERVED_SLOTS, top_n)
 
     by_score = sorted(range(len(scored_all)), key=lambda i: -scored_all[i][1])
+    # Only reserve a slot for a priority hit that is EITHER an informe-like
+    # document (priority 2 — trusted regardless of score) OR carries some
+    # actual semantic/keyword signal (score > 0). Round-2 WARNING fix: a bare
+    # priority-1 contract-number mention with score 0.0 (an invoice, an SMS
+    # notification) used to reserve a slot unconditionally, evicting a
+    # strictly-higher-scoring semantic candidate ranked #6-#8 that `by_score`
+    # would otherwise have chosen.
     reserved = sorted(
-        (i for i in range(len(scored_all)) if scored_all[i][2] > 0),
+        (i for i in range(len(scored_all)) if scored_all[i][2] > 0 and (scored_all[i][2] == 2 or scored_all[i][1] > 0)),
         key=lambda i: (-scored_all[i][2], -scored_all[i][1]),
     )[:reserved_n]
 
@@ -664,16 +696,24 @@ async def _match_una_obligacion(
         if i not in reserved_set:
             chosen.append(i)
 
-    candidates_scored = sorted(((scored_all[i][0], scored_all[i][1]) for i in chosen), key=lambda p: -p[1])
+    candidates_scored = sorted(
+        ((scored_all[i][0], scored_all[i][1], scored_all[i][3]) for i in chosen), key=lambda p: -p[1]
+    )
 
     # Step 2: LLM relevance on the slate — ONE batched call, not one per candidate
     matched_list: list[dict] = []
     if candidates_scored:
-        candidates = [ev for ev, _s in candidates_scored]
-        blended_scores = [s for _ev, s in candidates_scored]
+        candidates = [ev for ev, _s, _kw in candidates_scored]
+        blended_scores = [s for _ev, s, _kw in candidates_scored]
+        # keyword_scores (NOT blended_scores) feeds the LLM-failure fallback bar
+        # (round-2 CRITICAL fix): `_fallback_flags`'s 0.30 bar is documented as
+        # keyword overlap, and comparing it against the cosine-inflated blended
+        # score meant the whole slate was accepted on any relevance-LLM error
+        # whenever embeddings succeeded, regardless of actual keyword support.
+        keyword_scores = [kw for _ev, _s, kw in candidates_scored]
         async with sem:
             flags = await _llm_relevance_batch(
-                ob_text, [ev.get("content", "") for ev in candidates], llm, blended_scores, contrato_contexto
+                ob_text, [ev.get("content", "") for ev in candidates], llm, keyword_scores, contrato_contexto
             )
         matched_list.extend(ev for ev, keep in zip(candidates, flags, strict=True) if keep)
         # Additive: the blended score behind each KEPT match, keyed by the

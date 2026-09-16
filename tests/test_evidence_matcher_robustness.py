@@ -41,8 +41,28 @@ def test_parses_an_array_followed_by_trailing_prose_with_brackets():
 
 
 def test_parses_an_array_preceded_by_a_reasoning_preamble_with_brackets():
-    raw = 'Analizo: el item [1] parece relevante.\n[{"idx": 1, "relevante": true, "score": 0.9}]'
+    """The preamble's numbers must NOT be mistaken for the verdict: this raw
+    response has a preamble bracket list that DISAGREES with the structured
+    array that follows it (round-2 CRITICAL regression — taking the FIRST
+    balanced array returned the preamble `[2, 3]` as a legacy flat-index list,
+    inverting the model's actual verdict)."""
+    raw = "Analizo: los items [2, 3] parecen relevantes.\n" '[{"idx": 1, "relevante": true, "score": 0.9}]'
+    assert _parse_relevance_response(raw, 3) == [True, False, False]
+
+
+def test_extracts_the_last_object_array_when_multiple_bracket_runs_are_present():
+    """Mirrors a realistic non-contrived model reply: 'Veo 2 items. El [2] no
+    aplica.' followed by the real structured verdict — the bracketed mention in
+    the prose must never be treated as the answer."""
+    raw = 'Veo 2 items. El [2] no aplica.\n[{"idx":1,"relevante":true,"score":0.95},{"idx":2,"relevante":false}]'
     assert _parse_relevance_response(raw, 2) == [True, False]
+
+
+def test_bare_int_array_is_only_accepted_when_no_object_array_exists_anywhere():
+    """No object array anywhere in the text: the legacy flat-index format is the
+    only signal available, so it must still be honored."""
+    raw = "Analizo la lista.\n[1, 3]"
+    assert _parse_relevance_response(raw, 3) == [True, False, True]
 
 
 def test_recovers_the_complete_objects_from_a_truncated_array():
