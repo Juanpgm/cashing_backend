@@ -459,7 +459,7 @@ async def descubrir_evidencias(
         if cached is not None:
             return cached
 
-    contrato_contexto: dict[str, str] = {"fecha_inicio": fecha_inicio, "fecha_fin": fecha_fin}
+    contrato_contexto: dict[str, str | int | float | None] = {"fecha_inicio": fecha_inicio, "fecha_fin": fecha_fin}
     if contrato is not None:
         contrato_contexto["numero_contrato"] = contrato.numero_contrato
         if contrato.entidad:

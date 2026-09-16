@@ -125,6 +125,10 @@ class AgentState(TypedDict, total=False):
     matched_evidence_scores: dict[str, dict[str, float]] | None  # obligacion_id → {evidencia_id: blended_score}
     deduplicated_evidence: list[dict[str, Any]] | None
     evidencias_descartadas: int | None  # items filtrados como ruido por evidence_filter
+    # LLM-generated search phrases per obligación (evidencias/discovery-fix
+    # WU7, app.agent.nodes.query_expansion.expand_search_terms) — fed into
+    # the Gmail/Drive/Calendar query builders.
+    expanded_terms: dict[str, list[str]] | None
 
     # ── Phase 5: document assembly ────────────────────────────────────────
     document_drafts: list[dict[str, Any]] | None
