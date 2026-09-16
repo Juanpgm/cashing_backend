@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 from app.models.actividad import Actividad
 from app.models.contrato import Contrato
-from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
+from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro, PosicionCuota
 from app.models.documento_cuenta_cobro import DocumentoCuentaCobro
 from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
 from app.models.evidencia import Evidencia
@@ -46,6 +46,9 @@ async def contrato(db: AsyncSession, test_user: dict[str, Any]) -> Contrato:
 
 @pytest.fixture
 async def cuenta(db: AsyncSession, contrato: Contrato) -> CuentaCobro:
+    """posicion=PRIMERA: the only cuenta this contrato fixture ever gets in
+    this test — checklist/primera-cuota-2026-09-16 makes CEDULA/RUT/RPC/CDP key
+    off `_is_first_cuenta`, so it must be explicit."""
     cc = CuentaCobro(
         contrato_id=contrato.id,
         mes=1,
@@ -53,6 +56,7 @@ async def cuenta(db: AsyncSession, contrato: Contrato) -> CuentaCobro:
         estado=EstadoCuentaCobro.BORRADOR,
         valor=1_000_000,
         requisitos_modo="estandar",  # checklist already defined (gate resolved)
+        posicion=PosicionCuota.PRIMERA,
     )
     db.add(cc)
     await db.commit()
@@ -62,13 +66,15 @@ async def cuenta(db: AsyncSession, contrato: Contrato) -> CuentaCobro:
 
 @pytest.fixture
 async def cuenta_sin_definir(db: AsyncSession, contrato: Contrato) -> CuentaCobro:
-    """A freshly-created cuenta whose checklist gate has NOT been resolved."""
+    """A freshly-created cuenta whose checklist gate has NOT been resolved.
+    posicion=PRIMERA for the same reason as `cuenta` above."""
     cc = CuentaCobro(
         contrato_id=contrato.id,
         mes=2,
         anio=2024,
         estado=EstadoCuentaCobro.BORRADOR,
         valor=1_000_000,
+        posicion=PosicionCuota.PRIMERA,
     )
     db.add(cc)
     await db.commit()
