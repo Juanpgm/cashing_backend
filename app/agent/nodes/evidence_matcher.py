@@ -245,7 +245,7 @@ def _keyword_score(obligation_text: str, evidence_text: str) -> float:
     return len(overlap) / len(ob_words)
 
 
-def _mentions_any(evidence: dict, variants: list[str]) -> bool:
+def _mentions_any(evidence: dict[str, object], variants: list[str]) -> bool:
     """Word-boundary search for any of `variants` in the evidence text.
 
     A plain `variant in text` substring test made `ORD-41612` a hit for the
@@ -268,7 +268,7 @@ def _contains_contract_number(evidence: dict, numero_variants: list[str]) -> boo
     return _mentions_any(evidence, contract_match_variants_of(numero_variants))
 
 
-def _has_strong_contract_number(evidence: dict, numero_variants: list[str]) -> bool:
+def _has_strong_contract_number(evidence: dict[str, object], numero_variants: list[str]) -> bool:
     """True only for the FULL number (raw or hyphen-normalized).
 
     This is the high-specificity signal: a different contract of the same
