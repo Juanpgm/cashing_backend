@@ -18,6 +18,7 @@ import structlog
 
 from app.agent.prompts.contract_terms import contract_header
 from app.agent.prompts.email_evidence import _extract_keywords
+from app.agent.prompts.query_budget import obligacion_key as _obligacion_id
 from app.agent.prompts.query_expansion import QUERY_EXPANSION_SYSTEM_PROMPT, build_query_expansion_prompt
 from app.schemas.agent import LLMMessage
 
@@ -27,8 +28,6 @@ _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 _MAX_PHRASES_PER_OBLIGACION = 8
 
 
-def _obligacion_id(ob: dict, index: int) -> str:
-    return str(ob.get("id") or index)
 
 
 def _deterministic_terms(obligaciones: list[dict]) -> dict[str, list[str]]:
@@ -36,6 +35,18 @@ def _deterministic_terms(obligaciones: list[dict]) -> dict[str, list[str]]:
     return {
         _obligacion_id(ob, i): _extract_keywords(str(ob.get("descripcion") or "")) for i, ob in enumerate(obligaciones)
     }
+
+
+def _is_unusable_provider(llm: object) -> bool:
+    """True for a provider that cannot answer this prompt meaningfully.
+
+    Currently the fake/deterministic adapter (`LLM_PROVIDER=fake`, and every
+    test that injects it): its scripted replies follow the chat tool-call
+    contract, not this node's JSON one, so a call can only end in the
+    deterministic fallback anyway. Detected by duck-typing on the class name so
+    this module does not import the fake adapter into production paths.
+    """
+    return type(llm).__name__ == "FakeLLMPort"
 
 
 def _merge_unique(phrases: list[str], extra: list[str]) -> list[str]:
@@ -111,7 +122,14 @@ async def expand_search_terms(
     if context_phrases:
         fallback = {ob_id: _merge_unique(phrases, context_phrases) for ob_id, phrases in fallback.items()}
 
-    if llm is None:
+    # No provider, or a provider that cannot produce a real expansion: return
+    # the deterministic terms without spending a round trip. This matters now
+    # that EVIDENCE_QUERY_EXPANSION_ENABLED defaults to True — ~30 existing
+    # tests exercise `_gather_email_evidence` with no LLM mock, and the fake
+    # provider is scripted for chat turns, not for this JSON contract, so
+    # calling it would only produce an unparseable answer and this same
+    # fallback, one wasted call later.
+    if llm is None or _is_unusable_provider(llm):
         return fallback
 
     header = contract_header(contexto)

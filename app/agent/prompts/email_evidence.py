@@ -63,7 +63,11 @@ def _safe_entity_phrase(entidad: str, limit: int) -> str:
     phrase searchable; if the first word alone exceeds the limit we fall back
     to the hard cut rather than emitting nothing.
     """
-    cleaned = (entidad or "").strip().replace('"', "")
+    from app.agent.prompts.contract_terms import entidad_search_term
+
+    # Strip the legal-entity suffix first: "S.A.S"/"E.S.E"/"Ltda" is boilerplate
+    # shared by thousands of entities and only dilutes the phrase.
+    cleaned = entidad_search_term(entidad).replace('"', "")
     if len(cleaned) <= limit:
         return cleaned
     head = cleaned[:limit]

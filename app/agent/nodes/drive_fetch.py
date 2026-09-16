@@ -17,7 +17,7 @@ from app.adapters.drive.port import DriveQuery
 from app.adapters.microsoft.graph_adapter import MicrosoftGraphAdapter
 from app.agent.prompts.contract_terms import contract_query_variants
 from app.agent.prompts.email_evidence import _extract_keywords
-from app.agent.prompts.query_budget import round_robin
+from app.agent.prompts.query_budget import obligacion_key, round_robin
 from app.agent.state import AgentState
 from app.core.config import settings
 from app.models.integracion import IntegrationProvider
@@ -152,7 +152,8 @@ async def drive_fetch_node(state: AgentState, provider: IntegrationProvider = In
 
     if obligaciones:
         groups = [
-            _obligacion_group(str(ob.get("descripcion", "")), str(ob.get("id") or "")) for ob in obligaciones_para_query
+            _obligacion_group(str(ob.get("descripcion", "")), obligacion_key(ob, i))
+            for i, ob in enumerate(obligaciones_para_query)
         ]
     else:
         groups = [_obligacion_group(state.get("user_input", ""))]

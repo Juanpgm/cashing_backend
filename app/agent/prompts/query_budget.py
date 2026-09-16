@@ -58,3 +58,16 @@ def round_robin(groups: Sequence[Sequence[T]], budget: int) -> list[T]:
             break
 
     return out
+
+
+def obligacion_key(ob: dict, index: int) -> str:
+    """The ONE derivation of an obligación's `expanded_terms` key.
+
+    `query_expansion` wrote `str(ob.get("id") or index)` while all three
+    consumers (Gmail/Drive/Calendar) read `str(ob.get("id") or "")`, so an
+    obligación with a falsy id was keyed "0" on write and "" on read and its
+    expanded phrases were silently dropped. Unreachable today because
+    `_resolve_obligaciones` guarantees a non-empty id, but the invariant was one
+    new producer away from breaking, so both sides now call this.
+    """
+    return str(ob.get("id") or index)

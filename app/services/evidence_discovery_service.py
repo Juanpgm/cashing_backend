@@ -38,7 +38,7 @@ from app.agent.prompts.email_evidence import (
     build_obligation_queries,
 )
 from app.agent.prompts.evidence_filter import score_non_personal_email, score_non_personal_ms_email
-from app.agent.prompts.query_budget import round_robin
+from app.agent.prompts.query_budget import obligacion_key, round_robin
 from app.agent.state import AgentState
 from app.core.config import settings
 from app.core.exceptions import NO_PROVIDER_CONNECTED, ExternalServiceError, NotFoundError, ValidationError
@@ -326,13 +326,13 @@ async def _gather_email_evidence(
     # floor covers BOTH signals rather than spending every floor slot on
     # keywords and truncating expansion away.
     obligacion_groups: list[list[str]] = []
-    for ob in obligaciones_para_query:
+    for ob_index, ob in enumerate(obligaciones_para_query):
         own = _build_email_queries(provider, ob["descripcion"], fecha_inicio, fecha_fin, supervisor_email, entidad)[
             : settings.EVIDENCE_QUERIES_PER_OBLIGACION
         ]
         phrase_queries: list[str] = []
         if provider == IntegrationProvider.GOOGLE and expanded_terms:
-            phrases = expanded_terms.get(str(ob.get("id") or "")) or []
+            phrases = expanded_terms.get(obligacion_key(ob, ob_index)) or []
             if phrases:
                 fi, ff = _widen_gmail_window(fecha_inicio, fecha_fin, settings.EVIDENCE_WINDOW_MARGIN_DAYS)
                 phrase_queries = build_expanded_phrase_queries(phrases, fi, ff)
@@ -497,10 +497,6 @@ async def descubrir_evidencias(
             fecha_fin = fecha_fin or date.today().isoformat()
 
     cache_cuenta_id: uuid.UUID | None = req.cuenta_id if not local_only else None
-    if cache_cuenta_id is not None and not refresh:
-        cached = discovery_cache.get_cached(usuario_id, cache_cuenta_id, fecha_inicio, fecha_fin)
-        if cached is not None:
-            return cached
 
     contrato_contexto: dict[str, str | int | float | None] = {"fecha_inicio": fecha_inicio, "fecha_fin": fecha_fin}
     if contrato is not None:
@@ -514,6 +510,20 @@ async def descubrir_evidencias(
     # la expansión semántica) porque alimenta AMBAS cosas: expand_search_terms
     # (evidencias/discovery-fix WU7b) y, más abajo, el estado del agente.
     contexto_usuario = await _contexto_usuario(db, req.cuenta_id)
+
+    # Cache lookup happens HERE, not before the context is loaded (round-2 fix):
+    # contexto_usuario and the contract's numero/entidad/objeto are SEARCH
+    # INPUTS — they seed expand_search_terms and every prompt header — so they
+    # belong in the key. Previously a user could edit "¿Qué hiciste este mes?",
+    # click discover again and silently get the pre-edit result for the whole
+    # TTL.
+    cache_fingerprint = discovery_cache.context_fingerprint(contrato_contexto, contexto_usuario)
+    if cache_cuenta_id is not None and not refresh:
+        cached = discovery_cache.get_cached(
+            usuario_id, cache_cuenta_id, fecha_inicio, fecha_fin, context_fingerprint=cache_fingerprint
+        )
+        if cached is not None:
+            return cached
 
     # Semantic query expansion (evidencias/discovery-fix WU7) — one LLM call
     # for search phrases beyond the contract number/obligación wording, so
@@ -678,5 +688,7 @@ async def descubrir_evidencias(
         fuentes=fuentes,
     )
     if cache_cuenta_id is not None:
-        discovery_cache.store(usuario_id, cache_cuenta_id, fecha_inicio, fecha_fin, response)
+        discovery_cache.store(
+            usuario_id, cache_cuenta_id, fecha_inicio, fecha_fin, response, context_fingerprint=cache_fingerprint
+        )
     return response

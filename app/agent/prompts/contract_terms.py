@@ -136,10 +136,17 @@ def contract_query_variants(numero: object | None) -> list[str]:
     return out
 
 
-def _normalize_entidad(entidad: str | None) -> str:
-    """Strip a trailing legal-entity suffix (S.A.S, E.S.E, Ltda, ...) so the
-    entidad name is usable as a full-text search term without matching only
-    on boilerplate."""
+def entidad_search_term(entidad: str | None) -> str:
+    """Entidad name usable as a full-text search term: a trailing legal-entity
+    suffix (S.A.S, E.S.E, Ltda, ...) is stripped so the query matches on the
+    distinctive name rather than on boilerplate every entity shares.
+
+    Round-2: this logic (then `_normalize_entidad`) was reachable ONLY from
+    `contract_search_terms`, which had no production caller at all and whose
+    docstring falsely claimed to be "the shared vocabulary fed into the
+    Gmail/Drive/Calendar query builders". That function is deleted; the useful
+    half is kept and actually wired into the entidad query term.
+    """
     name = (entidad or "").strip()
     if not name:
         return ""
@@ -195,35 +202,6 @@ def contract_header(contexto: dict[str, object] | None) -> str:
     if not lines:
         return ""
     return "Contexto del contrato:\n" + "\n".join(lines)
-
-
-def contract_search_terms(contexto: dict[str, object] | None) -> list[str]:
-    """Combine contract-number variants + normalized entidad + salient objeto
-    keywords into a single, deduplicated, order-preserving term list — the
-    shared vocabulary fed into the Gmail/Drive/Calendar query builders."""
-    from app.agent.prompts.email_evidence import _extract_keywords
-
-    contexto = contexto or {}
-    numero = contexto.get("numero_contrato")
-    entidad = contexto.get("entidad")
-    objeto = contexto.get("objeto")
-
-    terms: list[str] = list(contract_number_variants(numero if isinstance(numero, str) else None))
-
-    entidad_norm = _normalize_entidad(entidad if isinstance(entidad, str) else None)
-    if len(entidad_norm) >= _MIN_TOKEN_LEN:
-        terms.append(entidad_norm)
-
-    if isinstance(objeto, str) and objeto.strip():
-        terms.extend(_extract_keywords(objeto)[:5])
-
-    seen: set[str] = set()
-    out: list[str] = []
-    for term in terms:
-        if term and term not in seen:
-            seen.add(term)
-            out.append(term)
-    return out
 
 
 def contract_match_variants(numero: object | None) -> list[str]:

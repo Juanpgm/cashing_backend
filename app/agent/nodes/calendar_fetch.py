@@ -19,7 +19,7 @@ from app.adapters.calendar.port import CalendarEvent
 from app.adapters.microsoft.graph_adapter import MicrosoftGraphAdapter
 from app.agent.prompts.contract_terms import contract_query_variants
 from app.agent.prompts.email_evidence import _extract_keywords
-from app.agent.prompts.query_budget import round_robin
+from app.agent.prompts.query_budget import obligacion_key, round_robin
 from app.agent.state import AgentState
 from app.core.config import settings
 from app.models.integracion import IntegrationProvider
@@ -94,9 +94,9 @@ def _calendar_terms(
 
     expanded_terms = expanded_terms or {}
     groups: list[list[str]] = []
-    for ob in obligaciones:
+    for i, ob in enumerate(obligaciones):
         own = _extract_keywords(str(ob.get("descripcion") or ""))[:2]
-        phrases = list(expanded_terms.get(str(ob.get("id") or "")) or [])
+        phrases = list(expanded_terms.get(obligacion_key(ob, i)) or [])
         group: list[str] = []
         for pair in zip_longest(own, phrases):
             group.extend(t for t in pair if t)

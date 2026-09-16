@@ -703,9 +703,15 @@ async def test_gather_gmail_evidence_expansion_still_respects_query_budget(monke
 
 
 @pytest.mark.asyncio
-async def test_descubrir_evidencias_expansion_disabled_by_default_no_extra_llm_call() -> None:
-    """The feature flag defaults OFF — expand_search_terms/get_llm must NOT be
-    invoked, and existing behavior is completely unaffected."""
+async def test_descubrir_evidencias_survives_a_failing_expansion() -> None:
+    """Semantic expansion is ON by default (round 2), so what deserves pinning
+    is the FAIL-OPEN contract, not the flag's value.
+
+    This test previously asserted `expansion_spy.assert_not_called()`, i.e. it
+    only restated the default — the one test that "failed" when the flag was
+    flipped in measurement. Discovery must complete normally when expansion
+    raises, with the deterministic keyword terms still reaching the builders.
+    """
     from app.services import evidence_discovery_service as eds
 
     req = EvidenceDiscoveryRequest(
@@ -721,7 +727,7 @@ async def test_descubrir_evidencias_expansion_disabled_by_default_no_extra_llm_c
     cal_adapter.search_events = AsyncMock(return_value=[])
     justify_llm = AsyncMock()
     justify_llm.complete = AsyncMock(return_value=MagicMock(content="No hay evidencia."))
-    expansion_spy = AsyncMock()
+    expansion_spy = AsyncMock(side_effect=RuntimeError("expansion provider down"))
 
     only_google, only_google_statuses = _patch_only_google_connected(eds)
     with (
@@ -733,9 +739,13 @@ async def test_descubrir_evidencias_expansion_disabled_by_default_no_extra_llm_c
         patch("app.agent.nodes.evidence_justify.get_llm", return_value=justify_llm),
         patch.object(eds, "expand_search_terms", expansion_spy),
     ):
-        await eds.descubrir_evidencias(MagicMock(), uuid.uuid4(), req)
+        result = await eds.descubrir_evidencias(MagicMock(), uuid.uuid4(), req)
 
-    expansion_spy.assert_not_called()
+    expansion_spy.assert_called_once()
+    assert len(result.obligaciones) == 1  # the run completed despite the failure
+    # ...and the obligación's own keyword query still reached Gmail.
+    fired = " ".join(c.args[1] for c in gmail.search_messages.call_args_list).lower()
+    assert "informe" in fired
 
 
 @pytest.mark.asyncio

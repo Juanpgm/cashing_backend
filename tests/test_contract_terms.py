@@ -9,7 +9,7 @@ search or scoring signal. These variants close that gap.
 
 from __future__ import annotations
 
-from app.agent.prompts.contract_terms import contract_header, contract_number_variants, contract_search_terms
+from app.agent.prompts.contract_terms import contract_header, contract_number_variants, entidad_search_term
 
 
 class TestContractNumberVariants:
@@ -71,38 +71,25 @@ class TestContractNumberVariants:
         assert contract_number_variants("CTR12345") == ["CTR12345"]
 
 
-class TestContractSearchTerms:
-    def test_empty_contexto_returns_empty(self) -> None:
-        assert contract_search_terms({}) == []
+class TestEntidadSearchTerm:
+    """Round 2: `contract_search_terms` was deleted — it had no production
+    caller and its docstring falsely claimed to be the shared vocabulary fed
+    into the query builders (the real one is `contract_query_variants` plus the
+    round-robin allocation in `query_budget`). Its only useful half, stripping
+    legal-entity suffixes, survives here and IS wired into the entidad query."""
 
-    def test_combines_number_entidad_and_objeto_keywords(self) -> None:
-        contexto = {
-            "numero_contrato": "4161.010.26.1.027.2025",
-            "entidad": "DAGMA S.A.S",
-            "objeto": "Prestación de servicios profesionales de apoyo a la gestión ambiental",
-        }
-        terms = contract_search_terms(contexto)
+    def test_strips_a_trailing_legal_suffix(self) -> None:
+        assert entidad_search_term("DAGMA S.A.S") == "DAGMA"
+        assert entidad_search_term("Constructora Andina S.A.S.") == "Constructora Andina"
+        assert entidad_search_term("Hospital Universitario E.S.E") == "Hospital Universitario"
+        assert entidad_search_term("Inversiones Beta Ltda.") == "Inversiones Beta"
 
-        assert "4161.010.26.1.027.2025" in terms
-        assert "4161" in terms
-        assert "DAGMA" in terms  # legal suffix stripped
-        assert "S.A.S" not in terms
-        assert any("gestión" in t or "ambiental" in t for t in terms)
+    def test_leaves_a_name_without_a_suffix_untouched(self) -> None:
+        assert entidad_search_term("Alcaldía de Cali") == "Alcaldía de Cali"
 
-    def test_missing_entidad_and_objeto_still_returns_number_variants(self) -> None:
-        terms = contract_search_terms({"numero_contrato": "4161.010.26.1.027.2025"})
-        assert "4161.010.26.1.027.2025" in terms
-        assert len(terms) > 0
-
-    def test_missing_numero_still_returns_entidad_and_objeto_terms(self) -> None:
-        terms = contract_search_terms({"entidad": "Alcaldía de Cali", "objeto": "Servicios de consultoría jurídica"})
-        assert any("Alcaldía" in t or "Cali" in t for t in terms)
-        assert any("consultoría" in t or "jurídica" in t for t in terms)
-
-    def test_no_duplicate_terms(self) -> None:
-        contexto = {"numero_contrato": "CTO-123/2025", "entidad": "CTO"}
-        terms = contract_search_terms(contexto)
-        assert len(terms) == len(set(terms))
+    def test_empty_and_none(self) -> None:
+        assert entidad_search_term(None) == ""
+        assert entidad_search_term("   ") == ""
 
 
 class TestContractHeader:

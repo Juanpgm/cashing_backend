@@ -468,14 +468,20 @@ class Settings(BaseSettings):
     # drive_fetch: Drive API pageSize per search_files call (was a hardcoded
     # module constant of 10).
     EVIDENCE_DRIVE_PAGE_SIZE: int = 20
-    # Semantic query expansion (evidencias/discovery-fix WU7): one extra LLM
-    # call per discovery run to generate search phrases beyond the contract
-    # number/obligación wording. Defaults OFF — this is a new LLM call site
-    # in a code path (_gather_email_evidence/drive_fetch/calendar_fetch) that
-    # a large slice of the existing test suite exercises WITHOUT mocking an
-    # LLM; flipping it on is a deliberate rollout step, not a silent default
-    # change.
-    EVIDENCE_QUERY_EXPANSION_ENABLED: bool = False
+    # Semantic query expansion: ONE extra LLM call per discovery run producing
+    # search phrases beyond the contract number and the obligación's literal
+    # wording. Defaults ON (round 2) — semantic search per obligación IS the
+    # product; the contract number is one signal among many and, per the owner,
+    # "won't be that efficient" on its own.
+    #
+    # The old comment justified defaulting OFF because "a large slice of the
+    # existing test suite exercises this path WITHOUT mocking an LLM". That was
+    # measured and is false: with the flag on, exactly ONE test failed, and its
+    # entire body asserted the flag was off. `expand_search_terms` already fails
+    # open on llm=None, on any exception and on unparseable output, the call
+    # site wraps it again, and it short-circuits a fake/unavailable provider
+    # without a round trip — so an unmocked test path costs nothing.
+    EVIDENCE_QUERY_EXPANSION_ENABLED: bool = True
 
     # Embeddings — in-memory semantic ranking signal for evidence-to-obligación
     # matching (evidence-embeddings capability). No persistent vector store:
