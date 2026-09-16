@@ -1927,6 +1927,112 @@ async def test_zip_incluye_contrato_reaparecido_luego_satisfecho_en_cuota_no_pri
     assert "CONTRATO" not in root
 
 
+async def test_zip_omite_contrato_sin_reaparicion_en_cuota_no_primera(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """checklist/primera-cuota-2026-09-16, round 3, finding #8 (WARNING): the
+    ORIGINAL guarantee — a CONTRATO that does NOT reappear (a shared contract-
+    level document exists AND the contrato has obligaciones, so neither half of
+    rule 2 fires) is genuinely omitted from the differential package and
+    disclosed as already radicated with cuota 1. Round 2 inverted the only test
+    covering this branch (to pin the reappeared-then-satisfied case) without
+    adding a replacement, leaving the branch that decides whether a real
+    contract document is dropped from the package completely unguarded."""
+    from app.models.documento_fuente import DocumentoFuente
+    from app.models.documento_fuente import TipoDocumentoFuente as _Tipo
+    from app.services import checklist_service
+
+    user = test_user["user"]
+    assert cuenta.posicion == PosicionCuota.RECURRENTE
+    # `cuenta`'s contrato already carries obligaciones — adding the shared
+    # contract-level CONTRATO document closes rule 2's other half BEFORE the
+    # checklist is built, so CONTRATO never reappears for this cuota.
+    db.add(
+        DocumentoFuente(
+            usuario_id=user.id,
+            contrato_id=cuenta.contrato_id,
+            cuenta_cobro_id=None,
+            storage_key=f"docs/{uuid.uuid4()}/contrato.pdf",
+            nombre="contrato.pdf",
+            tipo=_Tipo.CONTRATO,
+        )
+    )
+    await db.commit()
+    await checklist_service.asegurar_checklist(db, cuenta)
+    await db.commit()
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: _fake_storage())
+
+    content, _filename = await informe_service.generar_zip_evidencias(db, user.id, cuenta.id)
+
+    with zipfile.ZipFile(io.BytesIO(content)) as zf:
+        names = zf.namelist()
+        root = zf.read("LEEME.txt").decode("utf-8")
+    assert not any(n.startswith("DOCUMENTOS_CONTRATO/CONTRATO/") for n in names)
+    assert "CONTRATO" in _linea_omision(root)
+
+
+async def test_zip_reenvia_ficha_tecnica_y_acta_inicio_en_cada_cuota(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """checklist/primera-cuota-2026-09-16, round 3, finding #7 (WARNING) — an
+    explicit, pinned DECISION, not an accident: FICHA_TECNICA and ACTA_INICIO
+    are `solo_primera_cuenta` in the catalog but nivel-contrato, so
+    `requisito_aplica_a_cuenta` keeps them VISIBLE on every cuota and the
+    checklist keeps asking the user for them. The package mirrors the
+    checklist: whatever the checklist asks for on this cuota ships with it, and
+    is therefore NOT disclosed as "ya radicado en la cuota 1". Omitting them
+    while still requesting them is the finding-#1/#3 bug shape (a visible,
+    linked document silently dropped and falsely declared already radicated)."""
+    from app.models.documento_fuente import TipoDocumentoFuente as _Tipo
+
+    user = test_user["user"]
+    assert cuenta.posicion == PosicionCuota.RECURRENTE
+    await _vincular_doc(db, test_user, cuenta, "FICHA_TECNICA", _Tipo.FICHA_TECNICA, "ficha.pdf")
+    await _vincular_doc(db, test_user, cuenta, "ACTA_INICIO", _Tipo.ACTA_INICIO, "acta.pdf")
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: _fake_storage())
+
+    content, _filename = await informe_service.generar_zip_evidencias(db, user.id, cuenta.id)
+
+    with zipfile.ZipFile(io.BytesIO(content)) as zf:
+        names = zf.namelist()
+        root = zf.read("LEEME.txt").decode("utf-8")
+    assert "DOCUMENTOS_CONTRATO/FICHA_TECNICA/ficha.pdf" in names
+    assert "DOCUMENTOS_CONTRATO/ACTA_INICIO/acta.pdf" in names
+    omision = _linea_omision(root)
+    assert "FICHA_TECNICA" not in omision
+    assert "ACTA_INICIO" not in omision
+    # Control: codes that genuinely do not apply here are still omitted.
+    assert "CEDULA" in omision
+
+
+async def test_zip_no_declara_omitidas_ficha_tecnica_ni_acta_inicio_sin_documento(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half of the round 3, finding #7 decision, and the one that
+    isolates the applicability branch from the content exception: with NO
+    document linked, FICHA_TECNICA/ACTA_INICIO still must not be disclosed as
+    "ya radicado en la cuota 1" — they are nivel-contrato, the checklist is
+    still asking the user for them on THIS cuota, so declaring them already
+    radicated would be false. A flat catalog-flag omission set (every
+    `solo_primera_cuenta` code) would list them here."""
+    from app.services import checklist_service
+
+    user = test_user["user"]
+    assert cuenta.posicion == PosicionCuota.RECURRENTE
+    await checklist_service.asegurar_checklist(db, cuenta)
+    await db.commit()
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: _fake_storage())
+
+    content, _filename = await informe_service.generar_zip_evidencias(db, user.id, cuenta.id)
+
+    with zipfile.ZipFile(io.BytesIO(content)) as zf:
+        root = zf.read("LEEME.txt").decode("utf-8")
+    omision = _linea_omision(root)
+    assert "FICHA_TECNICA" not in omision
+    assert "ACTA_INICIO" not in omision
+    assert "CEDULA" in omision
+
+
 def _linea_omision(root: str) -> str:
     """The LEEME's "Documentos de primera cuota omitidos" line, or "" when the
     package omitted nothing. A bare `codigo in root` is a weak oracle — the root
