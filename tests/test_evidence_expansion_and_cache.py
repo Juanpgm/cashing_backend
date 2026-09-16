@@ -23,6 +23,19 @@ import uuid
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _force_real_llm_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A developer's local `secrets/.env.local` may set `LLM_PROVIDER=fake` for
+    cost-free manual testing. These tests exercise the real/litellm
+    credentials-guard and LLM-call/fallback paths and must not silently
+    short-circuit because of that environment-specific override. The one test
+    that specifically wants fake-provider behavior re-overrides this itself."""
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "LLM_PROVIDER", "litellm")
+
+
 # ── The default ───────────────────────────────────────────────────────────────
 
 
