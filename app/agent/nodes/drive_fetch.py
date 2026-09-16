@@ -7,7 +7,7 @@ encontrados con su link (webViewLink) para soportar la cuenta de cobro.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from itertools import zip_longest
 
 import structlog
@@ -117,8 +117,20 @@ async def drive_fetch_node(state: AgentState, provider: IntegrationProvider = In
     max_obligaciones = settings.EVIDENCE_MAX_OBLIGACIONES_QUERIES
     obligaciones_para_query = obligaciones if max_obligaciones <= 0 else obligaciones[:max_obligaciones]
 
+    # Round-3 fix (confirmed WARNING): EVIDENCE_WINDOW_MARGIN_DAYS only widened
+    # Gmail's window (`_widen_gmail_window` in evidence_discovery_service.py).
+    # Drive used the raw period, so a closeout document CREATED after the
+    # period (an August informe finished Sep 2 — exactly the artifact class
+    # that lives in Drive) had both createdTime/modifiedTime outside the
+    # window and was unreachable, even though the identical document mailed
+    # to the supervisor WAS found via Gmail's wider window.
     date_from = _to_drive_datetime(fecha_inicio)
     date_to = _to_drive_datetime(fecha_fin, end_of_day=True)
+    margin = timedelta(days=settings.EVIDENCE_WINDOW_MARGIN_DAYS)
+    if date_from is not None:
+        date_from -= margin
+    if date_to is not None:
+        date_to += margin
 
     def _query(term: str) -> DriveQuery:
         return DriveQuery(

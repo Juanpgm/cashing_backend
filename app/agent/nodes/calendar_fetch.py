@@ -11,6 +11,7 @@ personales sin llamadas LLM adicionales.
 from __future__ import annotations
 
 import time
+from datetime import date, timedelta
 from itertools import zip_longest
 
 import structlog
@@ -202,8 +203,21 @@ async def calendar_fetch_node(
         return {**state, "calendar_evidencias": existing}
 
     contrato = state.get("contrato_contexto") or {}
-    time_min = _to_rfc3339(str(contrato.get("fecha_inicio", "")))
-    time_max = _to_rfc3339(str(contrato.get("fecha_fin", "")), end_of_day=True)
+    # Round-3 fix (confirmed WARNING): EVIDENCE_WINDOW_MARGIN_DAYS only widened
+    # Gmail's window (`_widen_gmail_window` in evidence_discovery_service.py).
+    # Calendar used the raw period, so a wrap-up Meet held in the first days
+    # of the month AFTER the period closes — exactly the kind of closeout
+    # evidence the margin exists to catch — was unreachable.
+    fecha_inicio_raw = str(contrato.get("fecha_inicio", "")).strip()
+    fecha_fin_raw = str(contrato.get("fecha_fin", "")).strip()
+    margin = timedelta(days=settings.EVIDENCE_WINDOW_MARGIN_DAYS)
+    try:
+        fecha_inicio_widened = (date.fromisoformat(fecha_inicio_raw) - margin).isoformat() if fecha_inicio_raw else ""
+        fecha_fin_widened = (date.fromisoformat(fecha_fin_raw) + margin).isoformat() if fecha_fin_raw else ""
+    except ValueError:
+        fecha_inicio_widened, fecha_fin_widened = fecha_inicio_raw, fecha_fin_raw
+    time_min = _to_rfc3339(fecha_inicio_widened)
+    time_max = _to_rfc3339(fecha_fin_widened, end_of_day=True)
     if not time_min or not time_max:
         return {**state, "calendar_evidencias": existing}
 

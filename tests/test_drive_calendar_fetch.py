@@ -256,6 +256,44 @@ async def test_drive_fetch_no_db_returns_empty():
     assert result["drive_evidencias"] == []
 
 
+@pytest.mark.asyncio
+async def test_drive_fetch_widens_the_date_window_by_the_configured_margin():
+    """WARNING regression: EVIDENCE_WINDOW_MARGIN_DAYS only widened Gmail's
+    window (`_widen_gmail_window` in evidence_discovery_service.py) — Drive
+    used the raw period. A closeout document CREATED after the period (e.g.
+    an August informe finished Sep 2, the exact artifact class that lives in
+    Drive) had both createdTime/modifiedTime outside the window and was
+    unreachable, even though the identical document mailed to the supervisor
+    WAS found via Gmail's wider window."""
+    from datetime import timedelta
+
+    from app.agent.nodes import drive_fetch as mod
+    from app.core.config import settings
+
+    adapter = MagicMock()
+    adapter.search_files = AsyncMock(return_value=[])
+
+    state = {
+        "user_id": uuid.uuid4(),
+        "_db": MagicMock(),
+        "contrato_contexto": {"fecha_inicio": "2024-08-01", "fecha_fin": "2024-08-31"},
+        "obligaciones_contexto": [{"id": "ob1", "descripcion": "Entregar informe mensual de actividades"}],
+    }
+
+    with patch.object(mod, "DriveAdapter", return_value=adapter):
+        await mod.drive_fetch_node(state)
+
+    calls = adapter.search_files.call_args_list
+    assert calls, "no Drive queries were fired"
+    margin = timedelta(days=settings.EVIDENCE_WINDOW_MARGIN_DAYS)
+    expected_from = datetime(2024, 8, 1) - margin
+    expected_to = datetime(2024, 8, 31, 23, 59, 59) + margin
+    for call in calls:
+        query = call.args[1]
+        assert query.date_from == expected_from, f"date_from not widened: {query.date_from}"
+        assert query.date_to == expected_to, f"date_to not widened: {query.date_to}"
+
+
 def test_build_drive_queries_includes_date_clause():
     from app.agent.nodes.drive_fetch import build_drive_queries
 
@@ -603,6 +641,40 @@ async def test_calendar_fetch_no_dates_returns_empty():
 
     result = await calendar_fetch_node({"user_id": uuid.uuid4(), "_db": MagicMock(), "contrato_contexto": {}})
     assert result["calendar_evidencias"] == []
+
+
+@pytest.mark.asyncio
+async def test_calendar_fetch_widens_the_date_window_by_the_configured_margin():
+    """WARNING regression: same gap as Drive — a wrap-up Meet held in the
+    first days of the month AFTER the period closes is exactly the kind of
+    closeout evidence Gmail's ±margin exists to catch, but Calendar used the
+    raw, unwidened period."""
+    from datetime import timedelta
+
+    from app.agent.nodes import calendar_fetch as mod
+    from app.core.config import settings
+
+    adapter = MagicMock()
+    adapter.search_events = AsyncMock(return_value=[])
+
+    state = {
+        "user_id": uuid.uuid4(),
+        "_db": MagicMock(),
+        "contrato_contexto": {"fecha_inicio": "2024-08-01", "fecha_fin": "2024-08-31"},
+        "obligaciones_contexto": [],
+    }
+
+    with patch.object(mod, "GoogleCalendarAdapter", return_value=adapter):
+        await mod.calendar_fetch_node(state)
+
+    calls = adapter.search_events.call_args_list
+    assert calls, "no Calendar queries were fired"
+    margin = timedelta(days=settings.EVIDENCE_WINDOW_MARGIN_DAYS)
+    expected_min = (datetime(2024, 8, 1) - margin).strftime("%Y-%m-%dT%H:%M:%SZ")
+    expected_max = (datetime(2024, 8, 31, 23, 59, 59) + margin).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for call in calls:
+        assert call.args[1] == expected_min, f"time_min not widened: {call.args[1]}"
+        assert call.args[2] == expected_max, f"time_max not widened: {call.args[2]}"
 
 
 @pytest.mark.asyncio
