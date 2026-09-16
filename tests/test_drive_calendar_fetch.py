@@ -459,6 +459,13 @@ async def test_calendar_fetch_includes_expanded_phrase_terms():
 
 @pytest.mark.asyncio
 async def test_calendar_fetch_bounds_term_count_by_setting(monkeypatch):
+    """`EVIDENCE_MAX_CALENDAR_TERMS` bounds the CONTRACT-level block and the
+    discretionary pool — it never truncates the per-obligación floor.
+
+    Round 2: this used to assert a flat `await_count == 2`, which is what let
+    the contract-number variants swallow every Calendar slot and leave the
+    obligación unsearched (confirmed CRITICAL finding).
+    """
     from app.agent.nodes import calendar_fetch as mod
 
     monkeypatch.setattr(mod.settings, "EVIDENCE_MAX_CALENDAR_TERMS", 2)
@@ -481,7 +488,13 @@ async def test_calendar_fetch_bounds_term_count_by_setting(monkeypatch):
     with patch.object(mod, "GoogleCalendarAdapter", return_value=mock_adapter):
         await mod.calendar_fetch_node(state)
 
-    assert mock_adapter.search_events.await_count == 2
+    terms = [call.kwargs["q"] for call in mock_adapter.search_events.call_args_list]
+    # Contract block capped at the setting (2), floor of 2 for the one obligación.
+    assert sum(1 for t in terms if "4161" in t or t == "DAGMA") == 2
+    assert mock_adapter.search_events.await_count == 2 + mod.settings.EVIDENCE_MIN_QUERIES_PER_OBLIGACION
+    assert any("asistir" in t.lower() or "reuniones" in t.lower() for t in terms), (
+        f"obligación keyword starved out of Calendar — terms: {terms}"
+    )
 
 
 @pytest.mark.asyncio

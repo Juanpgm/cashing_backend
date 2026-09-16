@@ -589,8 +589,15 @@ async def test_gather_gmail_evidence_never_filters_email_containing_contract_num
 
 @pytest.mark.asyncio
 async def test_gather_gmail_evidence_fires_contract_number_queries_first(monkeypatch) -> None:
-    """When numero_contrato is passed, its query variants must be fired — and
-    take priority over per-obligación keyword queries under the query budget."""
+    """When numero_contrato is passed, its query variants must be fired FIRST —
+    but never at the cost of the obligación getting no query at all.
+
+    Round 2: this test used to assert that a budget of 2 was spent ENTIRELY on
+    contract-number queries (`len(captured) == 2 and all("4161" in q)`), which
+    is precisely the confirmed CRITICAL starvation defect. Priority is still
+    pinned (the contract block leads), but the per-obligación floor
+    (`EVIDENCE_MIN_QUERIES_PER_OBLIGACION`) is now honoured on top of it.
+    """
     from app.core.config import settings
     from app.services import evidence_discovery_service as eds
 
@@ -617,10 +624,14 @@ async def test_gather_gmail_evidence_fires_contract_number_queries_first(monkeyp
             numero_contrato="4161.010.26.1.027.2025",
         )
 
-    # Only 2 queries fit under the budget — both must be contract-number
-    # queries, not the obligación's keyword query.
-    assert len(captured_queries) == 2
-    assert all("4161" in q for q in captured_queries)
+    # The contract-level block leads, bounded by the (tiny) budget...
+    assert "4161.010.26.1.027.2025" in captured_queries[0]
+    assert sum(1 for q in captured_queries if "4161" in q) == 2
+    # ...and the obligación is STILL searched — starvation is the bug, not the
+    # contract.
+    assert any("informe" in q.lower() for q in captured_queries), (
+        f"obligación query starved by the contract block — fired: {captured_queries}"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

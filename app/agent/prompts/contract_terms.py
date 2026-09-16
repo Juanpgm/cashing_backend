@@ -37,15 +37,25 @@ _LEGAL_SUFFIXES: tuple[str, ...] = (
 )
 
 
-def contract_number_variants(numero: str | None) -> list[str]:
+def contract_number_variants(numero: object | None) -> list[str]:
     """Return contract-number variants ordered from most to least specific.
 
     Handles dotted numbers (DAGMA/Cali style), numbers that already use
     slashes/hyphens (e.g. "CTO-123/2025"), and returns `[]` for
     `None`/empty/whitespace-only input. Never emits a token shorter than 3
     characters or a bare 4-digit year on its own.
+
+    Accepts `object | None` rather than `str | None` because every caller reads
+    it out of a loosely-typed `contrato_contexto: dict[str, str | int | float |
+    None]`; a non-str value is coerced instead of raising `AttributeError`
+    (round-2: this was a real mypy arg-type regression at three call sites).
+
+    NOTE: this is the SCORING vocabulary. For provider QUERIES use
+    `contract_query_variants`, which drops the forms no search backend can match.
     """
-    raw = (numero or "").strip()
+    if numero is None:
+        return []
+    raw = (numero if isinstance(numero, str) else str(numero)).strip()
     if not raw:
         return []
 
@@ -77,6 +87,40 @@ def contract_number_variants(numero: str | None) -> list[str]:
         if token not in seen:
             seen.add(token)
             out.append(token)
+    return out
+
+
+def contract_query_variants(numero: object | None) -> list[str]:
+    """The subset of `contract_number_variants` worth spending a QUERY slot on.
+
+    Round-2 fix (confirmed CRITICAL): all seven variants of a dotted DAGMA/Cali
+    number were fired as provider queries, filling every budget. Five of them
+    cannot usefully match anything:
+
+    - `"4161 010 26 1 027 2025"` — Gmail/Drive tokenize a quoted phrase, and no
+      real document writes the number spaced out like that;
+    - `"41610102610272025"` — the digits-glued form appears in no document;
+    - `"027-2025"` / `"027.2025"` — the last-pair forms are shared by every
+      contract numbered in that consecutive range;
+    - `"4161"` — the bare first segment is the ENTITY's dependency code, shared
+      by every contract of that entity, so it is a pure noise magnet.
+
+    All seven remain available for SCORING via `contract_number_variants` (a
+    document that happens to spell the number differently should still rank),
+    but only the raw form and ONE normalized (hyphen-joined) form are searched.
+    """
+    variants = contract_number_variants(numero)
+    if not variants:
+        return []
+
+    raw = variants[0]
+    out = [raw]
+
+    segments = _SEGMENT_RE.findall(raw)
+    if len(segments) > 1:
+        hyphenated = "-".join(segments)
+        if hyphenated != raw:
+            out.append(hyphenated)
     return out
 
 

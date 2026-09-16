@@ -8,14 +8,16 @@ encontrados con su link (webViewLink) para soportar la cuenta de cobro.
 from __future__ import annotations
 
 from datetime import datetime
+from itertools import zip_longest
 
 import structlog
 
 from app.adapters.drive.drive_adapter import DriveAdapter
 from app.adapters.drive.port import DriveQuery
 from app.adapters.microsoft.graph_adapter import MicrosoftGraphAdapter
-from app.agent.prompts.contract_terms import contract_number_variants
+from app.agent.prompts.contract_terms import contract_query_variants
 from app.agent.prompts.email_evidence import _extract_keywords
+from app.agent.prompts.query_budget import round_robin
 from app.agent.state import AgentState
 from app.core.config import settings
 from app.models.integracion import IntegrationProvider
@@ -106,7 +108,7 @@ async def drive_fetch_node(state: AgentState, provider: IntegrationProvider = In
     obligaciones = state.get("obligaciones_contexto") or []
     fecha_inicio = str(contrato.get("fecha_inicio", ""))
     fecha_fin = str(contrato.get("fecha_fin", ""))
-    numero_variants = contract_number_variants(contrato.get("numero_contrato"))
+    numero_query_variants = contract_query_variants(contrato.get("numero_contrato"))
     # LLM-generated search phrases (evidencias/discovery-fix WU7) — deliverable
     # names, counterpart names, filename variants — keyed by obligación id.
     expanded_terms: dict[str, list[str]] = state.get("expanded_terms") or {}
@@ -115,29 +117,56 @@ async def drive_fetch_node(state: AgentState, provider: IntegrationProvider = In
     max_obligaciones = settings.EVIDENCE_MAX_OBLIGACIONES_QUERIES
     obligaciones_para_query = obligaciones if max_obligaciones <= 0 else obligaciones[:max_obligaciones]
 
-    n_generic = len(_GENERIC_TERMS)
+    date_from = _to_drive_datetime(fecha_inicio)
+    date_to = _to_drive_datetime(fecha_fin, end_of_day=True)
 
-    def _split_priority_and_generic(descripcion: str, ob_id: str = "") -> list[DriveQuery]:
-        """Cap the priority section (contract-number variants + expanded
-        phrases + obligación keywords) by EVIDENCE_QUERIES_PER_OBLIGACION, but
-        ALWAYS keep every generic-term query — they used to be sliced away
-        entirely once an obligación yielded >= N keywords (evidencias/
-        discovery-fix root cause #4, pinned by
-        test_drive_fetch_generic_terms_always_included...).
-        """
-        extra_terms = list(numero_variants) + list(expanded_terms.get(ob_id) or [])
-        all_queries = build_drive_queries(descripcion, fecha_inicio, fecha_fin, extra_terms=extra_terms)
-        priority, generic = all_queries[:-n_generic], all_queries[-n_generic:]
-        return priority[: settings.EVIDENCE_QUERIES_PER_OBLIGACION] + generic
+    def _query(term: str) -> DriveQuery:
+        return DriveQuery(
+            keywords=[term],
+            date_from=date_from,
+            date_to=date_to,
+            exclude_folders=True,
+            max_results=settings.EVIDENCE_DRIVE_PAGE_SIZE,
+        )
 
-    queries: list[DriveQuery] = []
+    # Contract-level terms are a per-RUN signal, emitted ONCE — repeating them
+    # inside every obligación's slice is what consumed the whole budget before
+    # a single obligación keyword was reached (round-2 CRITICAL fix). Only the
+    # matchable query variants are used; the weaker forms stay available for
+    # scoring via `contract_number_variants`.
+    contract_terms: list[str] = list(numero_query_variants)
+    entidad = str(contrato.get("entidad") or "").strip()
+    if len(entidad) > 3:
+        contract_terms.append(entidad)
+    contract_terms = contract_terms[: settings.EVIDENCE_MAX_CONTRACT_QUERIES]
+
+    # One group per obligación — its own keywords interleaved with its expanded
+    # semantic phrases, so the round-robin floor covers both signals.
+    def _obligacion_group(descripcion: str, ob_id: str = "") -> list[str]:
+        own = [kw.replace("'", "") for kw in _extract_keywords(descripcion)[: settings.EVIDENCE_QUERIES_PER_OBLIGACION]]
+        phrases = list(expanded_terms.get(ob_id) or [])
+        group: list[str] = []
+        for pair in zip_longest(own, phrases):
+            group.extend(t for t in pair if t)
+        return group
+
     if obligaciones:
-        for oblig in obligaciones_para_query:
-            queries.extend(
-                _split_priority_and_generic(str(oblig.get("descripcion", "")), str(oblig.get("id") or ""))
-            )
+        groups = [
+            _obligacion_group(str(ob.get("descripcion", "")), str(ob.get("id") or "")) for ob in obligaciones_para_query
+        ]
     else:
-        queries = _split_priority_and_generic(state.get("user_input", ""))
+        groups = [_obligacion_group(state.get("user_input", ""))]
+    groups = [g for g in groups if g]
+
+    obligacion_budget = max(
+        settings.EVIDENCE_MAX_QUERIES_TOTAL - len(contract_terms) - len(_GENERIC_TERMS),
+        settings.EVIDENCE_MIN_QUERIES_PER_OBLIGACION * len(groups),
+    )
+
+    # Generic evidence terms ALWAYS run and are never truncated (evidencias/
+    # discovery-fix root cause #4) — they are the contract-agnostic recall net.
+    terms = [*contract_terms, *round_robin(groups, obligacion_budget), *_GENERIC_TERMS]
+    queries: list[DriveQuery] = [_query(t) for t in terms]
 
     # Deduplicar queries preservando orden (DriveQuery no es hasheable: se usa
     # una tupla normalizada de sus campos como clave).
@@ -159,7 +188,7 @@ async def drive_fetch_node(state: AgentState, provider: IntegrationProvider = In
     adapter = DriveAdapter(db) if provider == IntegrationProvider.GOOGLE else MicrosoftGraphAdapter(db)
     files_by_id: dict[str, dict] = {}
     try:
-        for query in unique_queries[: settings.EVIDENCE_MAX_QUERIES_TOTAL]:
+        for query in unique_queries:
             try:
                 files = await adapter.search_files(user_id, query)
             except Exception as exc:

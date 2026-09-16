@@ -10,13 +10,16 @@ personales sin llamadas LLM adicionales.
 
 from __future__ import annotations
 
+from itertools import zip_longest
+
 import structlog
 
 from app.adapters.calendar.calendar_adapter import GoogleCalendarAdapter
 from app.adapters.calendar.port import CalendarEvent
 from app.adapters.microsoft.graph_adapter import MicrosoftGraphAdapter
-from app.agent.prompts.contract_terms import contract_number_variants
+from app.agent.prompts.contract_terms import contract_query_variants
 from app.agent.prompts.email_evidence import _extract_keywords
+from app.agent.prompts.query_budget import round_robin
 from app.agent.state import AgentState
 from app.core.config import settings
 from app.models.integracion import IntegrationProvider
@@ -68,25 +71,44 @@ def _build_calendar_query(obligaciones: list[dict]) -> str | None:
 def _calendar_terms(
     contrato: dict, obligaciones: list[dict], expanded_terms: dict[str, list[str]] | None = None
 ) -> list[str]:
-    """One short term per Calendar API call — contract-number variants and
-    entidad first (strongest signals), then obligación keywords and any
-    LLM-generated expanded phrases (evidencias/discovery-fix WU7), bounded by
-    `EVIDENCE_MAX_CALENDAR_TERMS`."""
-    terms: list[str] = list(contract_number_variants(contrato.get("numero_contrato")))
+    """One short term per Calendar API call, allocated with two SEPARATE budgets.
+
+    Round-2 fix for the confirmed CRITICAL starvation finding: this used to
+    concatenate every contract-number variant, then the entidad, then every
+    obligación's keywords, and truncate the flat list at
+    `EVIDENCE_MAX_CALENDAR_TERMS`. For a dotted DAGMA/Cali number the 7 variants
+    plus the entidad filled all 8 slots, so NO obligación keyword and NO
+    expanded phrase ever reached Calendar.
+
+    Now: a small reserved contract-level block (only the matchable query
+    variants — see `contract_query_variants` — plus the entidad), then the
+    remaining budget dealt ROUND-ROBIN across obligaciones so each one is
+    guaranteed its own keyword and its own expanded phrase.
+    """
+    contract_terms: list[str] = list(contract_query_variants(contrato.get("numero_contrato")))
 
     entidad = contrato.get("entidad")
     if entidad and len(str(entidad).strip()) > 3:
-        terms.append(str(entidad).strip())
+        contract_terms.append(str(entidad).strip())
+    contract_terms = contract_terms[: min(settings.EVIDENCE_MAX_CONTRACT_QUERIES, settings.EVIDENCE_MAX_CALENDAR_TERMS)]
 
     expanded_terms = expanded_terms or {}
+    groups: list[list[str]] = []
     for ob in obligaciones:
-        desc = ob.get("descripcion") or ""
-        terms.extend(_extract_keywords(desc)[:2])
-        ob_id = str(ob.get("id") or "")
-        terms.extend(expanded_terms.get(ob_id) or [])
+        own = _extract_keywords(str(ob.get("descripcion") or ""))[:2]
+        phrases = list(expanded_terms.get(str(ob.get("id") or "")) or [])
+        group: list[str] = []
+        for pair in zip_longest(own, phrases):
+            group.extend(t for t in pair if t)
+        if group:
+            groups.append(group)
 
-    unique = list(dict.fromkeys(t for t in terms if t))
-    return unique[: settings.EVIDENCE_MAX_CALENDAR_TERMS]
+    budget = max(
+        settings.EVIDENCE_MAX_CALENDAR_TERMS - len(contract_terms),
+        settings.EVIDENCE_MIN_QUERIES_PER_OBLIGACION * len(groups),
+    )
+    terms = [*contract_terms, *round_robin(groups, budget)]
+    return list(dict.fromkeys(t for t in terms if t))
 
 
 def _extract_event_metadata(event: CalendarEvent) -> dict:

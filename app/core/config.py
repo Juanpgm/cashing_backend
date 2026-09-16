@@ -415,9 +415,20 @@ class Settings(BaseSettings):
     # closeout emails around fecha_fin) is not silently excluded.
     EVIDENCE_WINDOW_MARGIN_DAYS: int = 15
     # Hard cap on total Gmail queries fired per discovery run (contract-level +
-    # per-obligación combined) — contract-number queries are ordered first so
-    # truncation never drops them before a generic keyword query.
-    EVIDENCE_MAX_GMAIL_QUERIES: int = 12
+    # per-obligación combined). Raised 12 -> 24 in round 2: at 12 the
+    # contract-level block alone consumed 9-10 slots and only obligación #1 was
+    # ever searched. Contract-level queries now have their own reserved block
+    # (EVIDENCE_MAX_CONTRACT_QUERIES) and the rest is dealt round-robin across
+    # obligaciones, so this is a true ceiling rather than a starvation point.
+    EVIDENCE_MAX_GMAIL_QUERIES: int = 24
+    # Reserved slots for contract-LEVEL queries (raw number + one normalized
+    # form + entidad + supervisor + the has:attachment variant) in each
+    # provider's budget. Everything above this is dealt round-robin to the
+    # obligaciones, which is what guarantees the per-obligación floor.
+    EVIDENCE_MAX_CONTRACT_QUERIES: int = 5
+    # Per-obligación floor: how many slots each obligación is guaranteed in the
+    # round-robin allocation (its best keyword + its best expanded phrase).
+    EVIDENCE_MIN_QUERIES_PER_OBLIGACION: int = 2
     # Gmail messages fetched per query (was a hardcoded module constant of 10).
     EVIDENCE_MAX_EMAILS_PER_QUERY: int = 25
     # evidence_matcher: relevance threshold applied to the LLM's own 0-1 score
@@ -433,7 +444,15 @@ class Settings(BaseSettings):
     # variant / entidad / obligación keyword), each a separate Calendar API
     # call merged by event id — replaces the old single AND-of-everything query
     # that matched nothing once more than 1-2 terms were combined.
-    EVIDENCE_MAX_CALENDAR_TERMS: int = 8
+    # Raised 8 -> 20 in round 2 for the same reason as the Gmail budget: the
+    # contract-number variants filled all 8 slots and no obligación keyword or
+    # expanded phrase ever reached Calendar.
+    EVIDENCE_MAX_CALENDAR_TERMS: int = 20
+    # Total merged calendar events kept per provider, mirroring the
+    # EVIDENCE_MAX_EMAILS_TOTAL / EVIDENCE_MAX_FILES_TOTAL caps. Calendar was
+    # the only source with no total cap, so a per-term fan-out could return
+    # terms x EVIDENCE_MAX_EVENTS items into the filter/embedding batches.
+    EVIDENCE_MAX_EVENTS_TOTAL: int = 60
     # drive_fetch: Drive API pageSize per search_files call (was a hardcoded
     # module constant of 10).
     EVIDENCE_DRIVE_PAGE_SIZE: int = 20

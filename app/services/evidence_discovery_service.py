@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import date, timedelta
+from itertools import zip_longest
 
 import structlog
 from sqlalchemy import select
@@ -29,7 +30,7 @@ from app.agent.nodes.evidence_justify import evidence_justify_node
 from app.agent.nodes.evidence_matcher import evidence_matcher_node
 from app.agent.nodes.evidence_orchestrator import evidence_orchestrator_node
 from app.agent.nodes.query_expansion import expand_search_terms
-from app.agent.prompts.contract_terms import contract_number_variants
+from app.agent.prompts.contract_terms import contract_number_variants, contract_query_variants
 from app.agent.prompts.email_evidence import (
     _extract_keywords,
     build_contract_queries,
@@ -37,6 +38,7 @@ from app.agent.prompts.email_evidence import (
     build_obligation_queries,
 )
 from app.agent.prompts.evidence_filter import score_non_personal_email, score_non_personal_ms_email
+from app.agent.prompts.query_budget import round_robin
 from app.agent.state import AgentState
 from app.core.config import settings
 from app.core.exceptions import NO_PROVIDER_CONNECTED, ExternalServiceError, NotFoundError, ValidationError
@@ -303,26 +305,49 @@ async def _gather_email_evidence(
     max_obligaciones = settings.EVIDENCE_MAX_OBLIGACIONES_QUERIES
     obligaciones_para_query = obligaciones if max_obligaciones <= 0 else obligaciones[:max_obligaciones]
 
-    queries: list[str] = []
+    query_budget = settings.EVIDENCE_MAX_GMAIL_QUERIES if provider == IntegrationProvider.GOOGLE else (
+        settings.EVIDENCE_MAX_QUERIES_TOTAL
+    )
+
+    # Two SEPARATE budgets, not one FIFO list (round-2 fix for the confirmed
+    # CRITICAL starvation finding). Contract-level queries get a small reserved
+    # block; the remainder is dealt ROUND-ROBIN across obligaciones so each one
+    # is guaranteed its best keyword query and its best expanded phrase before
+    # any obligación gets a third.
+    contract_queries: list[str] = []
     if provider == IntegrationProvider.GOOGLE:
         fi, ff = _widen_gmail_window(fecha_inicio, fecha_fin, settings.EVIDENCE_WINDOW_MARGIN_DAYS)
-        queries.extend(
-            build_contract_queries(
-                contract_number_variants(numero_contrato), fi, ff, supervisor_email or None, entidad or None
-            )
-        )
+        contract_queries = build_contract_queries(
+            contract_query_variants(numero_contrato), fi, ff, supervisor_email or None, entidad or None
+        )[: min(settings.EVIDENCE_MAX_CONTRACT_QUERIES, query_budget)]
+
+    # One group per obligación, each already ordered best-first: its own keyword
+    # queries interleaved with its expanded semantic phrases, so the round-robin
+    # floor covers BOTH signals rather than spending every floor slot on
+    # keywords and truncating expansion away.
+    obligacion_groups: list[list[str]] = []
     for ob in obligaciones_para_query:
-        queries.extend(
-            _build_email_queries(provider, ob["descripcion"], fecha_inicio, fecha_fin, supervisor_email, entidad)[
-                : settings.EVIDENCE_QUERIES_PER_OBLIGACION
-            ]
-        )
+        own = _build_email_queries(provider, ob["descripcion"], fecha_inicio, fecha_fin, supervisor_email, entidad)[
+            : settings.EVIDENCE_QUERIES_PER_OBLIGACION
+        ]
+        phrase_queries: list[str] = []
         if provider == IntegrationProvider.GOOGLE and expanded_terms:
-            ob_id = str(ob.get("id") or "")
-            phrases = expanded_terms.get(ob_id) or []
+            phrases = expanded_terms.get(str(ob.get("id") or "")) or []
             if phrases:
                 fi, ff = _widen_gmail_window(fecha_inicio, fecha_fin, settings.EVIDENCE_WINDOW_MARGIN_DAYS)
-                queries.extend(build_expanded_phrase_queries(phrases, fi, ff))
+                phrase_queries = build_expanded_phrase_queries(phrases, fi, ff)
+        group: list[str] = []
+        for pair in zip_longest(own, phrase_queries):
+            group.extend(q for q in pair if q)
+        if group:
+            obligacion_groups.append(group)
+
+    obligacion_budget = max(
+        query_budget - len(contract_queries),
+        settings.EVIDENCE_MIN_QUERIES_PER_OBLIGACION * len(obligacion_groups),
+    )
+    queries: list[str] = [*contract_queries, *round_robin(obligacion_groups, obligacion_budget)]
+
     seen_q: set[str] = set()
     unique_queries: list[str] = []
     for q in queries:
@@ -330,9 +355,10 @@ async def _gather_email_evidence(
             seen_q.add(q)
             unique_queries.append(q)
 
-    query_budget = settings.EVIDENCE_MAX_GMAIL_QUERIES if provider == IntegrationProvider.GOOGLE else (
-        settings.EVIDENCE_MAX_QUERIES_TOTAL
-    )
+    # The per-obligación floor may legitimately push past the nominal budget for
+    # a contract with many obligaciones — honouring the floor is the point of
+    # this allocation, so the effective ceiling is whichever is larger.
+    query_budget = max(query_budget, len(unique_queries))
     numero_variants = contract_number_variants(numero_contrato)
     supervisor_domain = (supervisor_email or "").split("@")[-1].strip().lower() or None if supervisor_email else None
     emails_by_id: dict[str, dict] = {}
