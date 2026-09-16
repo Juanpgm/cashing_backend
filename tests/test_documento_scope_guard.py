@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from app.models.contrato import Contrato
-from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
+from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro, PosicionCuota
 from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
 from app.services.document_service import upload_document
 from httpx import AsyncClient
@@ -67,6 +67,13 @@ async def _crear_contrato(db: AsyncSession, user_id: uuid.UUID, numero: str = "C
 
 
 async def _crear_cuenta(db: AsyncSession, contrato: Contrato, mes: int = 1) -> CuentaCobro:
+    """checklist/primera-cuota-2026-09-16: mirrors `crear_cuenta_cobro`'s own
+    `posicion` derivation — the first cuenta inserted for a contrato is
+    PRIMERA, every later one RECURRENTE. Load-bearing now that CEDULA/RUT/RPC/
+    CDP (and conditionally CONTRATO) key off `_is_first_cuenta`."""
+    existe_previa = (
+        await db.execute(select(CuentaCobro.id).where(CuentaCobro.contrato_id == contrato.id).limit(1))
+    ).scalar_one_or_none()
     cuenta = CuentaCobro(
         contrato_id=contrato.id,
         mes=mes,
@@ -74,6 +81,7 @@ async def _crear_cuenta(db: AsyncSession, contrato: Contrato, mes: int = 1) -> C
         estado=EstadoCuentaCobro.BORRADOR,
         valor=1_000_000,
         requisitos_modo="estandar",
+        posicion=PosicionCuota.RECURRENTE if existe_previa is not None else PosicionCuota.PRIMERA,
     )
     db.add(cuenta)
     await db.commit()

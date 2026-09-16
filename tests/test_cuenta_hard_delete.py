@@ -21,7 +21,7 @@ from app.models.borrador_cuenta_cobro import BorradorCuentaCobro
 from app.models.clasificacion_job import ClasificacionEvidenciasJob
 from app.models.contrato import Contrato
 from app.models.conversacion import Conversacion
-from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
+from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro, PosicionCuota
 from app.models.documento_cuenta_cobro import DocumentoCuentaCobro, DocumentoRequisitoVinculo
 from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
 from app.models.evidencia import Evidencia
@@ -258,3 +258,122 @@ async def test_eliminar_cuenta_cobro_libera_mes_anio_para_recrear(db: AsyncSessi
     assert recreated.mes == 9
     assert recreated.anio == 2024
     assert recreated.id != original.id
+
+
+async def test_eliminar_cuenta_cobro_promueve_siguiente_a_primera_cuando_borra_la_primera(
+    db: AsyncSession,
+) -> None:
+    """checklist/primera-cuota-2026-09-16, round 2, finding #2 (CRITICAL): deleting
+    the PRIMERA cuota must not leave the contrato with zero active PRIMERA
+    cuentas forever — the lowest-numero surviving cuenta is promoted so
+    CEDULA/RUT/RPC/CDP/CONTRATO keep being requested somewhere, rather than
+    relying only on `_construir_checklist_aplica_ctx`'s read-time fail-safe."""
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+
+    primera = await cuenta_cobro_service.crear_cuenta_cobro(
+        db, user.id, CuentaCobroCreate(contrato_id=contrato.id, mes=1, anio=2024, valor=Decimal("1000000.00"))
+    )
+    await db.commit()
+    segunda = await cuenta_cobro_service.crear_cuenta_cobro(
+        db, user.id, CuentaCobroCreate(contrato_id=contrato.id, mes=2, anio=2024, valor=Decimal("1000000.00"))
+    )
+    await db.commit()
+    tercera = await cuenta_cobro_service.crear_cuenta_cobro(
+        db, user.id, CuentaCobroCreate(contrato_id=contrato.id, mes=3, anio=2024, valor=Decimal("1000000.00"))
+    )
+    await db.commit()
+
+    assert primera.posicion == PosicionCuota.PRIMERA
+    assert segunda.posicion == PosicionCuota.RECURRENTE
+    assert tercera.posicion == PosicionCuota.RECURRENTE
+
+    await cuenta_cobro_service.eliminar_cuenta_cobro(db, user.id, primera.id, _mock_storage())
+    await db.commit()
+
+    segunda_row = (await db.execute(select(CuentaCobro).where(CuentaCobro.id == segunda.id))).scalar_one()
+    tercera_row = (await db.execute(select(CuentaCobro).where(CuentaCobro.id == tercera.id))).scalar_one()
+    assert segunda_row.posicion == PosicionCuota.PRIMERA  # lowest surviving numero_cuota promoted
+    assert tercera_row.posicion == PosicionCuota.RECURRENTE
+
+
+async def test_promocion_a_primera_no_reabre_el_checklist_de_una_cuenta_cerrada(db: AsyncSession) -> None:
+    """checklist/primera-cuota-2026-09-16, round 3, finding #9 (WARNING):
+    deleting the PRIMERA promotes the earliest survivor even when that cuenta is
+    already APROBADA. The promotion itself is correct — it IS the first cuota
+    now — but it used to flip `is_first`, which made the next checklist read
+    MATERIALIZE fresh PENDIENTE CEDULA/RUT/RPC/CDP rows on a settled cuenta and
+    turn its `radicacion_lista` back to False. A settled cuenta's checklist is a
+    historical record: nothing may add requisitos to it after the fact.
+
+    Narrowing the promotion to BORRADOR survivors instead would be worse — with
+    no open survivor the read-time fail-safe then fires for EVERY closed cuenta
+    at once, doubling the blast radius.
+    """
+    from app.services import checklist_service
+
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+
+    primera = await cuenta_cobro_service.crear_cuenta_cobro(
+        db, user.id, CuentaCobroCreate(contrato_id=contrato.id, mes=1, anio=2024, valor=Decimal("1000000.00"))
+    )
+    await db.commit()
+    segunda = await cuenta_cobro_service.crear_cuenta_cobro(
+        db, user.id, CuentaCobroCreate(contrato_id=contrato.id, mes=2, anio=2024, valor=Decimal("1000000.00"))
+    )
+    await db.commit()
+
+    segunda_row = (await db.execute(select(CuentaCobro).where(CuentaCobro.id == segunda.id))).scalar_one()
+    segunda_row.requisitos_modo = "estandar"
+    await checklist_service.asegurar_checklist(db, segunda_row)
+    await db.commit()
+    filas_antes = {
+        f.requisito_codigo
+        for f in (
+            await db.execute(select(DocumentoCuentaCobro).where(DocumentoCuentaCobro.cuenta_cobro_id == segunda.id))
+        )
+        .scalars()
+        .all()
+    }
+    segunda_row.estado = EstadoCuentaCobro.APROBADA
+    await db.commit()
+
+    await cuenta_cobro_service.eliminar_cuenta_cobro(db, user.id, primera.id, _mock_storage())
+    await db.commit()
+
+    await db.refresh(segunda_row)
+    assert segunda_row.posicion == PosicionCuota.PRIMERA
+    await checklist_service.construir_checklist_completo(db, segunda_row)
+    await db.commit()
+
+    filas_despues = {
+        f.requisito_codigo
+        for f in (
+            await db.execute(select(DocumentoCuentaCobro).where(DocumentoCuentaCobro.cuenta_cobro_id == segunda.id))
+        )
+        .scalars()
+        .all()
+    }
+    assert filas_despues == filas_antes
+
+
+async def test_eliminar_cuenta_cobro_no_promueve_nada_si_no_borra_la_primera(db: AsyncSession) -> None:
+    """Deleting a non-PRIMERA cuota must never touch anyone else's posicion."""
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+
+    primera = await cuenta_cobro_service.crear_cuenta_cobro(
+        db, user.id, CuentaCobroCreate(contrato_id=contrato.id, mes=1, anio=2024, valor=Decimal("1000000.00"))
+    )
+    await db.commit()
+    segunda = await cuenta_cobro_service.crear_cuenta_cobro(
+        db, user.id, CuentaCobroCreate(contrato_id=contrato.id, mes=2, anio=2024, valor=Decimal("1000000.00"))
+    )
+    await db.commit()
+
+    await cuenta_cobro_service.eliminar_cuenta_cobro(db, user.id, segunda.id, _mock_storage())
+    await db.commit()
+
+    primera_row = (await db.execute(select(CuentaCobro).where(CuentaCobro.id == primera.id))).scalar_one()
+    assert primera_row.posicion == PosicionCuota.PRIMERA

@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from app.models.contrato import Contrato
-from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
+from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro, PosicionCuota
 from app.models.documento_cuenta_cobro import DocumentoCuentaCobro, EstadoRequisito
 from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
 from app.services import checklist_service, document_service
@@ -45,6 +45,13 @@ async def _contrato(db: AsyncSession, user_id: Any) -> Contrato:
 
 
 async def _cuenta(db: AsyncSession, contrato: Contrato, mes: int) -> CuentaCobro:
+    """checklist/primera-cuota-2026-09-16: mirrors `crear_cuenta_cobro`'s own
+    `posicion` derivation — the first cuenta inserted for a contrato is
+    PRIMERA, every later one RECURRENTE. Load-bearing now that CEDULA/RUT/RPC/
+    CDP (and conditionally CONTRATO) key off `_is_first_cuenta`."""
+    existe_previa = (
+        await db.execute(select(CuentaCobro.id).where(CuentaCobro.contrato_id == contrato.id).limit(1))
+    ).scalar_one_or_none()
     cc = CuentaCobro(
         contrato_id=contrato.id,
         mes=mes,
@@ -52,6 +59,7 @@ async def _cuenta(db: AsyncSession, contrato: Contrato, mes: int) -> CuentaCobro
         estado=EstadoCuentaCobro.BORRADOR,
         valor=1_000_000,
         requisitos_modo="estandar",
+        posicion=PosicionCuota.RECURRENTE if existe_previa is not None else PosicionCuota.PRIMERA,
     )
     db.add(cc)
     await db.commit()
@@ -111,19 +119,26 @@ async def test_documento_no_cruza_entre_cuentas(db: AsyncSession, test_user: dic
 
 
 async def test_documento_nivel_contrato_se_comparte(db: AsyncSession, test_user: dict[str, Any]) -> None:
+    """Uses ACTA_INICIO rather than RUT/CEDULA/RPC/CDP: those four are now
+    unconditionally first-cuota-only (checklist/primera-cuota-2026-09-16, rule
+    1) — their row simply does not materialize on cuenta B at all, so they can
+    no longer demonstrate "a shared doc auto-fulfils the row on every cuenta".
+    ACTA_INICIO is nivel-contrato but untouched by that rule (still shown +
+    shared unconditionally on every cuenta), so it still exercises exactly the
+    sharing behaviour this test targets."""
     user = test_user["user"]
     c = await _contrato(db, user.id)
     ca = await _cuenta(db, c, mes=1)
     cb = await _cuenta(db, c, mes=2)
 
-    # Contract-level RUT document: shared (cuenta_cobro_id NULL).
+    # Contract-level ACTA_INICIO document: shared (cuenta_cobro_id NULL).
     df = DocumentoFuente(
         usuario_id=user.id,
         contrato_id=c.id,
         cuenta_cobro_id=None,
-        storage_key="k/rut.pdf",
-        nombre="rut.pdf",
-        tipo=TipoDocumentoFuente.RUT,
+        storage_key="k/acta_inicio.pdf",
+        nombre="acta_inicio.pdf",
+        tipo=TipoDocumentoFuente.ACTA_INICIO,
     )
     db.add(df)
     await db.commit()
@@ -137,9 +152,9 @@ async def test_documento_nivel_contrato_se_comparte(db: AsyncSession, test_user:
     await checklist_service.auto_vincular_documentos_fuente(db, cb)
     await db.commit()
 
-    # The single shared RUT auto-fulfils the RUT requisito in BOTH cuentas.
-    assert (await _fila(db, ca, "RUT")).estado == EstadoRequisito.CARGADO
-    assert (await _fila(db, cb, "RUT")).estado == EstadoRequisito.CARGADO
+    # The single shared ACTA_INICIO auto-fulfils the requisito in BOTH cuentas.
+    assert (await _fila(db, ca, "ACTA_INICIO")).estado == EstadoRequisito.CARGADO
+    assert (await _fila(db, cb, "ACTA_INICIO")).estado == EstadoRequisito.CARGADO
 
 
 async def test_listar_documentos_contrato_solo_nivel_contrato(db: AsyncSession, test_user: dict[str, Any]) -> None:
@@ -237,9 +252,17 @@ async def test_eliminar_documento_resetea_fila_a_pendiente(db: AsyncSession, tes
 
 
 async def test_documento_nivel_contrato_multidoc_compartido(db: AsyncSession, test_user: dict[str, Any]) -> None:
-    """RPC (contract-level) can hold MULTIPLE shared documents at once (e.g. RPC
-    original + RPC de adición) in one cuenta, and the shared pool still
-    auto-satisfies OTHER cuentas of the same contract (1:N model, two-tier)."""
+    """ACTA_INICIO (contract-level) can hold MULTIPLE shared documents at once
+    in one cuenta, and the shared pool still auto-satisfies OTHER cuentas of
+    the same contract (1:N model, two-tier).
+
+    Uses ACTA_INICIO rather than RPC: RPC is now unconditionally first-cuota-
+    only (checklist/primera-cuota-2026-09-16, rule 1) — its row simply does not
+    materialize on cuenta B at all, so it can no longer demonstrate "the shared
+    pool still auto-satisfies OTHER cuentas". ACTA_INICIO is nivel-contrato but
+    untouched by that rule (still shown + shared unconditionally on every
+    cuenta), so it still exercises exactly the multi-doc sharing behaviour this
+    test targets."""
     user = test_user["user"]
     c = await _contrato(db, user.id)
     ca = await _cuenta(db, c, mes=1)
@@ -249,17 +272,17 @@ async def test_documento_nivel_contrato_multidoc_compartido(db: AsyncSession, te
         usuario_id=user.id,
         contrato_id=c.id,
         cuenta_cobro_id=None,
-        storage_key="k/rpc-original",
-        nombre="rpc-original.pdf",
-        tipo=TipoDocumentoFuente.RPC,
+        storage_key="k/acta-inicio-original",
+        nombre="acta-inicio-original.pdf",
+        tipo=TipoDocumentoFuente.ACTA_INICIO,
     )
     df_adicion = DocumentoFuente(
         usuario_id=user.id,
         contrato_id=c.id,
         cuenta_cobro_id=None,
-        storage_key="k/rpc-adicion",
-        nombre="rpc-adicion.pdf",
-        tipo=TipoDocumentoFuente.RPC,
+        storage_key="k/acta-inicio-adicion",
+        nombre="acta-inicio-adicion.pdf",
+        tipo=TipoDocumentoFuente.ACTA_INICIO,
     )
     db.add_all([df_original, df_adicion])
     await db.commit()
@@ -270,21 +293,21 @@ async def test_documento_nivel_contrato_multidoc_compartido(db: AsyncSession, te
     await checklist_service.asegurar_checklist(db, cb)
     await db.commit()
 
-    # Cuenta A: explicitly link BOTH shared RPC documents to the same requisito.
-    await checklist_service.vincular_documento_fuente(db, ca.id, "RPC", df_original.id)
-    await checklist_service.vincular_documento_fuente(db, ca.id, "RPC", df_adicion.id)
+    # Cuenta A: explicitly link BOTH shared ACTA_INICIO documents to the same requisito.
+    await checklist_service.vincular_documento_fuente(db, ca.id, "ACTA_INICIO", df_original.id)
+    await checklist_service.vincular_documento_fuente(db, ca.id, "ACTA_INICIO", df_adicion.id)
     await db.commit()
 
     payload_a = await checklist_service.construir_checklist_completo(db, ca)
-    rpc_a = next(i for i in payload_a["items"] if i["requisito"]["codigo"] == "RPC")
-    assert rpc_a["estado"] == EstadoRequisito.CARGADO
-    assert {d["id"] for d in rpc_a["documentos_fuente"]} == {df_original.id, df_adicion.id}
+    acta_a = next(i for i in payload_a["items"] if i["requisito"]["codigo"] == "ACTA_INICIO")
+    assert acta_a["estado"] == EstadoRequisito.CARGADO
+    assert {d["id"] for d in acta_a["documentos_fuente"]} == {df_original.id, df_adicion.id}
 
     # Cuenta B: never explicitly linked — auto-link from the SAME shared pool still
     # satisfies the requisito (conservative: picks a single best candidate).
     await checklist_service.auto_vincular_documentos_fuente(db, cb)
     await db.commit()
     payload_b = await checklist_service.construir_checklist_completo(db, cb)
-    rpc_b = next(i for i in payload_b["items"] if i["requisito"]["codigo"] == "RPC")
-    assert rpc_b["estado"] == EstadoRequisito.CARGADO
-    assert len(rpc_b["documentos_fuente"]) >= 1
+    acta_b = next(i for i in payload_b["items"] if i["requisito"]["codigo"] == "ACTA_INICIO")
+    assert acta_b["estado"] == EstadoRequisito.CARGADO
+    assert len(acta_b["documentos_fuente"]) >= 1

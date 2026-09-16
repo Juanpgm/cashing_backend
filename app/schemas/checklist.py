@@ -120,6 +120,16 @@ class RequisitoChecklistItem(BaseModel):
             "should show 'detección falló' instead of a silent pendiente."
         ),
     )
+    heredado: bool = Field(
+        False,
+        description=(
+            "True when this row no longer formally applies to the cuenta (e.g. a "
+            "first-cuota-only requisito on a later cuota) but stays visible because it "
+            "already carries a real linked document — row existence + content is the "
+            "decision (checklist/primera-cuota-2026-09-16, round 2). Never counted in "
+            "'pendientes'."
+        ),
+    )
 
 
 class ChecklistResumen(BaseModel):

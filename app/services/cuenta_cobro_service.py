@@ -1546,6 +1546,15 @@ async def eliminar_cuenta_cobro(
         raise ValidationError("No se puede eliminar una cuenta aprobada o pagada.")
 
     pdf_storage_key = cuenta.pdf_storage_key
+    # Captured before the delete (checklist/primera-cuota-2026-09-16, round 2,
+    # finding #2): if the PRIMERA cuota is the one being removed, the contrato
+    # must not end up with zero active PRIMERA cuentas — the checklist's own
+    # `_construir_checklist_aplica_ctx` fail-safe covers the read path, but
+    # this promotes a real, persistent replacement so CEDULA/RUT/RPC/CDP/
+    # CONTRATO keep being requested going forward without relying on that
+    # fallback forever.
+    contrato_id = cuenta.contrato_id
+    era_primera = cuenta.posicion == PosicionCuota.PRIMERA
 
     actividad_ids = [
         row[0] for row in (await db.execute(select(Actividad.id).where(Actividad.cuenta_cobro_id == cuenta_id))).all()
@@ -1606,6 +1615,19 @@ async def eliminar_cuenta_cobro(
     )
 
     await db.execute(sa_delete(CuentaCobro).where(CuentaCobro.id == cuenta_id))
+
+    if era_primera:
+        siguiente = (
+            await db.execute(
+                select(CuentaCobro)
+                .where(CuentaCobro.contrato_id == contrato_id, CuentaCobro.deleted_at.is_(None))
+                .order_by(CuentaCobro.numero_cuota)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if siguiente is not None:
+            siguiente.posicion = PosicionCuota.PRIMERA
+
     await db.commit()
 
     await logger.ainfo(

@@ -13,6 +13,7 @@ from sqlalchemy import delete as sa_delete
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.exceptions import CHECKLIST_CUENTA_CERRADA, ValidationError
 from app.models.documento_cuenta_cobro import DocumentoCuentaCobro, EstadoRequisito
 from app.models.requisito_cuenta import RequisitoCuenta
 from app.schemas.requisito_cuenta import (
@@ -52,8 +53,26 @@ async def definir_set(
     Previous custom definitions are removed (cascading their checklist rows),
     and standard PENDIENTE rows are cleared so the structure recomputes for the
     chosen mode. Fulfilled rows (cargado/detectado/cumplido/no_aplica) are kept.
+
+    Refuses outright on a SETTLED cuenta (`checklist_service.cuenta_esta_cerrada`)
+    — see the guard below.
     """
     cuenta = await cuenta_cobro_service._get_cuenta_con_ownership(db, usuario_id, cuenta_id)
+
+    # This function is destructive-then-rebuild, and `asegurar_checklist` never
+    # materializes new rows on a settled cuenta (round 3, finding #9). Running it
+    # there would execute the two deletes below and get NOTHING back: the
+    # mandatory requisitos of an already-radicated compliance record would be
+    # erased permanently (APROBADA/PAGADA have no transition back to BORRADOR),
+    # and the truncated checklist would then report `radicacion_lista=True` with
+    # zero documents behind it. Refuse BEFORE deleting anything, never half-run
+    # (checklist/primera-cuota-2026-09-16, round 4, BLOCKER).
+    if checklist_service.cuenta_esta_cerrada(cuenta):
+        raise ValidationError(
+            "Esta cuenta de cobro ya fue radicada; su checklist quedó congelado como registro "
+            "de lo que se radicó y no se puede redefinir.",
+            code=CHECKLIST_CUENTA_CERRADA,
+        )
 
     # Drop previous custom definitions — FK CASCADE removes their checklist rows.
     await db.execute(sa_delete(RequisitoCuenta).where(RequisitoCuenta.cuenta_cobro_id == cuenta_id))

@@ -22,12 +22,13 @@ from app.core.security import create_access_token, hash_password
 from app.models.actividad import Actividad
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro, PosicionCuota
+from app.models.documento_cuenta_cobro import DocumentoCuentaCobro, EstadoRequisito
 from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
 from app.models.evidencia import Evidencia
 from app.models.obligacion import Obligacion, TipoObligacion
 from app.models.usuario import Usuario
 from app.schemas.stepper_state import StepperStateResponse
-from app.services import stepper_state_service
+from app.services import checklist_service, stepper_state_service
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -477,7 +478,7 @@ async def test_step5_formato_always_non_blocking(
     assert result.steps[4].key == "formato"
     assert result.steps[4].blocking is False
     assert result.steps[4].complete is True
-    assert result.steps[4].detail == {"plantilla_ingerida": False, "plantillas": []}
+    assert result.steps[4].detail == {"plantilla_ingerida": False, "plantillas": [], "informes_pendientes": []}
 
 
 async def test_step5_formato_lists_every_plantilla_per_tipo(
@@ -521,6 +522,114 @@ async def test_step5_formato_lists_every_plantilla_per_tipo(
         {"tipo_documento": "cuenta_cobro", "formato": "docx", "clonable": True, "campos_total": 2},
         {"tipo_documento": "informe_actividades", "formato": "pdf", "clonable": False, "campos_total": 0},
     ]
+
+
+# ── WU6 (checklist/primera-cuota-2026-09-16): step 5 gates on the two
+# informes' checklist state instead of always reporting complete=True. ──────
+
+
+async def _fila_informe(db: AsyncSession, cuenta: CuentaCobro, codigo: str) -> DocumentoCuentaCobro:
+    from sqlalchemy import select as _select
+
+    res = await db.execute(
+        _select(DocumentoCuentaCobro).where(
+            DocumentoCuentaCobro.cuenta_cobro_id == cuenta.id,
+            DocumentoCuentaCobro.requisito_codigo == codigo,
+        )
+    )
+    return res.scalar_one()
+
+
+async def test_step5_formato_incomplete_when_no_informe_generated(
+    db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
+) -> None:
+    user = test_user["user"]
+    cuenta = await _make_cuenta(db, contrato, requisitos_modo="estandar")
+    await checklist_service.asegurar_checklist(db, cuenta)
+    await db.commit()
+
+    result = await stepper_state_service.obtener_stepper_state(db, user.id, cuenta.id)
+
+    assert result.steps[4].complete is False
+    assert result.steps[4].blocking is False  # never blocks — the radicar gate enforces informes already
+    assert result.steps[4].detail is not None
+    assert result.steps[4].detail["informes_pendientes"] == ["INFORME_ACTIVIDADES", "INFORME_SUPERVISION"]
+
+
+async def test_step5_formato_incomplete_when_only_one_informe_generated(
+    db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
+) -> None:
+    user = test_user["user"]
+    cuenta = await _make_cuenta(db, contrato, requisitos_modo="estandar")
+    await checklist_service.asegurar_checklist(db, cuenta)
+    await db.commit()
+    fila = await _fila_informe(db, cuenta, "INFORME_ACTIVIDADES")
+    fila.estado = EstadoRequisito.CARGADO
+    await db.commit()
+
+    result = await stepper_state_service.obtener_stepper_state(db, user.id, cuenta.id)
+
+    assert result.steps[4].complete is False
+    assert result.steps[4].detail is not None
+    assert result.steps[4].detail["informes_pendientes"] == ["INFORME_SUPERVISION"]
+
+
+async def test_step5_formato_complete_when_both_informes_generated(
+    db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
+) -> None:
+    user = test_user["user"]
+    cuenta = await _make_cuenta(db, contrato, requisitos_modo="estandar")
+    await checklist_service.asegurar_checklist(db, cuenta)
+    await db.commit()
+    fila_act = await _fila_informe(db, cuenta, "INFORME_ACTIVIDADES")
+    fila_sup = await _fila_informe(db, cuenta, "INFORME_SUPERVISION")
+    fila_act.estado = EstadoRequisito.CARGADO
+    fila_sup.estado = EstadoRequisito.DETECTADO
+    await db.commit()
+
+    result = await stepper_state_service.obtener_stepper_state(db, user.id, cuenta.id)
+
+    assert result.steps[4].complete is True
+    assert result.steps[4].detail is not None
+    assert result.steps[4].detail["informes_pendientes"] == []
+
+
+async def test_step5_formato_no_aplica_counts_as_satisfied(
+    db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
+) -> None:
+    user = test_user["user"]
+    cuenta = await _make_cuenta(db, contrato, requisitos_modo="estandar")
+    await checklist_service.asegurar_checklist(db, cuenta)
+    await db.commit()
+    fila_act = await _fila_informe(db, cuenta, "INFORME_ACTIVIDADES")
+    fila_sup = await _fila_informe(db, cuenta, "INFORME_SUPERVISION")
+    fila_act.estado = EstadoRequisito.NO_APLICA
+    fila_sup.estado = EstadoRequisito.NO_APLICA
+    await db.commit()
+
+    result = await stepper_state_service.obtener_stepper_state(db, user.id, cuenta.id)
+
+    assert result.steps[4].complete is True
+    assert result.steps[4].detail is not None
+    assert result.steps[4].detail["informes_pendientes"] == []
+
+
+async def test_step5_formato_complete_when_reemplazar_mode_dropped_informe_rows(
+    db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
+) -> None:
+    """`reemplazar` mode only materializes EVIDENCIAS (+ any custom-mapped
+    code) — INFORME_ACTIVIDADES/INFORME_SUPERVISION rows never exist, so
+    there's nothing to generate and step 5 is vacuously complete."""
+    user = test_user["user"]
+    cuenta = await _make_cuenta(db, contrato, requisitos_modo="reemplazar")
+    await checklist_service.asegurar_checklist(db, cuenta)
+    await db.commit()
+
+    result = await stepper_state_service.obtener_stepper_state(db, user.id, cuenta.id)
+
+    assert result.steps[4].complete is True
+    assert result.steps[4].detail is not None
+    assert result.steps[4].detail["informes_pendientes"] == []
 
 
 async def test_step4_evidencias_incomplete_when_pendientes_greater_than_zero(

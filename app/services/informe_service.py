@@ -1672,12 +1672,67 @@ async def generar_zip_evidencias(
     # Differential package: on a non-first cuota, first-cuota-only contract docs
     # (catalog rows with solo_primera_cuenta) were already radicated with cuota 1.
     # "First" reuses the checklist's own persisted-posicion predicate.
+    from app.models.documento_cuenta_cobro import DocumentoCuentaCobro
     from app.services import checklist_service
 
     codigos_solo_primera: set[str] = set()
     if not checklist_service._is_first_cuenta(cuenta):
         catalogo = await checklist_service.listar_catalogo(db)
-        codigos_solo_primera = {req.codigo for req in catalogo if req.solo_primera_cuenta}
+        ctx = await checklist_service._construir_checklist_aplica_ctx(db, cuenta)
+        # Round 3, finding #1: the package must apply the SAME applicability rule
+        # the checklist materializes and displays with — a custom requisito
+        # explicitly mapped to a standard code (`mapea_a_estandar`) is persisted
+        # as that standard row, so ignoring the mapping here both dropped it from
+        # the package and made the LEEME claim it was "ya radicado en la cuota 1"
+        # while the checklist was still asking the user for it.
+        mapeos = checklist_service._mapeos_por_codigo(await checklist_service.listar_requisitos_cuenta(db, cuenta.id))
+        # `vinculos` is eager-loaded because `_fila_tiene_contenido` reads it
+        # (round 3, finding #5). It is declared lazy="raise", so a missed
+        # eager-load raises sqlalchemy.exc.InvalidRequestError — NOT
+        # MissingGreenlet, which would point the next debugger at an async
+        # context boundary instead of the raiseload contract (round 4, #8).
+        filas_por_codigo = {
+            f.requisito_codigo: f
+            for f in (
+                await db.execute(
+                    select(DocumentoCuentaCobro)
+                    .options(selectinload(DocumentoCuentaCobro.vinculos))
+                    .where(DocumentoCuentaCobro.cuenta_cobro_id == cuenta.id)
+                )
+            )
+            .scalars()
+            .all()
+            if f.requisito_codigo is not None
+        }
+        for req in catalogo:
+            if not req.solo_primera_cuenta:
+                continue
+            if checklist_service._aplica_con_mapeo(req, ctx, mapeos):
+                # Applies normally on THIS cuenta — nivel-contrato exempt
+                # (FICHA_TECNICA/ACTA_INICIO stay visible on every cuota by
+                # design), CONTRATO's rule-2 reappearance, or an explicit custom
+                # mapping. The package mirrors the checklist: whatever the
+                # checklist asks the user for on this cuota ships with it.
+                continue
+            # Round 2, findings #1/#3: a row materialized for THIS cuenta that
+            # already carries real content (e.g. CONTRATO reappeared then got
+            # its document uploaded — self-defeating the very exception that
+            # created the row; or a legacy CEDULA/RUT/RPC/CDP row with a real
+            # upload) was never "already radicated with cuota 1" — keep it out
+            # of the omission set so both the package AND the LEEME disclosure
+            # line stay consistent with what actually ships.
+            #
+            # Round 4, finding #7: this is also why an explicit NO_APLICA /
+            # CUMPLIDO_MANUAL decision counts as content in
+            # `_fila_tiene_contenido`. The LEEME line below states the omitted
+            # documents were "ya radicados en la cuota 1" — a claim about a
+            # prior filing. Asserting that about a requisito the contractor
+            # just declared inapplicable on THIS cuota contradicts their own
+            # recorded decision, in the package handed to the supervisor.
+            fila = filas_por_codigo.get(req.codigo)
+            if fila is not None and checklist_service._fila_tiene_contenido(fila):
+                continue
+            codigos_solo_primera.add(req.codigo)
 
     storage = get_evidencia_storage()
 
