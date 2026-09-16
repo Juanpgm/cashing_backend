@@ -398,6 +398,17 @@ def _score_ok(score: object) -> bool:
     string is now parsed, and a 0-100 percentage is normalized before the
     comparison. An absent/null/unparseable score stays tolerated — the rubric
     documents the field as checked "when present" for legacy-model compat.
+
+    SUGGESTION fix (round-3): `if value > 1.0: value /= 100.0` treated EVERY
+    out-of-range value as a percentage, so a model drifting to a 0-10
+    confidence scale (the prompt only says "de 0 a 1", a common miscalibration
+    for small models) got silently divided by 100 too — an honest 8/10 became
+    0.08 and a genuine `relevante: true` verdict was discarded with no
+    recovery path (a real list, not None, so the keyword-score fallback never
+    fires either). Values normalize only when unambiguously a percentage
+    (> 10); a value in the ambiguous (1, 10] range is now treated the same as
+    an absent/unparseable score — tolerated, letting `relevante` decide —
+    rather than confidently misinterpreted as a percentage.
     """
     if score is None or isinstance(score, bool):
         return True
@@ -409,8 +420,10 @@ def _score_ok(score: object) -> bool:
     if not isinstance(score, (int, float)):
         return True
     value = float(score)
-    if value > 1.0:
+    if value > 10.0:
         value /= 100.0
+    elif value > 1.0:
+        return True
     return value >= settings.EVIDENCE_RELEVANCE_MIN
 
 

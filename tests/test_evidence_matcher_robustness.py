@@ -117,6 +117,22 @@ def test_percentage_score_is_normalized_before_comparison():
     assert _parse_relevance_response('[{"idx": 1, "relevante": true, "score": 40}]', 1) == [False]
 
 
+def test_a_0_to_10_scale_score_does_not_fall_in_the_dead_zone():
+    """SUGGESTION regression: `if value > 1.0: value /= 100.0` treats EVERY
+    out-of-range score as a percentage, so a model drifting to a 0-10
+    confidence scale (a common failure mode for small models, and the prompt
+    only says "de 0 a 1") got silently divided by 100 too — e.g. an honest
+    8/10 became 0.08 and a true `relevante: true` verdict was discarded with
+    no recovery path. Values in the ambiguous (1, 10] range are now treated
+    as unparseable/out-of-range and let `relevante` decide, exactly like an
+    absent score — instead of confidently misinterpreting them as a
+    percentage."""
+    assert _parse_relevance_response('[{"idx": 1, "relevante": true, "score": 8}]', 1) == [True]
+    assert _parse_relevance_response('[{"idx": 1, "relevante": true, "score": 1.5}]', 1) == [True]
+    # A genuine relevante:false verdict must still stay false regardless of score.
+    assert _parse_relevance_response('[{"idx": 1, "relevante": false, "score": 8}]', 1) == [False]
+
+
 def test_null_score_is_treated_as_absent_not_as_passing():
     assert _parse_relevance_response('[{"idx": 1, "relevante": true, "score": null}]', 1) == [True]
 
