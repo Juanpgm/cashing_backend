@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from app.agent.nodes.query_expansion import expand_search_terms
+from app.core.config import settings
 
 
 class _FakeResp:
@@ -37,7 +38,11 @@ async def test_llm_none_falls_back_to_deterministic_keywords() -> None:
 
 
 @pytest.mark.asyncio
-async def test_well_formed_llm_response_returns_phrases_per_obligacion() -> None:
+async def test_well_formed_llm_response_returns_phrases_per_obligacion(monkeypatch) -> None:
+    # Expansion skips the LLM round trip when the configured model has no
+    # credentials (an unauthenticated call burns tenacity's retry/backoff chain
+    # for nothing). Stub one so the LLM path under test actually runs.
+    monkeypatch.setattr(settings, "GROQ_API_KEY", "sk-test")
     obligaciones = [
         {"id": "ob1", "descripcion": "Entregar informe mensual de actividades"},
         {"id": "ob2", "descripcion": "Asistir a reuniones de seguimiento"},
@@ -99,10 +104,14 @@ async def test_llm_response_missing_an_obligacion_still_gets_fallback_for_it() -
 
 
 @pytest.mark.asyncio
-async def test_contexto_usuario_included_as_primary_hint_in_prompt() -> None:
+async def test_contexto_usuario_included_as_primary_hint_in_prompt(monkeypatch) -> None:
     """evidencias/discovery-fix WU7b: the contratista's own monthly summary
     ("¿Qué hiciste este mes?") must reach the expansion prompt as the primary
     hint of what was actually done this period."""
+    # Expansion skips the LLM round trip when the configured model has no
+    # credentials (an unauthenticated call burns tenacity's retry/backoff chain
+    # for nothing). Stub one so the LLM path under test actually runs.
+    monkeypatch.setattr(settings, "GROQ_API_KEY", "sk-test")
     obligaciones = [{"id": "ob1", "descripcion": "Entregar informe mensual"}]
     llm = AsyncMock()
     llm.complete = AsyncMock(return_value=_FakeResp('{"ob1": ["a", "b", "c", "d"]}'))
@@ -137,9 +146,7 @@ async def test_contexto_usuario_phrases_merged_even_when_llm_ignores_them() -> N
     llm = AsyncMock()
     llm.complete = AsyncMock(return_value=_FakeResp('{"ob1": ["informe de avance", "reporte", "x", "y"]}'))
 
-    result = await expand_search_terms(
-        {}, obligaciones, llm, contexto_usuario="Coordiné la logística del evento anual"
-    )
+    result = await expand_search_terms({}, obligaciones, llm, contexto_usuario="Coordiné la logística del evento anual")
 
     assert any(term in result["ob1"] for term in ("coordiné", "logística", "evento"))
 
@@ -157,7 +164,11 @@ async def test_no_contexto_usuario_behaves_exactly_as_before() -> None:
 
 
 @pytest.mark.asyncio
-async def test_prompt_includes_contract_header() -> None:
+async def test_prompt_includes_contract_header(monkeypatch) -> None:
+    # Expansion skips the LLM round trip when the configured model has no
+    # credentials (an unauthenticated call burns tenacity's retry/backoff chain
+    # for nothing). Stub one so the LLM path under test actually runs.
+    monkeypatch.setattr(settings, "GROQ_API_KEY", "sk-test")
     obligaciones = [{"id": "ob1", "descripcion": "Entregar informe mensual"}]
     llm = AsyncMock()
     llm.complete = AsyncMock(return_value=_FakeResp('{"ob1": ["a", "b", "c", "d"]}'))

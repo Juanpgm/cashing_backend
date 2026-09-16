@@ -757,6 +757,10 @@ async def test_descubrir_evidencias_expansion_enabled_feeds_gmail_queries(monkey
 
     monkeypatch.setattr(settings, "EVIDENCE_QUERY_EXPANSION_ENABLED", True)
     monkeypatch.setattr(settings, "EVIDENCE_MAX_GMAIL_QUERIES", 50)
+    # Expansion deliberately skips the round trip when the configured model has
+    # no credentials (otherwise every unauthenticated call burns tenacity's
+    # retry/backoff chain), so stub one to exercise the real path here.
+    monkeypatch.setattr(settings, "GROQ_API_KEY", "sk-test")
 
     req = EvidenceDiscoveryRequest(
         obligaciones=[{"id": "ob1", "descripcion": "Entregar informe mensual de actividades"}],

@@ -11,6 +11,7 @@ malformed output — this must never fail the discovery run.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 
@@ -20,6 +21,7 @@ from app.agent.prompts.contract_terms import contract_header
 from app.agent.prompts.email_evidence import _extract_keywords
 from app.agent.prompts.query_budget import obligacion_key as _obligacion_id
 from app.agent.prompts.query_expansion import QUERY_EXPANSION_SYSTEM_PROMPT, build_query_expansion_prompt
+from app.core.config import settings
 from app.schemas.agent import LLMMessage
 
 logger = structlog.get_logger("agent.nodes.query_expansion")
@@ -33,6 +35,34 @@ def _deterministic_terms(obligaciones: list[dict]) -> dict[str, list[str]]:
     return {
         _obligacion_id(ob, i): _extract_keywords(str(ob.get("descripcion") or "")) for i, ob in enumerate(obligaciones)
     }
+
+
+def _model_credentials_ready(model: str) -> bool:
+    """Can the configured model actually be called?
+
+    Expansion is a BEST-EFFORT enhancement whose fallback is already
+    deterministic, so it must never pay for a call that cannot succeed.
+    `LiteLLMAdapter._call_model` is wrapped in tenacity
+    `@retry(stop_after_attempt(2), wait_exponential(min=1, max=4))` and walks a
+    3-model fallback chain, so ONE call against an unauthenticated provider
+    burns ~3s of real `asyncio.sleep` before failing — measured as a 4.8s -> 59.4s
+    regression in a single test file when this feature was switched on by
+    default, and the same wasted latency on a user-facing "descubrir" click for
+    any deployment that has not configured a key.
+
+    Ollama needs no key. An unrecognised provider is attempted rather than
+    silently skipped — better a wasted call than a silently disabled feature.
+    """
+    model = (model or "").strip().lower()
+    if model.startswith(("ollama/", "ollama_chat/")):
+        return True
+    if model.startswith("groq/"):
+        return bool(settings.GROQ_API_KEY)
+    if model.startswith("gemini/"):
+        return bool(settings.GEMINI_API_KEY)
+    if model.startswith(("openai/", "gpt-")):
+        return bool(settings.OPENAI_API_KEY)
+    return True
 
 
 def _is_unusable_provider(llm: object) -> bool:
@@ -127,24 +157,37 @@ async def expand_search_terms(
     # provider is scripted for chat turns, not for this JSON contract, so
     # calling it would only produce an unparseable answer and this same
     # fallback, one wasted call later.
-    if llm is None or _is_unusable_provider(llm):
+    if (
+        llm is None
+        or _is_unusable_provider(llm)
+        or not _model_credentials_ready(settings.LLM_EVIDENCE_CLASSIFIER_MODEL)
+    ):
         return fallback
 
     header = contract_header(contexto)
     prompt = build_query_expansion_prompt(header, obligaciones, contexto_usuario)
     valid_ids = set(fallback.keys())
 
+    # Hard time bound: even with valid credentials a hung or throttled provider
+    # must never stall the user-facing discovery click. On timeout we keep the
+    # deterministic terms, exactly as on any other failure.
     try:
-        resp = await llm.complete(
-            [
-                LLMMessage(role="system", content=QUERY_EXPANSION_SYSTEM_PROMPT),
-                LLMMessage(role="user", content=prompt),
-            ],
-            temperature=0.3,
-            max_tokens=1200,
-            reasoning_effort="low",
+        resp = await asyncio.wait_for(
+            llm.complete(
+                [
+                    LLMMessage(role="system", content=QUERY_EXPANSION_SYSTEM_PROMPT),
+                    LLMMessage(role="user", content=prompt),
+                ],
+                temperature=0.3,
+                max_tokens=1200,
+                reasoning_effort="low",
+            ),
+            timeout=settings.EVIDENCE_QUERY_EXPANSION_TIMEOUT_SECONDS,
         )
         parsed = _parse_expansion_response(resp.content, valid_ids)
+    except TimeoutError:
+        logger.warning("query_expansion_timeout", n_obligaciones=len(obligaciones))
+        return fallback
     except Exception as exc:
         logger.warning("query_expansion_llm_failed", error=str(exc), n_obligaciones=len(obligaciones))
         return fallback

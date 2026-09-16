@@ -100,8 +100,14 @@ async def test_expansion_is_silent_and_cheap_for_a_fake_provider():
 
 
 @pytest.mark.asyncio
-async def test_expansion_makes_at_most_one_llm_call_for_many_obligaciones():
+async def test_expansion_makes_at_most_one_llm_call_for_many_obligaciones(monkeypatch):
+    """One call TOTAL, never one per obligación. Credentials are stubbed because
+    expansion deliberately skips the round trip when the configured model has
+    none (see the cost tests below)."""
     from app.agent.nodes.query_expansion import expand_search_terms
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "GROQ_API_KEY", "sk-test")
 
     calls = {"n": 0}
 
@@ -224,3 +230,86 @@ def test_entidad_search_term_strips_legal_suffixes():
     assert entidad_search_term("Hospital Universitario E.S.E") == "Hospital Universitario"
     assert entidad_search_term("DAGMA") == "DAGMA"
     assert entidad_search_term(None) == ""
+
+
+# ── Expansion must be CHEAP when the provider cannot answer ───────────────────
+#
+# Flipping EVIDENCE_QUERY_EXPANSION_ENABLED to True made one discovery test file
+# go from 4.8s to 59.4s. Root cause: `LiteLLMAdapter._call_model` is wrapped in
+# tenacity `@retry(stop_after_attempt(2), wait_exponential(min=1, max=4))` and
+# walks a 3-model fallback chain, so ONE expansion call against an
+# unauthenticated/unreachable provider burns ~3s of real `asyncio.sleep` before
+# reaching the deterministic fallback. That is wasted latency on a user-facing
+# "descubrir" click, not just a slow suite.
+
+
+def test_expansion_is_skipped_when_the_model_has_no_credentials(monkeypatch):
+    from app.agent.nodes.query_expansion import _model_credentials_ready
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "GROQ_API_KEY", "")
+    assert _model_credentials_ready("groq/openai/gpt-oss-20b") is False
+
+    monkeypatch.setattr(settings, "GROQ_API_KEY", "sk-real")
+    assert _model_credentials_ready("groq/openai/gpt-oss-20b") is True
+
+
+def test_ollama_needs_no_api_key(monkeypatch):
+    """An Ollama-only deployment must keep semantic expansion."""
+    from app.agent.nodes.query_expansion import _model_credentials_ready
+
+    assert _model_credentials_ready("ollama/llama3.1:8b") is True
+    assert _model_credentials_ready("ollama_chat/llama3.1:8b") is True
+
+
+def test_unknown_provider_is_attempted_rather_than_silently_skipped():
+    from app.agent.nodes.query_expansion import _model_credentials_ready
+
+    assert _model_credentials_ready("some-new-vendor/model-x") is True
+
+
+@pytest.mark.asyncio
+async def test_expansion_without_credentials_makes_no_llm_call(monkeypatch):
+    from app.agent.nodes import query_expansion as mod
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "GROQ_API_KEY", "")
+    monkeypatch.setattr(settings, "LLM_EVIDENCE_CLASSIFIER_MODEL", "groq/openai/gpt-oss-20b")
+
+    calls = {"n": 0}
+
+    class _LLM:
+        async def complete(self, messages, **kwargs):
+            calls["n"] += 1
+            raise AssertionError("must not be called without credentials")
+
+    out = await mod.expand_search_terms(
+        {}, [{"id": "ob1", "descripcion": "Elaborar informes mensuales de seguimiento"}], _LLM()
+    )
+    assert calls["n"] == 0
+    assert out["ob1"], "deterministic fallback must still be returned"
+
+
+@pytest.mark.asyncio
+async def test_expansion_is_time_bounded_and_falls_back_on_timeout(monkeypatch):
+    """Even WITH credentials, a hung provider must not stall a user click."""
+    import asyncio
+
+    from app.agent.nodes import query_expansion as mod
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "GROQ_API_KEY", "sk-real")
+    monkeypatch.setattr(settings, "EVIDENCE_QUERY_EXPANSION_TIMEOUT_SECONDS", 0.1)
+
+    class _Hangs:
+        async def complete(self, messages, **kwargs):
+            await asyncio.sleep(30)
+
+    started = asyncio.get_event_loop().time()
+    out = await mod.expand_search_terms(
+        {}, [{"id": "ob1", "descripcion": "Elaborar informes mensuales de seguimiento"}], _Hangs()
+    )
+    elapsed = asyncio.get_event_loop().time() - started
+
+    assert elapsed < 5, f"expansion was not time-bounded (took {elapsed:.1f}s)"
+    assert out["ob1"], "deterministic fallback must still be returned"

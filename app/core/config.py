@@ -482,6 +482,12 @@ class Settings(BaseSettings):
     # site wraps it again, and it short-circuits a fake/unavailable provider
     # without a round trip — so an unmocked test path costs nothing.
     EVIDENCE_QUERY_EXPANSION_ENABLED: bool = True
+    # Hard bound on the single expansion LLM call. It is an enhancement with a
+    # deterministic fallback, so it must never stall a user-facing "descubrir"
+    # click: LiteLLMAdapter retries each model twice with exponential backoff
+    # across a 3-model chain, which is minutes of latency for a provider that is
+    # down. On timeout the deterministic keyword terms are used.
+    EVIDENCE_QUERY_EXPANSION_TIMEOUT_SECONDS: float = 8.0
 
     # Embeddings — in-memory semantic ranking signal for evidence-to-obligación
     # matching (evidence-embeddings capability). No persistent vector store:
