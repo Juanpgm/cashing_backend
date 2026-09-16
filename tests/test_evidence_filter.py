@@ -365,6 +365,64 @@ def test_score_noreply_prefix_returns_3():
     assert "auto_prefix" in reason
 
 
+def test_score_contains_contract_number_is_never_noise():
+    """An email mentioning the contract number is real contractual evidence,
+    never noise — regardless of what other signals its sender/subject carry
+    (evidencias/discovery-fix WU4)."""
+    from app.agent.prompts.evidence_filter import score_non_personal_email
+
+    score, reason = score_non_personal_email(
+        sender="noreply@notificaciones-dagma.gov.co",
+        subject="50% OFF descuento oferta exclusiva",
+        labels=["CATEGORY_PROMOTIONS"],
+        contains_contract_number=True,
+    )
+    assert score == 0
+    assert reason == "contains_contract_number"
+
+
+def test_score_without_contract_number_flag_behaves_as_before():
+    from app.agent.prompts.evidence_filter import score_non_personal_email
+
+    score, _ = score_non_personal_email(
+        sender="offers@tienda.com",
+        subject="Oferta exclusiva",
+        labels=["CATEGORY_PROMOTIONS"],
+        contains_contract_number=False,
+    )
+    assert score >= 3
+
+
+def test_score_supervisor_domain_exempts_auto_prefix_penalty():
+    """A sender whose domain matches the supervisor's domain is real entity
+    correspondence, even from an 'info@'/'notificaciones@'-style address —
+    exempt it from the auto-prefix penalty. Uses a non-institutional domain
+    (not .gov.co/.edu.co/.org.co) so the existing whitelist doesn't already
+    short-circuit this before the exemption logic is exercised."""
+    from app.agent.prompts.evidence_filter import score_non_personal_email
+
+    score, reason = score_non_personal_email(
+        sender="info@entidadprivada.com",
+        subject="Seguimiento del contrato",
+        labels=[],
+        supervisor_domain="entidadprivada.com",
+    )
+    assert reason != "auto_prefix:info@entidadprivada.com"
+    assert score < 3
+
+
+def test_score_supervisor_domain_mismatch_still_applies_auto_prefix_penalty():
+    from app.agent.prompts.evidence_filter import score_non_personal_email
+
+    score, _ = score_non_personal_email(
+        sender="info@otraempresa.com",
+        subject="Seguimiento",
+        labels=[],
+        supervisor_domain="entidadprivada.com",
+    )
+    assert score >= 3
+
+
 def test_score_no_reply_hyphen_normalizes():
     from app.agent.prompts.evidence_filter import score_non_personal_email
 

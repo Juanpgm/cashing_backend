@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from app.adapters.llm import get_llm
+from app.agent.prompts.contract_terms import contract_number_variants
 from app.agent.state import AgentState
 from app.core.config import settings
 from app.schemas.agent import LLMMessage
@@ -156,19 +157,37 @@ def _obligacion_text(ob: Any) -> str:
     return str(ob)
 
 
+# Letters/digits + embedded dots/hyphens (min length 3): the old letters-only
+# `{4,}` regex could never match a contract number (all digits/dots) or a
+# hyphenated radicado code — root cause #2, evidencias/discovery-fix. Dots/
+# hyphens are only allowed AFTER the first character, so trailing punctuation
+# in prose ("actividades.") still tokenizes as "actividades" plus a lone "."
+# that itself never satisfies the {2,} minimum.
+_TOKEN_RE = re.compile(r"[a-z0-9áéíóúñü][a-z0-9áéíóúñü.\-]{2,}")
+
+
 def _keyword_score(obligation_text: str, evidence_text: str) -> float:
     """Simple keyword overlap score between obligation and evidence."""
     if not obligation_text or not evidence_text:
         return 0.0
 
-    # Tokenize: lower + split on non-alphanumeric (including Spanish chars)
-    ob_words = set(re.findall(r"[a-záéíóúñüA-ZÁÉÍÓÚÑÜ]{4,}", obligation_text.lower()))
-    ev_words = set(re.findall(r"[a-záéíóúñüA-ZÁÉÍÓÚÑÜ]{4,}", evidence_text.lower()))
+    ob_words = set(_TOKEN_RE.findall(obligation_text.lower()))
+    ev_words = set(_TOKEN_RE.findall(evidence_text.lower()))
 
     if not ob_words:
         return 0.0
     overlap = ob_words & ev_words
     return len(overlap) / len(ob_words)
+
+
+def _contains_contract_number(evidence: dict, numero_variants: list[str]) -> bool:
+    """True if the evidence's title/content mentions ANY contract-number
+    variant — treated as a near-certain match (evidencias/discovery-fix
+    WU4): it bypasses both the keyword threshold and the LLM relevance gate."""
+    if not numero_variants:
+        return False
+    text = f"{evidence.get('title', '')} {evidence.get('content', '')}".lower()
+    return any(variant.lower() in text for variant in numero_variants)
 
 
 def _fallback_flags(keyword_scores: list[float] | None, n: int) -> list[bool]:
@@ -278,6 +297,7 @@ async def _match_una_obligacion(
     ev_embeddings: list[list[float]] | None,
     llm: Any,
     sem: asyncio.Semaphore,
+    numero_variants: list[str] | None = None,
 ) -> tuple[str, list[dict], dict[str, float]]:
     """Resolve matches for ONE obligación — the per-obligación body of the
     (now-parallelized) loop in `evidence_matcher_node`. Touches NO shared
@@ -296,9 +316,26 @@ async def _match_una_obligacion(
             cos = _cosine_similarity(ob_vec, ev_embeddings[idx])
         return _blended_score(kw, cos)
 
+    # Step 0: contract-number bypass (evidencias/discovery-fix WU4) — an
+    # evidence item mentioning the contract number is a near-certain match:
+    # score it 1.0 and skip BOTH the keyword threshold AND the LLM relevance
+    # call entirely (a false-negative LLM verdict must not be able to drop it).
+    auto_matched: list[dict] = []
+    scores_dict: dict[str, float] = {}
+    scoreable: list[tuple[int, dict]] = []
+    for idx, ev in enumerate(evidence_raw):
+        if _contains_contract_number(ev, numero_variants or []):
+            item = dict(ev)
+            item.setdefault("matched_by", "numero_contrato")
+            auto_matched.append(item)
+            if "id" in ev:
+                scores_dict[ev["id"]] = 1.0
+        else:
+            scoreable.append((idx, ev))
+
     # Step 1: blended-score filter (≥0.15 threshold) — cosine can surface a
     # candidate keyword scoring alone would miss entirely (cross-language match).
-    scored_all = [(ev, _score(idx, ev)) for idx, ev in enumerate(evidence_raw)]
+    scored_all = [(ev, _score(idx, ev)) for idx, ev in scoreable]
     candidates_scored = [(ev, s) for ev, s in scored_all if s >= _KEYWORD_THRESHOLD]
 
     # Max-effort fallback: an obligación with ZERO candidates above threshold
@@ -311,6 +348,7 @@ async def _match_una_obligacion(
         candidates_scored = positive[:3]
 
     # Step 2: LLM relevance on top-N candidates — ONE batched call, not one per candidate
+    matched_list = list(auto_matched)
     if candidates_scored:
         candidates_scored = sorted(candidates_scored, key=lambda pair: pair[1], reverse=True)[
             : settings.EVIDENCE_MATCHER_TOP_N
@@ -321,19 +359,18 @@ async def _match_una_obligacion(
             flags = await _llm_relevance_batch(
                 ob_text, [ev.get("content", "") for ev in candidates], llm, blended_scores
             )
-        matched_list = [ev for ev, keep in zip(candidates, flags, strict=True) if keep]
+        matched_list.extend(ev for ev, keep in zip(candidates, flags, strict=True) if keep)
         # Additive: the blended score behind each KEPT match, keyed by the
         # evidence's own "id" field (present for local-upload evidence_raw
         # dicts; simply absent/skipped for sources that don't set one, e.g.
         # Google discovery — those flows don't consume this key).
-        scores_dict = {
-            ev["id"]: score
-            for ev, score, keep in zip(candidates, blended_scores, flags, strict=True)
-            if keep and "id" in ev
-        }
-    else:
-        matched_list = []
-        scores_dict = {}
+        scores_dict.update(
+            {
+                ev["id"]: score
+                for ev, score, keep in zip(candidates, blended_scores, flags, strict=True)
+                if keep and "id" in ev
+            }
+        )
 
     return ob_id, matched_list, scores_dict
 
@@ -358,6 +395,9 @@ async def evidence_matcher_node(state: AgentState) -> AgentState:
     llm = get_llm(model=settings.LLM_EVIDENCE_CLASSIFIER_MODEL)
     matched: dict[str, list[dict]] = {}
     matched_scores: dict[str, dict[str, float]] = {}
+
+    contrato_contexto = state.get("contrato_contexto") or {}
+    numero_variants = contract_number_variants(contrato_contexto.get("numero_contrato"))
 
     # Embed once for the whole run (per-contrato reuse, not once per evidence file):
     # one batch call for every obligación text, one for every evidence text. Skips
@@ -384,7 +424,9 @@ async def evidence_matcher_node(state: AgentState) -> AgentState:
         if not ob_id:
             ob_id = str(i)
         ob_vec = ob_embeddings[i] if ob_embeddings is not None else None
-        tareas.append(_match_una_obligacion(str(ob_id), ob_text, ob_vec, evidence_raw, ev_embeddings, llm, sem))
+        tareas.append(
+            _match_una_obligacion(str(ob_id), ob_text, ob_vec, evidence_raw, ev_embeddings, llm, sem, numero_variants)
+        )
 
     for ob_id, matched_list, scores_dict in await asyncio.gather(*tareas):
         matched[ob_id] = matched_list

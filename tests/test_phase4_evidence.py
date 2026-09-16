@@ -268,6 +268,60 @@ async def test_evidence_dedup_hash_consistency():
 
 
 @pytest.mark.asyncio
+async def test_evidence_dedup_empty_content_items_with_distinct_ids_are_not_collapsed():
+    """Root cause #6 (evidencias/discovery-fix): _content_hash("") is the SAME
+    constant hash for every empty-body email — 3 genuinely different emails
+    with no extractable body text used to collapse into 1. An external id
+    (message_id) distinguishes them even with empty content."""
+    from app.agent.nodes.evidence_dedup import evidence_dedup_node
+
+    state = {
+        "evidence_raw": [
+            {"source": "email", "content": "", "message_id": "m1"},
+            {"source": "email", "content": "", "message_id": "m2"},
+            {"source": "email", "content": "", "message_id": "m3"},
+        ],
+    }
+    result = await evidence_dedup_node(state)
+
+    assert len(result["deduplicated_evidence"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_evidence_dedup_empty_content_and_no_id_items_are_all_kept():
+    """No id AND no content: never assume two such items are the same
+    evidence (brief: 'items with empty content and no id are kept')."""
+    from app.agent.nodes.evidence_dedup import evidence_dedup_node
+
+    state = {
+        "evidence_raw": [
+            {"source": "calendar", "content": ""},
+            {"source": "calendar", "content": ""},
+        ],
+    }
+    result = await evidence_dedup_node(state)
+
+    assert len(result["deduplicated_evidence"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_evidence_dedup_same_message_id_collapses_even_with_different_content():
+    """The SAME message re-fetched (e.g. snippet updated between calls) must
+    still collapse to one — id is a stronger identity signal than content."""
+    from app.agent.nodes.evidence_dedup import evidence_dedup_node
+
+    state = {
+        "evidence_raw": [
+            {"source": "email", "content": "Snippet version A", "message_id": "m1"},
+            {"source": "email", "content": "Snippet version B (updated)", "message_id": "m1"},
+        ],
+    }
+    result = await evidence_dedup_node(state)
+
+    assert len(result["deduplicated_evidence"]) == 1
+
+
+@pytest.mark.asyncio
 async def test_evidence_dedup_5_duplicates_to_1_group():
     """5 items with identical content must be deduped to exactly 1 unique item."""
     from app.agent.nodes.evidence_dedup import evidence_dedup_node

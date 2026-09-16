@@ -303,6 +303,8 @@ async def _gather_email_evidence(
     query_budget = settings.EVIDENCE_MAX_GMAIL_QUERIES if provider == IntegrationProvider.GOOGLE else (
         settings.EVIDENCE_MAX_QUERIES_TOTAL
     )
+    numero_variants = contract_number_variants(numero_contrato)
+    supervisor_domain = (supervisor_email or "").split("@")[-1].strip().lower() or None if supervisor_email else None
     emails_by_id: dict[str, dict] = {}
     filtered_count = 0
     for query in unique_queries[:query_budget]:
@@ -313,12 +315,18 @@ async def _gather_email_evidence(
             continue
         for m in messages:
             if m.id not in emails_by_id:
+                contains_numero = any(
+                    variant.lower() in f"{m.subject or ''} {m.body_plain or m.snippet or ''}".lower()
+                    for variant in numero_variants
+                )
                 if provider == IntegrationProvider.MICROSOFT:
                     score, reason = score_non_personal_ms_email(
                         sender=m.sender,
                         subject=m.subject,
                         categories=list(m.labels or []),
                         inference_classification=dict(m.headers or {}).get("inferenceClassification", ""),
+                        supervisor_domain=supervisor_domain,
+                        contains_contract_number=contains_numero,
                     )
                 else:
                     score, reason = score_non_personal_email(
@@ -326,6 +334,8 @@ async def _gather_email_evidence(
                         subject=m.subject,
                         labels=list(m.labels or []),
                         headers=dict(m.headers or {}),
+                        supervisor_domain=supervisor_domain,
+                        contains_contract_number=contains_numero,
                     )
                 if score >= 3:
                     filtered_count += 1

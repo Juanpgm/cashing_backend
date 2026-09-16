@@ -243,19 +243,34 @@ def score_non_personal_email(
     subject: str,
     labels: list[str],
     headers: dict[str, str] | None = None,
+    *,
+    supervisor_domain: str | None = None,
+    contains_contract_number: bool = False,
 ) -> tuple[int, str]:
     """Accumulate non-personal signals for an email.
 
     Returns (score, main_reason). Threshold ≥ 3 = non-personal.
 
     Early-returns on definitive +5 signals to avoid redundant checks.
+
+    `contains_contract_number` (evidencias/discovery-fix WU4): an email
+    mentioning the contract number is real contractual evidence — never
+    noise, regardless of any other signal. `supervisor_domain`, when known,
+    exempts a sender on that SAME domain from the auto-prefix penalty (a
+    'notificaciones@'/'info@' address on the supervisor's own domain is
+    still real entity correspondence).
     """
+    if contains_contract_number:
+        return 0, "contains_contract_number"
+
     h = {k.lower(): v.lower() for k, v in (headers or {}).items()}
 
     # Whitelist — personal providers and institutional domains are never filtered.
     domain = _extract_domain(sender)
     if domain and _is_whitelisted(domain):
         return 0, ""
+
+    exempt_auto_prefix = bool(supervisor_domain) and domain == (supervisor_domain or "").strip().lower()
 
     # +5 — Gmail category labels (server-side ML classifier, highly accurate)
     for label in (labels or []):
@@ -293,9 +308,10 @@ def score_non_personal_email(
         reason = f"platform_domain:{domain}"
         return score, reason  # 4 ≥ 3 → already filter-worthy
 
-    # +3 — Automatic From prefix
+    # +3 — Automatic From prefix (exempt when the sender is on the
+    # supervisor's own domain — see `exempt_auto_prefix` above)
     user = _extract_user(sender)
-    if user and _normalize_prefix(user) in _AUTO_PREFIXES_NORMALIZED:
+    if not exempt_auto_prefix and user and _normalize_prefix(user) in _AUTO_PREFIXES_NORMALIZED:
         score += 3
         reason = f"auto_prefix:{user}"
         return score, reason
@@ -538,6 +554,9 @@ def score_non_personal_ms_email(
     subject: str,
     categories: list[str] | None = None,
     inference_classification: str = "",
+    *,
+    supervisor_domain: str | None = None,
+    contains_contract_number: bool = False,
 ) -> tuple[int, str]:
     """Mirrors score_non_personal_email for Outlook mail using Graph signals.
 
@@ -550,6 +569,9 @@ def score_non_personal_ms_email(
     the LLM layer instead of being silently discarded (spec: "Ambiguous email
     defaults to LLM review").
     """
+    if contains_contract_number:
+        return 0, "contains_contract_number"
+
     domain = _extract_domain(sender)
     if domain and _is_whitelisted(domain):
         return 0, ""
@@ -557,7 +579,14 @@ def score_non_personal_ms_email(
     if (inference_classification or "").strip().lower() == "other":
         return 5, "inferenceClassification:other"
 
-    return score_non_personal_email(sender, subject, categories or [], headers=None)
+    return score_non_personal_email(
+        sender,
+        subject,
+        categories or [],
+        headers=None,
+        supervisor_domain=supervisor_domain,
+        contains_contract_number=False,
+    )
 
 
 def is_noise_ms_calendar(title: str, metadata: dict) -> bool:

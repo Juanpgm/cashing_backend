@@ -528,6 +528,36 @@ async def test_gather_gmail_evidence_uses_settings_max_emails_per_query(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_gather_gmail_evidence_never_filters_email_containing_contract_number(monkeypatch) -> None:
+    """An email from an auto-prefix-style sender (e.g. notificaciones@) that
+    mentions the contract number must survive the noise heuristic — it's real
+    contractual evidence (evidencias/discovery-fix WU4)."""
+    from app.services import evidence_discovery_service as eds
+
+    numero = "4161.010.26.1.027.2025"
+    msg = _email("m-numero", f"Notificación contrato {numero}", f"Ver anexo del contrato {numero}")
+    msg.sender = "notificaciones@entidadprivada.com"  # non-institutional: not whitelisted by domain alone
+
+    adapter = MagicMock()
+    adapter.search_messages = AsyncMock(return_value=[msg])
+
+    with patch.object(eds, "GmailAdapter", return_value=adapter):
+        emails, filtered_count = await eds._gather_email_evidence(
+            MagicMock(),
+            uuid.uuid4(),
+            [{"id": "ob1", "descripcion": "Entregar informe mensual de actividades"}],
+            "2024-04-01",
+            "2024-04-30",
+            None,
+            None,
+            numero_contrato=numero,
+        )
+
+    assert filtered_count == 0
+    assert len(emails) == 1
+
+
+@pytest.mark.asyncio
 async def test_gather_gmail_evidence_fires_contract_number_queries_first(monkeypatch) -> None:
     """When numero_contrato is passed, its query variants must be fired — and
     take priority over per-obligación keyword queries under the query budget."""
