@@ -23,10 +23,11 @@ from app.core.exceptions import ForbiddenError, NotFoundError
 from app.models.actividad import Actividad
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro
-from app.models.documento_cuenta_cobro import DocumentoCuentaCobro, EstadoRequisito
+from app.models.documento_cuenta_cobro import EstadoRequisito
 from app.models.obligacion import Obligacion
 from app.models.requisito_documento import RequisitoDocumento
 from app.models.usuario import Usuario
+from app.services import checklist_service
 
 logger = structlog.get_logger("service.constancia")
 
@@ -113,12 +114,15 @@ async def generar_constancia_pdf(
         raise NotFoundError("Usuario", str(usuario_id))
 
     # ── 3. Load checklist items ───────────────────────────────────────────────
-    checklist_result = await db.execute(
-        select(DocumentoCuentaCobro)
-        .where(DocumentoCuentaCobro.cuenta_cobro_id == cuenta_id)
-        .order_by(DocumentoCuentaCobro.requisito_codigo)
+    # Routed through the same visibility seam `construir_checklist_completo`
+    # uses (checklist/primera-cuota-2026-09-16, round 2, finding #4) — a raw
+    # query here used to print CEDULA/RUT/RPC/CDP legacy rows the checklist
+    # itself has decided to hide on a later cuota as permanently "Pendiente"
+    # on the certificate handed to the supervisor.
+    checklist_rows = sorted(
+        await checklist_service.listar_filas_visibles(db, cuenta),
+        key=lambda row: row.requisito_codigo or "",
     )
-    checklist_rows = list(checklist_result.scalars().all())
 
     # Load RequisitoDocumento catalog for labels
     req_codigos = [row.requisito_codigo for row in checklist_rows]

@@ -213,3 +213,66 @@ async def test_constancia_sin_actividades_genera_igual(db: AsyncSession) -> None
     # Template was called with an empty actividades list
     call_context = mock_render.call_args[0][1]
     assert call_context["actividades"] == []
+
+
+@pytest.mark.asyncio
+async def test_constancia_oculta_filas_legacy_primera_cuota_en_cuenta_recurrente(db: AsyncSession) -> None:
+    """checklist/primera-cuota-2026-09-16, round 2, finding #4 (WARNING): the
+    constancia must not print CEDULA/RUT/RPC/CDP rows the checklist itself has
+    already decided to hide on a later cuota — those requisitos being
+    permanently "Pendiente" on the certificate handed to the supervisor is a
+    false signal for a contrato that is otherwise correctly radicado. Routes
+    through `checklist_service.listar_filas_visibles`, the same seam
+    `construir_checklist_completo` uses."""
+    from app.models.cuenta_cobro import PosicionCuota
+    from app.models.documento_cuenta_cobro import DocumentoCuentaCobro, EstadoRequisito
+    from app.services import checklist_service
+
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)
+    primera = CuentaCobro(
+        contrato_id=contrato.id,
+        mes=1,
+        anio=2024,
+        valor=3_000_000,
+        estado=EstadoCuentaCobro.BORRADOR,
+        numero_cuota=1,
+        posicion=PosicionCuota.PRIMERA,
+    )
+    db.add(primera)
+    await db.flush()
+    cuenta = CuentaCobro(
+        contrato_id=contrato.id,
+        mes=2,
+        anio=2024,
+        valor=3_000_000,
+        estado=EstadoCuentaCobro.BORRADOR,
+        numero_cuota=2,
+        posicion=PosicionCuota.RECURRENTE,
+    )
+    db.add(cuenta)
+    await db.flush()
+
+    # Legacy rows materialized before this rule shipped — empty, no linked doc.
+    for codigo in ("CEDULA", "RUT", "RPC", "CDP"):
+        db.add(
+            DocumentoCuentaCobro(
+                cuenta_cobro_id=cuenta.id,
+                requisito_codigo=codigo,
+                estado=EstadoRequisito.PENDIENTE,
+            )
+        )
+    await db.commit()
+
+    catalogo = await checklist_service.listar_catalogo(db)
+    etiquetas_ocultas = {r.etiqueta for r in catalogo if r.codigo in {"CEDULA", "RUT", "RPC", "CDP"}}
+
+    with patch(
+        "app.services.constancia_service.generate_pdf_from_template",
+        return_value=_FAKE_PDF,
+    ) as mock_render:
+        await constancia_service.generar_constancia_pdf(db, user.id, cuenta.id)
+
+    call_context = mock_render.call_args[0][1]
+    etiquetas = {item["etiqueta"] for item in call_context["checklist_items"]}
+    assert not (etiquetas & etiquetas_ocultas)
