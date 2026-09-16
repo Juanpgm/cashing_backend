@@ -45,10 +45,11 @@ obligación, y qué actividades demuestran.
 
 
 # Exclusiones de ruido aplicadas a todas las queries de Gmail (gratis, servidor-side).
-GMAIL_NOISE_EXCLUSIONS = (
-    "-category:promotions -category:social -category:forums "
-    "-category:updates -in:spam -in:trash"
-)
+#
+# `-category:updates` fue removido (evidencias/discovery-fix): esa categoría
+# también atrapa notificaciones legítimas de la entidad (SECOP, Drive shares,
+# invitaciones de Calendar) — descartaba evidencia real junto con el ruido.
+GMAIL_NOISE_EXCLUSIONS = "-category:promotions -category:social -category:forums -in:spam -in:trash"
 
 
 def build_obligation_queries(
@@ -74,11 +75,17 @@ def build_obligation_queries(
     noise = GMAIL_NOISE_EXCLUSIONS
     queries: list[str] = []
 
-    # 1. Palabras clave de la obligación en asunto
+    # 1. Palabras clave de la obligación en asunto + variante sin scope (cuerpo
+    #    del correo) — antes SOLO se buscaba en el asunto, así que una entidad
+    #    que responde citando la obligación en el cuerpo (no en el asunto)
+    #    nunca aparecía.
     if keywords:
         kw_str = " OR ".join(keywords[:4])
         queries.append(
             f"subject:({kw_str}) after:{fecha_inicio} before:{fecha_fin} {noise}"
+        )
+        queries.append(
+            f"({kw_str}) after:{fecha_inicio} before:{fecha_fin} {noise}"
         )
 
     # 2. Desde el supervisor
@@ -105,6 +112,53 @@ def build_obligation_queries(
         queries.append(
             f'"{safe_entity}" after:{fecha_inicio} before:{fecha_fin} {noise}'
         )
+
+    return queries
+
+
+def build_contract_queries(
+    numero_variants: list[str],
+    fecha_inicio: str,
+    fecha_fin: str,
+    supervisor_email: str | None = None,
+    entidad: str | None = None,
+) -> list[str]:
+    """Contract-level Gmail queries — NOT scoped to any single obligación.
+
+    Built once per discovery run (not per-obligación) and given priority in
+    the query budget: a contract number or entidad mention is a much stronger
+    signal than any single obligación's keywords, and the old design never
+    searched for either as free text (root cause #2/#3, evidencias/discovery-fix).
+
+    Args:
+        numero_variants: contract-number variants (see `contract_terms.
+            contract_number_variants`), most specific first.
+        fecha_inicio / fecha_fin: YYYY/MM/DD (Gmail query date format).
+        supervisor_email: correo del supervisor del contrato.
+        entidad: nombre de la entidad contratante.
+
+    Returns:
+        Queries ordered with contract-number variants first, then entidad,
+        then supervisor — so truncation to a query budget never drops the
+        number before the weaker signals.
+    """
+    noise = GMAIL_NOISE_EXCLUSIONS
+    queries: list[str] = []
+
+    for variant in numero_variants:
+        safe = variant.replace('"', "")
+        queries.append(f'"{safe}" after:{fecha_inicio} before:{fecha_fin} {noise}')
+
+    if numero_variants:
+        exact = numero_variants[0].replace('"', "")
+        queries.append(f'"{exact}" has:attachment after:{fecha_inicio} before:{fecha_fin} {noise}')
+
+    if entidad and len(entidad.strip()) > 3:
+        safe_entity = entidad.strip()[:60].replace('"', "")
+        queries.append(f'"{safe_entity}" after:{fecha_inicio} before:{fecha_fin} {noise}')
+
+    if supervisor_email:
+        queries.append(f"from:{supervisor_email} after:{fecha_inicio} before:{fecha_fin} {noise}")
 
     return queries
 

@@ -12,7 +12,7 @@ evidence_orchestrator → evidence_matcher → evidence_justify.
 from __future__ import annotations
 
 import uuid
-from datetime import date
+from datetime import date, timedelta
 
 import structlog
 from sqlalchemy import select
@@ -27,7 +27,8 @@ from app.agent.nodes.evidence_filter import evidence_filter_node
 from app.agent.nodes.evidence_justify import evidence_justify_node
 from app.agent.nodes.evidence_matcher import evidence_matcher_node
 from app.agent.nodes.evidence_orchestrator import evidence_orchestrator_node
-from app.agent.prompts.email_evidence import _extract_keywords, build_obligation_queries
+from app.agent.prompts.contract_terms import contract_number_variants
+from app.agent.prompts.email_evidence import _extract_keywords, build_contract_queries, build_obligation_queries
 from app.agent.prompts.evidence_filter import score_non_personal_email, score_non_personal_ms_email
 from app.agent.state import AgentState
 from app.core.config import settings
@@ -47,10 +48,26 @@ from app.services import discovery_cache, integration_service
 
 logger = structlog.get_logger("services.evidence_discovery")
 
-MAX_EMAILS_PER_QUERY = 10
 GMAIL_PERMALINK = "https://mail.google.com/mail/u/0/#all/{message_id}"
 OUTLOOK_PERMALINK = "https://outlook.office.com/mail/deeplink/read/{message_id}"
 MAX_ACTIVIDADES_PREVIAS = 20
+
+
+def _widen_gmail_window(fecha_inicio: str, fecha_fin: str, margin_days: int) -> tuple[str, str]:
+    """Widen [fecha_inicio, fecha_fin] by `margin_days` on both ends, and push
+    the end one extra day further — Gmail's `before:` operator is EXCLUSIVE,
+    so evidence dated exactly on fecha_fin was silently dropped before this.
+    Returns YYYY/MM/DD strings (Gmail query date format). Falls back to the
+    unwidened, converted dates on a malformed input instead of raising.
+    """
+    try:
+        start = date.fromisoformat((fecha_inicio or "").strip())
+        end = date.fromisoformat((fecha_fin or "").strip())
+    except ValueError:
+        return _to_gmail_date(fecha_inicio), _to_gmail_date(fecha_fin)
+    start -= timedelta(days=margin_days)
+    end += timedelta(days=margin_days + 1)
+    return start.strftime("%Y/%m/%d"), end.strftime("%Y/%m/%d")
 
 
 def _to_gmail_date(date_str: str) -> str:
@@ -230,7 +247,7 @@ def _build_email_queries(
     if provider == IntegrationProvider.MICROSOFT:
         keywords = _extract_keywords(descripcion)[:4]
         return [" ".join(keywords)] if keywords else []
-    fi, ff = _to_gmail_date(fecha_inicio), _to_gmail_date(fecha_fin)
+    fi, ff = _widen_gmail_window(fecha_inicio, fecha_fin, settings.EVIDENCE_WINDOW_MARGIN_DAYS)
     return build_obligation_queries(descripcion, fi, ff, supervisor_email or None, entidad or None)
 
 
@@ -243,11 +260,16 @@ async def _gather_email_evidence(
     supervisor_email: str | None,
     entidad: str | None,
     provider: IntegrationProvider = IntegrationProvider.GOOGLE,
+    numero_contrato: str | None = None,
 ) -> tuple[list[dict], int]:
     """Busca correos crudos como evidencia y los normaliza al formato común.
 
     `provider` selects the adapter (Gmail vs. Microsoft Graph) and the noise
     heuristic (score_non_personal_email vs. score_non_personal_ms_email).
+    `numero_contrato` (Google only) seeds contract-level queries — the
+    contract number, has:attachment variant, entidad and supervisor full-text
+    queries — fired ONCE per discovery run (not per-obligación) and given
+    priority over per-obligación keyword queries under the query budget.
 
     Returns (emails, filtered_count) — filtered_count is how many non-personal
     emails were dropped before they could contaminate the evidence pipeline.
@@ -258,6 +280,13 @@ async def _gather_email_evidence(
     obligaciones_para_query = obligaciones if max_obligaciones <= 0 else obligaciones[:max_obligaciones]
 
     queries: list[str] = []
+    if provider == IntegrationProvider.GOOGLE:
+        fi, ff = _widen_gmail_window(fecha_inicio, fecha_fin, settings.EVIDENCE_WINDOW_MARGIN_DAYS)
+        queries.extend(
+            build_contract_queries(
+                contract_number_variants(numero_contrato), fi, ff, supervisor_email or None, entidad or None
+            )
+        )
     for ob in obligaciones_para_query:
         queries.extend(
             _build_email_queries(provider, ob["descripcion"], fecha_inicio, fecha_fin, supervisor_email, entidad)[
@@ -271,11 +300,14 @@ async def _gather_email_evidence(
             seen_q.add(q)
             unique_queries.append(q)
 
+    query_budget = settings.EVIDENCE_MAX_GMAIL_QUERIES if provider == IntegrationProvider.GOOGLE else (
+        settings.EVIDENCE_MAX_QUERIES_TOTAL
+    )
     emails_by_id: dict[str, dict] = {}
     filtered_count = 0
-    for query in unique_queries[: settings.EVIDENCE_MAX_QUERIES_TOTAL]:
+    for query in unique_queries[:query_budget]:
         try:
-            messages = await adapter.search_messages(usuario_id, query, MAX_EMAILS_PER_QUERY)
+            messages = await adapter.search_messages(usuario_id, query, settings.EVIDENCE_MAX_EMAILS_PER_QUERY)
         except Exception as exc:
             await logger.awarning("email_query_failed", query=query, error=str(exc), provider=provider.value)
             continue
@@ -416,13 +448,26 @@ async def descubrir_evidencias(
         statuses = await integration_service.list_integration_statuses(db, usuario_id)
         connected_providers = [s.provider for s in statuses if s.connected]
 
+        # Prefiere el entidad/numero REALES del contrato (WU1) sobre lo que el
+        # frontend haya enviado — req.entidad existe para el caso sin contrato_id.
+        entidad_efectiva = (contrato.entidad if contrato is not None else None) or req.entidad
+        numero_contrato = contrato.numero_contrato if contrato is not None else None
+
         # 1. Reunir evidencia cruda de correo (Gmail/Outlook) por cada proveedor conectado.
         # El fallo de un proveedor no debe abortar los demás (spec: "Microsoft fails,
         # Google succeeds" — Google-sourced evidence is still returned).
         for provider in connected_providers:
             try:
                 provider_emails, provider_filtered = await _gather_email_evidence(
-                    db, usuario_id, obligaciones, fecha_inicio, fecha_fin, req.supervisor_email, req.entidad, provider
+                    db,
+                    usuario_id,
+                    obligaciones,
+                    fecha_inicio,
+                    fecha_fin,
+                    req.supervisor_email,
+                    entidad_efectiva,
+                    provider,
+                    numero_contrato=numero_contrato,
                 )
             except Exception as exc:
                 await logger.awarning("email_gather_provider_failed", provider=provider.value, error=str(exc))

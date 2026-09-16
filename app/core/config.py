@@ -408,6 +408,36 @@ class Settings(BaseSettings):
     EVIDENCE_MAX_EVENTS: int = 100
     EVIDENCE_MATCHER_TOP_N: int = 8
 
+    # evidencias/discovery-fix — Gmail query widening + contract-number search.
+    # Days of slack added on BOTH ends of [fecha_inicio, fecha_fin] before it's
+    # turned into Gmail after:/before: operators, so evidence dated right at
+    # the edge of the contract period (kickoff emails before fecha_inicio,
+    # closeout emails around fecha_fin) is not silently excluded.
+    EVIDENCE_WINDOW_MARGIN_DAYS: int = 15
+    # Hard cap on total Gmail queries fired per discovery run (contract-level +
+    # per-obligación combined) — contract-number queries are ordered first so
+    # truncation never drops them before a generic keyword query.
+    EVIDENCE_MAX_GMAIL_QUERIES: int = 12
+    # Gmail messages fetched per query (was a hardcoded module constant of 10).
+    EVIDENCE_MAX_EMAILS_PER_QUERY: int = 25
+    # evidence_matcher: relevance threshold applied to the LLM's own 0-1 score
+    # (JSON rubric output) once it's the source of truth, replacing the old
+    # int-list-only contract.
+    EVIDENCE_RELEVANCE_MIN: float = 0.5
+    # Above this many keyword/embedding candidates for one obligación, the
+    # zero-keyword-overlap pre-gate is re-applied (ranked by embeddings first)
+    # instead of sending every candidate to the LLM — bounds LLM fan-out cost
+    # for a contract with many broad expanded-phrase hits.
+    EVIDENCE_MAX_CANDIDATES_FOR_LLM: int = 40
+    # calendar_fetch: distinct short queries fired (one per contract-number
+    # variant / entidad / obligación keyword), each a separate Calendar API
+    # call merged by event id — replaces the old single AND-of-everything query
+    # that matched nothing once more than 1-2 terms were combined.
+    EVIDENCE_MAX_CALENDAR_TERMS: int = 8
+    # drive_fetch: Drive API pageSize per search_files call (was a hardcoded
+    # module constant of 10).
+    EVIDENCE_DRIVE_PAGE_SIZE: int = 20
+
     # Embeddings — in-memory semantic ranking signal for evidence-to-obligación
     # matching (evidence-embeddings capability). No persistent vector store:
     # vectors exist only for the duration of one classification run.

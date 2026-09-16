@@ -458,6 +458,112 @@ async def test_gather_gmail_evidence_queries_all_obligaciones_not_just_first_thr
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Gmail query widening + contract-number queries (evidencias/discovery-fix WU2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_gather_gmail_evidence_widens_date_window_by_margin_setting(monkeypatch) -> None:
+    """after:/before: must be widened by EVIDENCE_WINDOW_MARGIN_DAYS on both ends,
+    and before: pushed one extra day (Gmail's before: is EXCLUSIVE — evidence
+    dated exactly on fecha_fin was silently dropped otherwise)."""
+    from app.core.config import settings
+    from app.services import evidence_discovery_service as eds
+
+    monkeypatch.setattr(settings, "EVIDENCE_WINDOW_MARGIN_DAYS", 15)
+
+    captured_queries: list[str] = []
+
+    async def _fake_search(usuario_id, query, max_results):
+        captured_queries.append(query)
+        return []
+
+    adapter = MagicMock()
+    adapter.search_messages = AsyncMock(side_effect=_fake_search)
+
+    with patch.object(eds, "GmailAdapter", return_value=adapter):
+        await eds._gather_email_evidence(
+            MagicMock(),
+            uuid.uuid4(),
+            [{"id": "ob1", "descripcion": "Entregar informe mensual de actividades"}],
+            "2024-04-01",
+            "2024-04-30",
+            None,
+            None,
+        )
+
+    assert any("after:2024/03/17" in q for q in captured_queries)  # 04-01 - 15 days
+    assert any("before:2024/05/16" in q for q in captured_queries)  # 04-30 + 15 days + 1
+
+
+@pytest.mark.asyncio
+async def test_gather_gmail_evidence_uses_settings_max_emails_per_query(monkeypatch) -> None:
+    from app.core.config import settings
+    from app.services import evidence_discovery_service as eds
+
+    monkeypatch.setattr(settings, "EVIDENCE_MAX_EMAILS_PER_QUERY", 25)
+
+    captured_max_results: list[int] = []
+
+    async def _fake_search(usuario_id, query, max_results):
+        captured_max_results.append(max_results)
+        return []
+
+    adapter = MagicMock()
+    adapter.search_messages = AsyncMock(side_effect=_fake_search)
+
+    with patch.object(eds, "GmailAdapter", return_value=adapter):
+        await eds._gather_email_evidence(
+            MagicMock(),
+            uuid.uuid4(),
+            [{"id": "ob1", "descripcion": "Entregar informe mensual de actividades"}],
+            "2024-04-01",
+            "2024-04-30",
+            None,
+            None,
+        )
+
+    assert captured_max_results
+    assert all(n == 25 for n in captured_max_results)
+
+
+@pytest.mark.asyncio
+async def test_gather_gmail_evidence_fires_contract_number_queries_first(monkeypatch) -> None:
+    """When numero_contrato is passed, its query variants must be fired — and
+    take priority over per-obligación keyword queries under the query budget."""
+    from app.core.config import settings
+    from app.services import evidence_discovery_service as eds
+
+    monkeypatch.setattr(settings, "EVIDENCE_MAX_GMAIL_QUERIES", 2)
+
+    captured_queries: list[str] = []
+
+    async def _fake_search(usuario_id, query, max_results):
+        captured_queries.append(query)
+        return []
+
+    adapter = MagicMock()
+    adapter.search_messages = AsyncMock(side_effect=_fake_search)
+
+    with patch.object(eds, "GmailAdapter", return_value=adapter):
+        await eds._gather_email_evidence(
+            MagicMock(),
+            uuid.uuid4(),
+            [{"id": "ob1", "descripcion": "Entregar informe mensual de actividades"}],
+            "2024-04-01",
+            "2024-04-30",
+            None,
+            None,
+            numero_contrato="4161.010.26.1.027.2025",
+        )
+
+    # Only 2 queries fit under the budget — both must be contract-number
+    # queries, not the obligación's keyword query.
+    assert len(captured_queries) == 2
+    assert all("4161" in q for q in captured_queries)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Date-range default from contrato when fecha_inicio/fecha_fin are omitted
 # ─────────────────────────────────────────────────────────────────────────────
 
