@@ -422,3 +422,111 @@ async def test_subir_evidencia_actividad_reupload_no_duplica(
     assert r2.duplicada is True
     assert r2.id == r1.id
     assert storage.upload.call_count == 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Round 2 — id is AUTHORITATIVE identity (confirmed CRITICAL finding).
+#
+# `_deduplicate` dropped an item whose content hash collided EVEN WHEN its
+# external id was new, so: recurring Calendar events (content excludes the
+# date, so instances are byte-identical), same-named Drive files (content IS
+# the filename) and short identical email bodies ("Recibido, gracias.") all
+# collapsed to one. Dedup runs BEFORE filter/matcher, so the loss is upstream
+# of everything.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_dedup_keeps_recurring_calendar_events_with_distinct_event_ids():
+    from app.agent.nodes.evidence_dedup import _deduplicate
+
+    events = [{"source": "calendar", "event_id": f"e{i}", "content": "Comite de seguimiento"} for i in range(4)]
+    kept = _deduplicate(events)
+    assert len(kept) == 4, "recurring weekly meeting instances collapsed into one"
+
+
+def test_dedup_keeps_same_named_drive_files_with_distinct_file_ids():
+    from app.agent.nodes.evidence_dedup import _deduplicate
+
+    files = [
+        {"source": "drive", "file_id": f"f{i}", "title": "Informe mensual.pdf", "content": "Informe mensual.pdf"}
+        for i in range(3)
+    ]
+    kept = _deduplicate(files)
+    assert len(kept) == 3, "monthly documents sharing a filename collapsed into one"
+
+
+def test_dedup_keeps_distinct_emails_with_identical_short_bodies():
+    from app.agent.nodes.evidence_dedup import _deduplicate
+
+    emails = [
+        {"source": "email", "message_id": "m1", "title": "Re: Informe enero", "content": "Recibido, gracias."},
+        {"source": "email", "message_id": "m2", "title": "Re: Informe febrero", "content": "Recibido, gracias."},
+        {"source": "email", "message_id": "m3", "title": "Re: Acta de reunion", "content": "Recibido, gracias."},
+    ]
+    kept = _deduplicate(emails)
+    assert len(kept) == 3
+    assert [e["message_id"] for e in kept] == ["m1", "m2", "m3"]
+
+
+def test_dedup_still_collapses_the_same_id_refetched():
+    """The id remains a real dedup signal — this must not regress."""
+    from app.agent.nodes.evidence_dedup import _deduplicate
+
+    items = [
+        {"source": "email", "message_id": "m1", "content": "cuerpo original"},
+        {"source": "email", "message_id": "m1", "content": "cuerpo con snippet actualizado"},
+    ]
+    assert len(_deduplicate(items)) == 1
+
+
+def test_dedup_still_collapses_idless_items_with_identical_content():
+    """Content hashing is retained ONLY for items with no external id."""
+    from app.agent.nodes.evidence_dedup import _deduplicate
+
+    items = [
+        {"source": "local", "content": "mismo texto exacto"},
+        {"source": "local", "content": "mismo texto exacto"},
+    ]
+    assert len(_deduplicate(items)) == 1
+
+
+def test_dedup_keeps_idless_items_with_empty_content():
+    """Root cause #6 must stay fixed: `_content_hash("")` is a constant."""
+    from app.agent.nodes.evidence_dedup import _deduplicate
+
+    items = [{"source": "local", "content": ""}, {"source": "local", "content": ""}]
+    assert len(_deduplicate(items)) == 2
+
+
+def test_dedup_cross_provider_same_file_collapses_on_name_size_mime():
+    """The docstring's cross-provider case (same document, different provider
+    file ids) is the one thing id-authoritative dedup would lose — keyed on
+    (name, size, mime) instead of the bare filename so two genuinely different
+    files that merely share a name are NOT collapsed."""
+    from app.agent.nodes.evidence_dedup import _deduplicate
+
+    items = [
+        {
+            "source": "drive",
+            "file_id": "g1",
+            "provider": "google",
+            "title": "Informe mensual.pdf",
+            "content": "Informe mensual.pdf",
+            "size": 12345,
+            "mime_type": "application/pdf",
+        },
+        {
+            "source": "drive",
+            "file_id": "m1",
+            "provider": "microsoft",
+            "title": "Informe mensual.pdf",
+            "content": "Informe mensual.pdf",
+            "size": 12345,
+            "mime_type": "application/pdf",
+        },
+    ]
+    assert len(_deduplicate(items)) == 1
+
+    # Same name, DIFFERENT size → two distinct documents, both kept.
+    items[1]["size"] = 999
+    assert len(_deduplicate(items)) == 2

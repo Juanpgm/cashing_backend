@@ -17,26 +17,79 @@ moves to multiple workers.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import time
 import uuid
 
 from app.core.config import settings
 from app.schemas.google_workspace import EvidenceDiscoveryResponse
 
-CacheKey = tuple[uuid.UUID, uuid.UUID, str, str]
+# The 5th component is a fingerprint of everything ELSE that steers the search
+# (round-2 fix): the contract's numero/entidad/objeto and the contratista's own
+# "¿Qué hiciste este mes?" summary are real SEARCH INPUTS — they seed
+# `expand_search_terms` and every prompt header — but none of them were in the
+# key, so editing the monthly summary and clicking discover again served the
+# pre-edit result for the whole TTL with no indication why.
+CacheKey = tuple[uuid.UUID, uuid.UUID, str, str, str]
 
 _cache: dict[CacheKey, tuple[float, EvidenceDiscoveryResponse]] = {}
 
 
-def _key(usuario_id: uuid.UUID, cuenta_id: uuid.UUID, fecha_inicio: str, fecha_fin: str) -> CacheKey:
-    return (usuario_id, cuenta_id, fecha_inicio, fecha_fin)
+def context_fingerprint(
+    contrato_contexto: dict[str, object] | None,
+    contexto_usuario: str | None,
+    obligaciones: list[dict[str, object]] | None = None,
+) -> str:
+    """Short, stable hash of the non-date search inputs.
+
+    Key-order independent (sorted JSON) so two equal contexts always collide,
+    and None/empty are treated identically so an absent context behaves like an
+    empty one rather than creating a second cache entry.
+
+    `obligaciones` (round-3 fix, confirmed WARNING): the resolved obligación
+    list drives every per-obligación query AND the whole matcher/justify
+    output shape, but was never part of the fingerprint — editing the
+    contract's obligaciones (a normal in-product action) and clicking
+    'descubrir' again within the TTL served a response whose obligación list
+    structurally mismatched the current set. Folded in as a sorted
+    `id:descripcion` digest so reordering the same obligaciones does not, by
+    itself, invalidate the cache — only actual content changes do. Optional
+    and defaults to `None` so existing callers are unaffected.
+    """
+    ob_digest = sorted(f"{ob.get('id', '')}:{ob.get('descripcion', '')}" for ob in (obligaciones or []))
+    payload = json.dumps(
+        {
+            "contrato": {k: v for k, v in sorted((contrato_contexto or {}).items()) if v not in (None, "")},
+            "contexto_usuario": (contexto_usuario or "").strip(),
+            "obligaciones": ob_digest,
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _key(
+    usuario_id: uuid.UUID,
+    cuenta_id: uuid.UUID,
+    fecha_inicio: str,
+    fecha_fin: str,
+    context_fingerprint: str = "",
+) -> CacheKey:
+    return (usuario_id, cuenta_id, fecha_inicio, fecha_fin, context_fingerprint)
 
 
 def get_cached(
-    usuario_id: uuid.UUID, cuenta_id: uuid.UUID, fecha_inicio: str, fecha_fin: str
+    usuario_id: uuid.UUID,
+    cuenta_id: uuid.UUID,
+    fecha_inicio: str,
+    fecha_fin: str,
+    context_fingerprint: str = "",
 ) -> EvidenceDiscoveryResponse | None:
     """Returns the cached result for this exact key, or None on miss/expiry."""
-    key = _key(usuario_id, cuenta_id, fecha_inicio, fecha_fin)
+    key = _key(usuario_id, cuenta_id, fecha_inicio, fecha_fin, context_fingerprint)
     entry = _cache.get(key)
     if entry is None:
         return None
@@ -53,8 +106,9 @@ def store(
     fecha_inicio: str,
     fecha_fin: str,
     value: EvidenceDiscoveryResponse,
+    context_fingerprint: str = "",
 ) -> None:
-    key = _key(usuario_id, cuenta_id, fecha_inicio, fecha_fin)
+    key = _key(usuario_id, cuenta_id, fecha_inicio, fecha_fin, context_fingerprint)
     _cache[key] = (time.monotonic() + settings.DISCOVERY_CACHE_TTL_SECONDS, value)
 
 

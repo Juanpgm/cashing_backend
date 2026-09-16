@@ -19,7 +19,12 @@ from googleapiclient.errors import HttpError as GoogleHttpError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.calendar.port import CalendarAttendee, CalendarEvent
-from app.adapters.email.gmail_adapter import GmailAdapter
+from app.adapters.email.gmail_adapter import (
+    _GMAIL_MAX_RETRIES,
+    _GMAIL_RETRY_BASE_DELAY,
+    GmailAdapter,
+    _is_rate_limit_error,
+)
 from app.adapters.google_errors import (
     GOOGLE_TRANSPORT_ERRORS,
     raise_external_service_error,
@@ -28,6 +33,21 @@ from app.adapters.google_errors import (
 )
 
 logger = structlog.get_logger("adapters.calendar")
+
+
+def _extract_hangout_link(raw: dict[str, Any]) -> str:
+    """Google hangoutLink, or the first "video" entryPoint in conferenceData
+    when hangoutLink itself is absent — Meet links used to never surface
+    because only htmlLink was ever captured (evidencias/discovery-fix root
+    cause #5)."""
+    hangout = raw.get("hangoutLink") or ""
+    if hangout:
+        return str(hangout)
+    conference = raw.get("conferenceData") or {}
+    for entry_point in conference.get("entryPoints") or []:
+        if entry_point.get("entryPointType") == "video" and entry_point.get("uri"):
+            return str(entry_point["uri"])
+    return ""
 
 
 def _parse_event(raw: dict[str, Any]) -> CalendarEvent:
@@ -63,6 +83,7 @@ def _parse_event(raw: dict[str, Any]) -> CalendarEvent:
         attendees=attendees,
         organizer_email=organizer.get("email"),
         event_type=raw.get("eventType") or "default",
+        hangout_link=_extract_hangout_link(raw),
     )
 
 
@@ -75,6 +96,31 @@ class GoogleCalendarAdapter:
 
     def _build_service(self, creds):  # type: ignore[no-untyped-def]
         return build("calendar", "v3", credentials=creds, cache_discovery=False)
+
+    async def _execute_with_retry(self, fn: Any) -> Any:
+        """Run a blocking Calendar API call in the executor, retrying 429s with backoff.
+
+        Round-2 fix: `calendar_fetch_node` now fires ONE `events.list` per search
+        term instead of a single call, so the rate-limit exposure is multiplied
+        — but this adapter used a bare `run_in_executor` with no backoff, unlike
+        `GmailAdapter._execute_with_retry`. A throttled term was swallowed by the
+        node's per-term `continue` and its events were silently lost, with
+        `any_call_succeeded` still True so nothing surfaced to the caller. Shares
+        Gmail's retry constants so both Google adapters behave identically.
+        """
+        loop = asyncio.get_running_loop()
+        last_exc: GoogleHttpError | None = None
+        for attempt in range(_GMAIL_MAX_RETRIES):
+            try:
+                return await loop.run_in_executor(None, fn)
+            except GoogleHttpError as exc:
+                if not _is_rate_limit_error(exc) or attempt == _GMAIL_MAX_RETRIES - 1:
+                    raise
+                last_exc = exc
+                delay = _GMAIL_RETRY_BASE_DELAY * (2**attempt)
+                logger.warning("calendar_rate_limited_retry", attempt=attempt + 1, delay=delay)
+                await asyncio.sleep(delay)
+        raise last_exc  # type: ignore[misc]  # unreachable — loop either returns or raises
 
     async def search_events(
         self,
@@ -95,7 +141,6 @@ class GoogleCalendarAdapter:
         """
         creds = await self._auth.get_credentials(usuario_id)
         service = self._build_service(creds)
-        loop = asyncio.get_running_loop()
 
         def _list() -> dict:  # type: ignore[type-arg]
             params: dict[str, Any] = {
@@ -111,7 +156,7 @@ class GoogleCalendarAdapter:
             return service.events().list(**params).execute()
 
         try:
-            result = await loop.run_in_executor(None, _list)
+            result = await self._execute_with_retry(_list)
         except GoogleHttpError as exc:
             raise_google_http_error(
                 logger,

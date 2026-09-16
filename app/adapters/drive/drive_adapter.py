@@ -283,6 +283,12 @@ class DriveAdapter:
                     pageSize=query.max_results,
                     orderBy="modifiedTime desc",
                     fields="files(id,name,mimeType,size,createdTime,modifiedTime,webViewLink,webContentLink,parents)",
+                    # Files living in a Shared Drive (common for entity-provisioned
+                    # Workspace accounts) are otherwise invisible to this search
+                    # entirely — evidencias/discovery-fix root cause #4.
+                    includeItemsFromAllDrives=True,
+                    supportsAllDrives=True,
+                    corpora="allDrives",
                 )
                 .execute()
             )
@@ -301,10 +307,26 @@ class DriveAdapter:
             safe_terms = [kw.replace("'", "").replace("\\", "") for kw in query.keywords]
             or_clause = " or ".join(f"name contains '{kw}' or fullText contains '{kw}'" for kw in safe_terms)
             parts.append(f"({or_clause})")
-        if query.date_from:
-            parts.append(f"modifiedTime >= '{query.date_from.isoformat()}'")
-        if query.date_to:
-            parts.append(f"modifiedTime <= '{query.date_to.isoformat()}'")
+        if query.date_from or query.date_to:
+            # SYMMETRIC windows, ORed (round-2 fix). The previous form paired an
+            # ORed lower bound with a modifiedTime-only upper bound:
+            #   (createdTime >= from or modifiedTime >= from) and modifiedTime <= to
+            # For files Drive timestamps itself modifiedTime >= createdTime, so
+            # `createdTime >= from` is a strict subset of `modifiedTime >= from`
+            # and the OR added ZERO rows — an inert change. Worse, the case the
+            # comment claimed to fix (created inside the period, edited after
+            # it) was still excluded by the upper bound. Each timestamp now gets
+            # its OWN complete window, so a file qualifies if EITHER its
+            # creation or its last modification falls inside the period.
+            def _window(field: str) -> str:
+                bounds = []
+                if query.date_from:
+                    bounds.append(f"{field} >= '{query.date_from.isoformat()}'")
+                if query.date_to:
+                    bounds.append(f"{field} <= '{query.date_to.isoformat()}'")
+                return "(" + " and ".join(bounds) + ")"
+
+            parts.append(f"({_window('createdTime')} or {_window('modifiedTime')})")
         if query.exclude_folders:
             parts.append(f"mimeType != '{FOLDER_MIME}'")
         if query.mime_types:

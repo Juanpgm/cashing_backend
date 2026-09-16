@@ -458,6 +458,505 @@ async def test_gather_gmail_evidence_queries_all_obligaciones_not_just_first_thr
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Gmail query widening + contract-number queries (evidencias/discovery-fix WU2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_gather_gmail_evidence_widens_date_window_by_margin_setting(monkeypatch) -> None:
+    """after:/before: must be widened by EVIDENCE_WINDOW_MARGIN_DAYS on both ends,
+    and before: pushed one extra day (Gmail's before: is EXCLUSIVE — evidence
+    dated exactly on fecha_fin was silently dropped otherwise)."""
+    from app.core.config import settings
+    from app.services import evidence_discovery_service as eds
+
+    monkeypatch.setattr(settings, "EVIDENCE_WINDOW_MARGIN_DAYS", 15)
+
+    captured_queries: list[str] = []
+
+    async def _fake_search(usuario_id, query, max_results):
+        captured_queries.append(query)
+        return []
+
+    adapter = MagicMock()
+    adapter.search_messages = AsyncMock(side_effect=_fake_search)
+
+    with patch.object(eds, "GmailAdapter", return_value=adapter):
+        await eds._gather_email_evidence(
+            MagicMock(),
+            uuid.uuid4(),
+            [{"id": "ob1", "descripcion": "Entregar informe mensual de actividades"}],
+            "2024-04-01",
+            "2024-04-30",
+            None,
+            None,
+        )
+
+    assert any("after:2024/03/17" in q for q in captured_queries)  # 04-01 - 15 days
+    assert any("before:2024/05/16" in q for q in captured_queries)  # 04-30 + 15 days + 1
+
+
+@pytest.mark.asyncio
+async def test_gather_gmail_evidence_min_floor_counts_inspected_not_kept_messages(monkeypatch) -> None:
+    """WARNING regression: `per_query` chose EVIDENCE_MAX_EMAILS_PER_QUERY vs
+    EVIDENCE_MIN_EMAILS_PER_QUERY based on `len(emails_by_id)` (KEPT messages),
+    but the cost being bounded is FETCHED messages — `search_messages` issues
+    one users.messages.get per returned id regardless of whether the message
+    later gets filtered as noise. In a noise-heavy mailbox the KEPT pool never
+    grows, so the floor never engaged and every query kept fetching the full
+    per-query cap."""
+    from app.core.config import settings
+    from app.services import evidence_discovery_service as eds
+
+    monkeypatch.setattr(settings, "EVIDENCE_MAX_EMAILS_TOTAL", 10)
+    monkeypatch.setattr(settings, "EVIDENCE_MAX_EMAILS_PER_QUERY", 25)
+    monkeypatch.setattr(settings, "EVIDENCE_MIN_EMAILS_PER_QUERY", 5)
+
+    call_sizes: list[int] = []
+
+    async def _fake_search(usuario_id, query, max_results):
+        call_sizes.append(max_results)
+        # 25 promotional messages per query, none of which survive the noise
+        # filter — the KEPT pool never grows past 0.
+        return [
+            EmailMessage(
+                id=f"{query}-{i}",
+                thread_id="t",
+                subject="Oferta especial",
+                sender="promo@retail-blast.com",
+                recipients=["contratista@gmail.com"],
+                date=datetime(2024, 4, 10, tzinfo=UTC),
+                body_plain="descuentos",
+                snippet="descuentos",
+                labels=["CATEGORY_PROMOTIONS"],
+            )
+            for i in range(max_results)
+        ]
+
+    adapter = MagicMock()
+    adapter.search_messages = AsyncMock(side_effect=_fake_search)
+
+    obligaciones = [
+        {"id": f"ob{i}", "descripcion": f"{verbo.capitalize()} procesos territoriales anuales"}
+        for i, verbo in enumerate(["auditar", "certificar", "diagnosticar", "evaluar", "fiscalizar"])
+    ]
+
+    with patch.object(eds, "GmailAdapter", return_value=adapter):
+        await eds._gather_email_evidence(
+            MagicMock(), uuid.uuid4(), obligaciones, "2024-04-01", "2024-04-30", None, None
+        )
+
+    # After the first query alone (25 inspected, all noise), the pool is
+    # already past EVIDENCE_MAX_EMAILS_TOTAL=10 by INSPECTION count even
+    # though the KEPT pool is still 0 — later queries must fetch the floor.
+    assert settings.EVIDENCE_MIN_EMAILS_PER_QUERY in call_sizes, (
+        f"the per_query floor never engaged despite {sum(call_sizes)} messages inspected — sizes: {call_sizes}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_gather_gmail_evidence_uses_settings_max_emails_per_query(monkeypatch) -> None:
+    from app.core.config import settings
+    from app.services import evidence_discovery_service as eds
+
+    monkeypatch.setattr(settings, "EVIDENCE_MAX_EMAILS_PER_QUERY", 25)
+
+    captured_max_results: list[int] = []
+
+    async def _fake_search(usuario_id, query, max_results):
+        captured_max_results.append(max_results)
+        return []
+
+    adapter = MagicMock()
+    adapter.search_messages = AsyncMock(side_effect=_fake_search)
+
+    with patch.object(eds, "GmailAdapter", return_value=adapter):
+        await eds._gather_email_evidence(
+            MagicMock(),
+            uuid.uuid4(),
+            [{"id": "ob1", "descripcion": "Entregar informe mensual de actividades"}],
+            "2024-04-01",
+            "2024-04-30",
+            None,
+            None,
+        )
+
+    assert captured_max_results
+    assert all(n == 25 for n in captured_max_results)
+
+
+@pytest.mark.asyncio
+async def test_gather_gmail_evidence_body_truncation_keeps_head_and_tail() -> None:
+    """A long email body must keep its head (2000 chars) AND tail (500 chars) —
+    not just the first 800 chars, which used to silently drop closing content
+    like a signature block mentioning the entity/supervisor (evidencias/
+    discovery-fix WU5)."""
+    from app.services import evidence_discovery_service as eds
+
+    body = "A" * 3000 + "TAIL_MARKER_END"
+    msg = _email("m-long", "Informe", body)
+
+    adapter = MagicMock()
+    adapter.search_messages = AsyncMock(return_value=[msg])
+
+    with patch.object(eds, "GmailAdapter", return_value=adapter):
+        emails, _ = await eds._gather_email_evidence(
+            MagicMock(),
+            uuid.uuid4(),
+            [{"id": "ob1", "descripcion": "Entregar informe mensual de actividades"}],
+            "2024-04-01",
+            "2024-04-30",
+            None,
+            None,
+        )
+
+    content = emails[0]["content"]
+    assert "TAIL_MARKER_END" in content
+    assert len(content) < len(body)
+
+
+@pytest.mark.asyncio
+async def test_gather_gmail_evidence_never_filters_email_containing_contract_number(monkeypatch) -> None:
+    """An email from an auto-prefix-style sender (e.g. notificaciones@) that
+    mentions the contract number must survive the noise heuristic — it's real
+    contractual evidence (evidencias/discovery-fix WU4)."""
+    from app.services import evidence_discovery_service as eds
+
+    numero = "4161.010.26.1.027.2025"
+    msg = _email("m-numero", f"Notificación contrato {numero}", f"Ver anexo del contrato {numero}")
+    msg.sender = "notificaciones@entidadprivada.com"  # non-institutional: not whitelisted by domain alone
+
+    adapter = MagicMock()
+    adapter.search_messages = AsyncMock(return_value=[msg])
+
+    with patch.object(eds, "GmailAdapter", return_value=adapter):
+        emails, filtered_count = await eds._gather_email_evidence(
+            MagicMock(),
+            uuid.uuid4(),
+            [{"id": "ob1", "descripcion": "Entregar informe mensual de actividades"}],
+            "2024-04-01",
+            "2024-04-30",
+            None,
+            None,
+            numero_contrato=numero,
+        )
+
+    assert filtered_count == 0
+    assert len(emails) == 1
+
+
+@pytest.mark.asyncio
+async def test_gather_gmail_evidence_fires_contract_number_queries_first(monkeypatch) -> None:
+    """When numero_contrato is passed, its query variants must be fired FIRST —
+    but never at the cost of the obligación getting no query at all.
+
+    Round 2: this test used to assert that a budget of 2 was spent ENTIRELY on
+    contract-number queries (`len(captured) == 2 and all("4161" in q)`), which
+    is precisely the confirmed CRITICAL starvation defect. Priority is still
+    pinned (the contract block leads), but the per-obligación floor
+    (`EVIDENCE_MIN_QUERIES_PER_OBLIGACION`) is now honoured on top of it.
+    """
+    from app.core.config import settings
+    from app.services import evidence_discovery_service as eds
+
+    monkeypatch.setattr(settings, "EVIDENCE_MAX_GMAIL_QUERIES", 2)
+
+    captured_queries: list[str] = []
+
+    async def _fake_search(usuario_id, query, max_results):
+        captured_queries.append(query)
+        return []
+
+    adapter = MagicMock()
+    adapter.search_messages = AsyncMock(side_effect=_fake_search)
+
+    with patch.object(eds, "GmailAdapter", return_value=adapter):
+        await eds._gather_email_evidence(
+            MagicMock(),
+            uuid.uuid4(),
+            [{"id": "ob1", "descripcion": "Entregar informe mensual de actividades"}],
+            "2024-04-01",
+            "2024-04-30",
+            None,
+            None,
+            numero_contrato="4161.010.26.1.027.2025",
+        )
+
+    # The contract-level block leads, bounded by the (tiny) budget...
+    assert "4161.010.26.1.027.2025" in captured_queries[0]
+    assert sum(1 for q in captured_queries if "4161" in q) == 2
+    # ...and the obligación is STILL searched — starvation is the bug, not the
+    # contract.
+    assert any("informe" in q.lower() for q in captured_queries), (
+        f"obligación query starved by the contract block — fired: {captured_queries}"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Semantic query expansion (evidencias/discovery-fix WU7)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_gather_gmail_evidence_fires_expanded_phrase_queries(monkeypatch) -> None:
+    from app.core.config import settings
+    from app.services import evidence_discovery_service as eds
+
+    monkeypatch.setattr(settings, "EVIDENCE_MAX_GMAIL_QUERIES", 50)
+
+    captured_queries: list[str] = []
+
+    async def _fake_search(usuario_id, query, max_results):
+        captured_queries.append(query)
+        return []
+
+    adapter = MagicMock()
+    adapter.search_messages = AsyncMock(side_effect=_fake_search)
+
+    with patch.object(eds, "GmailAdapter", return_value=adapter):
+        await eds._gather_email_evidence(
+            MagicMock(),
+            uuid.uuid4(),
+            [{"id": "ob1", "descripcion": "Entregar informe mensual de actividades"}],
+            "2024-04-01",
+            "2024-04-30",
+            None,
+            None,
+            expanded_terms={"ob1": ["planilla de seguridad social", "monthly progress report"]},
+        )
+
+    assert any("planilla de seguridad social" in q for q in captured_queries)
+    assert any("monthly progress report" in q for q in captured_queries)
+
+
+@pytest.mark.asyncio
+async def test_gather_gmail_evidence_expansion_still_respects_query_budget(monkeypatch) -> None:
+    from app.core.config import settings
+    from app.services import evidence_discovery_service as eds
+
+    monkeypatch.setattr(settings, "EVIDENCE_MAX_GMAIL_QUERIES", 3)
+
+    captured_queries: list[str] = []
+
+    async def _fake_search(usuario_id, query, max_results):
+        captured_queries.append(query)
+        return []
+
+    adapter = MagicMock()
+    adapter.search_messages = AsyncMock(side_effect=_fake_search)
+
+    with patch.object(eds, "GmailAdapter", return_value=adapter):
+        await eds._gather_email_evidence(
+            MagicMock(),
+            uuid.uuid4(),
+            [{"id": "ob1", "descripcion": "Entregar informe mensual de actividades"}],
+            "2024-04-01",
+            "2024-04-30",
+            None,
+            None,
+            expanded_terms={"ob1": ["a", "b", "c", "d", "e", "f"]},
+        )
+
+    assert len(captured_queries) <= 3
+
+
+@pytest.mark.asyncio
+async def test_descubrir_evidencias_survives_a_failing_expansion() -> None:
+    """Semantic expansion is ON by default (round 2), so what deserves pinning
+    is the FAIL-OPEN contract, not the flag's value.
+
+    This test previously asserted `expansion_spy.assert_not_called()`, i.e. it
+    only restated the default — the one test that "failed" when the flag was
+    flipped in measurement. Discovery must complete normally when expansion
+    raises, with the deterministic keyword terms still reaching the builders.
+    """
+    from app.services import evidence_discovery_service as eds
+
+    req = EvidenceDiscoveryRequest(
+        obligaciones=[{"id": "ob1", "descripcion": "Entregar informe mensual de actividades"}],
+        fecha_inicio="2024-04-01",
+        fecha_fin="2024-04-30",
+    )
+    gmail = MagicMock()
+    gmail.search_messages = AsyncMock(return_value=[])
+    drive_adapter = MagicMock()
+    drive_adapter.search_files = AsyncMock(return_value=[])
+    cal_adapter = MagicMock()
+    cal_adapter.search_events = AsyncMock(return_value=[])
+    justify_llm = AsyncMock()
+    justify_llm.complete = AsyncMock(return_value=MagicMock(content="No hay evidencia."))
+    expansion_spy = AsyncMock(side_effect=RuntimeError("expansion provider down"))
+
+    only_google, only_google_statuses = _patch_only_google_connected(eds)
+    with (
+        only_google,
+        only_google_statuses,
+        patch.object(eds, "GmailAdapter", return_value=gmail),
+        patch("app.agent.nodes.drive_fetch.DriveAdapter", return_value=drive_adapter),
+        patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", return_value=cal_adapter),
+        patch("app.agent.nodes.evidence_justify.get_llm", return_value=justify_llm),
+        patch.object(eds, "expand_search_terms", expansion_spy),
+    ):
+        result = await eds.descubrir_evidencias(MagicMock(), uuid.uuid4(), req)
+
+    expansion_spy.assert_called_once()
+    assert len(result.obligaciones) == 1  # the run completed despite the failure
+    # ...and the obligación's own keyword query still reached Gmail.
+    fired = " ".join(c.args[1] for c in gmail.search_messages.call_args_list).lower()
+    assert "informe" in fired
+
+
+@pytest.mark.asyncio
+async def test_descubrir_evidencias_expansion_enabled_feeds_gmail_queries(monkeypatch) -> None:
+    """With the feature flag on, the LLM's expanded phrases must reach Gmail
+    as additional queries (evidencias/discovery-fix WU7)."""
+    from app.core.config import settings
+    from app.services import evidence_discovery_service as eds
+
+    monkeypatch.setattr(settings, "EVIDENCE_QUERY_EXPANSION_ENABLED", True)
+    monkeypatch.setattr(settings, "EVIDENCE_MAX_GMAIL_QUERIES", 50)
+    # Expansion deliberately skips the round trip when the configured model has
+    # no credentials (otherwise every unauthenticated call burns tenacity's
+    # retry/backoff chain), so stub one to exercise the real path here.
+    monkeypatch.setattr(settings, "GROQ_API_KEY", "sk-test")
+
+    req = EvidenceDiscoveryRequest(
+        obligaciones=[{"id": "ob1", "descripcion": "Entregar informe mensual de actividades"}],
+        fecha_inicio="2024-04-01",
+        fecha_fin="2024-04-30",
+    )
+
+    captured_queries: list[str] = []
+
+    async def _fake_search(usuario_id, query, max_results):
+        captured_queries.append(query)
+        return []
+
+    gmail = MagicMock()
+    gmail.search_messages = AsyncMock(side_effect=_fake_search)
+    drive_adapter = MagicMock()
+    drive_adapter.search_files = AsyncMock(return_value=[])
+    cal_adapter = MagicMock()
+    cal_adapter.search_events = AsyncMock(return_value=[])
+    justify_llm = AsyncMock()
+    justify_llm.complete = AsyncMock(return_value=MagicMock(content="No hay evidencia."))
+    expansion_llm = AsyncMock()
+    expansion_llm.complete = AsyncMock(
+        return_value=MagicMock(content='{"ob1": ["planilla de seguridad social", "avance mensual", "x", "y"]}')
+    )
+
+    only_google, only_google_statuses = _patch_only_google_connected(eds)
+    with (
+        only_google,
+        only_google_statuses,
+        patch.object(eds, "GmailAdapter", return_value=gmail),
+        patch.object(eds, "get_llm", return_value=expansion_llm),
+        patch("app.agent.nodes.drive_fetch.DriveAdapter", return_value=drive_adapter),
+        patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", return_value=cal_adapter),
+        patch("app.agent.nodes.evidence_justify.get_llm", return_value=justify_llm),
+    ):
+        await eds.descubrir_evidencias(MagicMock(), uuid.uuid4(), req)
+
+    assert any("planilla de seguridad social" in q for q in captured_queries)
+
+
+@pytest.mark.asyncio
+async def test_gather_gmail_evidence_fires_context_derived_phrase_query(monkeypatch) -> None:
+    """A phrase derived from contexto_usuario (surfaced via expanded_terms)
+    must reach Gmail as a query — the same generic expanded_terms plumbing
+    WU7 already wires, closing the loop for WU7b's context phrases too."""
+    from app.core.config import settings
+    from app.services import evidence_discovery_service as eds
+
+    monkeypatch.setattr(settings, "EVIDENCE_MAX_GMAIL_QUERIES", 50)
+
+    captured_queries: list[str] = []
+
+    async def _fake_search(usuario_id, query, max_results):
+        captured_queries.append(query)
+        return []
+
+    adapter = MagicMock()
+    adapter.search_messages = AsyncMock(side_effect=_fake_search)
+
+    with patch.object(eds, "GmailAdapter", return_value=adapter):
+        await eds._gather_email_evidence(
+            MagicMock(),
+            uuid.uuid4(),
+            [{"id": "ob1", "descripcion": "Entregar informe mensual de actividades"}],
+            "2024-04-01",
+            "2024-04-30",
+            None,
+            None,
+            expanded_terms={"ob1": ["logística evento anual"]},  # derived from contexto_usuario
+        )
+
+    assert any("logística evento anual" in q for q in captured_queries)
+
+
+@pytest.mark.asyncio
+async def test_descubrir_evidencias_passes_contexto_usuario_to_expansion(db: AsyncSession) -> None:
+    """evidencias/discovery-fix WU7b: CuentaCobro.contexto_usuario ("¿Qué
+    hiciste este mes?") must reach expand_search_terms as the primary hint —
+    verified end-to-end through descubrir_evidencias with the feature flag on."""
+    from app.core.config import settings
+    from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
+    from app.services import evidence_discovery_service as eds
+
+    original_flag = settings.EVIDENCE_QUERY_EXPANSION_ENABLED
+    settings.EVIDENCE_QUERY_EXPANSION_ENABLED = True
+    try:
+        user = await _make_user(db)
+        contrato = await _make_contrato(db, user.id)
+        cuenta = CuentaCobro(
+            contrato_id=contrato.id,
+            mes=4,
+            anio=2024,
+            estado=EstadoCuentaCobro.BORRADOR,
+            valor=1_000_000,
+            contexto_usuario="Coordiné la logística del evento anual con proveedores externos",
+        )
+        db.add(cuenta)
+        await db.commit()
+
+        req = EvidenceDiscoveryRequest(
+            obligaciones=[{"id": "ob1", "descripcion": "Entregar informe mensual"}],
+            cuenta_id=cuenta.id,
+            fecha_inicio="2024-04-01",
+            fecha_fin="2024-04-30",
+        )
+
+        expansion_spy = AsyncMock(return_value={"ob1": ["x", "y", "z"]})
+        gmail = MagicMock()
+        gmail.search_messages = AsyncMock(return_value=[])
+        drive_adapter = MagicMock()
+        drive_adapter.search_files = AsyncMock(return_value=[])
+        cal_adapter = MagicMock()
+        cal_adapter.search_events = AsyncMock(return_value=[])
+        justify_llm = AsyncMock()
+        justify_llm.complete = AsyncMock(return_value=MagicMock(content="No hay evidencia."))
+
+        with (
+            patch.object(eds.integration_service, "has_any_connected_provider", AsyncMock(return_value=True)),
+            patch.object(
+                eds.integration_service, "list_integration_statuses", AsyncMock(return_value=[_connected_status()])
+            ),
+            patch.object(eds, "GmailAdapter", return_value=gmail),
+            patch.object(eds, "expand_search_terms", expansion_spy),
+            patch("app.agent.nodes.drive_fetch.DriveAdapter", return_value=drive_adapter),
+            patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", return_value=cal_adapter),
+            patch("app.agent.nodes.evidence_justify.get_llm", return_value=justify_llm),
+        ):
+            await eds.descubrir_evidencias(db, user.id, req)
+
+        expansion_spy.assert_awaited_once()
+        call_kwargs = expansion_spy.await_args.kwargs
+        assert call_kwargs.get("contexto_usuario") == "Coordiné la logística del evento anual con proveedores externos"
+    finally:
+        settings.EVIDENCE_QUERY_EXPANSION_ENABLED = original_flag
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Date-range default from contrato when fecha_inicio/fecha_fin are omitted
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -870,6 +1369,184 @@ async def test_descubrir_evidencias_refresh_true_bypasses_and_repopulates_cache(
     assert gmail_ctor.call_count == 2
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# contrato_contexto: numero_contrato/entidad/objeto must reach the agent state
+# (evidencias/discovery-fix root cause #1 — these were never loaded before).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_descubrir_evidencias_llena_contrato_contexto_con_numero_entidad_objeto(db: AsyncSession) -> None:
+    """contrato_contexto must carry numero_contrato/entidad/objeto (not just
+    fecha_inicio/fecha_fin) so the query builders and matcher can use the
+    contract number and entidad as search/scoring signals."""
+    from app.services import evidence_discovery_service as eds
+
+    user = await _make_user(db)
+    contrato = Contrato(
+        usuario_id=user.id,
+        numero_contrato="4161.010.26.1.027.2025",
+        objeto="Prestación de servicios profesionales de apoyo a la gestión ambiental",
+        valor_total=36_000_000,
+        valor_mensual=3_000_000,
+        fecha_inicio=date(2024, 2, 1),
+        fecha_fin=date(2024, 12, 31),
+        entidad="DAGMA - Departamento Administrativo de Gestión del Medio Ambiente",
+    )
+    db.add(contrato)
+    await db.commit()
+
+    req = EvidenceDiscoveryRequest(
+        obligaciones=[{"id": "ob1", "descripcion": "Entregar informe mensual de actividades"}],
+        contrato_id=contrato.id,
+        fecha_inicio="2024-04-01",
+        fecha_fin="2024-04-30",
+    )
+
+    captured: dict[str, Any] = {}
+
+    async def _spy_drive_fetch(state, provider=IntegrationProvider.GOOGLE):
+        captured["contrato_contexto"] = dict(state.get("contrato_contexto") or {})
+        return {**state, "drive_evidencias": []}
+
+    gmail = MagicMock()
+    gmail.search_messages = AsyncMock(return_value=[])
+    cal_adapter = MagicMock()
+    cal_adapter.search_events = AsyncMock(return_value=[])
+    justify_llm = AsyncMock()
+    justify_llm.complete = AsyncMock(return_value=MagicMock(content="No hay evidencia."))
+
+    only_google, only_google_statuses = _patch_only_google_connected(eds)
+    with (
+        only_google,
+        only_google_statuses,
+        patch.object(eds, "GmailAdapter", return_value=gmail),
+        patch.object(eds, "drive_fetch_node", _spy_drive_fetch),
+        patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", return_value=cal_adapter),
+        patch("app.agent.nodes.evidence_justify.get_llm", return_value=justify_llm),
+    ):
+        await eds.descubrir_evidencias(db, user.id, req)
+
+    ctx = captured["contrato_contexto"]
+    assert ctx["numero_contrato"] == "4161.010.26.1.027.2025"
+    assert "DAGMA" in ctx["entidad"]
+    assert "gestión" in ctx["objeto"].lower()
+    assert ctx["fecha_inicio"] == "2024-04-01"
+    assert ctx["fecha_fin"] == "2024-04-30"
+
+
+@pytest.mark.asyncio
+async def test_descubrir_evidencias_contrato_sin_entidad_ni_objeto_no_falla(db: AsyncSession) -> None:
+    """A contrato with no entidad still fills numero_contrato/objeto without KeyError."""
+    from app.services import evidence_discovery_service as eds
+
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)  # no entidad set
+    await db.commit()
+
+    req = EvidenceDiscoveryRequest(
+        obligaciones=[{"id": "ob1", "descripcion": "Entregar informe mensual"}],
+        contrato_id=contrato.id,
+        fecha_inicio="2024-04-01",
+        fecha_fin="2024-04-30",
+    )
+
+    captured: dict[str, Any] = {}
+
+    async def _spy_drive_fetch(state, provider=IntegrationProvider.GOOGLE):
+        captured["contrato_contexto"] = dict(state.get("contrato_contexto") or {})
+        return {**state, "drive_evidencias": []}
+
+    gmail = MagicMock()
+    gmail.search_messages = AsyncMock(return_value=[])
+    cal_adapter = MagicMock()
+    cal_adapter.search_events = AsyncMock(return_value=[])
+    justify_llm = AsyncMock()
+    justify_llm.complete = AsyncMock(return_value=MagicMock(content="No hay evidencia."))
+
+    only_google, only_google_statuses = _patch_only_google_connected(eds)
+    with (
+        only_google,
+        only_google_statuses,
+        patch.object(eds, "GmailAdapter", return_value=gmail),
+        patch.object(eds, "drive_fetch_node", _spy_drive_fetch),
+        patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", return_value=cal_adapter),
+        patch("app.agent.nodes.evidence_justify.get_llm", return_value=justify_llm),
+    ):
+        await eds.descubrir_evidencias(db, user.id, req)
+
+    ctx = captured["contrato_contexto"]
+    assert ctx["numero_contrato"] == "CTR-DISC-001"
+    assert "entidad" not in ctx
+    assert ctx["fecha_inicio"] == "2024-04-01"
+
+
+@pytest.mark.asyncio
+async def test_descubrir_evidencias_obligaciones_explicitas_sin_contrato_id_no_carga_contexto() -> None:
+    """Explicit obligaciones with no contrato_id/cuenta_id must not attempt to
+    load a Contrato — contrato_contexto stays limited to the date range."""
+    from app.services import evidence_discovery_service as eds
+
+    req = EvidenceDiscoveryRequest(
+        obligaciones=[{"id": "ob1", "descripcion": "Entregar informe mensual de actividades del contrato"}],
+        fecha_inicio="2024-04-01",
+        fecha_fin="2024-04-30",
+    )
+
+    captured: dict[str, Any] = {}
+
+    async def _spy_drive_fetch(state, provider=IntegrationProvider.GOOGLE):
+        captured["contrato_contexto"] = dict(state.get("contrato_contexto") or {})
+        return {**state, "drive_evidencias": []}
+
+    gmail = MagicMock()
+    gmail.search_messages = AsyncMock(return_value=[])
+    cal_adapter = MagicMock()
+    cal_adapter.search_events = AsyncMock(return_value=[])
+    justify_llm = AsyncMock()
+    justify_llm.complete = AsyncMock(return_value=MagicMock(content="No hay evidencia."))
+
+    only_google, only_google_statuses = _patch_only_google_connected(eds)
+    with (
+        only_google,
+        only_google_statuses,
+        patch.object(eds, "GmailAdapter", return_value=gmail),
+        patch.object(eds, "drive_fetch_node", _spy_drive_fetch),
+        patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", return_value=cal_adapter),
+        patch("app.agent.nodes.evidence_justify.get_llm", return_value=justify_llm),
+    ):
+        await eds.descubrir_evidencias(MagicMock(), uuid.uuid4(), req)
+
+    ctx = captured["contrato_contexto"]
+    assert "numero_contrato" not in ctx
+    assert set(ctx.keys()) == {"fecha_inicio", "fecha_fin"}
+
+
+@pytest.mark.asyncio
+async def test_descubrir_evidencias_contrato_no_encontrado_al_cargar_contexto_lanza_not_found() -> None:
+    """If the contrato vanishes between the ownership check and the context
+    load, the service must raise the existing domain NotFoundError, not 500."""
+    from app.core.exceptions import NotFoundError
+    from app.services import evidence_discovery_service as eds
+
+    contrato_id = uuid.uuid4()
+    req = EvidenceDiscoveryRequest(
+        obligaciones=[{"id": "ob1", "descripcion": "Entregar informe"}],
+        contrato_id=contrato_id,
+        fecha_inicio="2024-04-01",
+        fecha_fin="2024-04-30",
+    )
+
+    db = MagicMock()
+    execute_result = MagicMock()
+    execute_result.first.return_value = (contrato_id,)  # ownership check passes
+    db.execute = AsyncMock(return_value=execute_result)
+    db.get = AsyncMock(return_value=None)  # contrato vanished before context load
+
+    with pytest.raises(NotFoundError):
+        await eds.descubrir_evidencias(db, uuid.uuid4(), req)
+
+
 @pytest.mark.asyncio
 async def test_descubrir_evidencias_local_only_false_still_requires_provider_gate() -> None:
     """Explicit local_only=False (or omitted — the default) preserves the
@@ -890,3 +1567,83 @@ async def test_descubrir_evidencias_local_only_false_still_requires_provider_gat
         pytest.raises(ExternalServiceError),
     ):
         await eds.descubrir_evidencias(MagicMock(), uuid.uuid4(), req, local_only=False)
+
+
+@pytest.mark.asyncio
+async def test_descubrir_evidencias_writes_supervisor_email_into_contrato_contexto() -> None:
+    """WARNING regression: `evidence_filter_node` reads
+    `contrato_ctx.get("supervisor_email")` to derive `supervisor_domain` (the
+    layer-2 rescue for a supervisor writing from a non-institutional domain),
+    but `descubrir_evidencias` never wrote that key into `contrato_contexto` —
+    so the key was `None` on every production call and the layer-1 rescue at
+    the service pre-filter was silently reverted one layer later. Verified by
+    inspecting the actual state `evidence_filter_node` receives."""
+    from app.agent.nodes import evidence_filter as filter_mod
+    from app.services import evidence_discovery_service as eds
+
+    req = EvidenceDiscoveryRequest(
+        obligaciones=[{"id": "ob1", "descripcion": "Entregar informe mensual de actividades del contrato"}],
+        fecha_inicio="2024-04-01",
+        fecha_fin="2024-04-30",
+        supervisor_email="supervisor@interventoria-consorcio.com",
+    )
+
+    gmail = MagicMock()
+    gmail.search_messages = AsyncMock(return_value=[])
+    drive_adapter = MagicMock()
+    drive_adapter.search_files = AsyncMock(return_value=[])
+    cal_adapter = MagicMock()
+    cal_adapter.search_events = AsyncMock(return_value=[])
+
+    captured_state: dict = {}
+    real_filter_node = filter_mod.evidence_filter_node
+
+    async def _spy(state):
+        captured_state.update(state)
+        return await real_filter_node(state)
+
+    only_google, only_google_statuses = _patch_only_google_connected(eds)
+    with (
+        only_google,
+        only_google_statuses,
+        patch.object(eds, "GmailAdapter", return_value=gmail),
+        patch("app.agent.nodes.drive_fetch.DriveAdapter", return_value=drive_adapter),
+        patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", return_value=cal_adapter),
+        patch.object(eds, "evidence_filter_node", side_effect=_spy),
+    ):
+        await eds.descubrir_evidencias(MagicMock(), uuid.uuid4(), req)
+
+    assert captured_state.get("contrato_contexto", {}).get("supervisor_email") == (
+        "supervisor@interventoria-consorcio.com"
+    )
+
+
+@pytest.mark.asyncio
+async def test_service_prefilter_and_filter_node_reach_identical_verdicts_for_supervisor_mail() -> None:
+    """Regression for the layer-1/layer-2 divergence: a supervisor writing from
+    a non-institutional domain with an auto-prefix address must be KEPT by
+    both the service pre-filter (`score_non_personal_email`) and
+    `evidence_filter_node`'s heuristic layer, given the same
+    `contrato_contexto`."""
+    from app.agent.nodes.evidence_filter import _heuristic_is_noise
+    from app.agent.prompts.evidence_filter import score_non_personal_email
+
+    numero_variants = ["4161.010.26.1.027.2025"]
+    supervisor_email = "supervisor@interventoria-consorcio.com"
+    supervisor_domain = supervisor_email.split("@")[-1]
+    sender = "notificaciones@interventoria-consorcio.com"
+    subject = "Seguimiento contrato - entrega de informe"
+
+    service_score, _reason = score_non_personal_email(
+        sender, subject, [], {}, supervisor_domain=supervisor_domain, contains_contract_number=False
+    )
+    item = {
+        "source": "email",
+        "title": subject,
+        "content": "adjunto seguimiento",
+        "metadata": {"sender": sender, "labels": [], "headers": {}},
+    }
+    node_is_noise = _heuristic_is_noise(item, numero_variants=numero_variants, supervisor_domain=supervisor_domain)
+
+    assert service_score < 3, "service pre-filter dropped legitimate supervisor mail"
+    assert node_is_noise is False, "evidence_filter_node reversed the service pre-filter's supervisor rescue"

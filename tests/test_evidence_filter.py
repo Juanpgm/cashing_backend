@@ -196,6 +196,70 @@ async def test_llm_gate_keeps_on_empty_content():
     assert result == [True, True]
 
 
+# ── Round-3 fix: reuse the tolerant JSON extractor, not a greedy regex ────────
+
+
+@pytest.mark.asyncio
+async def test_llm_gate_tolerates_a_reasoning_preamble_with_brackets():
+    """WARNING regression: the greedy `_JSON_RE = r"\\[.*\\]"` spanned from the
+    FIRST bracket in a reasoning preamble to the LAST bracket in the real
+    array, producing an unparseable blob and silently disabling the noise
+    filter for the whole batch (fail-open: keep everything, i.e. the verdict
+    the classifier exists to prevent is never applied). Now reuses
+    `evidence_matcher._extract_json_array`, which recovers the real verdict
+    instead of failing the whole batch open."""
+    from app.agent.nodes.evidence_filter import _llm_classify_batch
+
+    llm = AsyncMock()
+    llm.complete = AsyncMock(
+        return_value=MagicMock(
+            content='Analizo los items [1] y [2].\n[{"idx": 0, "verdict": "RUIDO"}, {"idx": 1, "verdict": "TRABAJO"}]'
+        )
+    )
+
+    items = [_email_item("Boletin promocional"), _email_item("Informe mensual")]
+    result = await _llm_classify_batch(items, llm)
+
+    assert result == [False, True], f"tolerant parser was not used — fell back to keep-all: {result}"
+
+
+@pytest.mark.asyncio
+async def test_llm_gate_tolerates_trailing_prose_with_brackets():
+    """Same defect, trailing side: a footnote after the array containing a
+    bracket used to extend the greedy match past the real array's closing
+    bracket, making it unparseable too."""
+    from app.agent.nodes.evidence_filter import _llm_classify_batch
+
+    llm = AsyncMock()
+    llm.complete = AsyncMock(
+        return_value=MagicMock(content='[{"idx": 0, "verdict": "RUIDO"}]\nNota [1]: revisar el resto.')
+    )
+
+    items = [_email_item("Boletin promocional")]
+    result = await _llm_classify_batch(items, llm)
+
+    assert result == [False], f"tolerant parser was not used — fell back to keep-all: {result}"
+
+
+@pytest.mark.asyncio
+async def test_llm_gate_salvages_a_truncated_array():
+    """`max_tokens=700` can still cut the array mid-object for a reasoning
+    model; the complete prefix is a usable partial verdict and must not be
+    thrown away entirely."""
+    from app.agent.nodes.evidence_filter import _llm_classify_batch
+
+    llm = AsyncMock()
+    llm.complete = AsyncMock(return_value=MagicMock(content='[{"idx": 0, "verdict": "RUIDO"}, {"idx": 1, "verdict": "TR'))
+
+    items = [_email_item("Boletin promocional"), _email_item("Informe mensual")]
+    result = await _llm_classify_batch(items, llm)
+
+    # idx 0 is salvaged from the complete prefix (RUIDO -> dropped); idx 1's
+    # object was cut mid-value and is not recoverable, defaulting to TRABAJO
+    # (kept) via `idx_to_verdict.get(i, "TRABAJO")`.
+    assert result == [False, True]
+
+
 # ── groq/llama-3.1-8b-instant decommissioning fix ──────────────────────────────
 
 
@@ -214,6 +278,64 @@ async def test_llm_classify_batch_sends_reasoning_effort():
     kwargs = llm.complete.call_args.kwargs
     assert kwargs["reasoning_effort"] == "low"
     assert kwargs["max_tokens"] == 700
+
+
+@pytest.mark.asyncio
+async def test_llm_classify_batch_includes_contract_header_in_prompt():
+    """evidencias/discovery-fix WU5: the work-noise prompt must carry contract
+    context so the LLM can recognize entity correspondence it would otherwise
+    have no way to associate with this specific contract."""
+    from app.agent.nodes.evidence_filter import _llm_classify_batch
+
+    llm = AsyncMock()
+    llm.complete = AsyncMock(return_value=MagicMock(content='[{"idx": 0, "verdict": "TRABAJO"}]'))
+
+    items = [_email_item("Acta de reunión", sender="coord@entidad.gov.co")]
+    await _llm_classify_batch(
+        items, llm, contrato_contexto={"numero_contrato": "4161.010.26.1.027.2025", "entidad": "DAGMA"}
+    )
+
+    prompt = llm.complete.call_args.args[0][1].content
+    assert "4161.010.26.1.027.2025" in prompt
+    assert "DAGMA" in prompt
+
+
+@pytest.mark.asyncio
+async def test_evidence_filter_node_passes_contrato_contexto_to_llm_batch():
+    from app.agent.nodes import evidence_filter as mod
+
+    llm = AsyncMock()
+    llm.complete = AsyncMock(return_value=MagicMock(content='[{"idx": 0, "verdict": "TRABAJO"}]'))
+
+    state = {
+        "evidence_raw": [_email_item("Informe mensual", sender="supervisor@entidad.gov.co")],
+        "contrato_contexto": {"numero_contrato": "CTR-999"},
+    }
+    with patch.object(mod, "get_llm", return_value=llm):
+        await mod.evidence_filter_node(state)
+
+    prompt = llm.complete.call_args.args[0][1].content
+    assert "CTR-999" in prompt
+
+
+@pytest.mark.asyncio
+async def test_evidence_filter_node_passes_contexto_usuario_to_llm_batch():
+    """evidencias/discovery-fix WU7b: the contratista's monthly summary must
+    reach the work-noise prompt via the shared header."""
+    from app.agent.nodes import evidence_filter as mod
+
+    llm = AsyncMock()
+    llm.complete = AsyncMock(return_value=MagicMock(content='[{"idx": 0, "verdict": "TRABAJO"}]'))
+
+    state = {
+        "evidence_raw": [_email_item("Informe mensual", sender="supervisor@entidad.gov.co")],
+        "contexto_usuario": "Entregué el informe y asistí a 2 reuniones con el supervisor",
+    }
+    with patch.object(mod, "get_llm", return_value=llm):
+        await mod.evidence_filter_node(state)
+
+    prompt = llm.complete.call_args.args[0][1].content
+    assert "Entregué el informe y asistí a 2 reuniones con el supervisor" in prompt
 
 
 @pytest.mark.asyncio
@@ -365,6 +487,74 @@ def test_score_noreply_prefix_returns_3():
     assert "auto_prefix" in reason
 
 
+def test_score_contains_contract_number_exempts_the_weak_heuristics():
+    """An email mentioning the contract number survives the HEURISTIC signals
+    (auto prefixes, ESP-ish domains, subject patterns) — evidencias/discovery-fix
+    WU4.
+
+    Round 2: this test used to assert the exemption beat a CATEGORY_PROMOTIONS
+    label too, which is the confirmed CRITICAL defect — the branch deliberately
+    fires a bare `"4161"` Gmail query, so an entire promotional result set
+    entered the pipeline with the deterministic filter disarmed. Definitive
+    signals now outrank the exemption; see
+    tests/test_evidence_noise_bypass.py for that half.
+    """
+    from app.agent.prompts.evidence_filter import score_non_personal_email
+
+    score, reason = score_non_personal_email(
+        # NOT whitelisted (.com), so the exemption is what does the work here —
+        # a .gov.co sender would short-circuit on the whitelist instead.
+        sender="noreply@notificaciones-interventoria.com",
+        subject="50% OFF descuento oferta exclusiva",
+        labels=[],
+        contains_contract_number=True,
+    )
+    assert score == 0
+    assert reason == "contains_contract_number"
+
+
+def test_score_without_contract_number_flag_behaves_as_before():
+    from app.agent.prompts.evidence_filter import score_non_personal_email
+
+    score, _ = score_non_personal_email(
+        sender="offers@tienda.com",
+        subject="Oferta exclusiva",
+        labels=["CATEGORY_PROMOTIONS"],
+        contains_contract_number=False,
+    )
+    assert score >= 3
+
+
+def test_score_supervisor_domain_exempts_auto_prefix_penalty():
+    """A sender whose domain matches the supervisor's domain is real entity
+    correspondence, even from an 'info@'/'notificaciones@'-style address —
+    exempt it from the auto-prefix penalty. Uses a non-institutional domain
+    (not .gov.co/.edu.co/.org.co) so the existing whitelist doesn't already
+    short-circuit this before the exemption logic is exercised."""
+    from app.agent.prompts.evidence_filter import score_non_personal_email
+
+    score, reason = score_non_personal_email(
+        sender="info@entidadprivada.com",
+        subject="Seguimiento del contrato",
+        labels=[],
+        supervisor_domain="entidadprivada.com",
+    )
+    assert reason != "auto_prefix:info@entidadprivada.com"
+    assert score < 3
+
+
+def test_score_supervisor_domain_mismatch_still_applies_auto_prefix_penalty():
+    from app.agent.prompts.evidence_filter import score_non_personal_email
+
+    score, _ = score_non_personal_email(
+        sender="info@otraempresa.com",
+        subject="Seguimiento",
+        labels=[],
+        supervisor_domain="entidadprivada.com",
+    )
+    assert score >= 3
+
+
 def test_score_no_reply_hyphen_normalizes():
     from app.agent.prompts.evidence_filter import score_non_personal_email
 
@@ -459,6 +649,42 @@ def test_score_gmail_sender_never_filtered():
         subject="Invitación: Revisión Marketing mié 24 jun",
         labels=[],
         headers={"List-Unsubscribe": "<mailto:unsub@gmail.com>"},
+    )
+    assert score == 0
+
+
+def test_score_gmail_category_label_still_wins_over_a_whitelisted_domain():
+    """SUGGESTION regression, narrow fix: `CATEGORY_PROMOTIONS`/`SPAM` are
+    Gmail's own server-side ML classifier verdicts — sender-agnostic and
+    strictly better evidence than "the domain is gmail.com" (small Colombian
+    vendors and many mailing lists send from gmail.com/outlook.com too). Only
+    these two labels are moved above the whitelist; List-Unsubscribe/
+    Precedence/X-Mailer stay below it (see
+    test_score_gmail_sender_never_filtered above — a personal Calendar invite
+    routinely carries List-Unsubscribe and must still pass through)."""
+    from app.agent.prompts.evidence_filter import score_non_personal_email
+
+    score, reason = score_non_personal_email(
+        sender="promos@gmail.com",
+        subject="Oferta especial de la semana",
+        labels=["CATEGORY_PROMOTIONS"],
+        headers={},
+    )
+    assert score >= 3, f"Gmail's own promotions classifier disarmed by the whitelist: {(score, reason)}"
+
+
+def test_score_gmail_list_id_header_still_loses_to_the_whitelist():
+    """The narrow fix must NOT move List-Unsubscribe/Precedence/X-Mailer/List-Id
+    above the whitelist — those false-positive on legitimate Calendar invites
+    and Google Groups mail sent to/from a personal gmail.com address (see
+    test_score_gmail_sender_never_filtered)."""
+    from app.agent.prompts.evidence_filter import score_non_personal_email
+
+    score, _ = score_non_personal_email(
+        sender="equipo@gmail.com",
+        subject="Actualización del equipo",
+        labels=[],
+        headers={"List-Id": "<grupo.googlegroups.com>"},
     )
     assert score == 0
 

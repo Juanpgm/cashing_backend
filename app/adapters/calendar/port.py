@@ -48,6 +48,10 @@ class CalendarEvent:
     attendees: list[CalendarAttendee] = field(default_factory=list)
     organizer_email: str | None = None
     event_type: str = "default"  # Google eventType; Graph has no equivalent -> "default"
+    # Video-meeting URL — Google hangoutLink, or the first "video" entry point
+    # in conferenceData.entryPoints when hangoutLink itself is absent. "" when
+    # the event has no video conferencing attached (Graph has no equivalent yet).
+    hangout_link: str = ""
 
 
 class CalendarPort(Protocol):

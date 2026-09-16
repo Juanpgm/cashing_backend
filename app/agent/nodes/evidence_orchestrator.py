@@ -61,6 +61,7 @@ async def evidence_orchestrator_node(state: AgentState) -> AgentState:
                 "date": ev.get("date", ""),
                 "file_id": ev.get("file_id", ""),
                 "mime_type": ev.get("mime_type", ""),
+                "size": ev.get("size"),
                 "provider": ev.get("provider", ""),
                 "metadata": ev,
             }

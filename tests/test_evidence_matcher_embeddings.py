@@ -6,6 +6,7 @@ pre-existing keyword-only behavior whenever `embed()` errors.
 
 from __future__ import annotations
 
+import re
 from unittest.mock import patch
 
 import pytest
@@ -183,6 +184,108 @@ async def test_obligacion_embeddings_computed_once_per_run_across_many_files() -
     assert len(fake.embed_calls) == 2
     assert fake.embed_calls[0] == [ob_text]
     assert len(fake.embed_calls[1]) == 20
+
+
+async def test_obligacion_embedded_with_contract_objeto_as_context() -> None:
+    """evidencias/discovery-fix WU7: the obligación text sent to embed() must
+    include the contract's objeto as context — a bare obligación phrase like
+    "supervisar cronograma" embeds far more precisely when qualified by what
+    the whole contract is actually about."""
+    ob_text = "supervisar cronograma"
+    objeto = "Prestación de servicios profesionales de auditoría financiera"
+    ev_text = "contenido de la evidencia"
+    embed_key = f"{objeto} {ob_text}"
+    fake = _FakeEmbedLLM(embeddings={embed_key: [1.0, 0.0], ev_text: [1.0, 0.0]}, relevance_content="[1]")
+    state = {
+        "obligaciones_extraidas": [{"id": "ob1", "descripcion": ob_text}],
+        "evidence_raw": [{"id": "a", "content": ev_text}],
+        "contrato_contexto": {"objeto": objeto},
+    }
+
+    with patch.object(evidence_matcher, "get_llm", return_value=fake):
+        result = await evidence_matcher.evidence_matcher_node(state)
+
+    assert fake.embed_calls[0] == [embed_key]
+    assert [e["id"] for e in result["matched_evidence"]["ob1"]] == ["a"]
+
+
+async def test_obligacion_embedding_unaffected_when_no_objeto() -> None:
+    """No contrato_contexto/objeto → embeds the bare obligación text, same as
+    before (backward compatible)."""
+    ob_text = "supervisar cronograma presupuestal"
+    ev_text = "contenido de la evidencia"
+    fake = _FakeEmbedLLM(embeddings={ob_text: [1.0, 0.0], ev_text: [1.0, 0.0]}, relevance_content="[1]")
+    state = {
+        "obligaciones_extraidas": [{"id": "ob1", "descripcion": ob_text}],
+        "evidence_raw": [{"id": "a", "content": ev_text}],
+    }
+
+    with patch.object(evidence_matcher, "get_llm", return_value=fake):
+        await evidence_matcher.evidence_matcher_node(state)
+
+    assert fake.embed_calls[0] == [ob_text]
+
+
+# ── Semantic candidate pool gate (evidencias/discovery-fix WU7) ────────────────
+
+
+async def test_zero_keyword_overlap_candidate_reaches_llm_when_pool_small() -> None:
+    """A candidate found only via an expanded semantic phrase query may share
+    NO keywords at all with the obligación's own wording — it must still
+    reach the LLM stage when the candidate pool is small, not be silently
+    dropped by the 0.15 keyword pre-gate."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    fake = AsyncMock()
+    fake.complete = AsyncMock(return_value=MagicMock(content="[1]"))
+
+    state = {
+        "obligaciones_extraidas": [{"id": "ob1", "descripcion": "Coordinar logistica interna del evento anual"}],
+        "evidence_raw": [{"id": "a", "content": "Reunion con proveedor externo sobre catering y transporte"}],
+    }
+
+    with patch.object(evidence_matcher, "get_llm", return_value=fake):
+        result = await evidence_matcher.evidence_matcher_node(state)
+
+    fake.complete.assert_awaited_once()  # reached the LLM despite zero keyword overlap
+    assert [e["id"] for e in result["matched_evidence"]["ob1"]] == ["a"]
+
+
+async def test_keyword_pregate_reapplied_when_pool_exceeds_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A large, all-zero-overlap candidate pool is still SENT to the LLM, bounded
+    by EVIDENCE_MATCHER_TOP_N — it never collapses to an empty slate.
+
+    Round 2: this test previously asserted `fake.complete.assert_not_awaited()`
+    and `matched_evidence["ob1"] == []`, i.e. it pinned the confirmed CRITICAL
+    "candidate-pool cliff" as intended behaviour. Re-applying the 0.15 keyword
+    pre-gate above EVIDENCE_MAX_CANDIDATES_FOR_LLM made discovery non-monotonic
+    in the amount of evidence found: a pool of 40 produced 8 matches and a pool
+    of 41 produced ZERO, because the rescue only kept items scoring > 0.
+    Selection is now rank-based, and TOP_N (which always bounded the fan-out)
+    is the only cap needed.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    monkeypatch.setattr(settings, "EVIDENCE_MATCHER_TOP_N", 3)
+
+    fake = AsyncMock()
+    fake.complete = AsyncMock(return_value=MagicMock(content="[]"))
+
+    evidence_raw = [{"id": f"noise{i}", "content": "contenido sin relacion alguna con nada de esto"} for i in range(5)]
+    state = {
+        "obligaciones_extraidas": [{"id": "ob1", "descripcion": "algo especifico xyz totalmente diferente"}],
+        "evidence_raw": evidence_raw,
+    }
+
+    with patch.object(evidence_matcher, "get_llm", return_value=fake):
+        result = await evidence_matcher.evidence_matcher_node(state)
+
+    # The LLM IS consulted (exactly once, batched), on at most TOP_N items...
+    fake.complete.assert_awaited_once()
+    listado = fake.complete.await_args.args[0][1].content
+    assert len(re.findall(r"^\d+\. ", listado, flags=re.M)) <= 3
+    # ...and its "nothing is relevant" verdict is honoured.
+    assert result["matched_evidence"]["ob1"] == []
 
 
 # ── Confidence bucketing (deferred from Phase 1/2, due in Phase 3 wiring) ──────

@@ -12,13 +12,16 @@ evidence_orchestrator → evidence_matcher → evidence_justify.
 from __future__ import annotations
 
 import uuid
-from datetime import date
+from collections.abc import Awaitable, Callable
+from datetime import date, timedelta
+from itertools import zip_longest
 
 import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.email.gmail_adapter import GmailAdapter
+from app.adapters.llm import get_llm
 from app.adapters.microsoft.graph_adapter import MicrosoftGraphAdapter
 from app.agent.nodes.calendar_fetch import calendar_fetch_node
 from app.agent.nodes.drive_fetch import drive_fetch_node
@@ -27,8 +30,16 @@ from app.agent.nodes.evidence_filter import evidence_filter_node
 from app.agent.nodes.evidence_justify import evidence_justify_node
 from app.agent.nodes.evidence_matcher import evidence_matcher_node
 from app.agent.nodes.evidence_orchestrator import evidence_orchestrator_node
-from app.agent.prompts.email_evidence import _extract_keywords, build_obligation_queries
+from app.agent.nodes.query_expansion import expand_search_terms
+from app.agent.prompts.contract_terms import contract_number_variants, contract_query_variants
+from app.agent.prompts.email_evidence import (
+    _extract_keywords,
+    build_contract_queries,
+    build_expanded_phrase_queries,
+    build_obligation_queries,
+)
 from app.agent.prompts.evidence_filter import score_non_personal_email, score_non_personal_ms_email
+from app.agent.prompts.query_budget import obligacion_key, round_robin
 from app.agent.state import AgentState
 from app.core.config import settings
 from app.core.exceptions import NO_PROVIDER_CONNECTED, ExternalServiceError, NotFoundError, ValidationError
@@ -47,15 +58,42 @@ from app.services import discovery_cache, integration_service
 
 logger = structlog.get_logger("services.evidence_discovery")
 
-MAX_EMAILS_PER_QUERY = 10
 GMAIL_PERMALINK = "https://mail.google.com/mail/u/0/#all/{message_id}"
 OUTLOOK_PERMALINK = "https://outlook.office.com/mail/deeplink/read/{message_id}"
 MAX_ACTIVIDADES_PREVIAS = 20
 
 
+def _widen_gmail_window(fecha_inicio: str, fecha_fin: str, margin_days: int) -> tuple[str, str]:
+    """Widen [fecha_inicio, fecha_fin] by `margin_days` on both ends, and push
+    the end one extra day further — Gmail's `before:` operator is EXCLUSIVE,
+    so evidence dated exactly on fecha_fin was silently dropped before this.
+    Returns YYYY/MM/DD strings (Gmail query date format). Falls back to the
+    unwidened, converted dates on a malformed input instead of raising.
+    """
+    try:
+        start = date.fromisoformat((fecha_inicio or "").strip())
+        end = date.fromisoformat((fecha_fin or "").strip())
+    except ValueError:
+        return _to_gmail_date(fecha_inicio), _to_gmail_date(fecha_fin)
+    start -= timedelta(days=margin_days)
+    end += timedelta(days=margin_days + 1)
+    return start.strftime("%Y/%m/%d"), end.strftime("%Y/%m/%d")
+
+
 def _to_gmail_date(date_str: str) -> str:
     """YYYY-MM-DD → YYYY/MM/DD (formato de query de Gmail)."""
     return (date_str or "").strip().replace("-", "/")
+
+
+def _truncate_head_tail(text: str, head: int = 2000, tail: int = 500) -> str:
+    """Keep the first `head` chars AND the last `tail` chars of `text` when it's
+    longer than `head + tail` — a bare head-only truncation (the old [:800])
+    silently dropped closing content (signature blocks, final approvals) that
+    often carries the entity/supervisor signal (evidencias/discovery-fix WU5).
+    """
+    if len(text) <= head + tail:
+        return text
+    return f"{text[:head]}\n[...]\n{text[-tail:]}"
 
 
 async def _resolve_contrato_id(
@@ -230,7 +268,7 @@ def _build_email_queries(
     if provider == IntegrationProvider.MICROSOFT:
         keywords = _extract_keywords(descripcion)[:4]
         return [" ".join(keywords)] if keywords else []
-    fi, ff = _to_gmail_date(fecha_inicio), _to_gmail_date(fecha_fin)
+    fi, ff = _widen_gmail_window(fecha_inicio, fecha_fin, settings.EVIDENCE_WINDOW_MARGIN_DAYS)
     return build_obligation_queries(descripcion, fi, ff, supervisor_email or None, entidad or None)
 
 
@@ -243,11 +281,22 @@ async def _gather_email_evidence(
     supervisor_email: str | None,
     entidad: str | None,
     provider: IntegrationProvider = IntegrationProvider.GOOGLE,
+    numero_contrato: str | None = None,
+    expanded_terms: dict[str, list[str]] | None = None,
 ) -> tuple[list[dict], int]:
     """Busca correos crudos como evidencia y los normaliza al formato común.
 
     `provider` selects the adapter (Gmail vs. Microsoft Graph) and the noise
     heuristic (score_non_personal_email vs. score_non_personal_ms_email).
+    `numero_contrato` (Google only) seeds contract-level queries — the
+    contract number, has:attachment variant, entidad and supervisor full-text
+    queries — fired ONCE per discovery run (not per-obligación) and given
+    priority over per-obligación keyword queries under the query budget.
+    `expanded_terms` (evidencias/discovery-fix WU7, Google only): per-obligación
+    LLM-generated search phrases (see `app.agent.nodes.query_expansion.
+    expand_search_terms`) — fired as ADDITIONAL unscoped full-text queries so
+    evidence that never mentions the contract number or the obligación's own
+    wording can still be found. Still bounded by the same query budget below.
 
     Returns (emails, filtered_count) — filtered_count is how many non-personal
     emails were dropped before they could contaminate the evidence pipeline.
@@ -257,13 +306,74 @@ async def _gather_email_evidence(
     max_obligaciones = settings.EVIDENCE_MAX_OBLIGACIONES_QUERIES
     obligaciones_para_query = obligaciones if max_obligaciones <= 0 else obligaciones[:max_obligaciones]
 
-    queries: list[str] = []
-    for ob in obligaciones_para_query:
-        queries.extend(
-            _build_email_queries(provider, ob["descripcion"], fecha_inicio, fecha_fin, supervisor_email, entidad)[
-                : settings.EVIDENCE_QUERIES_PER_OBLIGACION
-            ]
-        )
+    query_budget = (
+        settings.EVIDENCE_MAX_GMAIL_QUERIES
+        if provider == IntegrationProvider.GOOGLE
+        else (settings.EVIDENCE_MAX_QUERIES_TOTAL)
+    )
+
+    # Two SEPARATE budgets, not one FIFO list (round-2 fix for the confirmed
+    # CRITICAL starvation finding). Contract-level queries get a small reserved
+    # block; the remainder is dealt ROUND-ROBIN across obligaciones so each one
+    # is guaranteed its best keyword query and its best expanded phrase before
+    # any obligación gets a third.
+    contract_queries: list[str] = []
+    if provider == IntegrationProvider.GOOGLE:
+        fi, ff = _widen_gmail_window(fecha_inicio, fecha_fin, settings.EVIDENCE_WINDOW_MARGIN_DAYS)
+        contract_queries = build_contract_queries(
+            contract_query_variants(numero_contrato), fi, ff, supervisor_email or None, entidad or None
+        )[: min(settings.EVIDENCE_MAX_CONTRACT_QUERIES, query_budget)]
+
+    # One group per obligación, each already ordered best-first: its own keyword
+    # queries interleaved with its expanded semantic phrases, so the round-robin
+    # floor covers BOTH signals rather than spending every floor slot on
+    # keywords and truncating expansion away.
+    obligacion_groups: list[list[str]] = []
+    for ob_index, ob in enumerate(obligaciones_para_query):
+        own = _build_email_queries(provider, ob["descripcion"], fecha_inicio, fecha_fin, supervisor_email, entidad)[
+            : settings.EVIDENCE_QUERIES_PER_OBLIGACION
+        ]
+        phrase_queries: list[str] = []
+        if provider == IntegrationProvider.GOOGLE and expanded_terms:
+            phrases = expanded_terms.get(obligacion_key(ob, ob_index)) or []
+            if phrases:
+                fi, ff = _widen_gmail_window(fecha_inicio, fecha_fin, settings.EVIDENCE_WINDOW_MARGIN_DAYS)
+                phrase_queries = build_expanded_phrase_queries(phrases, fi, ff)
+        group: list[str] = []
+        for pair in zip_longest(own, phrase_queries):
+            group.extend(q for q in pair if q)
+        if group:
+            obligacion_groups.append(group)
+
+    # Round-3 fix (confirmed WARNING): `obligacion_budget = max(remaining,
+    # MIN_PER_OB * n_groups)` let the per-obligación FLOOR REQUIREMENT alone
+    # decide the total once obligaciones outnumbered the budget — e.g. a
+    # 20-obligación contract demanded 40 obligación-side queries regardless of
+    # `query_budget`, and the ceiling was then re-widened to
+    # `max(query_budget, len(unique_queries))` to match, making
+    # EVIDENCE_MAX_GMAIL_QUERIES purely advisory. The per-obligación floor is
+    # still honoured ON TOP of the ceiling for a contract with few obligaciones
+    # (unchanged, intentional round-2 behavior — starving an obligación
+    # entirely is worse than a small overrun), but the floor REQUIREMENT
+    # itself is now capped at the nominal budget, so the worst-case overrun is
+    # bounded by `len(contract_queries)` no matter how many obligaciones exist.
+    remaining_after_contract = max(query_budget - len(contract_queries), 0)
+    if obligacion_groups:
+        floor_needed = settings.EVIDENCE_MIN_QUERIES_PER_OBLIGACION * len(obligacion_groups)
+        capped_floor = min(floor_needed, query_budget)
+        if capped_floor < floor_needed:
+            logger.info(
+                "email_query_budget_floor_capped",
+                requested=floor_needed,
+                capped_to=capped_floor,
+                n_obligaciones=len(obligacion_groups),
+                provider=provider.value,
+            )
+        obligacion_budget = max(remaining_after_contract, capped_floor)
+    else:
+        obligacion_budget = 0
+    queries: list[str] = [*contract_queries, *round_robin(obligacion_groups, obligacion_budget)]
+
     seen_q: set[str] = set()
     unique_queries: list[str] = []
     for q in queries:
@@ -271,22 +381,61 @@ async def _gather_email_evidence(
             seen_q.add(q)
             unique_queries.append(q)
 
+    # The per-obligación floor may legitimately push a BOUNDED amount past the
+    # nominal budget (see cap above) — honouring it is the point of this
+    # allocation, so the effective ceiling is whichever is larger.
+    query_budget = max(query_budget, len(unique_queries))
+    numero_variants = contract_number_variants(numero_contrato)
+    supervisor_domain = (supervisor_email or "").split("@")[-1].strip().lower() or None if supervisor_email else None
     emails_by_id: dict[str, dict] = {}
     filtered_count = 0
-    for query in unique_queries[: settings.EVIDENCE_MAX_QUERIES_TOTAL]:
+    # Round-3 fix (confirmed WARNING): the floor compared against
+    # `len(emails_by_id)` — messages that SURVIVED `score_non_personal_email` —
+    # but the cost being bounded is FETCHED messages (`search_messages` fans
+    # out one `users.messages.get` per returned id regardless of whether the
+    # message is later kept or filtered as noise). In a noise-heavy mailbox
+    # the kept pool never reached EVIDENCE_MAX_EMAILS_TOTAL, so every query
+    # kept fetching the full per-query cap and the fan-out this floor exists
+    # to bound never actually shrank. Count every message RETURNED instead.
+    messages_inspected = 0
+    for query in unique_queries[:query_budget]:
+        # Bound the FETCH work without skipping queries (round-2 confirmed
+        # WARNING). `search_messages` fans out one `users.messages.get` per
+        # returned id, so 25/query across the budget meant hundreds of full
+        # message fetches and body parses per user click, ~80% of them
+        # discarded by the EVIDENCE_MAX_EMAILS_TOTAL truncation below.
+        #
+        # Breaking out of the loop once the pool is full would be worse, not
+        # better: contract-level queries run first, so an early break would
+        # leave every obligación unsearched — the exact starvation this branch
+        # exists to fix. Instead, later queries still RUN but fetch only a
+        # small floor of messages each, so every obligación keeps coverage
+        # while total amplification stays bounded.
+        per_query = (
+            settings.EVIDENCE_MAX_EMAILS_PER_QUERY
+            if messages_inspected < settings.EVIDENCE_MAX_EMAILS_TOTAL
+            else settings.EVIDENCE_MIN_EMAILS_PER_QUERY
+        )
         try:
-            messages = await adapter.search_messages(usuario_id, query, MAX_EMAILS_PER_QUERY)
+            messages = await adapter.search_messages(usuario_id, query, per_query)
         except Exception as exc:
             await logger.awarning("email_query_failed", query=query, error=str(exc), provider=provider.value)
             continue
+        messages_inspected += len(messages)
         for m in messages:
             if m.id not in emails_by_id:
+                contains_numero = any(
+                    variant.lower() in f"{m.subject or ''} {m.body_plain or m.snippet or ''}".lower()
+                    for variant in numero_variants
+                )
                 if provider == IntegrationProvider.MICROSOFT:
                     score, reason = score_non_personal_ms_email(
                         sender=m.sender,
                         subject=m.subject,
                         categories=list(m.labels or []),
                         inference_classification=dict(m.headers or {}).get("inferenceClassification", ""),
+                        supervisor_domain=supervisor_domain,
+                        contains_contract_number=contains_numero,
                     )
                 else:
                     score, reason = score_non_personal_email(
@@ -294,6 +443,8 @@ async def _gather_email_evidence(
                         subject=m.subject,
                         labels=list(m.labels or []),
                         headers=dict(m.headers or {}),
+                        supervisor_domain=supervisor_domain,
+                        contains_contract_number=contains_numero,
                     )
                 if score >= 3:
                     filtered_count += 1
@@ -313,7 +464,7 @@ async def _gather_email_evidence(
                 attachment = m.attachments[0] if m.attachments else None
                 emails_by_id[m.id] = {
                     "source": "email",
-                    "content": (m.body_plain or m.snippet or "")[:800],
+                    "content": _truncate_head_tail(m.body_plain or m.snippet or ""),
                     "title": m.subject,
                     "subject": m.subject,
                     "link": _email_permalink(provider, m.id, getattr(m, "web_link", "")),
@@ -364,9 +515,16 @@ async def descubrir_evidencias(
     fecha_inicio = req.fecha_inicio
     fecha_fin = req.fecha_fin
     contrato: Contrato | None = None
-    if contrato_id and (not fecha_inicio or not fecha_fin):
+    if contrato_id:
+        # SIEMPRE se carga el Contrato cuando hay contrato_id (antes solo se
+        # cargaba si faltaban las fechas): numero_contrato/entidad/objeto son
+        # las señales de búsqueda más fuertes (número de contrato exacto,
+        # nombre de la entidad) y nunca llegaban a contrato_contexto, así que
+        # ninguna query de Gmail/Drive/Calendar podía usarlas.
         contrato = await db.get(Contrato, contrato_id)
-        if contrato is not None:
+        if contrato is None:
+            raise NotFoundError("Contrato", str(contrato_id))
+        if not fecha_inicio or not fecha_fin:
             fecha_inicio = fecha_inicio or contrato.fecha_inicio.isoformat()
             # Local "today" (not UTC): for a Colombia-time user, the default period
             # end must be their calendar today. Using UTC pushed fecha_fin to
@@ -375,10 +533,62 @@ async def descubrir_evidencias(
             fecha_fin = fecha_fin or date.today().isoformat()
 
     cache_cuenta_id: uuid.UUID | None = req.cuenta_id if not local_only else None
+
+    contrato_contexto: dict[str, str | int | float | None] = {"fecha_inicio": fecha_inicio, "fecha_fin": fecha_fin}
+    if contrato is not None:
+        contrato_contexto["numero_contrato"] = contrato.numero_contrato
+        if contrato.entidad:
+            contrato_contexto["entidad"] = contrato.entidad
+        if contrato.objeto:
+            contrato_contexto["objeto"] = contrato.objeto
+    # Round-3 fix (confirmed WARNING): `evidence_filter_node` reads
+    # `contrato_ctx.get("supervisor_email")` to derive `supervisor_domain` (the
+    # layer-2 rescue for a supervisor writing from a non-institutional
+    # domain), but this key was never written into `contrato_contexto` — it
+    # was ONLY ever passed to the query builders (`_gather_email_evidence`).
+    # That made the key `None` on every production call, silently reverting
+    # the layer-1 rescue one layer later. Also feeds `contract_header`'s
+    # "Supervisor: <email>" line for the LLM noise-classification prompt.
+    if req.supervisor_email:
+        contrato_contexto["supervisor_email"] = req.supervisor_email
+
+    # Contexto libre del usuario ("qué hice este mes") — cargado aquí (antes de
+    # la expansión semántica) porque alimenta AMBAS cosas: expand_search_terms
+    # (evidencias/discovery-fix WU7b) y, más abajo, el estado del agente.
+    contexto_usuario = await _contexto_usuario(db, req.cuenta_id)
+
+    # Cache lookup happens HERE, not before the context is loaded (round-2 fix):
+    # contexto_usuario and the contract's numero/entidad/objeto are SEARCH
+    # INPUTS — they seed expand_search_terms and every prompt header — so they
+    # belong in the key. Previously a user could edit "¿Qué hiciste este mes?",
+    # click discover again and silently get the pre-edit result for the whole
+    # TTL. `obligaciones` (round-3 fix, confirmed WARNING): the resolved
+    # obligación list drives every per-obligación query and the whole
+    # matcher/justify output shape and was likewise missing from the key —
+    # editing obligaciones and re-running served a response with a
+    # structurally stale obligación list for the whole TTL.
+    cache_fingerprint = discovery_cache.context_fingerprint(contrato_contexto, contexto_usuario, obligaciones)
     if cache_cuenta_id is not None and not refresh:
-        cached = discovery_cache.get_cached(usuario_id, cache_cuenta_id, fecha_inicio, fecha_fin)
+        cached = discovery_cache.get_cached(
+            usuario_id, cache_cuenta_id, fecha_inicio, fecha_fin, context_fingerprint=cache_fingerprint
+        )
         if cached is not None:
             return cached
+
+    # Semantic query expansion (evidencias/discovery-fix WU7) — one LLM call
+    # for search phrases beyond the contract number/obligación wording, so
+    # evidence that never mentions either can still be found. Feature-flagged
+    # OFF by default: this is a new LLM call site in a path a large slice of
+    # the existing test suite exercises without mocking an LLM.
+    expanded_terms: dict[str, list[str]] = {}
+    if not local_only and settings.EVIDENCE_QUERY_EXPANSION_ENABLED and obligaciones:
+        try:
+            expansion_llm = get_llm(model=settings.LLM_EVIDENCE_CLASSIFIER_MODEL)
+            expanded_terms = await expand_search_terms(
+                contrato_contexto, obligaciones, expansion_llm, contexto_usuario=contexto_usuario
+            )
+        except Exception as exc:
+            await logger.awarning("query_expansion_failed", error=str(exc))
 
     email_evidencias: list[dict] = []
     email_filtered = 0
@@ -409,13 +619,27 @@ async def descubrir_evidencias(
         statuses = await integration_service.list_integration_statuses(db, usuario_id)
         connected_providers = [s.provider for s in statuses if s.connected]
 
+        # Prefiere el entidad/numero REALES del contrato (WU1) sobre lo que el
+        # frontend haya enviado — req.entidad existe para el caso sin contrato_id.
+        entidad_efectiva = (contrato.entidad if contrato is not None else None) or req.entidad
+        numero_contrato = contrato.numero_contrato if contrato is not None else None
+
         # 1. Reunir evidencia cruda de correo (Gmail/Outlook) por cada proveedor conectado.
         # El fallo de un proveedor no debe abortar los demás (spec: "Microsoft fails,
         # Google succeeds" — Google-sourced evidence is still returned).
         for provider in connected_providers:
             try:
                 provider_emails, provider_filtered = await _gather_email_evidence(
-                    db, usuario_id, obligaciones, fecha_inicio, fecha_fin, req.supervisor_email, req.entidad, provider
+                    db,
+                    usuario_id,
+                    obligaciones,
+                    fecha_inicio,
+                    fecha_fin,
+                    req.supervisor_email,
+                    entidad_efectiva,
+                    provider,
+                    numero_contrato=numero_contrato,
+                    expanded_terms=expanded_terms,
                 )
             except Exception as exc:
                 await logger.awarning("email_gather_provider_failed", provider=provider.value, error=str(exc))
@@ -426,22 +650,23 @@ async def descubrir_evidencias(
     # Actividades de meses anteriores del mismo contrato (grounding para no repetir texto).
     actividades_previas = await _actividades_previas(db, contrato_id, req.cuenta_id)
 
-    # Contexto libre del usuario ("qué hice este mes") + evidencias subidas con su
-    # texto extraído — ambos alimentan la generación junto con lo descubierto en Google.
-    contexto_usuario = await _contexto_usuario(db, req.cuenta_id)
+    # Evidencias subidas con su texto extraído — alimenta la generación junto
+    # con lo descubierto en Google/Microsoft. (contexto_usuario ya se cargó
+    # arriba, antes de la expansión semántica.)
     local_evidence = await _evidencias_subidas(db, req.cuenta_id)
 
     # Estado compartido por los nodos del agente.
     state: AgentState = {
         "user_id": usuario_id,
         "_db": db,
-        "contrato_contexto": {"fecha_inicio": fecha_inicio, "fecha_fin": fecha_fin},
+        "contrato_contexto": contrato_contexto,
         "obligaciones_contexto": obligaciones,
         "obligaciones_extraidas": obligaciones,  # evidence_matcher lee esta key
         "email_evidencias": email_evidencias,
         "actividades_previas": actividades_previas,
         "contexto_usuario": contexto_usuario,
         "local_evidence": local_evidence,
+        "expanded_terms": expanded_terms,
     }
 
     # 2-3. Explorar Drive y Calendar por cada proveedor conectado (skipped entirely
@@ -459,12 +684,26 @@ async def descubrir_evidencias(
 
     # 4. Consolidar → deduplicar (por si el mismo item aparece en ambos proveedores)
     #    → filtrar ruido → emparejar → justificar.
-    state = await evidence_orchestrator_node(state)
-    state = await evidence_dedup_node(state)
-    state["evidence_raw"] = state.get("deduplicated_evidence") or []
-    state = await evidence_filter_node(state)
-    state = await evidence_matcher_node(state)
-    state = await evidence_justify_node(state)
+    #    Each stage is isolated the same way the per-provider fetches above are
+    #    (round-2): this block ran with NO try/except, so any unexpected error —
+    #    a provider returning a malformed embedding batch, say — escaped as an
+    #    unhandled 500 on a user-facing "descubrir" click. Discovery must
+    #    degrade to whatever it already found, never fail the request.
+    async def _stage(
+        name: str, node: Callable[[AgentState], Awaitable[AgentState]], st: AgentState
+    ) -> AgentState:
+        try:
+            return await node(st)  # type: ignore[no-any-return]
+        except Exception as exc:
+            await logger.aerror("evidence_pipeline_stage_failed", stage=name, error=str(exc))
+            return st
+
+    state = await _stage("orchestrator", evidence_orchestrator_node, state)
+    state = await _stage("dedup", evidence_dedup_node, state)
+    state["evidence_raw"] = state.get("deduplicated_evidence") or state.get("evidence_raw") or []
+    state = await _stage("filter", evidence_filter_node, state)
+    state = await _stage("matcher", evidence_matcher_node, state)
+    state = await _stage("justify", evidence_justify_node, state)
 
     justificaciones = state.get("justificaciones") or []
     obligaciones_out = [ObligacionJustificada.model_validate(j) for j in justificaciones]
@@ -501,5 +740,7 @@ async def descubrir_evidencias(
         fuentes=fuentes,
     )
     if cache_cuenta_id is not None:
-        discovery_cache.store(usuario_id, cache_cuenta_id, fecha_inicio, fecha_fin, response)
+        discovery_cache.store(
+            usuario_id, cache_cuenta_id, fecha_inicio, fecha_fin, response, context_fingerprint=cache_fingerprint
+        )
     return response

@@ -16,26 +16,28 @@ import re
 # Threshold ≥ 3 → non-personal (heuristic layer drops it, never reaches LLM).
 
 # Headers whose mere presence guarantees a bulk/automated sender.
-_DEFINITIVE_HEADERS: frozenset[str] = frozenset({
-    "list-unsubscribe",
-    "list-unsubscribe-post",
-    "list-id",
-    "list-post",
-    "list-owner",
-    "x-campaign",
-    "x-campaign-id",
-    "x-mc-campaign",
-    "x-feedback-id",
-    # Platform-injected
-    "x-github-reason",
-    "x-github-sender",
-    "x-github-target",
-    "x-notifications",
-    "x-linkedin-class",
-    "x-linkedin-id",
-    "x-atlassian-token",
-    "x-jira-fingerprint",
-})
+_DEFINITIVE_HEADERS: frozenset[str] = frozenset(
+    {
+        "list-unsubscribe",
+        "list-unsubscribe-post",
+        "list-id",
+        "list-post",
+        "list-owner",
+        "x-campaign",
+        "x-campaign-id",
+        "x-mc-campaign",
+        "x-feedback-id",
+        # Platform-injected
+        "x-github-reason",
+        "x-github-sender",
+        "x-github-target",
+        "x-notifications",
+        "x-linkedin-class",
+        "x-linkedin-id",
+        "x-atlassian-token",
+        "x-jira-fingerprint",
+    }
+)
 
 _ESP_XMAILER_NAMES: tuple[str, ...] = (
     "mailchimp",
@@ -51,25 +53,49 @@ _ESP_XMAILER_NAMES: tuple[str, ...] = (
 _PRECEDENCE_BULK_VALUES: frozenset[str] = frozenset({"bulk", "list", "junk"})
 
 # Well-known platform domains — presence alone is +4.
-_PLATFORM_DOMAINS: frozenset[str] = frozenset({
-    # Dev / CI / PM
-    "github.com", "gitlab.com", "bitbucket.org",
-    "jira.atlassian.com", "trello.com", "circleci.com",
-    "travis-ci.org", "vercel.com", "netlify.com",
-    "heroku.com", "render.com",
-    # Social
-    "linkedin.com", "twitter.com", "x.com",
-    "facebookmail.com", "instagram.com", "tiktok.com",
-    "youtube.com", "pinterest.com", "reddit.com",
-    "discord.com", "slack.com",
-    # Services / SaaS
-    "paypal.com", "stripe.com", "shopify.com",
-    "amazon.com", "apple.com", "microsoft.com",
-    "google.com", "notion.so", "figma.com",
-    "zoom.us", "dropbox.com", "samsung.com",
-    # Google notification subdomain
-    "notifications.google.com",
-})
+_PLATFORM_DOMAINS: frozenset[str] = frozenset(
+    {
+        # Dev / CI / PM
+        "github.com",
+        "gitlab.com",
+        "bitbucket.org",
+        "jira.atlassian.com",
+        "trello.com",
+        "circleci.com",
+        "travis-ci.org",
+        "vercel.com",
+        "netlify.com",
+        "heroku.com",
+        "render.com",
+        # Social
+        "linkedin.com",
+        "twitter.com",
+        "x.com",
+        "facebookmail.com",
+        "instagram.com",
+        "tiktok.com",
+        "youtube.com",
+        "pinterest.com",
+        "reddit.com",
+        "discord.com",
+        "slack.com",
+        # Services / SaaS
+        "paypal.com",
+        "stripe.com",
+        "shopify.com",
+        "amazon.com",
+        "apple.com",
+        "microsoft.com",
+        "google.com",
+        "notion.so",
+        "figma.com",
+        "zoom.us",
+        "dropbox.com",
+        "samsung.com",
+        # Google notification subdomain
+        "notifications.google.com",
+    }
+)
 
 # ESP sending domains (wildcard subdomain match) — +5.
 _ESP_DOMAIN_PATTERNS: tuple[re.Pattern, ...] = tuple(
@@ -90,22 +116,70 @@ _ESP_DOMAIN_PATTERNS: tuple[re.Pattern, ...] = tuple(
 
 # Normalized auto-prefixes (hyphens/dots stripped, lowercase).
 # "no-reply" → "noreply", "no.reply" → "noreply", etc.
-_AUTO_PREFIXES_NORMALIZED: frozenset[str] = frozenset({
-    # English
-    "noreply", "donotreply", "notifications", "notification",
-    "newsletter", "alerts", "alert", "mailer", "postmaster",
-    "bounce", "support", "help", "team", "admin", "info",
-    "marketing", "promo", "hello", "hi", "news", "updates", "update",
-    "offers", "offer", "reply", "billing", "receipts", "receipt",
-    "orders", "order", "confirm", "verify", "security",
-    "automated", "robot", "bot",
-    # Spanish equivalents
-    "facturacion", "factura", "cobros", "cobro", "pagos", "pago",
-    "soporte", "ayuda", "equipo", "noticias", "actualizaciones",
-    "actualizacion", "ofertas", "oferta", "confirmacion", "confirma",
-    "verificacion", "verifica", "seguridad", "automatizado",
-    "admisiones", "admision",
-})
+_AUTO_PREFIXES_NORMALIZED: frozenset[str] = frozenset(
+    {
+        # English
+        "noreply",
+        "donotreply",
+        "notifications",
+        "notification",
+        "newsletter",
+        "alerts",
+        "alert",
+        "mailer",
+        "postmaster",
+        "bounce",
+        "support",
+        "help",
+        "team",
+        "admin",
+        "info",
+        "marketing",
+        "promo",
+        "hello",
+        "hi",
+        "news",
+        "updates",
+        "update",
+        "offers",
+        "offer",
+        "reply",
+        "billing",
+        "receipts",
+        "receipt",
+        "orders",
+        "order",
+        "confirm",
+        "verify",
+        "security",
+        "automated",
+        "robot",
+        "bot",
+        # Spanish equivalents
+        "facturacion",
+        "factura",
+        "cobros",
+        "cobro",
+        "pagos",
+        "pago",
+        "soporte",
+        "ayuda",
+        "equipo",
+        "noticias",
+        "actualizaciones",
+        "actualizacion",
+        "ofertas",
+        "oferta",
+        "confirmacion",
+        "confirma",
+        "verificacion",
+        "verifica",
+        "seguridad",
+        "automatizado",
+        "admisiones",
+        "admision",
+    }
+)
 
 # High-confidence subject patterns → +2.
 _SUBJECT_HIGH_CONFIDENCE: tuple[re.Pattern, ...] = tuple(
@@ -164,20 +238,22 @@ _SUBJECT_HIGH_CONFIDENCE: tuple[re.Pattern, ...] = tuple(
 
 # ── Whitelist — personal and institutional domains never filtered ─────────────
 
-_PERSONAL_DOMAINS: frozenset[str] = frozenset({
-    "gmail.com",
-    "outlook.com",
-    "hotmail.com",
-    "hotmail.es",
-    "yahoo.com",
-    "yahoo.es",
-    "icloud.com",
-    "live.com",
-    "live.com.co",
-    "protonmail.com",
-    "me.com",
-    "googlemail.com",
-})
+_PERSONAL_DOMAINS: frozenset[str] = frozenset(
+    {
+        "gmail.com",
+        "outlook.com",
+        "hotmail.com",
+        "hotmail.es",
+        "yahoo.com",
+        "yahoo.es",
+        "icloud.com",
+        "live.com",
+        "live.com.co",
+        "protonmail.com",
+        "me.com",
+        "googlemail.com",
+    }
+)
 
 # Domain suffixes — any domain ending with one of these is institutional.
 _INSTITUTIONAL_SUFFIXES: tuple[str, ...] = (
@@ -238,27 +314,65 @@ def _is_platform_domain(domain: str) -> bool:
 
 # ── Public scoring API ────────────────────────────────────────────────────────
 
+
 def score_non_personal_email(
     sender: str,
     subject: str,
     labels: list[str],
     headers: dict[str, str] | None = None,
+    *,
+    supervisor_domain: str | None = None,
+    contains_contract_number: bool = False,
 ) -> tuple[int, str]:
     """Accumulate non-personal signals for an email.
 
     Returns (score, main_reason). Threshold ≥ 3 = non-personal.
 
     Early-returns on definitive +5 signals to avoid redundant checks.
+
+    `contains_contract_number` (evidencias/discovery-fix WU4) exempts an email
+    from the WEAK, heuristic signals (auto prefixes, ESP domains, subject
+    patterns) — a 'notificaciones@' address quoting the contract number is real
+    entity correspondence. It does NOT exempt it from the DEFINITIVE ones.
+
+    Round-2 fix for a confirmed CRITICAL finding: this used to be the very first
+    statement, `return 0, "contains_contract_number"`, ahead of the Gmail
+    category-label check and the List-Unsubscribe / Precedence: bulk / X-Mailer
+    header checks. Those are server-side ML verdicts and RFC bulk markers — a
+    blast that happens to quote a number is still a blast, and a marketing email
+    carrying the bare dependency code was entering the pipeline with the whole
+    deterministic filter disarmed. The exemption now runs AFTER the +5
+    definitive signals, so a category label or a bulk header still wins.
+
+    `supervisor_domain`, when known, likewise exempts a sender on that SAME
+    domain from the auto-prefix penalty.
     """
     h = {k.lower(): v.lower() for k, v in (headers or {}).items()}
+
+    def _exempt_weak_signals() -> tuple[int, str] | None:
+        """Applied only after every +5 definitive check has passed."""
+        if contains_contract_number:
+            return 0, "contains_contract_number"
+        return None
+
+    # +5 — SPAM / CATEGORY_PROMOTIONS outrank the whitelist (round-3 narrow
+    # fix): Gmail's own ML classifier verdict, sender-agnostic, strictly
+    # better evidence than "the domain is gmail.com". Checked BEFORE the
+    # whitelist; every other signal (the rest of NOISE_GMAIL_LABELS, and the
+    # header-based checks below) stays AFTER it.
+    for label in labels or []:
+        if label in _DEFINITIVE_GMAIL_LABELS:
+            return 5, f"gmail_label:{label}"
 
     # Whitelist — personal providers and institutional domains are never filtered.
     domain = _extract_domain(sender)
     if domain and _is_whitelisted(domain):
         return 0, ""
 
+    exempt_auto_prefix = bool(supervisor_domain) and domain == (supervisor_domain or "").strip().lower()
+
     # +5 — Gmail category labels (server-side ML classifier, highly accurate)
-    for label in (labels or []):
+    for label in labels or []:
         if label in NOISE_GMAIL_LABELS:
             return 5, f"gmail_label:{label}"
 
@@ -278,6 +392,14 @@ def score_non_personal_email(
         if esp in xmailer:
             return 5, f"X-Mailer:{esp}"
 
+    # Every DEFINITIVE (+5) signal has now been checked and none fired. Only
+    # here is the contract-number exemption safe to apply: what remains below
+    # are heuristic guesses (auto prefixes, ESP-ish domains, subject patterns)
+    # that a genuine entity address quoting the contract number should survive.
+    exempt = _exempt_weak_signals()
+    if exempt is not None:
+        return exempt
+
     score = 0
     reason = ""
 
@@ -293,15 +415,20 @@ def score_non_personal_email(
         reason = f"platform_domain:{domain}"
         return score, reason  # 4 ≥ 3 → already filter-worthy
 
-    # +3 — Automatic From prefix
+    # +3 — Automatic From prefix (exempt when the sender is on the
+    # supervisor's own domain — see `exempt_auto_prefix` above)
     user = _extract_user(sender)
-    if user and _normalize_prefix(user) in _AUTO_PREFIXES_NORMALIZED:
+    if not exempt_auto_prefix and user and _normalize_prefix(user) in _AUTO_PREFIXES_NORMALIZED:
         score += 3
         reason = f"auto_prefix:{user}"
         return score, reason
 
-    # +3 — Legacy sender patterns (Colombian banks, telecos, payment platforms)
-    if any(p.search(sender) for p in NOISE_SENDER_PATTERNS):
+    # +3 — Legacy sender patterns (Colombian banks, telecos, payment platforms).
+    # The supervisor's OWN domain is exempt for the same reason as the
+    # auto-prefix rule above: "notificaciones@<supervisión>" matches this
+    # pattern but is real contractual correspondence, and exempting only the
+    # prefix rule left it filtered anyway (round-2).
+    if not exempt_auto_prefix and any(p.search(sender) for p in NOISE_SENDER_PATTERNS):
         score += 3
         reason = reason or "known_service_sender"
         return score, reason
@@ -329,13 +456,25 @@ def score_non_personal_email(
 
 # ── Legacy boolean helpers (kept for backward compatibility) ──────────────────
 
-NOISE_GMAIL_LABELS: frozenset[str] = frozenset({
-    "CATEGORY_PROMOTIONS",
-    "CATEGORY_SOCIAL",
-    "CATEGORY_FORUMS",
-    "CATEGORY_UPDATES",
-    "SPAM",
-})
+NOISE_GMAIL_LABELS: frozenset[str] = frozenset(
+    {
+        "CATEGORY_PROMOTIONS",
+        "CATEGORY_SOCIAL",
+        "CATEGORY_FORUMS",
+        "CATEGORY_UPDATES",
+        "SPAM",
+    }
+)
+
+# The subset of NOISE_GMAIL_LABELS trusted to outrank the domain whitelist
+# (round-3 narrow fix, confirmed SUGGESTION). SPAM/CATEGORY_PROMOTIONS are
+# sender-agnostic server-side ML verdicts with no known false-positive class
+# against this feature's evidence (unlike List-Unsubscribe/List-Id/Precedence/
+# X-Mailer, which routinely appear on legitimate Calendar invites and Google
+# Groups mail sent from a personal gmail.com address — see
+# test_score_gmail_sender_never_filtered). CATEGORY_SOCIAL/FORUMS/UPDATES stay
+# checked in their original post-whitelist position.
+_DEFINITIVE_GMAIL_LABELS: frozenset[str] = frozenset({"SPAM", "CATEGORY_PROMOTIONS"})
 
 NOISE_SENDER_PATTERNS: list[re.Pattern] = [
     re.compile(p, re.IGNORECASE)
@@ -538,6 +677,9 @@ def score_non_personal_ms_email(
     subject: str,
     categories: list[str] | None = None,
     inference_classification: str = "",
+    *,
+    supervisor_domain: str | None = None,
+    contains_contract_number: bool = False,
 ) -> tuple[int, str]:
     """Mirrors score_non_personal_email for Outlook mail using Graph signals.
 
@@ -554,10 +696,22 @@ def score_non_personal_ms_email(
     if domain and _is_whitelisted(domain):
         return 0, ""
 
+    # Graph's own ML clutter verdict is a DEFINITIVE signal and outranks the
+    # contract-number exemption, mirroring the Gmail path (round-2 fix).
     if (inference_classification or "").strip().lower() == "other":
         return 5, "inferenceClassification:other"
 
-    return score_non_personal_email(sender, subject, categories or [], headers=None)
+    if contains_contract_number:
+        return 0, "contains_contract_number"
+
+    return score_non_personal_email(
+        sender,
+        subject,
+        categories or [],
+        headers=None,
+        supervisor_domain=supervisor_domain,
+        contains_contract_number=False,
+    )
 
 
 def is_noise_ms_calendar(title: str, metadata: dict) -> bool:
@@ -620,18 +774,43 @@ RUIDO (verdict: "RUIDO") — descartar siempre:
 REGLA CLAVE: Si el correo lo envió un banco, plataforma de pago, e-commerce o servicio de \
 suscripción de forma automática → RUIDO, sin excepción.
 
+REGLA DEL CONTRATO: usa el "Contexto del contrato" de arriba. Es TRABAJO todo ítem que \
+mencione el número de contrato o el objeto contractual, y todo correo cuyo Remitente \
+pertenezca al dominio de la Entidad contratante o a su supervisión/interventoría — aunque \
+el remitente sea una dirección automática del tipo info@, notificaciones@ o contratacion@. \
+Esa regla NO aplica a bancos, plataformas de pago, e-commerce ni newsletters, que siguen \
+siendo RUIDO aunque citen un número parecido.
+
 Responde ÚNICAMENTE con un array JSON válido:
 [{"idx": 0, "verdict": "TRABAJO"}, {"idx": 1, "verdict": "RUIDO"}, ...]
 """
 
 
-def build_work_noise_prompt(items: list[dict]) -> str:
-    """Build user prompt for batch work/noise classification."""
-    lines = ["Clasifica estos ítems como TRABAJO o RUIDO:\n"]
+def build_work_noise_prompt(items: list[dict], header: str = "") -> str:
+    """Build user prompt for batch work/noise classification.
+
+    `header` (evidencias/discovery-fix WU5) is the shared contract-context
+    block (see `app.agent.prompts.contract_terms.contract_header`) — without
+    it the LLM has no way to recognize that a given sender/domain is this
+    contract's own entity correspondence.
+
+    Round-2 fix (confirmed WARNING): the header's stated purpose was
+    unachievable because the SENDER was never rendered — the model could not
+    tell a supervisor writing from `info@` apart from a marketing blast, no
+    matter how good the header was. `Remitente` is now emitted whenever the
+    item carries one, and WORK_NOISE_SYSTEM_PROMPT has an explicit rubric line
+    telling the model to use it together with the contract number and entidad.
+    """
+    intro = "Clasifica estos ítems como TRABAJO o RUIDO:\n"
+    lines = [header, intro] if header else [intro]
     for item in items:
-        lines.append(
-            f"[{item['idx']}] Fuente: {item['source']} | "
-            f"Título: {item['title'][:120]} | "
-            f"Contenido: {item['content'][:300]}"
-        )
+        parts = [
+            f"[{item['idx']}] Fuente: {item['source']}",
+            f"Título: {item['title'][:120]}",
+        ]
+        sender = str(item.get("sender") or "").strip()
+        if sender:
+            parts.append(f"Remitente: {sender[:120]}")
+        parts.append(f"Contenido: {item['content'][:300]}")
+        lines.append(" | ".join(parts))
     return "\n".join(lines)

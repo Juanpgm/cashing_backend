@@ -10,12 +10,11 @@ Default de agresividad: en caso de duda conserva el item (nunca pierde evidencia
 
 from __future__ import annotations
 
-import json
-import re
-
 import structlog
 
 from app.adapters.llm import get_llm
+from app.agent.nodes.evidence_matcher import _extract_json_array, _mentions_any, contract_match_variants_of
+from app.agent.prompts.contract_terms import contract_header, contract_number_variants
 from app.agent.prompts.evidence_filter import (
     WORK_NOISE_SYSTEM_PROMPT,
     build_work_noise_prompt,
@@ -32,23 +31,35 @@ from app.schemas.agent import LLMMessage
 
 logger = structlog.get_logger("agent.nodes.evidence_filter")
 
-_JSON_RE = re.compile(r"\[.*\]", re.DOTALL)
 _LLM_BATCH_SIZE = 15
 
 
-async def _llm_classify_batch(items: list[dict], llm) -> list[bool]:  # True = TRABAJO
+async def _llm_classify_batch(
+    items: list[dict], llm, contrato_contexto: dict | None = None
+) -> list[bool]:  # True = TRABAJO
     """Clasifica un lote de items como TRABAJO o RUIDO vía LLM.
 
     En caso de error de LLM o parseo, conserva todos los items (safe default).
     Devuelve lista de booleans (True = conservar) con mismo índice que `items`.
+    `contrato_contexto` (evidencias/discovery-fix WU5) feeds the shared
+    contract header into the prompt.
     """
     if not items:
         return []
 
     indexed = [
-        {"idx": i, "source": it["source"], "title": it["title"], "content": it["content"]} for i, it in enumerate(items)
+        {
+            "idx": i,
+            "source": it["source"],
+            "title": it["title"],
+            "content": it["content"],
+            # Round-2: the sender is what makes the contract header actionable
+            # (see build_work_noise_prompt) — it was never passed before.
+            "sender": (it.get("metadata") or {}).get("sender") or "",
+        }
+        for i, it in enumerate(items)
     ]
-    prompt = build_work_noise_prompt(indexed)
+    prompt = build_work_noise_prompt(indexed, header=contract_header(contrato_contexto))
 
     try:
         resp = await llm.complete(
@@ -74,10 +85,18 @@ async def _llm_classify_batch(items: list[dict], llm) -> list[bool]:  # True = T
             reasoning_effort="low",
         )
         raw = resp.content or ""
-        m = _JSON_RE.search(raw)
-        if not m:
+        # Round-3 fix (confirmed WARNING): the greedy `_JSON_RE = r"\[.*\]"`
+        # spanned from the FIRST bracket to the LAST bracket in the whole
+        # response — a reasoning preamble bracket or a trailing prose bracket
+        # (both routine for `LLM_EVIDENCE_CLASSIFIER_MODEL`, a reasoning
+        # model) made the span unparseable, and the except below then kept
+        # the WHOLE batch (fail open), silently disabling the noise filter
+        # the product depends on. Reuses the same tolerant extractor
+        # `evidence_matcher._extract_json_array` already uses for the
+        # identical JSON-array contract against the same model.
+        verdicts = _extract_json_array(raw)
+        if verdicts is None:
             raise ValueError("No JSON array in LLM response")
-        verdicts: list[dict] = json.loads(m.group())
         idx_to_verdict = {int(v["idx"]): v.get("verdict", "TRABAJO") for v in verdicts if isinstance(v, dict)}
     except Exception as exc:
         await logger.awarning("evidence_filter_llm_failed", error=str(exc), batch_size=len(items))
@@ -87,13 +106,23 @@ async def _llm_classify_batch(items: list[dict], llm) -> list[bool]:  # True = T
     return [idx_to_verdict.get(i, "TRABAJO") != "RUIDO" for i in range(len(items))]
 
 
-def _heuristic_is_noise(item: dict) -> bool:
+def _heuristic_is_noise(
+    item: dict,
+    numero_variants: list[str] | None = None,
+    supervisor_domain: str | None = None,
+) -> bool:
     """Capa 1: heurísticas deterministas por (source, provider). True = descartar.
 
     Dispatches to the Microsoft counterpart when `metadata.provider ==
     "microsoft"`; defaults to "google" (the Google heuristics) for legacy
     items that predate the provider marker (microsoft-noise-heuristics spec:
     "each item scored by its own provider's heuristic").
+
+    Round-2 fix (confirmed WARNING): `numero_variants`/`supervisor_domain` were
+    wired ONLY at the service pre-filter. This node then re-scored the very same
+    emails without them and silently undid the WU4 contract-number rescue one
+    layer later — the same message was saved at layer 1 and killed at layer 2.
+    Both default to None so every existing caller keeps working.
     """
     source = item.get("source", "")
     meta = item.get("metadata") or {}
@@ -105,12 +134,25 @@ def _heuristic_is_noise(item: dict) -> bool:
         labels = meta.get("labels") or []
         title = item.get("title") or ""
         headers = meta.get("headers") or {}
+        contains_numero = _mentions_any(item, contract_match_variants_of(numero_variants or []))
         if is_microsoft:
             score, _ = score_non_personal_ms_email(
-                sender, title, categories=labels, inference_classification=headers.get("inferenceClassification", "")
+                sender,
+                title,
+                categories=labels,
+                inference_classification=headers.get("inferenceClassification", ""),
+                supervisor_domain=supervisor_domain,
+                contains_contract_number=contains_numero,
             )
         else:
-            score, _ = score_non_personal_email(sender, title, labels, headers)
+            score, _ = score_non_personal_email(
+                sender,
+                title,
+                labels,
+                headers,
+                supervisor_domain=supervisor_domain,
+                contains_contract_number=contains_numero,
+            )
         return score >= 3
 
     if source == "calendar":
@@ -139,11 +181,19 @@ async def evidence_filter_node(state: AgentState) -> AgentState:
     if not evidence_raw:
         return {**state, "evidencias_descartadas": 0, "current_phase": "evidence_filter"}
 
+    # Contract-number / supervisor signals, so layer 1 here reaches the SAME
+    # verdict as the service pre-filter instead of reverting its rescue
+    # (round-2 confirmed WARNING).
+    contrato_ctx = state.get("contrato_contexto") or {}
+    numero_variants = contract_number_variants(contrato_ctx.get("numero_contrato"))
+    supervisor_email = str(contrato_ctx.get("supervisor_email") or "")
+    supervisor_domain = supervisor_email.split("@")[-1].strip().lower() if "@" in supervisor_email else None
+
     # Capa 1: heurísticas deterministas
     after_heuristics: list[dict] = []
     heuristic_dropped = 0
     for item in evidence_raw:
-        if _heuristic_is_noise(item):
+        if _heuristic_is_noise(item, numero_variants, supervisor_domain):
             heuristic_dropped += 1
             await logger.adebug(
                 "evidence_filter_heuristic_drop",
@@ -162,10 +212,18 @@ async def evidence_filter_node(state: AgentState) -> AgentState:
     llm = get_llm(model=settings.LLM_EVIDENCE_CLASSIFIER_MODEL)
     llm_dropped = 0
 
+    # Merge in the contratista's own monthly summary (evidencias/discovery-fix
+    # WU7b) for the shared header WITHOUT mutating `state["contrato_contexto"]`.
+    contrato_contexto = state.get("contrato_contexto") or {}
+    contexto_usuario_val = state.get("contexto_usuario")
+    contrato_contexto_for_prompt = (
+        {**contrato_contexto, "contexto_usuario": contexto_usuario_val} if contexto_usuario_val else contrato_contexto
+    )
+
     for batch_start in range(0, len(clasificables), _LLM_BATCH_SIZE):
         batch = clasificables[batch_start : batch_start + _LLM_BATCH_SIZE]
-        keep_flags = await _llm_classify_batch(batch, llm)
-        for item, keep in zip(batch, keep_flags):
+        keep_flags = await _llm_classify_batch(batch, llm, contrato_contexto_for_prompt)
+        for item, keep in zip(batch, keep_flags, strict=True):
             if keep:
                 kept.append(item)
             else:

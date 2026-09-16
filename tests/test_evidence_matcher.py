@@ -8,9 +8,31 @@ from dataclasses import dataclass
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from app.agent.nodes.evidence_matcher import _clasificar_via_llm, clasificar_evidencia
+from app.agent.nodes.evidence_matcher import _clasificar_via_llm, _keyword_score, clasificar_evidencia
 
 pytestmark = pytest.mark.asyncio
+
+
+class TestKeywordScoreTokenizer:
+    """`_keyword_score`'s old tokenizer (`[a-záéíóúñü]{4,}`) never matched a
+    digit — a contract number could never contribute to keyword overlap
+    scoring at all (evidencias/discovery-fix root cause #2). These use text
+    with NO shared words other than the number/hyphenated token itself, so a
+    coincidental letter-only overlap can't produce a false pass."""
+
+    async def test_digits_now_contribute_to_overlap(self) -> None:
+        score = _keyword_score(
+            "Numero 4161.010.26.1.027.2025 asignado",
+            "Ref 4161.010.26.1.027.2025 adjunto",
+        )
+        assert score > 0.0
+
+    async def test_hyphenated_tokens_survive(self) -> None:
+        score = _keyword_score("Radicado CTO-123-2025 asignado", "Ref CTO-123-2025 adjunto")
+        assert score > 0.0
+
+    async def test_still_zero_for_unrelated_text(self) -> None:
+        assert _keyword_score("informes tecnicos mensuales", "publicidad oferta descuento") == 0.0
 
 
 @dataclass

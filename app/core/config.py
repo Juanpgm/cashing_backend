@@ -408,6 +408,96 @@ class Settings(BaseSettings):
     EVIDENCE_MAX_EVENTS: int = 100
     EVIDENCE_MATCHER_TOP_N: int = 8
 
+    # evidencias/discovery-fix — Gmail query widening + contract-number search.
+    # Days of slack added on BOTH ends of [fecha_inicio, fecha_fin] before it's
+    # turned into Gmail after:/before: operators, so evidence dated right at
+    # the edge of the contract period (kickoff emails before fecha_inicio,
+    # closeout emails around fecha_fin) is not silently excluded.
+    EVIDENCE_WINDOW_MARGIN_DAYS: int = 15
+    # Hard cap on total Gmail queries fired per discovery run (contract-level +
+    # per-obligación combined). Raised 12 -> 24 in round 2: at 12 the
+    # contract-level block alone consumed 9-10 slots and only obligación #1 was
+    # ever searched. Contract-level queries now have their own reserved block
+    # (EVIDENCE_MAX_CONTRACT_QUERIES) and the rest is dealt round-robin across
+    # obligaciones, so this is a true ceiling rather than a starvation point.
+    EVIDENCE_MAX_GMAIL_QUERIES: int = 24
+    # Reserved slots for contract-LEVEL queries (raw number + one normalized
+    # form + entidad + supervisor + the has:attachment variant) in each
+    # provider's budget. Everything above this is dealt round-robin to the
+    # obligaciones, which is what guarantees the per-obligación floor.
+    EVIDENCE_MAX_CONTRACT_QUERIES: int = 5
+    # Per-obligación floor: how many slots each obligación is guaranteed in the
+    # round-robin allocation (its best keyword + its best expanded phrase).
+    EVIDENCE_MIN_QUERIES_PER_OBLIGACION: int = 2
+    # Gmail messages fetched per query (was a hardcoded module constant of 10).
+    EVIDENCE_MAX_EMAILS_PER_QUERY: int = 25
+    # Floor applied to later queries once EVIDENCE_MAX_EMAILS_TOTAL is already
+    # reached. Every query still runs — skipping them would starve the
+    # obligaciones, since contract-level queries go first — but each fetches
+    # only this many messages, bounding the users.messages.get fan-out.
+    EVIDENCE_MIN_EMAILS_PER_QUERY: int = 5
+    # evidence_matcher: relevance threshold applied to the LLM's own 0-1 score
+    # (JSON rubric output) once it's the source of truth, replacing the old
+    # int-list-only contract.
+    EVIDENCE_RELEVANCE_MIN: float = 0.5
+    # DEPRECATED (round 2), retained only so an existing .env setting does not
+    # fail validation. It used to re-apply the 0.15 keyword pre-gate above this
+    # pool size, which made discovery non-monotonic: 40 candidates -> 8 matches,
+    # 41 -> ZERO, because the rescue only kept items scoring > 0. Candidate
+    # selection is rank-based now and EVIDENCE_MATCHER_TOP_N is the only cap.
+    EVIDENCE_MAX_CANDIDATES_FOR_LLM: int = 40
+    # Slots in the per-obligación LLM slate RESERVED for evidence mentioning the
+    # contract number, so a number hit is guaranteed to be seen without being
+    # able to displace the best semantic candidates. Replaces the old additive
+    # +0.4 bonus, which let 50 items whose only link was a 4-digit prefix fill
+    # all 8 slots and push the genuine match out entirely.
+    EVIDENCE_NUMBER_RESERVED_SLOTS: int = 3
+    # calendar_fetch: distinct short queries fired (one per contract-number
+    # variant / entidad / obligación keyword), each a separate Calendar API
+    # call merged by event id — replaces the old single AND-of-everything query
+    # that matched nothing once more than 1-2 terms were combined.
+    # Raised 8 -> 20 in round 2 for the same reason as the Gmail budget: the
+    # contract-number variants filled all 8 slots and no obligación keyword or
+    # expanded phrase ever reached Calendar.
+    EVIDENCE_MAX_CALENDAR_TERMS: int = 20
+    # Total merged calendar events kept per provider, mirroring the
+    # EVIDENCE_MAX_EMAILS_TOTAL / EVIDENCE_MAX_FILES_TOTAL caps. Calendar was
+    # the only source with no total cap, so a per-term fan-out could return
+    # terms x EVIDENCE_MAX_EVENTS items into the filter/embedding batches.
+    EVIDENCE_MAX_EVENTS_TOTAL: int = 60
+    # Round-3 fix (confirmed WARNING): calendar_fetch_node fires ONE
+    # events.list per search term with no concurrency and, previously, no
+    # deadline at all. GoogleCalendarAdapter._execute_with_retry can sleep up
+    # to 0.5+1+2 = 3.5s per throttled call before giving up, and the per-term
+    # fan-out this feature introduced can reach 20-40+ terms for a
+    # many-obligación contract — up to 90-150s of pure backoff sleep on a
+    # single user-facing "descubrir" click. This bounds the WHOLE per-term
+    # loop, not any single call.
+    EVIDENCE_CALENDAR_FETCH_DEADLINE_SECONDS: float = 20.0
+    # drive_fetch: Drive API pageSize per search_files call (was a hardcoded
+    # module constant of 10).
+    EVIDENCE_DRIVE_PAGE_SIZE: int = 20
+    # Semantic query expansion: ONE extra LLM call per discovery run producing
+    # search phrases beyond the contract number and the obligación's literal
+    # wording. Defaults ON (round 2) — semantic search per obligación IS the
+    # product; the contract number is one signal among many and, per the owner,
+    # "won't be that efficient" on its own.
+    #
+    # The old comment justified defaulting OFF because "a large slice of the
+    # existing test suite exercises this path WITHOUT mocking an LLM". That was
+    # measured and is false: with the flag on, exactly ONE test failed, and its
+    # entire body asserted the flag was off. `expand_search_terms` already fails
+    # open on llm=None, on any exception and on unparseable output, the call
+    # site wraps it again, and it short-circuits a fake/unavailable provider
+    # without a round trip — so an unmocked test path costs nothing.
+    EVIDENCE_QUERY_EXPANSION_ENABLED: bool = True
+    # Hard bound on the single expansion LLM call. It is an enhancement with a
+    # deterministic fallback, so it must never stall a user-facing "descubrir"
+    # click: LiteLLMAdapter retries each model twice with exponential backoff
+    # across a 3-model chain, which is minutes of latency for a provider that is
+    # down. On timeout the deterministic keyword terms are used.
+    EVIDENCE_QUERY_EXPANSION_TIMEOUT_SECONDS: float = 8.0
+
     # Embeddings — in-memory semantic ranking signal for evidence-to-obligación
     # matching (evidence-embeddings capability). No persistent vector store:
     # vectors exist only for the duration of one classification run.

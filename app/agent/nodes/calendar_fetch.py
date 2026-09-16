@@ -10,12 +10,20 @@ personales sin llamadas LLM adicionales.
 
 from __future__ import annotations
 
+import time
+from datetime import date, timedelta
+from itertools import zip_longest
+
 import structlog
+from googleapiclient.errors import HttpError as GoogleHttpError
 
 from app.adapters.calendar.calendar_adapter import GoogleCalendarAdapter
 from app.adapters.calendar.port import CalendarEvent
+from app.adapters.email.gmail_adapter import _is_rate_limit_error
 from app.adapters.microsoft.graph_adapter import MicrosoftGraphAdapter
-from app.agent.prompts.email_evidence import _extract_keywords
+from app.agent.prompts.contract_terms import contract_query_variants
+from app.agent.prompts.email_evidence import _extract_keywords, _safe_entity_phrase
+from app.agent.prompts.query_budget import obligacion_key, round_robin
 from app.agent.state import AgentState
 from app.core.config import settings
 from app.models.integracion import IntegrationProvider
@@ -49,6 +57,12 @@ def _build_calendar_query(obligaciones: list[dict]) -> str | None:
     obligaciones, esto combina keywords de cada obligación (no solo las primeras
     3) y solo capa el TOTAL de términos combinados (MAX_TERMS_TOTAL), tras
     deduplicar, para no producir una query desmesuradamente larga.
+
+    Kept for backward compatibility (still exported/tested); superseded by
+    `_calendar_terms` for the actual per-term fan-out `calendar_fetch_node`
+    now does (root cause #5, evidencias/discovery-fix): joining every keyword
+    into ONE query made Google AND them together, matching nothing once more
+    than 1-2 terms combined.
     """
     keywords: list[str] = []
     for ob in obligaciones:
@@ -56,6 +70,72 @@ def _build_calendar_query(obligaciones: list[dict]) -> str | None:
         keywords.extend(_extract_keywords(desc)[:2])
     unique = list(dict.fromkeys(keywords))[:MAX_TERMS_TOTAL]
     return " ".join(unique) if unique else None
+
+
+def _calendar_terms(
+    contrato: dict, obligaciones: list[dict], expanded_terms: dict[str, list[str]] | None = None
+) -> list[str]:
+    """One short term per Calendar API call, allocated with two SEPARATE budgets.
+
+    Round-2 fix for the confirmed CRITICAL starvation finding: this used to
+    concatenate every contract-number variant, then the entidad, then every
+    obligación's keywords, and truncate the flat list at
+    `EVIDENCE_MAX_CALENDAR_TERMS`. For a dotted DAGMA/Cali number the 7 variants
+    plus the entidad filled all 8 slots, so NO obligación keyword and NO
+    expanded phrase ever reached Calendar.
+
+    Now: a small reserved contract-level block (only the matchable query
+    variants — see `contract_query_variants` — plus the entidad), then the
+    remaining budget dealt ROUND-ROBIN across obligaciones so each one is
+    guaranteed its own keyword and its own expanded phrase.
+    """
+    contract_terms: list[str] = list(contract_query_variants(contrato.get("numero_contrato")))
+
+    entidad = contrato.get("entidad")
+    if entidad and len(str(entidad).strip()) > 3:
+        # Round-3 fix (confirmed WARNING): the RAW untruncated entidad was used
+        # here as the Calendar `q` term — Google ANDs those tokens together,
+        # so an event titled "Reunión DAGMA" never matched a 65+ char formal
+        # name. Shares `_safe_entity_phrase` with Gmail/Drive.
+        contract_terms.append(_safe_entity_phrase(str(entidad).strip(), 60))
+    contract_terms = contract_terms[: min(settings.EVIDENCE_MAX_CONTRACT_QUERIES, settings.EVIDENCE_MAX_CALENDAR_TERMS)]
+
+    expanded_terms = expanded_terms or {}
+    groups: list[list[str]] = []
+    for i, ob in enumerate(obligaciones):
+        own = _extract_keywords(str(ob.get("descripcion") or ""))[:2]
+        phrases = list(expanded_terms.get(obligacion_key(ob, i)) or [])
+        group: list[str] = []
+        for pair in zip_longest(own, phrases):
+            group.extend(t for t in pair if t)
+        if group:
+            groups.append(group)
+
+    # Round-3 fix (confirmed WARNING, same shape as the Gmail/Drive ceiling
+    # regression): `budget = max(remaining, MIN_PER_OB * n_groups)` let the
+    # per-obligación FLOOR REQUIREMENT alone decide the total once obligaciones
+    # outnumbered EVIDENCE_MAX_CALENDAR_TERMS. The floor is still honoured ON
+    # TOP of the nominal budget for a contract with few obligaciones
+    # (unchanged, intentional round-2 behavior), but the floor REQUIREMENT
+    # itself is now capped at the nominal budget, bounding the worst-case
+    # overrun to `len(contract_terms)` regardless of obligación count.
+    nominal_budget = settings.EVIDENCE_MAX_CALENDAR_TERMS
+    remaining_after_contract = max(nominal_budget - len(contract_terms), 0)
+    if groups:
+        floor_needed = settings.EVIDENCE_MIN_QUERIES_PER_OBLIGACION * len(groups)
+        capped_floor = min(floor_needed, nominal_budget)
+        if capped_floor < floor_needed:
+            logger.info(
+                "calendar_query_budget_floor_capped",
+                requested=floor_needed,
+                capped_to=capped_floor,
+                n_obligaciones=len(groups),
+            )
+        budget = max(remaining_after_contract, capped_floor)
+    else:
+        budget = 0
+    terms = [*contract_terms, *round_robin(groups, budget)]
+    return list(dict.fromkeys(t for t in terms if t))
 
 
 def _extract_event_metadata(event: CalendarEvent) -> dict:
@@ -75,6 +155,25 @@ def _extract_event_metadata(event: CalendarEvent) -> dict:
     }
 
 
+def _event_content(ev: CalendarEvent) -> str:
+    """Fold summary + description + location + attendee emails into one text
+    blob for keyword/LLM scoring — location and attendees were previously
+    discarded entirely (evidencias/discovery-fix root cause #5)."""
+    parts = [ev.summary or "(evento sin título)", ev.description or ""]
+    if ev.location:
+        parts.append(f"Lugar: {ev.location}")
+    attendee_emails = ", ".join(a.email for a in ev.attendees if a.email)
+    if attendee_emails:
+        parts.append(f"Asistentes: {attendee_emails}")
+    return ". ".join(p for p in parts if p).strip()
+
+
+def _event_link(ev: CalendarEvent) -> str:
+    """Prefer the Meet URL when present — a Meet link is stronger contractual
+    evidence (a real meeting happened) than the bare Calendar event page."""
+    return ev.hangout_link or ev.html_link
+
+
 async def calendar_fetch_node(
     state: AgentState, provider: IntegrationProvider = IntegrationProvider.GOOGLE
 ) -> AgentState:
@@ -87,6 +186,14 @@ async def calendar_fetch_node(
     are APPENDED to any `calendar_evidencias` already in `state` — so calling this
     once per connected provider (evidence_discovery_service.descubrir_evidencias)
     merges every provider's events instead of the last call clobbering the rest.
+
+    Fires ONE short query per term (contract-number variants, entidad,
+    obligación keywords — see `_calendar_terms`) instead of ANDing every term
+    into a single query, which matched nothing once more than 1-2 terms
+    combined (root cause #5, evidencias/discovery-fix). Results are merged by
+    event id across terms. A term with no results/an error is skipped —
+    isolated per-term the same way drive_fetch_node isolates per-query
+    failures — so one bad term never drops evidence another term found.
     """
     existing: list[dict] = state.get("calendar_evidencias") or []
 
@@ -96,43 +203,109 @@ async def calendar_fetch_node(
         return {**state, "calendar_evidencias": existing}
 
     contrato = state.get("contrato_contexto") or {}
-    time_min = _to_rfc3339(str(contrato.get("fecha_inicio", "")))
-    time_max = _to_rfc3339(str(contrato.get("fecha_fin", "")), end_of_day=True)
+    # Round-3 fix (confirmed WARNING): EVIDENCE_WINDOW_MARGIN_DAYS only widened
+    # Gmail's window (`_widen_gmail_window` in evidence_discovery_service.py).
+    # Calendar used the raw period, so a wrap-up Meet held in the first days
+    # of the month AFTER the period closes — exactly the kind of closeout
+    # evidence the margin exists to catch — was unreachable.
+    fecha_inicio_raw = str(contrato.get("fecha_inicio", "")).strip()
+    fecha_fin_raw = str(contrato.get("fecha_fin", "")).strip()
+    margin = timedelta(days=settings.EVIDENCE_WINDOW_MARGIN_DAYS)
+    try:
+        fecha_inicio_widened = (date.fromisoformat(fecha_inicio_raw) - margin).isoformat() if fecha_inicio_raw else ""
+        fecha_fin_widened = (date.fromisoformat(fecha_fin_raw) + margin).isoformat() if fecha_fin_raw else ""
+    except ValueError:
+        fecha_inicio_widened, fecha_fin_widened = fecha_inicio_raw, fecha_fin_raw
+    time_min = _to_rfc3339(fecha_inicio_widened)
+    time_max = _to_rfc3339(fecha_fin_widened, end_of_day=True)
     if not time_min or not time_max:
         return {**state, "calendar_evidencias": existing}
 
     obligaciones = state.get("obligaciones_contexto") or []
-    q = _build_calendar_query(obligaciones)
+    terms = _calendar_terms(contrato, obligaciones, state.get("expanded_terms"))
+    queries: list[str | None] = list(terms) if terms else [None]
 
     adapter = GoogleCalendarAdapter(db) if provider == IntegrationProvider.GOOGLE else MicrosoftGraphAdapter(db)
-    try:
-        events = await adapter.search_events(user_id, time_min, time_max, max_results=settings.EVIDENCE_MAX_EVENTS, q=q)
-    except Exception as exc:
-        await logger.aerror("calendar_fetch_error", error=str(exc), user_id=str(user_id), provider=provider.value)
+
+    events_by_id: dict[str, CalendarEvent] = {}
+    any_call_succeeded = False
+    last_error: Exception | None = None
+    # Round-3 fix (confirmed WARNING): the per-term fan-out had no overall
+    # deadline and no early-exit on a definitively rate-limited term — a
+    # throttled Calendar keeps throttling the NEXT term too, so blindly
+    # continuing paid the full retry/backoff cost again for every remaining
+    # term. Both guards below bound the WHOLE loop, not any single call.
+    deadline = time.monotonic() + settings.EVIDENCE_CALENDAR_FETCH_DEADLINE_SECONDS
+    for idx, q in enumerate(queries):
+        if time.monotonic() >= deadline:
+            skipped = len(queries) - idx
+            await logger.awarning(
+                "calendar_fetch_deadline_exceeded",
+                skipped_terms=skipped,
+                deadline_seconds=settings.EVIDENCE_CALENDAR_FETCH_DEADLINE_SECONDS,
+                provider=provider.value,
+            )
+            break
+        try:
+            events = await adapter.search_events(
+                user_id, time_min, time_max, max_results=settings.EVIDENCE_MAX_EVENTS, q=q
+            )
+        except Exception as exc:
+            last_error = exc
+            await logger.awarning(
+                "calendar_query_failed", query=q, error=str(exc), user_id=str(user_id), provider=provider.value
+            )
+            if isinstance(exc, GoogleHttpError) and _is_rate_limit_error(exc):
+                skipped = len(queries) - idx - 1
+                if skipped:
+                    await logger.awarning(
+                        "calendar_fetch_terms_skipped_after_rate_limit",
+                        skipped_terms=skipped,
+                        provider=provider.value,
+                    )
+                break
+            continue
+        any_call_succeeded = True
+        for ev in events:
+            events_by_id.setdefault(ev.id, ev)
+
+    if not any_call_succeeded and last_error is not None:
+        await logger.aerror(
+            "calendar_fetch_error", error=str(last_error), user_id=str(user_id), provider=provider.value
+        )
         return {
             **state,
             "calendar_evidencias": existing,
-            "error": f"Error leyendo Calendar ({provider.value}): {exc}. Verifica que tu cuenta esté conectada.",
+            "error": f"Error leyendo Calendar ({provider.value}): {last_error}. Verifica que tu cuenta esté conectada.",
         }
 
-    calendar_evidencias = []
-    for ev in events:
-        summary = ev.summary or "(evento sin título)"
-        description = ev.description or ""
-        calendar_evidencias.append(
-            {
-                "source": "calendar",
-                "title": summary,
-                "content": f"{summary}. {description}".strip(),
-                "link": ev.html_link,
-                "date": _event_start(ev),
-                "event_id": ev.id,
-                "metadata": _extract_event_metadata(ev),
-                "provider": provider.value,
-            }
-        )
+    calendar_evidencias = [
+        {
+            "source": "calendar",
+            "title": ev.summary or "(evento sin título)",
+            "content": _event_content(ev),
+            "link": _event_link(ev),
+            "date": _event_start(ev),
+            "event_id": ev.id,
+            "metadata": _extract_event_metadata(ev),
+            "provider": provider.value,
+        }
+        # Round-2: Calendar was the ONLY source with no total cap. Email
+        # truncates at EVIDENCE_MAX_EMAILS_TOTAL and Drive at
+        # EVIDENCE_MAX_FILES_TOTAL, but the per-term fan-out this branch
+        # introduced could merge terms x EVIDENCE_MAX_EVENTS items and push all
+        # of them into evidence_filter's LLM batches and the single
+        # `_embed_batch` call, where an oversized input degrades the WHOLE run
+        # to keyword-only ranking. Applied to THIS call's contribution only, so
+        # a second provider's events are not discarded.
+        for ev in list(events_by_id.values())[: settings.EVIDENCE_MAX_EVENTS_TOTAL]
+    ]
 
     await logger.ainfo(
-        "calendar_fetch_complete", user_id=str(user_id), events=len(calendar_evidencias), q=q, provider=provider.value
+        "calendar_fetch_complete",
+        user_id=str(user_id),
+        events=len(calendar_evidencias),
+        terms=terms,
+        provider=provider.value,
     )
     return {**state, "calendar_evidencias": existing + calendar_evidencias}
