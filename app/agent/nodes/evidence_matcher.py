@@ -168,10 +168,21 @@ async def _embed_batch(texts: list[str], llm) -> list[list[float]] | None:
     if not texts:
         return []
     try:
-        return await llm.embed(texts)  # type: ignore[no-any-return]
+        vectors = await llm.embed(texts)
     except Exception as exc:
         logger.warning("evidence_matcher_embed_failed", error=str(exc))
         return None
+    # `_score` indexes `ev_embeddings[idx]` positionally, so a provider that
+    # returns fewer vectors than inputs raised IndexError out of the gather and
+    # surfaced as a 500. Fail open to keyword-only ranking instead.
+    if not isinstance(vectors, list) or len(vectors) != len(texts):
+        logger.warning(
+            "evidence_matcher_embed_length_mismatch",
+            expected=len(texts),
+            received=len(vectors) if isinstance(vectors, list) else None,
+        )
+        return None
+    return vectors
 
 
 def _obligacion_text(ob: Any) -> str:
@@ -324,38 +335,163 @@ def _parse_relevance_response(raw: str, n: int) -> list[bool] | None:
        follow the structured contract.
 
     Returns `None` (never a list) when the response has no parseable JSON at
-    all — the caller falls back to the deterministic keyword-score bar.
+    all — the caller falls back to the deterministic keyword-score bar. Every
+    failure to parse silently DISABLES the LLM noise filter the product depends
+    on, so extraction is deliberately tolerant (round-2 confirmed WARNING).
     """
-    match = _JSON_RE.search(raw or "")
-    if not match:
-        return None
-    try:
-        items = json.loads(match.group(0))
-    except (ValueError, TypeError):
-        return None
-    if not isinstance(items, list):
+    items = _extract_json_array(raw or "")
+    if items is None:
         return None
     if not items:
         return [False] * n
 
-    if all(isinstance(item, dict) for item in items):
-        flags = [False] * n
-        threshold = settings.EVIDENCE_RELEVANCE_MIN
-        for item in items:
+    flags = [False] * n
+    saw_structured = False
+    legacy_idx: set[int] = set()
+
+    # Per-item handling, NOT all-or-nothing: a single stray int used to send the
+    # whole array down the legacy branch and discard every dict entry.
+    for item in items:
+        if isinstance(item, dict):
+            saw_structured = True
             idx = item.get("idx")
-            if not isinstance(idx, (int, float)):
+            if not isinstance(idx, (int, float)) or isinstance(idx, bool):
                 continue
             i = int(idx) - 1
             if not (0 <= i < n):
                 continue
-            score = item.get("score")
-            score_ok = not isinstance(score, (int, float)) or score >= threshold
-            flags[i] = bool(item.get("relevante", False)) and score_ok
-        return flags
+            flags[i] = _is_relevante(item.get("relevante", False)) and _score_ok(item.get("score"))
+        elif isinstance(item, (int, float)) and not isinstance(item, bool):
+            legacy_idx.add(int(item))
 
-    # Legacy flat int-list format.
-    relevant_idx = {int(item) for item in items if isinstance(item, (int, float))}
-    return [(i + 1) in relevant_idx for i in range(n)]
+    # Legacy flat int-list format (older/smaller models): only when NO
+    # structured object was present, so a mixed array keeps the rich verdicts.
+    if not saw_structured:
+        return [(i + 1) in legacy_idx for i in range(n)]
+    for i in legacy_idx:
+        if 0 <= i - 1 < n:
+            flags[i - 1] = True
+    return flags
+
+
+_TRUTHY_RELEVANTE = {"true", "si", "sí", "1", "yes", "verdadero"}
+
+
+def _is_relevante(value: object) -> bool:
+    """Coerce `relevante` explicitly. `bool("false")` is True in Python, so the
+    old `bool(item.get("relevante"))` accepted the JSON string "false" as a
+    positive verdict (round-2 confirmed WARNING)."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in _TRUTHY_RELEVANTE
+    if isinstance(value, (int, float)):
+        return value > 0
+    return False
+
+
+def _score_ok(score: object) -> bool:
+    """Apply `EVIDENCE_RELEVANCE_MIN` by VALUE, not by type.
+
+    `not isinstance(score, (int, float)) or score >= threshold` let a quoted
+    "0.1" and an unnormalized 90 pass while rejecting an honest 0.4. A numeric
+    string is now parsed, and a 0-100 percentage is normalized before the
+    comparison. An absent/null/unparseable score stays tolerated — the rubric
+    documents the field as checked "when present" for legacy-model compat.
+    """
+    if score is None or isinstance(score, bool):
+        return True
+    if isinstance(score, str):
+        try:
+            score = float(score.strip().rstrip("%"))
+        except ValueError:
+            return True
+    if not isinstance(score, (int, float)):
+        return True
+    value = float(score)
+    if value > 1.0:
+        value /= 100.0
+    return value >= settings.EVIDENCE_RELEVANCE_MIN
+
+
+def _extract_json_array(raw: str) -> list | None:
+    """Find the response's JSON array, tolerant of the shapes models actually emit.
+
+    `re.search(r"\\[.*\\]", DOTALL)` is greedy across the WHOLE response, so a
+    reasoning preamble mentioning "[1]", a trailing "Nota [1]: ..." or a
+    max_tokens-truncated array all defeated it. This walks bracket depth from
+    each candidate opening bracket and, failing that, salvages the complete
+    objects from a truncated array rather than discarding the verdict entirely.
+    """
+    text = re.sub(r"```(?:json)?|```", "", raw).strip()
+
+    for start in (m.start() for m in re.finditer(r"\[", text)):
+        depth = 0
+        in_string = False
+        escaped = False
+        for pos in range(start, len(text)):
+            ch = text[pos]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        parsed = json.loads(text[start : pos + 1])
+                    except (ValueError, TypeError):
+                        break
+                    if isinstance(parsed, list):
+                        return parsed
+                    break
+        else:
+            # Ran off the end with brackets still open: the array was truncated.
+            salvaged = _salvage_truncated_array(text[start:])
+            if salvaged is not None:
+                return salvaged
+    return None
+
+
+def _salvage_truncated_array(fragment: str) -> list | None:
+    """Recover the complete top-level objects from an array cut off mid-item."""
+    items: list = []
+    depth = 0
+    in_string = False
+    escaped = False
+    obj_start = -1
+    for pos, ch in enumerate(fragment):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            if depth == 0:
+                obj_start = pos
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and obj_start >= 0:
+                try:
+                    items.append(json.loads(fragment[obj_start : pos + 1]))
+                except (ValueError, TypeError):
+                    pass
+                obj_start = -1
+    return items or None
 
 
 async def _llm_relevance_batch(
@@ -635,7 +771,18 @@ async def evidence_matcher_node(state: AgentState) -> AgentState:
             )
         )
 
-    for ob_id, matched_list, scores_dict in await asyncio.gather(*tareas):
+    # `return_exceptions=True`: one obligación's provider failure must degrade
+    # THAT obligación to empty, not abort the whole discovery run. The caller
+    # (`evidence_discovery_service.descubrir_evidencias`) invokes this node with
+    # no try/except, so a propagated exception became an unhandled 500.
+    ob_ids = [str(ob.get("id") if isinstance(ob, dict) else i) or str(i) for i, ob in enumerate(obligaciones)]
+    for fallback_id, outcome in zip(ob_ids, await asyncio.gather(*tareas, return_exceptions=True), strict=True):
+        if isinstance(outcome, BaseException):
+            await logger.awarning("evidence_matcher_obligacion_failed", ob_id=fallback_id, error=str(outcome))
+            matched[fallback_id] = []
+            matched_scores[fallback_id] = {}
+            continue
+        ob_id, matched_list, scores_dict = outcome
         matched[ob_id] = matched_list
         matched_scores[ob_id] = scores_dict
 

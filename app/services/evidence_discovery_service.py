@@ -607,12 +607,24 @@ async def descubrir_evidencias(
 
     # 4. Consolidar → deduplicar (por si el mismo item aparece en ambos proveedores)
     #    → filtrar ruido → emparejar → justificar.
-    state = await evidence_orchestrator_node(state)
-    state = await evidence_dedup_node(state)
-    state["evidence_raw"] = state.get("deduplicated_evidence") or []
-    state = await evidence_filter_node(state)
-    state = await evidence_matcher_node(state)
-    state = await evidence_justify_node(state)
+    #    Each stage is isolated the same way the per-provider fetches above are
+    #    (round-2): this block ran with NO try/except, so any unexpected error —
+    #    a provider returning a malformed embedding batch, say — escaped as an
+    #    unhandled 500 on a user-facing "descubrir" click. Discovery must
+    #    degrade to whatever it already found, never fail the request.
+    async def _stage(name: str, node, st: AgentState) -> AgentState:
+        try:
+            return await node(st)
+        except Exception as exc:
+            await logger.aerror("evidence_pipeline_stage_failed", stage=name, error=str(exc))
+            return st
+
+    state = await _stage("orchestrator", evidence_orchestrator_node, state)
+    state = await _stage("dedup", evidence_dedup_node, state)
+    state["evidence_raw"] = state.get("deduplicated_evidence") or state.get("evidence_raw") or []
+    state = await _stage("filter", evidence_filter_node, state)
+    state = await _stage("matcher", evidence_matcher_node, state)
+    state = await _stage("justify", evidence_justify_node, state)
 
     justificaciones = state.get("justificaciones") or []
     obligaciones_out = [ObligacionJustificada.model_validate(j) for j in justificaciones]
