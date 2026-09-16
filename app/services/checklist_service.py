@@ -555,11 +555,22 @@ def _aplica_con_mapeo(
     items control their own first-cuota-only gating — not the catalog rule
     rule 1 unconditionally hides RUT/CEDULA/RPC/CDP under, which would
     otherwise silently drop an explicitly-declared requisito with no row and
-    no signal to the user."""
+    no signal to the user.
+
+    The override is strictly ADDITIVE (round 3, finding #4): it can only make a
+    requisito apply, never take away an applicability the catalog already
+    grants. Replacing the catalog answer used to cancel CONTRATO's rule-2
+    reappearance whenever a custom item mapped to CONTRATO declared
+    `solo_primera_cuenta=True` — leaving the cuenta with NO row at all (the
+    standard one hidden by the mapping, the custom one skipped because it maps
+    to a standard code), which is precisely the silent drop this function
+    exists to prevent."""
+    if requisito_aplica_a_cuenta(req, ctx):
+        return True
     mapeo = mapeos_por_codigo.get(req.codigo)
     if mapeo is not None:
         return ctx.is_first or not mapeo.solo_primera_cuenta
-    return requisito_aplica_a_cuenta(req, ctx)
+    return False
 
 
 class _CustomLike(Protocol):

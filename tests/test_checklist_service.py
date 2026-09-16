@@ -338,6 +338,37 @@ async def test_asegurar_checklist_custom_mapeado_respeta_su_propio_solo_primera_
     assert "RUT" in codigos  # mapped standard row must still materialize, not vanish
 
 
+async def test_asegurar_checklist_custom_mapeado_no_anula_la_reaparicion_de_contrato(
+    db: AsyncSession, contrato: Contrato
+) -> None:
+    """checklist/primera-cuota-2026-09-16, round 3, finding #4 (WARNING): an
+    explicit `mapea_a_estandar` mapping must be ADDITIVE to the catalog rule,
+    never replace it. A custom item mapped to CONTRATO whose OWN
+    `solo_primera_cuenta=True` used to cancel CONTRATO's rule-2 reappearance
+    exception, so a contrato with no shared document and no obligaciones got NO
+    row at all — neither standard (hidden by the mapping) nor custom (skipped
+    because it maps to a standard code), i.e. the exact silent drop the mapping
+    override exists to prevent."""
+    await _make_cuenta_custom(db, contrato, mes=1)
+    cuenta2 = await _make_cuenta_custom(db, contrato, mes=2)
+    # No shared contract-level CONTRATO document and no Obligacion rows → both
+    # halves of rule 2 fire, so CONTRATO must reappear on this later cuenta.
+    await _make_requisito_custom(
+        db,
+        cuenta2,
+        "CONTRATO_FIRMADO",
+        "Contrato firmado",
+        mapea_a_estandar="CONTRATO",
+        solo_primera_cuenta=True,
+    )
+
+    filas = await checklist_service.asegurar_checklist(db, cuenta2)
+    await db.commit()
+
+    codigos = {f.requisito_codigo for f in filas}
+    assert "CONTRATO" in codigos
+
+
 async def test_asegurar_checklist_is_idempotent(db: AsyncSession, contrato: Contrato) -> None:
     cuenta = await _make_cuenta(db, contrato, mes=1)
 
