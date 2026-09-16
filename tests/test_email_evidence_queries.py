@@ -74,3 +74,56 @@ class TestBuildObligationQueriesUnscopedBody:
         unscoped_queries = [q for q in queries if not q.startswith("subject:(") and "informe" in q]
         assert subject_queries
         assert unscoped_queries, f"expected an unscoped body query, got: {queries}"
+
+
+class TestSafeEntityPhrasePreservesTrailingAcronym:
+    """WARNING regression: Colombian official entity names put the distinctive
+    acronym LAST ("... del Medio Ambiente DAGMA", "... Social ESE", "...
+    Empresas Municipales de Cali EICE ESP - EMCALI"). `_safe_entity_phrase`
+    truncated on a word boundary but always kept the HEAD and cut the TAIL —
+    dropping exactly the token that appears in real correspondence subject
+    lines, and that SECOP imports write into `Contrato.entidad` verbatim
+    (secop_service.py only applies a hard `[:255]`, no acronym-aware
+    shortening)."""
+
+    def test_keeps_the_trailing_acronym_when_the_head_alone_would_drop_it(self) -> None:
+        from app.agent.prompts.email_evidence import _safe_entity_phrase
+
+        entidad = "Departamento Administrativo de Gestion del Medio Ambiente DAGMA"
+        result = _safe_entity_phrase(entidad, 60)
+
+        assert "DAGMA" in result, f"acronym dropped: {result!r}"
+        assert len(result) <= 60
+
+    def test_keeps_the_acronym_even_at_a_tighter_per_obligacion_limit(self) -> None:
+        from app.agent.prompts.email_evidence import _safe_entity_phrase
+
+        entidad = "Departamento Administrativo de Gestion del Medio Ambiente DAGMA"
+        result = _safe_entity_phrase(entidad, 40)
+
+        assert "DAGMA" in result, f"acronym dropped: {result!r}"
+        assert len(result) <= 40
+
+    def test_realistic_secop_shaped_name_keeps_the_acronym(self) -> None:
+        from app.agent.prompts.email_evidence import _safe_entity_phrase
+
+        entidad = "CALI DEPARTAMENTO ADMINISTRATIVO DE GESTION DEL MEDIO AMBIENTE - DAGMA"
+        result = _safe_entity_phrase(entidad, 60)
+
+        assert "DAGMA" in result, f"acronym dropped: {result!r}"
+
+    def test_short_entidad_under_the_limit_is_unaffected(self) -> None:
+        from app.agent.prompts.email_evidence import _safe_entity_phrase
+
+        assert _safe_entity_phrase("DAGMA", 60) == "DAGMA"
+
+    def test_no_trailing_acronym_falls_back_to_the_word_boundary_cut(self) -> None:
+        """Not every long entidad name ends in an acronym — the pre-existing
+        word-boundary behavior must still apply."""
+        from app.agent.prompts.email_evidence import _safe_entity_phrase
+
+        entidad = "Departamento Administrativo de Gestion del Medio Ambiente Territorial"
+        result = _safe_entity_phrase(entidad, 40)
+
+        assert len(result) <= 40
+        assert not result.endswith((" de", " del", " la", " el"))

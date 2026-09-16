@@ -21,7 +21,7 @@ from app.adapters.calendar.port import CalendarEvent
 from app.adapters.email.gmail_adapter import _is_rate_limit_error
 from app.adapters.microsoft.graph_adapter import MicrosoftGraphAdapter
 from app.agent.prompts.contract_terms import contract_query_variants
-from app.agent.prompts.email_evidence import _extract_keywords
+from app.agent.prompts.email_evidence import _extract_keywords, _safe_entity_phrase
 from app.agent.prompts.query_budget import obligacion_key, round_robin
 from app.agent.state import AgentState
 from app.core.config import settings
@@ -92,7 +92,11 @@ def _calendar_terms(
 
     entidad = contrato.get("entidad")
     if entidad and len(str(entidad).strip()) > 3:
-        contract_terms.append(str(entidad).strip())
+        # Round-3 fix (confirmed WARNING): the RAW untruncated entidad was used
+        # here as the Calendar `q` term — Google ANDs those tokens together,
+        # so an event titled "Reunión DAGMA" never matched a 65+ char formal
+        # name. Shares `_safe_entity_phrase` with Gmail/Drive.
+        contract_terms.append(_safe_entity_phrase(str(entidad).strip(), 60))
     contract_terms = contract_terms[: min(settings.EVIDENCE_MAX_CONTRACT_QUERIES, settings.EVIDENCE_MAX_CALENDAR_TERMS)]
 
     expanded_terms = expanded_terms or {}

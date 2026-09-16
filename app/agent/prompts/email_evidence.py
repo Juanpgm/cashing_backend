@@ -62,6 +62,16 @@ def _safe_entity_phrase(entidad: str, limit: int) -> str:
     still consuming a slot in the query budget. Cutting on whitespace keeps the
     phrase searchable; if the first word alone exceeds the limit we fall back
     to the hard cut rather than emitting nothing.
+
+    Round-3 fix (confirmed WARNING): Colombian official entity names put the
+    distinctive acronym LAST ("... del Medio Ambiente DAGMA", "... Social
+    ESE", "... Empresas Municipales de Cali EICE ESP - EMCALI") — a plain
+    word-boundary cut from the head keeps the generic part and drops exactly
+    the token that appears in real correspondence subject lines, and that
+    SECOP imports write into `Contrato.entidad` verbatim (only a hard
+    `[:255]`, no acronym-aware shortening). When the name ends in a
+    2-8-character all-uppercase token, that acronym is preserved and the head
+    is trimmed to make room for it instead.
     """
     from app.agent.prompts.contract_terms import entidad_search_term
 
@@ -70,6 +80,20 @@ def _safe_entity_phrase(entidad: str, limit: int) -> str:
     cleaned = entidad_search_term(entidad).replace('"', "")
     if len(cleaned) <= limit:
         return cleaned
+
+    tokens = cleaned.split()
+    last = tokens[-1] if tokens else ""
+    if 2 <= len(last) <= 8 and last.isupper() and last.isalpha():
+        budget = limit - len(last) - 1  # room for a separating space
+        if budget > 0:
+            head = cleaned[:budget]
+            cut = head.rfind(" ")
+            prefix = (head[:cut] if cut > 0 else "").rstrip(" -,.")
+            candidate = f"{prefix} {last}".strip() if prefix else last
+            if candidate and len(candidate) <= limit:
+                return candidate
+        return last
+
     head = cleaned[:limit]
     cut = head.rfind(" ")
     return (head[:cut].rstrip(" -,.") if cut > 0 else head).strip()

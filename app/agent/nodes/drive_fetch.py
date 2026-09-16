@@ -16,7 +16,7 @@ from app.adapters.drive.drive_adapter import DriveAdapter
 from app.adapters.drive.port import DriveQuery
 from app.adapters.microsoft.graph_adapter import MicrosoftGraphAdapter
 from app.agent.prompts.contract_terms import contract_query_variants
-from app.agent.prompts.email_evidence import _extract_keywords
+from app.agent.prompts.email_evidence import _extract_keywords, _safe_entity_phrase
 from app.agent.prompts.query_budget import obligacion_key, round_robin
 from app.agent.state import AgentState
 from app.core.config import settings
@@ -137,7 +137,12 @@ async def drive_fetch_node(state: AgentState, provider: IntegrationProvider = In
     contract_terms: list[str] = list(numero_query_variants)
     entidad = str(contrato.get("entidad") or "").strip()
     if len(entidad) > 3:
-        contract_terms.append(entidad)
+        # Round-3 fix (confirmed WARNING): the RAW untruncated entidad was used
+        # here, so a 65+ char formal SECOP name never matched the acronym real
+        # filenames actually contain ("Informe DAGMA.pdf"). Shares
+        # `_safe_entity_phrase` with Gmail's contract-level query instead of a
+        # third, independent derivation.
+        contract_terms.append(_safe_entity_phrase(entidad, 60))
     contract_terms = contract_terms[: settings.EVIDENCE_MAX_CONTRACT_QUERIES]
 
     # One group per obligación — its own keywords interleaved with its expanded

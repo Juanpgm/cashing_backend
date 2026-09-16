@@ -318,6 +318,39 @@ async def test_drive_queries_the_contract_number_once_not_once_per_obligacion():
     assert terms.count(DAGMA_NUMERO) == 1, f"contract number queried {terms.count(DAGMA_NUMERO)}x — fired: {terms}"
 
 
+LONG_ENTIDAD = "Departamento Administrativo de Gestion del Medio Ambiente DAGMA"
+
+
+@pytest.mark.asyncio
+async def test_drive_entidad_term_uses_the_shared_acronym_safe_derivation():
+    """WARNING regression: drive_fetch used the RAW untruncated entidad as a
+    Drive term, so the acronym real filenames actually contain ('Informe
+    DAGMA.pdf') never matched a 65-char formal name. Now shares
+    `_safe_entity_phrase` with Gmail, which keeps the acronym."""
+    from app.agent.nodes import drive_fetch as mod
+
+    adapter = MagicMock()
+    adapter.search_files = AsyncMock(return_value=[])
+
+    state = {
+        "user_id": uuid.uuid4(),
+        "_db": MagicMock(),
+        "contrato_contexto": {
+            "fecha_inicio": "2025-09-01",
+            "fecha_fin": "2025-09-30",
+            "entidad": LONG_ENTIDAD,
+        },
+        "obligaciones_contexto": OBLIGACIONES,
+    }
+
+    with patch.object(mod, "DriveAdapter", return_value=adapter):
+        await mod.drive_fetch_node(state)
+
+    terms = _drive_terms(adapter.search_files.call_args_list)
+    assert any("DAGMA" in t for t in terms), f"acronym never reached Drive — fired: {terms}"
+    assert LONG_ENTIDAD not in terms, "raw untruncated entidad still used instead of the safe-phrase derivation"
+
+
 @pytest.mark.asyncio
 async def test_drive_total_queries_never_exceed_the_configured_ceiling():
     """Same shape as the Gmail ceiling regression: with many obligaciones the
@@ -382,6 +415,18 @@ def test_calendar_terms_keep_the_raw_contract_number():
 
     terms = _calendar_terms({"numero_contrato": DAGMA_NUMERO, "entidad": ENTIDAD}, OBLIGACIONES, EXPANDED)
     assert DAGMA_NUMERO in terms
+
+
+def test_calendar_terms_entidad_uses_the_shared_acronym_safe_derivation():
+    """WARNING regression: calendar_fetch used the RAW untruncated entidad as
+    the Calendar `q` term, so Google ANDs those tokens together and an event
+    titled 'Reunión DAGMA' never matched. Now shares `_safe_entity_phrase`
+    with Gmail, which keeps the acronym."""
+    from app.agent.nodes.calendar_fetch import _calendar_terms
+
+    terms = _calendar_terms({"entidad": LONG_ENTIDAD}, OBLIGACIONES, EXPANDED)
+    assert any("DAGMA" in t for t in terms), f"acronym never reached Calendar — terms: {terms}"
+    assert LONG_ENTIDAD not in terms, "raw untruncated entidad still used instead of the safe-phrase derivation"
 
 
 def test_calendar_terms_never_exceed_the_configured_ceiling():
