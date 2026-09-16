@@ -226,7 +226,15 @@ async def calendar_fetch_node(
             "metadata": _extract_event_metadata(ev),
             "provider": provider.value,
         }
-        for ev in events_by_id.values()
+        # Round-2: Calendar was the ONLY source with no total cap. Email
+        # truncates at EVIDENCE_MAX_EMAILS_TOTAL and Drive at
+        # EVIDENCE_MAX_FILES_TOTAL, but the per-term fan-out this branch
+        # introduced could merge terms x EVIDENCE_MAX_EVENTS items and push all
+        # of them into evidence_filter's LLM batches and the single
+        # `_embed_batch` call, where an oversized input degrades the WHOLE run
+        # to keyword-only ranking. Applied to THIS call's contribution only, so
+        # a second provider's events are not discarded.
+        for ev in list(events_by_id.values())[: settings.EVIDENCE_MAX_EVENTS_TOTAL]
     ]
 
     await logger.ainfo(

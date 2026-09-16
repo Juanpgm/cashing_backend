@@ -431,6 +431,11 @@ class Settings(BaseSettings):
     EVIDENCE_MIN_QUERIES_PER_OBLIGACION: int = 2
     # Gmail messages fetched per query (was a hardcoded module constant of 10).
     EVIDENCE_MAX_EMAILS_PER_QUERY: int = 25
+    # Floor applied to later queries once EVIDENCE_MAX_EMAILS_TOTAL is already
+    # reached. Every query still runs — skipping them would starve the
+    # obligaciones, since contract-level queries go first — but each fetches
+    # only this many messages, bounding the users.messages.get fan-out.
+    EVIDENCE_MIN_EMAILS_PER_QUERY: int = 5
     # evidence_matcher: relevance threshold applied to the LLM's own 0-1 score
     # (JSON rubric output) once it's the source of truth, replacing the old
     # int-list-only contract.

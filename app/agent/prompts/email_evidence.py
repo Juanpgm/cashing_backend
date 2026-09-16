@@ -52,6 +52,25 @@ obligación, y qué actividades demuestran.
 GMAIL_NOISE_EXCLUSIONS = "-category:promotions -category:social -category:forums -in:spam -in:trash"
 
 
+def _safe_entity_phrase(entidad: str, limit: int) -> str:
+    """Quote-safe entidad, truncated on a WORD boundary.
+
+    Round-2 fix (confirmed WARNING): a bare `entidad[:limit]` cut long official
+    Colombian names mid-token and the fragment was then emitted as a QUOTED
+    exact-phrase Gmail query. Gmail tokenizes phrase searches, so
+    `"...Domiciliarios de Barrancaberme"` can never match a document while
+    still consuming a slot in the query budget. Cutting on whitespace keeps the
+    phrase searchable; if the first word alone exceeds the limit we fall back
+    to the hard cut rather than emitting nothing.
+    """
+    cleaned = (entidad or "").strip().replace('"', "")
+    if len(cleaned) <= limit:
+        return cleaned
+    head = cleaned[:limit]
+    cut = head.rfind(" ")
+    return (head[:cut].rstrip(" -,.") if cut > 0 else head).strip()
+
+
 def build_obligation_queries(
     descripcion: str,
     fecha_inicio: str,
@@ -108,7 +127,7 @@ def build_obligation_queries(
 
     # 5. Entidad en el cuerpo (si disponible)
     if entidad and len(entidad) > 5:
-        safe_entity = entidad[:40].replace('"', "")
+        safe_entity = _safe_entity_phrase(entidad, 40)
         queries.append(
             f'"{safe_entity}" after:{fecha_inicio} before:{fecha_fin} {noise}'
         )
@@ -154,7 +173,7 @@ def build_contract_queries(
         queries.append(f'"{exact}" has:attachment after:{fecha_inicio} before:{fecha_fin} {noise}')
 
     if entidad and len(entidad.strip()) > 3:
-        safe_entity = entidad.strip()[:60].replace('"', "")
+        safe_entity = _safe_entity_phrase(entidad, 60)
         queries.append(f'"{safe_entity}" after:{fecha_inicio} before:{fecha_fin} {noise}')
 
     if supervisor_email:

@@ -364,8 +364,25 @@ async def _gather_email_evidence(
     emails_by_id: dict[str, dict] = {}
     filtered_count = 0
     for query in unique_queries[:query_budget]:
+        # Bound the FETCH work without skipping queries (round-2 confirmed
+        # WARNING). `search_messages` fans out one `users.messages.get` per
+        # returned id, so 25/query across the budget meant hundreds of full
+        # message fetches and body parses per user click, ~80% of them
+        # discarded by the EVIDENCE_MAX_EMAILS_TOTAL truncation below.
+        #
+        # Breaking out of the loop once the pool is full would be worse, not
+        # better: contract-level queries run first, so an early break would
+        # leave every obligación unsearched — the exact starvation this branch
+        # exists to fix. Instead, later queries still RUN but fetch only a
+        # small floor of messages each, so every obligación keeps coverage
+        # while total amplification stays bounded.
+        per_query = (
+            settings.EVIDENCE_MAX_EMAILS_PER_QUERY
+            if len(emails_by_id) < settings.EVIDENCE_MAX_EMAILS_TOTAL
+            else settings.EVIDENCE_MIN_EMAILS_PER_QUERY
+        )
         try:
-            messages = await adapter.search_messages(usuario_id, query, settings.EVIDENCE_MAX_EMAILS_PER_QUERY)
+            messages = await adapter.search_messages(usuario_id, query, per_query)
         except Exception as exc:
             await logger.awarning("email_query_failed", query=query, error=str(exc), provider=provider.value)
             continue
