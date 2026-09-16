@@ -238,13 +238,30 @@ def _step6_justificaciones(contrato: Contrato, actividades: list[Actividad]) -> 
     )
 
 
-async def _step5_formato(db: AsyncSession, usuario_id: uuid.UUID, contrato: Contrato) -> StepState:
-    """organism structure OR standard fallback — always available, never blocks.
+_INFORME_CODIGOS = ("INFORME_ACTIVIDADES", "INFORME_SUPERVISION")
+
+
+async def _step5_formato(db: AsyncSession, usuario_id: uuid.UUID, contrato: Contrato, cuenta: CuentaCobro) -> StepState:
+    """organism structure OR standard fallback, gated on both informes being
+    generated. Never hard-blocks (`blocking` stays False — the radicar gate
+    already enforces informes via `computar_resumen`); `complete` instead
+    reports readiness for the frontend to advance the wizard.
 
     Lists EVERY ingested `PlantillaOrganismo` for the contrato's normalized
     entidad (informe_actividades / informe_supervision / cuenta_cobro /
     documento_soporte), so the frontend can render one card per tipo.
     `plantilla_ingerida` (any row exists) stays for backwards compat.
+
+    `complete` (checklist/primera-cuota-2026-09-16, WU6): True only when BOTH
+    INFORME_ACTIVIDADES and INFORME_SUPERVISION checklist rows are satisfied
+    (`checklist_service.es_estado_satisfecho` — the same CARGADO/DETECTADO/
+    CUMPLIDO_MANUAL/NO_APLICA rule `computar_resumen` uses). Reads
+    `DocumentoCuentaCobro` directly (mirrors `_step3_checklist`'s own pattern)
+    rather than `checklist_service.construir_checklist_completo`, which calls
+    `asegurar_checklist` and would violate this module's read-only contract
+    (see module docstring). A row that doesn't exist yet — the checklist gate
+    unresolved, or `reemplazar` mode dropped it — is NOT pending: there is
+    nothing to generate, so it never blocks step 5.
     """
     plantillas: list[PlantillaOrganismo] = []
     if contrato.entidad and contrato.entidad.strip():
@@ -257,10 +274,27 @@ async def _step5_formato(db: AsyncSession, usuario_id: uuid.UUID, contrato: Cont
             .order_by(PlantillaOrganismo.tipo_documento)
         )
         plantillas = list(result.scalars().all())
+
+    from app.services import checklist_service
+
+    informes_res = await db.execute(
+        select(DocumentoCuentaCobro.requisito_codigo, DocumentoCuentaCobro.estado).where(
+            DocumentoCuentaCobro.cuenta_cobro_id == cuenta.id,
+            DocumentoCuentaCobro.requisito_codigo.in_(_INFORME_CODIGOS),
+        )
+    )
+    estado_por_codigo = dict(informes_res.all())
+    informes_pendientes = [
+        codigo
+        for codigo in _INFORME_CODIGOS
+        if codigo in estado_por_codigo and not checklist_service.es_estado_satisfecho(estado_por_codigo[codigo])
+    ]
+    complete = not informes_pendientes
+
     return StepState(
         step=5,
         key="formato",
-        complete=True,
+        complete=complete,
         blocking=False,
         code=None,
         detail={
@@ -274,6 +308,7 @@ async def _step5_formato(db: AsyncSession, usuario_id: uuid.UUID, contrato: Cont
                 }
                 for p in plantillas
             ],
+            "informes_pendientes": informes_pendientes,
         },
     )
 
@@ -340,7 +375,7 @@ async def obtener_stepper_state(
         _step2_cuota(cuenta),
         await _step3_checklist(db, cuenta),
         _step4_evidencias(estado),
-        await _step5_formato(db, usuario_id, contrato),
+        await _step5_formato(db, usuario_id, contrato, cuenta),
         _step6_justificaciones(contrato, cuenta.actividades),
         _step7_paquete(estado),
     ]

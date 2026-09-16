@@ -2624,6 +2624,21 @@ async def listar_arbol_evidencias(db: AsyncSession, cuenta: CuentaCobro) -> list
 # ── summary ────────────────────────────────────────────────────────────────
 
 
+def es_estado_satisfecho(estado: EstadoRequisito) -> bool:
+    """Whether a checklist row's estado counts as "done" — CARGADO, DETECTADO,
+    CUMPLIDO_MANUAL or NO_APLICA. Single source of truth for `computar_resumen`
+    and any other reader needing the same "is this requisito satisfied" rule
+    (e.g. `stepper_state_service._step5_formato`'s informes-generated check,
+    checklist/primera-cuota-2026-09-16 WU6) — never reimplement this tuple ad
+    hoc elsewhere."""
+    return estado in (
+        EstadoRequisito.CARGADO,
+        EstadoRequisito.DETECTADO,
+        EstadoRequisito.CUMPLIDO_MANUAL,
+        EstadoRequisito.NO_APLICA,
+    )
+
+
 def _fila_obligatorio_y_ref(
     fila: DocumentoCuentaCobro,
     cat_by_codigo: dict[str, RequisitoDocumento],
@@ -2684,11 +2699,7 @@ def computar_resumen(
         if estado == EstadoRequisito.NO_APLICA:
             continue
         total += 1
-        if estado in (
-            EstadoRequisito.CARGADO,
-            EstadoRequisito.DETECTADO,
-            EstadoRequisito.CUMPLIDO_MANUAL,
-        ):
+        if es_estado_satisfecho(estado):
             cumplidos += 1
         else:
             pendientes.append(ref)

@@ -593,6 +593,23 @@ async def test_marcar_no_aplica_and_cumplido_manual(db: AsyncSession, contrato: 
 # ── resumen ────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.parametrize(
+    "estado,esperado",
+    [
+        (EstadoRequisito.CARGADO, True),
+        (EstadoRequisito.DETECTADO, True),
+        (EstadoRequisito.CUMPLIDO_MANUAL, True),
+        (EstadoRequisito.NO_APLICA, True),
+        (EstadoRequisito.PENDIENTE, False),
+    ],
+)
+def test_es_estado_satisfecho(estado: EstadoRequisito, esperado: bool) -> None:
+    """Single source of truth for "is this checklist row done" — shared by
+    `computar_resumen` and `stepper_state_service._step5_formato` (WU6,
+    checklist/primera-cuota-2026-09-16)."""
+    assert checklist_service.es_estado_satisfecho(estado) is esperado
+
+
 async def test_computar_resumen_marks_radicacion_lista_when_complete(db: AsyncSession, contrato: Contrato) -> None:
     cuenta = await _make_cuenta(db, contrato, mes=1)
     await checklist_service.asegurar_checklist(db, cuenta)
