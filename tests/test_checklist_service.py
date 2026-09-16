@@ -2132,3 +2132,149 @@ async def test_asegurar_checklist_no_registra_nada_cuando_no_falta_ninguna_fila(
         await checklist_service.asegurar_checklist(db, cuenta)
 
     assert not [ln for ln in logs if ln["event"] == "checklist_materializacion_bloqueada_cuenta_cerrada"]
+
+
+async def test_rematerializar_checklist_es_la_salida_de_emergencia_del_guard(
+    db: AsyncSession, contrato: Contrato
+) -> None:
+    """checklist/primera-cuota-2026-09-16, round 4, finding #6 (WARNING): the
+    settled-cuenta freeze is absolute — a catalog code added by a later
+    migration can never reach an already-radicated cuenta, and the operator has
+    no remediation path either. `rematerializar_checklist` is that documented,
+    logged escape hatch for a migration or an admin task. It is deliberately NOT
+    wired into any endpoint."""
+    import structlog
+
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    await checklist_service.asegurar_checklist(db, cuenta)
+    await db.commit()
+    fila = (
+        await db.execute(
+            select(DocumentoCuentaCobro).where(
+                DocumentoCuentaCobro.cuenta_cobro_id == cuenta.id,
+                DocumentoCuentaCobro.requisito_codigo == "CONTRATO",
+            )
+        )
+    ).scalar_one()
+    await db.delete(fila)
+    cuenta.estado = EstadoCuentaCobro.PAGADA
+    await db.commit()
+
+    # `asegurar_checklist` refuses, as designed.
+    await checklist_service.asegurar_checklist(db, cuenta)
+    await db.commit()
+    codigos = {
+        f.requisito_codigo
+        for f in (
+            await db.execute(
+                select(DocumentoCuentaCobro).where(DocumentoCuentaCobro.cuenta_cobro_id == cuenta.id)
+            )
+        )
+        .scalars()
+        .all()
+    }
+    assert "CONTRATO" not in codigos
+
+    with structlog.testing.capture_logs() as logs:
+        await checklist_service.rematerializar_checklist(db, cuenta, motivo="backfill migracion 044")
+    await db.commit()
+
+    codigos = {
+        f.requisito_codigo
+        for f in (
+            await db.execute(
+                select(DocumentoCuentaCobro).where(DocumentoCuentaCobro.cuenta_cobro_id == cuenta.id)
+            )
+        )
+        .scalars()
+        .all()
+    }
+    assert "CONTRATO" in codigos
+
+    eventos = [ln for ln in logs if ln["event"] == "checklist_rematerializado"]
+    assert len(eventos) == 1
+    assert eventos[0]["log_level"] == "warning"
+    assert eventos[0]["motivo"] == "backfill migracion 044"
+    assert eventos[0]["estado"] == "pagada"
+    assert eventos[0]["codigos_creados"] == ["CONTRATO"]
+    # The bypass is explicit, never a side effect: the guard is untouched for
+    # every other caller.
+    assert not [ln for ln in logs if ln["event"] == "checklist_materializacion_bloqueada_cuenta_cerrada"]
+
+
+async def test_rematerializar_checklist_no_esta_expuesto_en_ninguna_ruta(db: AsyncSession) -> None:
+    """The escape hatch must stay out of the public API surface in this slice —
+    it exists for a migration or an admin task, not for a user click."""
+    import pathlib
+
+    api_dir = pathlib.Path(checklist_service.__file__).parents[1] / "api"
+    hits = [p.name for p in api_dir.rglob("*.py") if "rematerializar_checklist" in p.read_text(encoding="utf-8")]
+    assert hits == []
+
+
+async def test_contrato_no_reaparece_en_una_cuenta_cerrada(
+    db: AsyncSession, contrato: Contrato, test_user: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """checklist/primera-cuota-2026-09-16, round 4, finding #9 (SUGGESTION):
+    pins the DECISION, not an accident. Round 2's rule-2 reappearance says a
+    later cuota's CONTRATO row comes back when the shared nivel-contrato
+    contract document disappears. On a SETTLED cuenta the settled guard cancels
+    that, and it should: materializing a fresh PENDIENTE CONTRATO row would
+    print "Pendiente" on the constancia of an already-approved cuenta, the exact
+    false signal the guard exists to prevent. The still-open cuota does get it
+    back, so the contractor is asked wherever action is possible.
+
+    The monkeypatched control proves the guard — not the ctx, not the visibility
+    filter — is what suppresses the reappearance, so this test cannot pass
+    vacuously."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.services import document_service
+
+    user = test_user["user"]
+    db.add(
+        Obligacion(contrato_id=contrato.id, descripcion="Obligación contractual", tipo=TipoObligacion.GENERAL, orden=1)
+    )
+    await _make_cuenta(db, contrato, mes=1)
+    cerrada = await _make_cuenta(db, contrato, mes=2)
+    doc = DocumentoFuente(
+        usuario_id=user.id,
+        contrato_id=contrato.id,
+        cuenta_cobro_id=None,
+        storage_key="k/contrato-compartido.pdf",
+        nombre="contrato-compartido.pdf",
+        tipo=TipoDocumentoFuente.CONTRATO,
+    )
+    db.add(doc)
+    await db.commit()
+
+    await checklist_service.asegurar_checklist(db, cerrada)
+    await db.commit()
+    assert "CONTRATO" not in {
+        i["requisito"]["codigo"] for i in await _items(db, cerrada)
+    }, "precondition: a shared contract document hides CONTRATO on a later cuota"
+
+    cerrada.estado = EstadoCuentaCobro.APROBADA
+    await db.commit()
+    fake = AsyncMock()
+    fake.delete = AsyncMock()
+    with patch("app.services.document_service._get_storage", return_value=fake):
+        await document_service.eliminar_documento(db, user.id, doc.id)
+
+    assert "CONTRATO" not in {i["requisito"]["codigo"] for i in await _items(db, cerrada)}
+
+    abierta = await _make_cuenta(db, contrato, mes=3)
+    assert "CONTRATO" in {
+        i["requisito"]["codigo"] for i in await _items(db, abierta)
+    }, "the still-open cuota must be asked for the contract again"
+
+    monkeypatch.setattr(checklist_service, "_ESTADOS_CUENTA_CERRADA", frozenset())
+    assert "CONTRATO" in {
+        i["requisito"]["codigo"] for i in await _items(db, cerrada)
+    }, "control: without the guard the row WOULD reappear — the guard is the differentiator"
+
+
+async def _items(db: AsyncSession, cuenta: CuentaCobro) -> list[dict[str, Any]]:
+    payload = await checklist_service.construir_checklist_completo(db, cuenta)
+    await db.commit()
+    return list(payload["items"])

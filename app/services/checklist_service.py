@@ -523,6 +523,33 @@ async def _construir_checklist_aplica_ctx(db: AsyncSession, cuenta: CuentaCobro)
 # closed cuenta to PRIMERA (which `eliminar_cuenta_cobro` legitimately does when
 # the real first cuota is deleted) materialized fresh PENDIENTE CEDULA/RUT/RPC/
 # CDP rows on it and flipped its `radicacion_lista` back to False.
+#
+# Exact boundary of the guard (round 4 — three consequences pinned deliberately,
+# each with a test, because each one is a decision rather than an oversight):
+#
+#  1. It blocks CREATION only. Existing rows stay readable, filterable and
+#     writable; `computar_resumen` and the constancia are unaffected.
+#  2. It cancels CONTRATO's rule-2 reappearance on a settled cuenta, and that is
+#     INTENDED. When the shared nivel-contrato CONTRATO document is deleted
+#     later, `requisito_aplica_a_cuenta` says CONTRATO applies again, but
+#     `_filtrar_filas_visibles` can only keep or hide rows that exist — it
+#     cannot create one — so the row stays absent. The alternative is worse:
+#     materializing a fresh PENDIENTE CONTRATO row would print "Pendiente" on
+#     the constancia of an already-approved-and-paid cuenta, which is precisely
+#     the false signal this guard was written to stop. No gate is wrongly
+#     passed either (radicar requires BORRADOR/RECHAZADA), and the next OPEN
+#     cuota does get CONTRATO back, so the contractor is still asked for the
+#     contract wherever action is still possible. See
+#     `test_contrato_no_reaparece_en_una_cuenta_cerrada`.
+#  3. A catalog code added by a LATER migration therefore never reaches an
+#     already-settled cuenta through any request path. That freeze is the
+#     product answer, but it is not absolute: `rematerializar_checklist` is the
+#     explicit, logged backfill/admin escape hatch a catalog migration must use
+#     (round 4, finding #6).
+#
+# Any caller that DELETES checklist rows must refuse up front on a settled
+# cuenta (`cuenta_esta_cerrada`) instead of relying on a rebuild that will not
+# happen — see `requisito_cuenta_service.definir_set` (round 4, BLOCKER).
 _ESTADOS_CUENTA_CERRADA = frozenset(
     {EstadoCuentaCobro.ENVIADA, EstadoCuentaCobro.APROBADA, EstadoCuentaCobro.PAGADA}
 )
@@ -710,6 +737,55 @@ async def asegurar_checklist(
     ctx: ChecklistAplicaCtx | None = None,
 ) -> list[DocumentoCuentaCobro]:
     """Idempotent: ensure a DocumentoCuentaCobro row exists for every applicable
+    requirement. See `_materializar_checklist` — this is the ONLY entry point
+    every request path uses, and it always honours the settled-cuenta guard.
+    `rematerializar_checklist` is the deliberate, logged bypass.
+    """
+    todas, _creadas = await _materializar_checklist(db, cuenta, ctx=ctx, ignorar_guard_cuenta_cerrada=False)
+    return todas
+
+
+async def rematerializar_checklist(
+    db: AsyncSession,
+    cuenta: CuentaCobro,
+    *,
+    motivo: str,
+) -> list[DocumentoCuentaCobro]:
+    """Run the materialization loops on a SETTLED cuenta, bypassing the
+    `_ESTADOS_CUENTA_CERRADA` guard. The escape hatch for a migration or an
+    admin/support task — deliberately NOT wired into any endpoint.
+
+    Why it exists (round 4, finding #6): the freeze is otherwise absolute.
+    `listar_catalogo` reads `RequisitoDocumento` live, so a code added by a
+    future alembic migration (the way 043 added the primera-cuota flags) enters
+    the catalog immediately — but `asegurar_checklist` is its only writer, and
+    it refuses on every ENVIADA/APROBADA/PAGADA cuenta. Without this function a
+    catalog migration would produce a cohort of structurally un-backfillable
+    cuentas, and an operator correcting a support case would have no path at
+    all. Deleting rows is still never done here: it only ADDS what is missing.
+
+    `motivo` is mandatory and logged with the created codes, so a bypass always
+    leaves a reviewable trace.
+    """
+    todas, creadas = await _materializar_checklist(db, cuenta, ctx=None, ignorar_guard_cuenta_cerrada=True)
+    await logger.awarning(
+        "checklist_rematerializado",
+        cuenta_id=str(cuenta.id),
+        estado=cuenta.estado.value,
+        motivo=motivo,
+        codigos_creados=sorted(f.requisito_codigo or str(f.requisito_cuenta_id) for f in creadas),
+    )
+    return todas
+
+
+async def _materializar_checklist(
+    db: AsyncSession,
+    cuenta: CuentaCobro,
+    *,
+    ctx: ChecklistAplicaCtx | None,
+    ignorar_guard_cuenta_cerrada: bool,
+) -> tuple[list[DocumentoCuentaCobro], list[DocumentoCuentaCobro]]:
+    """Idempotent: ensure a DocumentoCuentaCobro row exists for every applicable
     requirement, merging the standard catalog with the cuenta's custom
     requisitos according to ``cuenta.requisitos_modo``:
 
@@ -720,10 +796,17 @@ async def asegurar_checklist(
       maps to); the rest of the catalog is dropped.
 
     New rows always start PENDIENTE — links are never copied from a previous
-    cuenta. Returns the full list of rows (existing + newly created).
+    cuenta. Returns ``(todas, creadas)``: every row (existing + newly created),
+    and just the newly created ones.
 
     A cuenta in `_ESTADOS_CUENTA_CERRADA` never gets NEW rows: its checklist is
-    the historical record of what was radicated (round 3, finding #9).
+    the historical record of what was radicated (round 3, finding #9). The
+    refused codes are logged rather than silently dropped (round 4, finding #5).
+
+    ``ignorar_guard_cuenta_cerrada``: True ONLY from
+    `rematerializar_checklist`, the documented backfill/admin escape hatch
+    (round 4, finding #6). Every request path goes through `asegurar_checklist`,
+    which passes False.
 
     ``ctx``: pass an already-built `ChecklistAplicaCtx` when the caller (e.g.
     `construir_checklist_completo`) needs the exact same one for a later
@@ -759,7 +842,7 @@ async def asegurar_checklist(
     # A settled cuenta keeps exactly the checklist it was radicated with — see
     # `_ESTADOS_CUENTA_CERRADA` (round 3, finding #9). Existing rows are still
     # returned (and still readable/filterable); only NEW ones are refused.
-    puede_materializar = not cuenta_esta_cerrada(cuenta)
+    puede_materializar = ignorar_guard_cuenta_cerrada or not cuenta_esta_cerrada(cuenta)
 
     # Standard rows
     for req in catalogo:
@@ -815,7 +898,7 @@ async def asegurar_checklist(
     todas = [*filas, *creadas]
     await _detectar_alias_cdp(db, cuenta, todas, catalogo)
 
-    return todas
+    return todas, creadas
 
 
 def previsualizar_checklist(
@@ -3107,7 +3190,10 @@ async def listar_filas_visibles(db: AsyncSession, cuenta: CuentaCobro) -> list[D
     catalogo = await listar_catalogo(db)
     cat_by_codigo = {c.codigo: c for c in catalogo}
     # `vinculos` is eager-loaded because `_fila_tiene_contenido` reads it (round
-    # 3, finding #5) — lazy-loading it here would raise MissingGreenlet.
+    # 3, finding #5). `DocumentoCuentaCobro.vinculos` is declared lazy="raise",
+    # so a missed eager-load raises sqlalchemy.exc.InvalidRequestError — NOT
+    # MissingGreenlet: raiseload short-circuits before any IO is attempted, so
+    # the async greenlet boundary is never reached (round 4, finding #8).
     res = await db.execute(
         select(DocumentoCuentaCobro)
         .options(selectinload(DocumentoCuentaCobro.vinculos))
