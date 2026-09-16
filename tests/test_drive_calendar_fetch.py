@@ -427,6 +427,106 @@ async def test_calendar_fetch_fires_one_query_per_term_and_merges_by_id():
     assert any(q and "4161" in q for q in call_queries)  # contract number was one of the terms
 
 
+def _rate_limit_error():
+    from googleapiclient.errors import HttpError as GoogleHttpError
+
+    resp = MagicMock()
+    resp.status = 429
+    resp.reason = "rate limited"
+    return GoogleHttpError(resp=resp, content=b'{"error": {"message": "rate limited", "code": 429}}', uri=None)
+
+
+@pytest.mark.asyncio
+async def test_calendar_fetch_stops_firing_further_terms_after_one_term_exhausts_429_retries():
+    """WARNING regression: the per-term loop had no early-exit on a
+    definitively rate-limited term — a throttled Calendar keeps throttling
+    the NEXT term too, so blindly continuing to fire pays the same
+    retry/backoff cost again for nothing, for every remaining term."""
+    from app.agent.nodes import calendar_fetch as mod
+
+    call_queries: list[str | None] = []
+
+    async def _raise_429(usuario_id, time_min, time_max, calendar_id="primary", max_results=50, q=None):
+        call_queries.append(q)
+        raise _rate_limit_error()
+
+    mock_adapter = MagicMock()
+    mock_adapter.search_events = AsyncMock(side_effect=_raise_429)
+
+    obligaciones = [
+        {"id": f"ob{i}", "descripcion": f"{verbo.capitalize()} procesos territoriales anuales"}
+        for i, verbo in enumerate(
+            ["auditar", "certificar", "diagnosticar", "evaluar", "fiscalizar", "inspeccionar", "monitorear"]
+        )
+    ]
+    state = {
+        "user_id": uuid.uuid4(),
+        "_db": MagicMock(),
+        "contrato_contexto": {"fecha_inicio": "2024-04-01", "fecha_fin": "2024-04-30"},
+        "obligaciones_contexto": obligaciones,
+    }
+
+    with patch.object(mod, "GoogleCalendarAdapter", return_value=mock_adapter):
+        await mod.calendar_fetch_node(state)
+
+    # Fired at least the first term, but stopped well short of firing every
+    # term once the first came back definitively rate-limited.
+    assert 0 < len(call_queries) < len(obligaciones)
+
+
+@pytest.mark.asyncio
+async def test_calendar_fetch_has_an_overall_deadline_across_terms(monkeypatch):
+    """No per-term failure here — just slow-but-successful calls. Without an
+    overall deadline, a large obligación count means dozens of sequential
+    round trips with no time bound at all on a user-facing 'descubrir' click."""
+    import asyncio
+
+    from app.agent.nodes import calendar_fetch as mod
+
+    monkeypatch.setattr(mod.settings, "EVIDENCE_CALENDAR_FETCH_DEADLINE_SECONDS", 0.05)
+
+    call_queries: list[str | None] = []
+
+    async def _slow(usuario_id, time_min, time_max, calendar_id="primary", max_results=50, q=None):
+        call_queries.append(q)
+        await asyncio.sleep(0.03)
+        return []
+
+    mock_adapter = MagicMock()
+    mock_adapter.search_events = AsyncMock(side_effect=_slow)
+
+    obligaciones = [
+        {"id": f"ob{i}", "descripcion": f"{verbo.capitalize()} procesos territoriales anuales"}
+        for i, verbo in enumerate(
+            [
+                "auditar",
+                "certificar",
+                "diagnosticar",
+                "evaluar",
+                "fiscalizar",
+                "inspeccionar",
+                "monitorear",
+                "planificar",
+                "coordinar",
+                "ejecutar",
+            ]
+        )
+    ]
+    state = {
+        "user_id": uuid.uuid4(),
+        "_db": MagicMock(),
+        "contrato_contexto": {"fecha_inicio": "2024-04-01", "fecha_fin": "2024-04-30"},
+        "obligaciones_contexto": obligaciones,
+    }
+
+    with patch.object(mod, "GoogleCalendarAdapter", return_value=mock_adapter):
+        await mod.calendar_fetch_node(state)
+
+    assert 0 < len(call_queries) < len(obligaciones), (
+        f"deadline never engaged — fired all {len(call_queries)} terms despite a 0.05s deadline"
+    )
+
+
 @pytest.mark.asyncio
 async def test_calendar_fetch_includes_expanded_phrase_terms():
     """evidencias/discovery-fix WU7: LLM-generated search phrases must also be

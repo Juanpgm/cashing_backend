@@ -465,6 +465,15 @@ class Settings(BaseSettings):
     # the only source with no total cap, so a per-term fan-out could return
     # terms x EVIDENCE_MAX_EVENTS items into the filter/embedding batches.
     EVIDENCE_MAX_EVENTS_TOTAL: int = 60
+    # Round-3 fix (confirmed WARNING): calendar_fetch_node fires ONE
+    # events.list per search term with no concurrency and, previously, no
+    # deadline at all. GoogleCalendarAdapter._execute_with_retry can sleep up
+    # to 0.5+1+2 = 3.5s per throttled call before giving up, and the per-term
+    # fan-out this feature introduced can reach 20-40+ terms for a
+    # many-obligación contract — up to 90-150s of pure backoff sleep on a
+    # single user-facing "descubrir" click. This bounds the WHOLE per-term
+    # loop, not any single call.
+    EVIDENCE_CALENDAR_FETCH_DEADLINE_SECONDS: float = 20.0
     # drive_fetch: Drive API pageSize per search_files call (was a hardcoded
     # module constant of 10).
     EVIDENCE_DRIVE_PAGE_SIZE: int = 20

@@ -10,12 +10,15 @@ personales sin llamadas LLM adicionales.
 
 from __future__ import annotations
 
+import time
 from itertools import zip_longest
 
 import structlog
+from googleapiclient.errors import HttpError as GoogleHttpError
 
 from app.adapters.calendar.calendar_adapter import GoogleCalendarAdapter
 from app.adapters.calendar.port import CalendarEvent
+from app.adapters.email.gmail_adapter import _is_rate_limit_error
 from app.adapters.microsoft.graph_adapter import MicrosoftGraphAdapter
 from app.agent.prompts.contract_terms import contract_query_variants
 from app.agent.prompts.email_evidence import _extract_keywords
@@ -209,7 +212,22 @@ async def calendar_fetch_node(
     events_by_id: dict[str, CalendarEvent] = {}
     any_call_succeeded = False
     last_error: Exception | None = None
-    for q in queries:
+    # Round-3 fix (confirmed WARNING): the per-term fan-out had no overall
+    # deadline and no early-exit on a definitively rate-limited term — a
+    # throttled Calendar keeps throttling the NEXT term too, so blindly
+    # continuing paid the full retry/backoff cost again for every remaining
+    # term. Both guards below bound the WHOLE loop, not any single call.
+    deadline = time.monotonic() + settings.EVIDENCE_CALENDAR_FETCH_DEADLINE_SECONDS
+    for idx, q in enumerate(queries):
+        if time.monotonic() >= deadline:
+            skipped = len(queries) - idx
+            await logger.awarning(
+                "calendar_fetch_deadline_exceeded",
+                skipped_terms=skipped,
+                deadline_seconds=settings.EVIDENCE_CALENDAR_FETCH_DEADLINE_SECONDS,
+                provider=provider.value,
+            )
+            break
         try:
             events = await adapter.search_events(
                 user_id, time_min, time_max, max_results=settings.EVIDENCE_MAX_EVENTS, q=q
@@ -219,6 +237,15 @@ async def calendar_fetch_node(
             await logger.awarning(
                 "calendar_query_failed", query=q, error=str(exc), user_id=str(user_id), provider=provider.value
             )
+            if isinstance(exc, GoogleHttpError) and _is_rate_limit_error(exc):
+                skipped = len(queries) - idx - 1
+                if skipped:
+                    await logger.awarning(
+                        "calendar_fetch_terms_skipped_after_rate_limit",
+                        skipped_terms=skipped,
+                        provider=provider.value,
+                    )
+                break
             continue
         any_call_succeeded = True
         for ev in events:
