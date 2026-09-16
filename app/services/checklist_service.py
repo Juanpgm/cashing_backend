@@ -748,21 +748,29 @@ async def asegurar_checklist(
     mapeos_por_codigo = _mapeos_por_codigo(custom)
 
     creadas: list[DocumentoCuentaCobro] = []
+    # Codes the settled-cuenta guard refused to materialize. Collected instead of
+    # short-circuiting the loops so the refusal can be LOGGED (round 4, finding
+    # #5): the guard used to be a bare `break` with no log, no counter and
+    # nothing in the payload, so a truncated checklist was indistinguishable
+    # from a legitimately short one — which is what made the round-4 BLOCKER
+    # invisible in production.
+    omitidas: list[str] = []
 
     # A settled cuenta keeps exactly the checklist it was radicated with — see
     # `_ESTADOS_CUENTA_CERRADA` (round 3, finding #9). Existing rows are still
     # returned (and still readable/filterable); only NEW ones are refused.
-    puede_materializar = cuenta.estado not in _ESTADOS_CUENTA_CERRADA
+    puede_materializar = not cuenta_esta_cerrada(cuenta)
 
     # Standard rows
     for req in catalogo:
-        if not puede_materializar:
-            break
         if req.codigo not in codigos_estandar:
             continue
         if not _aplica_con_mapeo(req, ctx, mapeos_por_codigo):
             continue
         if req.codigo in por_codigo:
+            continue
+        if not puede_materializar:
+            omitidas.append(req.codigo)
             continue
         fila = DocumentoCuentaCobro(
             cuenta_cobro_id=cuenta.id,
@@ -774,13 +782,16 @@ async def asegurar_checklist(
 
     # Custom rows (only when the mode includes custom requisitos). A custom item
     # mapped to a standard code is already covered by the standard row above.
-    if puede_materializar and modo in ("augment", "reemplazar"):
+    if modo in ("augment", "reemplazar"):
         for item in custom:
             if item.mapea_a_estandar:
                 continue
             if item.solo_primera_cuenta and not ctx.is_first:
                 continue
             if item.id in por_custom:
+                continue
+            if not puede_materializar:
+                omitidas.append(item.codigo)
                 continue
             fila = DocumentoCuentaCobro(
                 cuenta_cobro_id=cuenta.id,
@@ -789,6 +800,14 @@ async def asegurar_checklist(
             )
             db.add(fila)
             creadas.append(fila)
+
+    if omitidas:
+        await logger.awarning(
+            "checklist_materializacion_bloqueada_cuenta_cerrada",
+            cuenta_id=str(cuenta.id),
+            estado=cuenta.estado.value,
+            codigos_omitidos=sorted(omitidas),
+        )
 
     if creadas:
         await db.flush()

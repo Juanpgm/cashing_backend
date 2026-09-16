@@ -2077,3 +2077,58 @@ async def test_self_heal_conserva_los_vinculos_que_si_estan_en_el_pool(
         .all()
     )
     assert set(restantes) == {bueno.id}
+
+
+async def test_asegurar_checklist_registra_la_materializacion_bloqueada(
+    db: AsyncSession, contrato: Contrato
+) -> None:
+    """checklist/primera-cuota-2026-09-16, round 4, finding #5 (WARNING): the
+    settled-cuenta guard was a bare `break` — no log, no counter, nothing in the
+    payload. Neither the user, support, nor the logs could tell "this cuenta
+    legitimately has N requisitos" from "the guard silently swallowed two of
+    them", which is exactly why the round-4 BLOCKER was undetectable."""
+    import structlog
+
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    await checklist_service.asegurar_checklist(db, cuenta)
+    await db.commit()
+
+    fila = (
+        await db.execute(
+            select(DocumentoCuentaCobro).where(
+                DocumentoCuentaCobro.cuenta_cobro_id == cuenta.id,
+                DocumentoCuentaCobro.requisito_codigo == "CONTRATO",
+            )
+        )
+    ).scalar_one()
+    await db.delete(fila)
+    cuenta.estado = EstadoCuentaCobro.APROBADA
+    await db.commit()
+
+    with structlog.testing.capture_logs() as logs:
+        await checklist_service.asegurar_checklist(db, cuenta)
+
+    bloqueos = [ln for ln in logs if ln["event"] == "checklist_materializacion_bloqueada_cuenta_cerrada"]
+    assert len(bloqueos) == 1
+    assert bloqueos[0]["log_level"] == "warning"
+    assert bloqueos[0]["estado"] == "aprobada"
+    assert bloqueos[0]["cuenta_id"] == str(cuenta.id)
+    assert bloqueos[0]["codigos_omitidos"] == ["CONTRATO"]
+
+
+async def test_asegurar_checklist_no_registra_nada_cuando_no_falta_ninguna_fila(
+    db: AsyncSession, contrato: Contrato
+) -> None:
+    """Control: a settled cuenta whose checklist is already complete is an
+    ordinary idempotent no-op and must stay quiet."""
+    import structlog
+
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    await checklist_service.asegurar_checklist(db, cuenta)
+    cuenta.estado = EstadoCuentaCobro.PAGADA
+    await db.commit()
+
+    with structlog.testing.capture_logs() as logs:
+        await checklist_service.asegurar_checklist(db, cuenta)
+
+    assert not [ln for ln in logs if ln["event"] == "checklist_materializacion_bloqueada_cuenta_cerrada"]
