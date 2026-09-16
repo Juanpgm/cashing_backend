@@ -75,6 +75,17 @@ def _to_gmail_date(date_str: str) -> str:
     return (date_str or "").strip().replace("-", "/")
 
 
+def _truncate_head_tail(text: str, head: int = 2000, tail: int = 500) -> str:
+    """Keep the first `head` chars AND the last `tail` chars of `text` when it's
+    longer than `head + tail` — a bare head-only truncation (the old [:800])
+    silently dropped closing content (signature blocks, final approvals) that
+    often carries the entity/supervisor signal (evidencias/discovery-fix WU5).
+    """
+    if len(text) <= head + tail:
+        return text
+    return f"{text[:head]}\n[...]\n{text[-tail:]}"
+
+
 async def _resolve_contrato_id(
     db: AsyncSession, usuario_id: uuid.UUID, req: EvidenceDiscoveryRequest
 ) -> uuid.UUID | None:
@@ -355,7 +366,7 @@ async def _gather_email_evidence(
                 attachment = m.attachments[0] if m.attachments else None
                 emails_by_id[m.id] = {
                     "source": "email",
-                    "content": (m.body_plain or m.snippet or "")[:800],
+                    "content": _truncate_head_tail(m.body_plain or m.snippet or ""),
                     "title": m.subject,
                     "subject": m.subject,
                     "link": _email_permalink(provider, m.id, getattr(m, "web_link", "")),

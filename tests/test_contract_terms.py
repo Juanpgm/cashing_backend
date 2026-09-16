@@ -9,7 +9,7 @@ search or scoring signal. These variants close that gap.
 
 from __future__ import annotations
 
-from app.agent.prompts.contract_terms import contract_number_variants, contract_search_terms
+from app.agent.prompts.contract_terms import contract_header, contract_number_variants, contract_search_terms
 
 
 class TestContractNumberVariants:
@@ -103,3 +103,37 @@ class TestContractSearchTerms:
         contexto = {"numero_contrato": "CTO-123/2025", "entidad": "CTO"}
         terms = contract_search_terms(contexto)
         assert len(terms) == len(set(terms))
+
+
+class TestContractHeader:
+    def test_none_returns_empty_string(self) -> None:
+        assert contract_header(None) == ""
+
+    def test_empty_dict_returns_empty_string(self) -> None:
+        assert contract_header({}) == ""
+
+    def test_includes_numero_entidad_objeto_periodo(self) -> None:
+        header = contract_header(
+            {
+                "numero_contrato": "4161.010.26.1.027.2025",
+                "entidad": "DAGMA",
+                "objeto": "Prestación de servicios profesionales de apoyo a la gestión",
+                "fecha_inicio": "2024-02-01",
+                "fecha_fin": "2024-12-31",
+            }
+        )
+        assert "4161.010.26.1.027.2025" in header
+        assert "DAGMA" in header
+        assert "apoyo a la gestión" in header
+        assert "2024-02-01" in header and "2024-12-31" in header
+
+    def test_truncates_long_objeto_to_about_300_chars(self) -> None:
+        header = contract_header({"objeto": "x" * 500})
+        objeto_line = next(line for line in header.splitlines() if line.startswith("Objeto:"))
+        assert len(objeto_line) < 320
+
+    def test_missing_fields_omitted_gracefully(self) -> None:
+        header = contract_header({"numero_contrato": "CTR-001"})
+        assert "CTR-001" in header
+        assert "Entidad" not in header
+        assert "Objeto" not in header

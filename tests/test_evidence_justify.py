@@ -127,6 +127,87 @@ async def test_evidence_justify_parses_strict_actividad_justificacion_format():
 
 
 @pytest.mark.asyncio
+async def test_evidence_justify_parses_json_format_first():
+    """evidencias/discovery-fix WU5: a well-formed JSON {"actividad", "justificacion"}
+    response must parse WITHOUT falling back to the ACTIVIDAD:/JUSTIFICACION: regex."""
+    from app.agent.nodes import evidence_justify as mod
+
+    fake_resp = MagicMock()
+    fake_resp.content = (
+        '{"actividad": "Elaboré y entregué el informe mensual de avance al supervisor.", '
+        '"justificacion": "El informe adjunto (informe.pdf, 2024-04-10) demuestra el cumplimiento."}'
+    )
+    mock_llm = AsyncMock()
+    mock_llm.complete = AsyncMock(return_value=fake_resp)
+
+    state = {
+        "obligaciones_contexto": [{"id": "ob1", "descripcion": "Entregar informe mensual"}],
+        "matched_evidence": {
+            "ob1": [{"source": "drive", "title": "informe.pdf", "link": "https://drive/x", "date": "2024-04-10"}]
+        },
+    }
+
+    with patch.object(mod, "get_llm", return_value=mock_llm):
+        result = await mod.evidence_justify_node(state)
+
+    just = result["justificaciones"][0]
+    assert just["actividad"] == "Elaboré y entregué el informe mensual de avance al supervisor."
+    assert just["justificacion"].startswith("El informe adjunto")
+    assert just["origen"] == "llm"
+
+
+@pytest.mark.asyncio
+async def test_evidence_justify_malformed_json_falls_back_to_regex_format():
+    """A response that LOOKS like JSON but is malformed must still fall back to
+    the ACTIVIDAD:/JUSTIFICACION: regex parser instead of returning None outright."""
+    from app.agent.nodes import evidence_justify as mod
+
+    fake_resp = MagicMock()
+    fake_resp.content = (
+        '{"actividad": "no cierra bien...\n'
+        "ACTIVIDAD: Elaboré y entregué el informe mensual.\n"
+        "JUSTIFICACION: El informe adjunto demuestra el cumplimiento de la obligación."
+    )
+    mock_llm = AsyncMock()
+    mock_llm.complete = AsyncMock(return_value=fake_resp)
+
+    state = {
+        "obligaciones_contexto": [{"id": "ob1", "descripcion": "Entregar informe mensual"}],
+        "matched_evidence": {"ob1": [{"source": "drive", "title": "informe.pdf", "link": "https://drive/x"}]},
+    }
+
+    with patch.object(mod, "get_llm", return_value=mock_llm):
+        result = await mod.evidence_justify_node(state)
+
+    just = result["justificaciones"][0]
+    assert just["actividad"] == "Elaboré y entregué el informe mensual."
+    assert just["origen"] == "llm"
+
+
+@pytest.mark.asyncio
+async def test_evidence_justify_includes_contract_header_in_prompt():
+    from app.agent.nodes import evidence_justify as mod
+
+    fake_resp = MagicMock()
+    fake_resp.content = "ACTIVIDAD: Actividad.\nJUSTIFICACION: Justificación distinta y suficiente."
+    mock_llm = AsyncMock()
+    mock_llm.complete = AsyncMock(return_value=fake_resp)
+
+    state = {
+        "obligaciones_contexto": [{"id": "ob1", "descripcion": "Entregar informe mensual"}],
+        "matched_evidence": {"ob1": [{"source": "drive", "title": "informe.pdf", "link": "https://drive/x"}]},
+        "contrato_contexto": {"numero_contrato": "4161.010.26.1.027.2025", "entidad": "DAGMA"},
+    }
+
+    with patch.object(mod, "get_llm", return_value=mock_llm):
+        await mod.evidence_justify_node(state)
+
+    prompt = mock_llm.complete.call_args.args[0][1].content
+    assert "4161.010.26.1.027.2025" in prompt
+    assert "DAGMA" in prompt
+
+
+@pytest.mark.asyncio
 async def test_evidence_justify_near_identical_llm_output_falls_back_deterministically():
     """If the LLM (despite the FORBID rules) returns the SAME text for both ACTIVIDAD
     and JUSTIFICACION, the node must not persist two copies — justificacion falls

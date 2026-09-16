@@ -16,6 +16,7 @@ import re
 import structlog
 
 from app.adapters.llm import get_llm
+from app.agent.prompts.contract_terms import contract_header
 from app.agent.prompts.evidence_filter import (
     WORK_NOISE_SYSTEM_PROMPT,
     build_work_noise_prompt,
@@ -36,11 +37,15 @@ _JSON_RE = re.compile(r"\[.*\]", re.DOTALL)
 _LLM_BATCH_SIZE = 15
 
 
-async def _llm_classify_batch(items: list[dict], llm) -> list[bool]:  # True = TRABAJO
+async def _llm_classify_batch(
+    items: list[dict], llm, contrato_contexto: dict | None = None
+) -> list[bool]:  # True = TRABAJO
     """Clasifica un lote de items como TRABAJO o RUIDO vía LLM.
 
     En caso de error de LLM o parseo, conserva todos los items (safe default).
     Devuelve lista de booleans (True = conservar) con mismo índice que `items`.
+    `contrato_contexto` (evidencias/discovery-fix WU5) feeds the shared
+    contract header into the prompt.
     """
     if not items:
         return []
@@ -48,7 +53,7 @@ async def _llm_classify_batch(items: list[dict], llm) -> list[bool]:  # True = T
     indexed = [
         {"idx": i, "source": it["source"], "title": it["title"], "content": it["content"]} for i, it in enumerate(items)
     ]
-    prompt = build_work_noise_prompt(indexed)
+    prompt = build_work_noise_prompt(indexed, header=contract_header(contrato_contexto))
 
     try:
         resp = await llm.complete(
@@ -164,8 +169,8 @@ async def evidence_filter_node(state: AgentState) -> AgentState:
 
     for batch_start in range(0, len(clasificables), _LLM_BATCH_SIZE):
         batch = clasificables[batch_start : batch_start + _LLM_BATCH_SIZE]
-        keep_flags = await _llm_classify_batch(batch, llm)
-        for item, keep in zip(batch, keep_flags):
+        keep_flags = await _llm_classify_batch(batch, llm, state.get("contrato_contexto"))
+        for item, keep in zip(batch, keep_flags, strict=True):
             if keep:
                 kept.append(item)
             else:

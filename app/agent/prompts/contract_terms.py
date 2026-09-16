@@ -95,6 +95,42 @@ def _normalize_entidad(entidad: str | None) -> str:
     return name.strip()
 
 
+def contract_header(contexto: dict[str, object] | None) -> str:
+    """Shared Spanish contract-context header — número, entidad, objeto
+    (truncated ~300 chars) and período — used by the matcher, work-noise
+    filter and justifier prompts so the LLM always has contract context
+    (evidencias/discovery-fix WU5, root cause #8: these prompts previously
+    received NO contract information at all). Returns "" when contexto is
+    empty/None, so callers can safely prepend it to any prompt unconditionally.
+    """
+    contexto = contexto or {}
+    lines: list[str] = []
+
+    numero = contexto.get("numero_contrato")
+    if isinstance(numero, str) and numero.strip():
+        lines.append(f"Número de contrato: {numero.strip()}")
+
+    entidad = contexto.get("entidad")
+    if isinstance(entidad, str) and entidad.strip():
+        lines.append(f"Entidad: {entidad.strip()}")
+
+    objeto = contexto.get("objeto")
+    if isinstance(objeto, str) and objeto.strip():
+        objeto_str = objeto.strip()
+        if len(objeto_str) > 300:
+            objeto_str = objeto_str[:300].rstrip() + "…"
+        lines.append(f"Objeto: {objeto_str}")
+
+    fecha_inicio = contexto.get("fecha_inicio")
+    fecha_fin = contexto.get("fecha_fin")
+    if fecha_inicio or fecha_fin:
+        lines.append(f"Período: {fecha_inicio or '?'} a {fecha_fin or '?'}")
+
+    if not lines:
+        return ""
+    return "Contexto del contrato:\n" + "\n".join(lines)
+
+
 def contract_search_terms(contexto: dict[str, object] | None) -> list[str]:
     """Combine contract-number variants + normalized entidad + salient objeto
     keywords into a single, deduplicated, order-preserving term list — the

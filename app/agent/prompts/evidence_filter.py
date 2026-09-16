@@ -654,9 +654,16 @@ Responde ÚNICAMENTE con un array JSON válido:
 """
 
 
-def build_work_noise_prompt(items: list[dict]) -> str:
-    """Build user prompt for batch work/noise classification."""
-    lines = ["Clasifica estos ítems como TRABAJO o RUIDO:\n"]
+def build_work_noise_prompt(items: list[dict], header: str = "") -> str:
+    """Build user prompt for batch work/noise classification.
+
+    `header` (evidencias/discovery-fix WU5) is the shared contract-context
+    block (see `app.agent.prompts.contract_terms.contract_header`) — without
+    it the LLM has no way to recognize that a given sender/domain is this
+    contract's own entity correspondence.
+    """
+    intro = "Clasifica estos ítems como TRABAJO o RUIDO:\n"
+    lines = [header, intro] if header else [intro]
     for item in items:
         lines.append(
             f"[{item['idx']}] Fuente: {item['source']} | "

@@ -20,6 +20,7 @@ from app.agent.prompts.actividad_generation import (
     is_near_identical,
     parse_actividad_justificacion,
 )
+from app.agent.prompts.contract_terms import contract_header
 from app.agent.prompts.evidence_justification import format_evidencias_for_prompt
 from app.agent.state import AgentState
 from app.schemas.agent import LLMMessage
@@ -210,9 +211,9 @@ async def evidence_justify_node(state: AgentState) -> AgentState:
     matched: dict[str, list[dict]] = state.get("matched_evidence") or {}
     obligaciones = state.get("obligaciones_contexto") or state.get("obligaciones_extraidas") or []
     contrato = state.get("contrato_contexto") or {}
-    contrato_contexto = ""
-    if contrato:
-        contrato_contexto = ", ".join(f"{k}: {v}" for k, v in contrato.items() if v)
+    # Shared header (evidencias/discovery-fix WU5) — número/entidad/objeto/
+    # período in one Spanish block, same as the matcher and work-noise prompts.
+    contrato_contexto = contract_header(contrato)
     actividades_previas = state.get("actividades_previas") or []
     contexto_usuario = str(state.get("contexto_usuario") or "")
 

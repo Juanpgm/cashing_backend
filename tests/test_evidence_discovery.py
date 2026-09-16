@@ -528,6 +528,36 @@ async def test_gather_gmail_evidence_uses_settings_max_emails_per_query(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_gather_gmail_evidence_body_truncation_keeps_head_and_tail() -> None:
+    """A long email body must keep its head (2000 chars) AND tail (500 chars) —
+    not just the first 800 chars, which used to silently drop closing content
+    like a signature block mentioning the entity/supervisor (evidencias/
+    discovery-fix WU5)."""
+    from app.services import evidence_discovery_service as eds
+
+    body = "A" * 3000 + "TAIL_MARKER_END"
+    msg = _email("m-long", "Informe", body)
+
+    adapter = MagicMock()
+    adapter.search_messages = AsyncMock(return_value=[msg])
+
+    with patch.object(eds, "GmailAdapter", return_value=adapter):
+        emails, _ = await eds._gather_email_evidence(
+            MagicMock(),
+            uuid.uuid4(),
+            [{"id": "ob1", "descripcion": "Entregar informe mensual de actividades"}],
+            "2024-04-01",
+            "2024-04-30",
+            None,
+            None,
+        )
+
+    content = emails[0]["content"]
+    assert "TAIL_MARKER_END" in content
+    assert len(content) < len(body)
+
+
+@pytest.mark.asyncio
 async def test_gather_gmail_evidence_never_filters_email_containing_contract_number(monkeypatch) -> None:
     """An email from an auto-prefix-style sender (e.g. notificaciones@) that
     mentions the contract number must survive the noise heuristic — it's real

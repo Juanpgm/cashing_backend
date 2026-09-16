@@ -217,6 +217,44 @@ async def test_llm_classify_batch_sends_reasoning_effort():
 
 
 @pytest.mark.asyncio
+async def test_llm_classify_batch_includes_contract_header_in_prompt():
+    """evidencias/discovery-fix WU5: the work-noise prompt must carry contract
+    context so the LLM can recognize entity correspondence it would otherwise
+    have no way to associate with this specific contract."""
+    from app.agent.nodes.evidence_filter import _llm_classify_batch
+
+    llm = AsyncMock()
+    llm.complete = AsyncMock(return_value=MagicMock(content='[{"idx": 0, "verdict": "TRABAJO"}]'))
+
+    items = [_email_item("Acta de reunión", sender="coord@entidad.gov.co")]
+    await _llm_classify_batch(
+        items, llm, contrato_contexto={"numero_contrato": "4161.010.26.1.027.2025", "entidad": "DAGMA"}
+    )
+
+    prompt = llm.complete.call_args.args[0][1].content
+    assert "4161.010.26.1.027.2025" in prompt
+    assert "DAGMA" in prompt
+
+
+@pytest.mark.asyncio
+async def test_evidence_filter_node_passes_contrato_contexto_to_llm_batch():
+    from app.agent.nodes import evidence_filter as mod
+
+    llm = AsyncMock()
+    llm.complete = AsyncMock(return_value=MagicMock(content='[{"idx": 0, "verdict": "TRABAJO"}]'))
+
+    state = {
+        "evidence_raw": [_email_item("Informe mensual", sender="supervisor@entidad.gov.co")],
+        "contrato_contexto": {"numero_contrato": "CTR-999"},
+    }
+    with patch.object(mod, "get_llm", return_value=llm):
+        await mod.evidence_filter_node(state)
+
+    prompt = llm.complete.call_args.args[0][1].content
+    assert "CTR-999" in prompt
+
+
+@pytest.mark.asyncio
 async def test_evidence_filter_node_constructs_llm_against_live_groq_model():
     """groq/llama-3.1-8b-instant was decommissioned by Groq — evidence_filter_node
     must build its LLM client against the current model."""

@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from app.adapters.llm import get_llm
-from app.agent.prompts.contract_terms import contract_number_variants
+from app.agent.prompts.contract_terms import contract_header, contract_number_variants
 from app.agent.state import AgentState
 from app.core.config import settings
 from app.schemas.agent import LLMMessage
@@ -37,11 +37,30 @@ _FALLBACK_ACCEPT_THRESHOLD = 0.30
 _LLM_FANOUT_CONCURRENCY = 5
 
 _RELEVANCE_BATCH_SYSTEM = """\
-Eres un clasificador. Dada una obligación contractual y una lista numerada de evidencias, \
-indica cuáles evidencias son RELEVANTES para demostrar el cumplimiento de esa obligación.
+Eres un clasificador experto en contratos de prestación de servicios de la función \
+pública colombiana. Dada una obligación contractual y una lista numerada de evidencias, \
+indica cuáles evidencias demuestran razonablemente el cumplimiento de esa obligación.
 
-Responde SOLO con un array JSON de los números (empezando en 1) de las evidencias relevantes. \
-Ejemplo: [1, 3]. Si ninguna es relevante, responde [].
+CUENTA COMO EVIDENCIA (relevante):
+- Informes, actas, entregables, planillas de seguridad social, aprobaciones o vistos buenos.
+- Correos con el supervisor o funcionarios de la entidad contratante.
+- Reuniones o videollamadas (Meet/Teams) con la entidad, con o sin acta formal.
+- Documentos que mencionan el número de contrato, la entidad o el objeto contractual.
+
+NO CUENTA COMO EVIDENCIA (no relevante):
+- Boletines, newsletters o notificaciones automáticas sin relación con el contrato.
+- Correos personales o de marketing.
+- Contenido genérico que no demuestra ninguna actividad del contratista.
+
+Responde ÚNICAMENTE con un array JSON de objetos, uno por evidencia numerada:
+[{"idx": 1, "relevante": true, "score": 0.9, "razon": "menciona el informe mensual"}, ...]
+
+- "idx": número de la evidencia (empezando en 1).
+- "relevante": true/false.
+- "score": qué tan seguro estás de la relevancia, de 0 a 1.
+- "razon": explicación breve (una frase).
+
+Si ninguna evidencia es relevante, responde [].
 """
 
 _JSON_RE = re.compile(r"\[.*\]", re.DOTALL)
@@ -204,8 +223,58 @@ def _fallback_flags(keyword_scores: list[float] | None, n: int) -> list[bool]:
     return [score >= _FALLBACK_ACCEPT_THRESHOLD for score in keyword_scores]
 
 
+def _parse_relevance_response(raw: str, n: int) -> list[bool] | None:
+    """Parse the LLM's relevance-batch answer, tolerant of two shapes:
+
+    1. NEW structured format (evidencias/discovery-fix WU5): a JSON array of
+       `{"idx": int, "relevante": bool, "score": 0-1, "razon": str}` objects.
+       An item is kept only when `relevante` is true AND its `score` (when
+       present) clears `settings.EVIDENCE_RELEVANCE_MIN`.
+    2. LEGACY format: a flat JSON array of relevant indices, e.g. `[1, 3]` —
+       kept for backward compatibility with older/smaller models that don't
+       follow the structured contract.
+
+    Returns `None` (never a list) when the response has no parseable JSON at
+    all — the caller falls back to the deterministic keyword-score bar.
+    """
+    match = _JSON_RE.search(raw or "")
+    if not match:
+        return None
+    try:
+        items = json.loads(match.group(0))
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(items, list):
+        return None
+    if not items:
+        return [False] * n
+
+    if all(isinstance(item, dict) for item in items):
+        flags = [False] * n
+        threshold = settings.EVIDENCE_RELEVANCE_MIN
+        for item in items:
+            idx = item.get("idx")
+            if not isinstance(idx, (int, float)):
+                continue
+            i = int(idx) - 1
+            if not (0 <= i < n):
+                continue
+            score = item.get("score")
+            score_ok = not isinstance(score, (int, float)) or score >= threshold
+            flags[i] = bool(item.get("relevante", False)) and score_ok
+        return flags
+
+    # Legacy flat int-list format.
+    relevant_idx = {int(item) for item in items if isinstance(item, (int, float))}
+    return [(i + 1) in relevant_idx for i in range(n)]
+
+
 async def _llm_relevance_batch(
-    obligation: str, evidences: list[str], llm, keyword_scores: list[float] | None = None
+    obligation: str,
+    evidences: list[str],
+    llm,
+    keyword_scores: list[float] | None = None,
+    contrato_contexto: dict | None = None,
 ) -> list[bool]:
     """Classify all candidate evidences for one obligation in a SINGLE LLM call.
 
@@ -216,11 +285,13 @@ async def _llm_relevance_batch(
     if not evidences:
         return []
 
-    listado = "\n".join(f"{i + 1}. {ev[:600]}" for i, ev in enumerate(evidences))
+    header = contract_header(contrato_contexto)
+    listado = "\n".join(f"{i + 1}. {ev[:1500]}" for i, ev in enumerate(evidences))
     prompt = (
-        f"Obligación: {obligation[:500]}\n\n"
-        f"Evidencias:\n{listado}\n\n"
-        "¿Cuáles evidencias son relevantes? Responde solo el array JSON de números."
+        (f"{header}\n\n" if header else "")
+        + f"Obligación: {obligation[:800]}\n\n"
+        + f"Evidencias:\n{listado}\n\n"
+        + "Clasifica cada evidencia según las instrucciones."
     )
     try:
         resp = await llm.complete(
@@ -230,20 +301,17 @@ async def _llm_relevance_batch(
             ],
             temperature=0.0,
             # groq/openai/gpt-oss-20b is a reasoning model — reasoning_tokens count
-            # against max_tokens before the visible JSON array output; 120 gives
-            # real headroom above the verified-working 64, per the empirical
-            # investigation in the groq-fallback-model-decommissioned fix (see
-            # this commit and the sibling `max_tokens` tuning in
-            # `evidence_filter.py`/`cruzar_service.py` from the same fix).
-            max_tokens=120,
+            # against max_tokens before the visible JSON array output. Raised from
+            # 120 to 800 (evidencias/discovery-fix WU5): the structured
+            # {"idx","relevante","score","razon"} output is far larger per-item
+            # than the old bare-int-array contract and needs real headroom.
+            max_tokens=800,
             reasoning_effort="low",
         )
-        match = _JSON_RE.search(resp.content)
-        if not match:
+        flags = _parse_relevance_response(resp.content, len(evidences))
+        if flags is None:
             return _fallback_flags(keyword_scores, len(evidences))
-        nums = json.loads(match.group(0))
-        relevant_idx = {int(n) for n in nums if isinstance(n, (int, float))}
-        return [(i + 1) in relevant_idx for i in range(len(evidences))]
+        return flags
     except Exception as exc:
         logger.warning(
             "evidence_matcher_llm_relevance_failed",
@@ -298,6 +366,7 @@ async def _match_una_obligacion(
     llm: Any,
     sem: asyncio.Semaphore,
     numero_variants: list[str] | None = None,
+    contrato_contexto: dict | None = None,
 ) -> tuple[str, list[dict], dict[str, float]]:
     """Resolve matches for ONE obligación — the per-obligación body of the
     (now-parallelized) loop in `evidence_matcher_node`. Touches NO shared
@@ -357,7 +426,7 @@ async def _match_una_obligacion(
         blended_scores = [s for _ev, s in candidates_scored]
         async with sem:
             flags = await _llm_relevance_batch(
-                ob_text, [ev.get("content", "") for ev in candidates], llm, blended_scores
+                ob_text, [ev.get("content", "") for ev in candidates], llm, blended_scores, contrato_contexto
             )
         matched_list.extend(ev for ev, keep in zip(candidates, flags, strict=True) if keep)
         # Additive: the blended score behind each KEPT match, keyed by the
@@ -425,7 +494,9 @@ async def evidence_matcher_node(state: AgentState) -> AgentState:
             ob_id = str(i)
         ob_vec = ob_embeddings[i] if ob_embeddings is not None else None
         tareas.append(
-            _match_una_obligacion(str(ob_id), ob_text, ob_vec, evidence_raw, ev_embeddings, llm, sem, numero_variants)
+            _match_una_obligacion(
+                str(ob_id), ob_text, ob_vec, evidence_raw, ev_embeddings, llm, sem, numero_variants, contrato_contexto
+            )
         )
 
     for ob_id, matched_list, scores_dict in await asyncio.gather(*tareas):

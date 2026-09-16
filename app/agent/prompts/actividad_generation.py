@@ -14,6 +14,7 @@ same text (or one a paraphrase of the other).
 
 from __future__ import annotations
 
+import json
 import re
 import unicodedata
 
@@ -91,13 +92,46 @@ _ACTIVIDAD_RE = re.compile(r"ACTIVIDAD\s*:\s*(.+?)(?:\n\s*JUSTIFICACION\s*:|\Z)"
 _JUSTIFICACION_RE = re.compile(r"JUSTIFICACION\s*:\s*(.+)", re.IGNORECASE | re.DOTALL)
 
 
-def parse_actividad_justificacion(content: str) -> tuple[str, str] | None:
-    """Parse the strict `ACTIVIDAD: ...` / `JUSTIFICACION: ...` format.
+_JSON_OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)
 
-    Returns (actividad, justificacion) or None if the response doesn't follow the
-    contract (e.g. a small/local model ignored the format instruction) — callers
-    should fall back to a deterministic, non-echoing text in that case.
+
+def _parse_json_actividad_justificacion(content: str) -> tuple[str, str] | None:
+    """Parse a `{"actividad": ..., "justificacion": ...}` JSON response
+    (evidencias/discovery-fix WU5). Returns None on ANY parse/shape failure —
+    the caller falls back to the legacy ACTIVIDAD:/JUSTIFICACION: regex."""
+    match = _JSON_OBJ_RE.search(content)
+    if not match:
+        return None
+    try:
+        data = json.loads(match.group(0))
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    actividad = data.get("actividad")
+    justificacion = data.get("justificacion")
+    if not isinstance(actividad, str) or not isinstance(justificacion, str):
+        return None
+    actividad, justificacion = actividad.strip(), justificacion.strip()
+    if not actividad or not justificacion:
+        return None
+    return actividad, justificacion
+
+
+def parse_actividad_justificacion(content: str) -> tuple[str, str] | None:
+    """Parse the model's actividad/justificación answer.
+
+    Tries the JSON `{"actividad": ..., "justificacion": ...}` format FIRST
+    (evidencias/discovery-fix WU5), then falls back to the legacy strict
+    `ACTIVIDAD: ...` / `JUSTIFICACION: ...` format. Returns None if the
+    response follows neither contract (e.g. a small/local model ignored the
+    format instruction) — callers should fall back to a deterministic,
+    non-echoing text in that case.
     """
+    parsed = _parse_json_actividad_justificacion(content)
+    if parsed is not None:
+        return parsed
+
     m_act = _ACTIVIDAD_RE.search(content)
     m_just = _JUSTIFICACION_RE.search(content)
     if not m_act or not m_just:

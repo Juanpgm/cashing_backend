@@ -95,6 +95,88 @@ async def test_matcher_contract_number_match_still_allows_llm_for_other_candidat
 
 
 @pytest.mark.asyncio
+async def test_matcher_relevance_batch_structured_json_output() -> None:
+    """The rewritten prompt (evidencias/discovery-fix WU5) asks for structured
+    JSON with a per-item score; a score below EVIDENCE_RELEVANCE_MIN must be
+    rejected even when relevante=true."""
+    fake = _CountingLLM(
+        '[{"idx": 1, "relevante": true, "score": 0.8, "razon": "coincide"}, '
+        '{"idx": 2, "relevante": true, "score": 0.2, "razon": "debil"}]'
+    )
+    state = {
+        "obligaciones_extraidas": [{"id": "ob1", "descripcion": "realizar informes tecnicos mensuales consultoria"}],
+        "evidence_raw": [
+            {"id": "a", "content": "informes tecnicos mensuales realizados consultoria"},
+            {"id": "b", "content": "informes tecnicos mensuales asesoria adicional"},
+        ],
+    }
+
+    with patch.object(evidence_matcher, "get_llm", return_value=fake):
+        result = await evidence_matcher.evidence_matcher_node(state)
+
+    matched_ids = {e["id"] for e in result["matched_evidence"]["ob1"]}
+    assert matched_ids == {"a"}  # "b" scored 0.2 < EVIDENCE_RELEVANCE_MIN (0.5)
+
+
+@pytest.mark.asyncio
+async def test_matcher_relevance_batch_legacy_int_list_still_parsed() -> None:
+    """Tolerant fallback: the OLD plain-int-list format (`[1]`) must still work."""
+    fake = _CountingLLM("[1]")
+    state = {
+        "obligaciones_extraidas": [{"id": "ob1", "descripcion": "realizar informes tecnicos mensuales consultoria"}],
+        "evidence_raw": [
+            {"id": "a", "content": "informes tecnicos mensuales realizados consultoria"},
+            {"id": "b", "content": "informes administrativos presupuesto reunion"},
+        ],
+    }
+
+    with patch.object(evidence_matcher, "get_llm", return_value=fake):
+        result = await evidence_matcher.evidence_matcher_node(state)
+
+    assert [e["id"] for e in result["matched_evidence"]["ob1"]] == ["a"]
+
+
+@pytest.mark.asyncio
+async def test_matcher_relevance_batch_max_tokens_raised_to_800() -> None:
+    fake = _CountingLLM("[1]")
+    state = {
+        "obligaciones_extraidas": [{"id": "ob1", "descripcion": "realizar informes tecnicos mensuales consultoria"}],
+        "evidence_raw": [{"id": "a", "content": "informes tecnicos mensuales realizados consultoria"}],
+    }
+
+    with patch.object(evidence_matcher, "get_llm", return_value=fake):
+        await evidence_matcher.evidence_matcher_node(state)
+
+    assert fake.last_kwargs["max_tokens"] == 800
+
+
+@pytest.mark.asyncio
+async def test_matcher_relevance_batch_includes_contract_header_in_prompt() -> None:
+    class _CapturingLLM:
+        def __init__(self, content: str) -> None:
+            self.content = content
+            self.last_messages: list | None = None
+
+        async def complete(self, messages, temperature=0.0, max_tokens=64, **kwargs) -> _FakeResp:
+            self.last_messages = messages
+            return _FakeResp(self.content)
+
+    fake = _CapturingLLM("[1]")
+    state = {
+        "obligaciones_extraidas": [{"id": "ob1", "descripcion": "realizar informes tecnicos mensuales consultoria"}],
+        "evidence_raw": [{"id": "a", "content": "informes tecnicos mensuales realizados consultoria"}],
+        "contrato_contexto": {"numero_contrato": "4161.010.26.1.027.2025", "entidad": "DAGMA"},
+    }
+
+    with patch.object(evidence_matcher, "get_llm", return_value=fake):
+        await evidence_matcher.evidence_matcher_node(state)
+
+    prompt_text = "\n".join(m.content for m in fake.last_messages)
+    assert "4161.010.26.1.027.2025" in prompt_text
+    assert "DAGMA" in prompt_text
+
+
+@pytest.mark.asyncio
 async def test_matcher_empty_when_no_candidates() -> None:
     fake = _CountingLLM("[]")
     state = {
