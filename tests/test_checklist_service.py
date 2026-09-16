@@ -285,6 +285,59 @@ async def test_asegurar_checklist_custom_solo_primera_cuenta_unaffected(
     assert "CARNET_VACUNAS" not in custom_codigos  # solo_primera_cuenta, later cuenta → hidden
 
 
+async def test_asegurar_checklist_sin_primera_activa_trata_cuenta_como_primera(
+    db: AsyncSession, contrato: Contrato
+) -> None:
+    """checklist/primera-cuota-2026-09-16, round 2, finding #2 (CRITICAL): if
+    the contrato's PRIMERA cuenta was deleted (and nothing promoted a
+    replacement — see `test_eliminar_cuenta_cobro_promueve_siguiente_a_primera_
+    cuando_borra_la_primera` for that half of the fix), the surviving
+    RECURRENTE cuenta must still get CEDULA/RUT/RPC/CDP/CONTRATO — otherwise
+    those identity/budget documents become permanently unrequested for the
+    whole contrato. `_construir_checklist_aplica_ctx` fails safe to
+    is_first=True whenever the contrato has zero active PRIMERA cuentas."""
+    cuenta1 = await _make_cuenta(db, contrato, mes=1)
+    cuenta2 = await _make_cuenta(db, contrato, mes=2)
+    # Hard-delete cuota 1 directly (isolates the checklist-side fail-safe from
+    # `eliminar_cuenta_cobro`'s own promotion fix, tested separately).
+    await db.delete(cuenta1)
+    await db.commit()
+    await db.refresh(cuenta2)
+    assert cuenta2.posicion == PosicionCuota.RECURRENTE
+
+    filas = await checklist_service.asegurar_checklist(db, cuenta2)
+    await db.commit()
+
+    codigos = {f.requisito_codigo for f in filas}
+    assert {"CEDULA", "RUT", "RPC", "CDP", "CONTRATO"} <= codigos
+
+
+async def test_asegurar_checklist_custom_mapeado_respeta_su_propio_solo_primera_cuenta(
+    db: AsyncSession, contrato: Contrato
+) -> None:
+    """checklist/primera-cuota-2026-09-16, round 2, finding #5 (WARNING): a
+    custom requisito explicitly mapped (`mapea_a_estandar`) to a standard code
+    that rule 1 hides on a later cuenta (RUT here) must still materialize as
+    the standard row when the CUSTOM item's OWN `solo_primera_cuenta=False`
+    says it applies — an explicit mapping overrides the catalog rule instead
+    of silently dropping the requisito with no row and no signal."""
+    cuenta1 = await _make_cuenta_custom(db, contrato, mes=1)
+    await _make_requisito_custom(
+        db, cuenta1, "RUT_ACTUALIZADO", "RUT actualizado", mapea_a_estandar="RUT", solo_primera_cuenta=False
+    )
+
+    cuenta2 = await _make_cuenta_custom(db, contrato, mes=2)
+    await _make_requisito_custom(
+        db, cuenta2, "RUT_ACTUALIZADO", "RUT actualizado", mapea_a_estandar="RUT", solo_primera_cuenta=False
+    )
+
+    filas = await checklist_service.asegurar_checklist(db, cuenta2)
+    await db.commit()
+
+    codigos = {f.requisito_codigo for f in filas}
+    assert "RUT" in codigos  # mapped standard row must still materialize, not vanish
+
+
 async def test_asegurar_checklist_is_idempotent(db: AsyncSession, contrato: Contrato) -> None:
     cuenta = await _make_cuenta(db, contrato, mes=1)
 
@@ -379,6 +432,32 @@ async def test_previsualizar_checklist_solo_primera_cuenta_hidden_on_later_cuent
 
     codigos = {f["requisito_codigo"] for f in preview}
     assert "FICHA_TECNICA_CUSTOM" not in codigos
+
+
+async def test_previsualizar_checklist_custom_mapeado_respeta_su_propio_solo_primera_cuenta(
+    db: AsyncSession, contrato: Contrato
+) -> None:
+    """Mirrors `test_asegurar_checklist_custom_mapeado_respeta_su_propio_solo_
+    primera_cuenta` for the preview path (round 2, finding #5)."""
+    from app.schemas.requisito_cuenta import RequisitoEstructuradoItem
+
+    await _make_cuenta(db, contrato, mes=1)
+    cuenta2 = await _make_cuenta(db, contrato, mes=2)
+    catalogo = await checklist_service.listar_catalogo(db)
+
+    candidato = RequisitoEstructuradoItem(
+        id=None,
+        codigo="RUT_ACTUALIZADO",
+        etiqueta="RUT actualizado",
+        mapea_a_estandar="RUT",
+        solo_primera_cuenta=False,
+        origen="inferido",
+    )
+
+    preview = checklist_service.previsualizar_checklist(cuenta2, catalogo, [candidato], modo="augment")
+
+    codigos = {f["requisito_codigo"] for f in preview}
+    assert "RUT" in codigos
 
 
 async def test_new_cuenta_does_not_inherit_old_cuenta_links(
@@ -685,16 +764,20 @@ async def _make_requisito_custom(
     *,
     activo: bool = True,
     obligatorio: bool = True,
+    mapea_a_estandar: str | None = None,
+    solo_primera_cuenta: bool = False,
 ) -> RequisitoCuenta:
     rc = RequisitoCuenta(
         cuenta_cobro_id=cuenta.id,
         codigo=codigo,
         etiqueta=etiqueta,
         obligatorio=obligatorio,
+        solo_primera_cuenta=solo_primera_cuenta,
         keywords_deteccion=[],
         orden=500,
         origen="inferido",
         activo=activo,
+        mapea_a_estandar=mapea_a_estandar,
     )
     db.add(rc)
     await db.commit()
@@ -924,6 +1007,86 @@ async def test_construir_checklist_completo_hides_legacy_contrato_row_when_no_ex
     codigos_items = {i["requisito"]["codigo"] for i in payload["items"]}
     assert "CONTRATO" not in codigos_items
     assert "CONTRATO" not in payload["resumen"]["lista_pendientes"]
+
+
+async def test_construir_checklist_completo_conserva_fila_legacy_con_documento(
+    db: AsyncSession, contrato: Contrato, test_user: dict[str, Any]
+) -> None:
+    """checklist/primera-cuota-2026-09-16, round 2, finding #3 (WARNING): the
+    read-time filter must only hide EMPTY legacy rows (pendiente, no linked
+    document) — a legacy CEDULA row that already carries a real uploaded
+    document must stay visible, not vanish along with its document from every
+    reader. It is marked `heredado` so it doesn't re-enter `lista_pendientes`."""
+    user = test_user["user"]
+    await _make_cuenta(db, contrato, mes=1)
+    cuenta2 = await _make_cuenta(db, contrato, mes=2)
+
+    doc = DocumentoFuente(
+        usuario_id=user.id,
+        contrato_id=contrato.id,
+        cuenta_cobro_id=cuenta2.id,
+        storage_key="k/cedula",
+        nombre="cedula.pdf",
+        tipo=TipoDocumentoFuente.CEDULA,
+    )
+    db.add(doc)
+    await db.flush()
+    fila = DocumentoCuentaCobro(
+        cuenta_cobro_id=cuenta2.id,
+        requisito_codigo="CEDULA",
+        estado=EstadoRequisito.CARGADO,
+        documento_fuente_id=doc.id,
+    )
+    db.add(fila)
+    await db.commit()
+
+    payload = await checklist_service.construir_checklist_completo(db, cuenta2)
+
+    codigos_items = {i["requisito"]["codigo"] for i in payload["items"]}
+    assert "CEDULA" in codigos_items
+    cedula_item = next(i for i in payload["items"] if i["requisito"]["codigo"] == "CEDULA")
+    assert cedula_item["heredado"] is True
+    assert "CEDULA" not in payload["resumen"]["lista_pendientes"]
+
+
+async def test_construir_checklist_completo_contrato_reaparecido_no_desaparece_al_subir_documento(
+    db: AsyncSession, contrato: Contrato, test_user: dict[str, Any]
+) -> None:
+    """checklist/primera-cuota-2026-09-16, round 2, finding #1 (CRITICAL):
+    CONTRATO reappears (rule 2a, no shared doc yet) and materializes for
+    cuenta2. Uploading the shared document flips `tiene_doc_contrato_
+    compartido` back to True, which self-defeatingly re-hid CONTRATO at read
+    time — dropping the very document the row asked the user for. Row
+    existence + real content is the decision: the row must stay visible."""
+    user = test_user["user"]
+    await _make_cuenta(db, contrato, mes=1)
+    db.add(Obligacion(contrato_id=contrato.id, descripcion="Obligación 1", tipo=TipoObligacion.GENERAL, orden=1))
+    await db.commit()
+
+    cuenta2 = await _make_cuenta(db, contrato, mes=2)
+    filas = await checklist_service.asegurar_checklist(db, cuenta2)
+    await db.commit()
+    assert "CONTRATO" in {f.requisito_codigo for f in filas}  # reappeared (rule 2a)
+
+    doc = DocumentoFuente(
+        usuario_id=user.id,
+        contrato_id=contrato.id,
+        cuenta_cobro_id=None,  # nivel-contrato upload → shared, cuenta_cobro_id NULL
+        storage_key="k/contrato",
+        nombre="contrato.pdf",
+        tipo=TipoDocumentoFuente.CONTRATO,
+    )
+    db.add(doc)
+    await db.commit()
+    await checklist_service.vincular_documento_fuente(db, cuenta2.id, "CONTRATO", doc.id)
+    await db.commit()
+
+    payload = await checklist_service.construir_checklist_completo(db, cuenta2)
+
+    codigos_items = {i["requisito"]["codigo"] for i in payload["items"]}
+    assert "CONTRATO" in codigos_items
+    contrato_item = next(i for i in payload["items"] if i["requisito"]["codigo"] == "CONTRATO")
+    assert contrato_item["estado"] == EstadoRequisito.CARGADO
 
 
 async def test_construir_checklist_completo_first_cuenta_unaffected(db: AsyncSession, contrato: Contrato) -> None:

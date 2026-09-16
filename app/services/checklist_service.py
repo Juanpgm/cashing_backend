@@ -419,11 +419,41 @@ class ChecklistAplicaCtx:
     contrato_tiene_obligaciones: bool = True
 
 
+async def _tiene_primera_activa(db: AsyncSession, contrato_id: uuid.UUID) -> bool:
+    """Whether the contrato has an active (non-deleted) PRIMERA cuenta at all.
+
+    Fail-safe backstop for `_construir_checklist_aplica_ctx` (checklist/
+    primera-cuota-2026-09-16, round 2, finding #2): if cuota 1 is hard-deleted
+    and nothing promotes a replacement, the contrato would otherwise have ZERO
+    cuentas satisfying `_is_first_cuenta`, permanently unrequesting CEDULA/RUT/
+    RPC/CDP/CONTRATO for the whole contrato — the pre-existing `es_nivel_
+    contrato` backstop these codes relied on no longer covers rule 1.
+    """
+    return (
+        await db.execute(
+            select(CuentaCobro.id)
+            .where(
+                CuentaCobro.contrato_id == contrato_id,
+                CuentaCobro.posicion == PosicionCuota.PRIMERA,
+                CuentaCobro.deleted_at.is_(None),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none() is not None
+
+
 async def _construir_checklist_aplica_ctx(db: AsyncSession, cuenta: CuentaCobro) -> ChecklistAplicaCtx:
     """Build the real `ChecklistAplicaCtx` for `cuenta` — only issues the two
     extra lookups (shared CONTRATO document / contrato obligaciones) when the
     cuenta is NOT first, since a first cuenta never needs them."""
     is_first = _is_first_cuenta(cuenta)
+    if not is_first and not await _tiene_primera_activa(db, cuenta.contrato_id):
+        # Fail-safe: the contrato has no active PRIMERA cuenta at all — treat
+        # THIS cuenta as first rather than silently hiding identity/budget
+        # documents forever (finding #2). `eliminar_cuenta_cobro` also
+        # promotes a replacement PRIMERA when possible; this covers the read
+        # path for the window before/absent that promotion.
+        is_first = True
     if is_first:
         return ChecklistAplicaCtx(is_first=True)
 
@@ -458,16 +488,22 @@ async def _construir_checklist_aplica_ctx(db: AsyncSession, cuenta: CuentaCobro)
 _PRIMERA_CUOTA_OCULTOS = frozenset({"CEDULA", "RUT", "RPC", "CDP"})
 
 
-def requisito_aplica_a_cuenta(req: "RequisitoDocumento | _CustomLike", cuenta: CuentaCobro, ctx: ChecklistAplicaCtx) -> bool:
+def requisito_aplica_a_cuenta(req: RequisitoDocumento | _CustomLike, ctx: ChecklistAplicaCtx) -> bool:
     """Whether `req` (a standard `RequisitoDocumento` catalog row, or a custom
-    `_CustomLike` item) should materialize/appear on `cuenta`.
+    `_CustomLike` item) should materialize/appear on the cuenta `ctx` was built
+    for.
 
     Single source of truth shared by `asegurar_checklist` (persisting),
     `previsualizar_checklist` (pure preview) and `construir_checklist_completo`
     (read-time filtering of rows materialized before this rule existed, so no
-    data migration is needed to hide them retroactively).
+    data migration is needed to hide them retroactively) for STANDARD catalog
+    codes — a custom `RequisitoCuenta` explicitly mapped to a standard code via
+    `mapea_a_estandar` is decided by `_aplica_con_mapeo` instead, which honours
+    the custom item's own `solo_primera_cuenta` (round 2, finding #5).
 
-    - First cuota: everything applies.
+    - First cuota (`ctx.is_first`, itself already true when the contrato has no
+      active PRIMERA cuenta at all — see `_construir_checklist_aplica_ctx`):
+      everything applies.
     - CEDULA/RUT/RPC/CDP: first-cuota-only, unconditionally (rule 1).
     - CONTRATO: first-cuota-only, EXCEPT it reappears when there is no shared
       contract-level document, or the contrato has zero Obligacion rows (rule 2).
@@ -485,6 +521,45 @@ def requisito_aplica_a_cuenta(req: "RequisitoDocumento | _CustomLike", cuenta: C
     if req.solo_primera_cuenta and not es_nivel_contrato(codigo):
         return False
     return True
+
+
+def _fila_tiene_contenido(fila: DocumentoCuentaCobro) -> bool:
+    """Whether `fila` already carries user-provided content (a linked document,
+    via either the primary slot or a `DocumentoRequisitoVinculo` — the primary
+    slot is always kept in sync with the first/preferred link, so checking it
+    alone is sufficient without eager-loading `vinculos`) — as opposed to being
+    an untouched PENDIENTE placeholder.
+
+    Rows with content must never disappear once materialized: the read-time
+    filter and the radicación package only hide EMPTY rows (checklist/primera-
+    cuota-2026-09-16, round 2, findings #1/#3) — otherwise a reappeared CONTRATO
+    row self-defeats the moment its document is uploaded, and a legacy CEDULA/
+    RUT/RPC/CDP row silently drops a real document from every reader.
+    """
+    if fila.estado != EstadoRequisito.PENDIENTE:
+        return True
+    return fila.documento_fuente_id is not None or fila.secop_documento_id is not None
+
+
+def _aplica_con_mapeo(
+    req: RequisitoDocumento,
+    ctx: ChecklistAplicaCtx,
+    mapeos_por_codigo: dict[str, _CustomLike],
+) -> bool:
+    """Whether standard catalog row `req` should materialize, honouring an
+    explicit custom mapping's OWN `solo_primera_cuenta` over the catalog rule
+    (checklist/primera-cuota-2026-09-16, round 2, finding #5): a custom
+    `RequisitoCuenta`/candidate mapped to a standard code (`mapea_a_estandar`)
+    is materialized AS that standard row instead of a separate custom row (see
+    `_codigos_estandar_a_crear`), so it must keep the product rule that custom
+    items control their own first-cuota-only gating — not the catalog rule
+    rule 1 unconditionally hides RUT/CEDULA/RPC/CDP under, which would
+    otherwise silently drop an explicitly-declared requisito with no row and
+    no signal to the user."""
+    mapeo = mapeos_por_codigo.get(req.codigo)
+    if mapeo is not None:
+        return ctx.is_first or not mapeo.solo_primera_cuenta
+    return requisito_aplica_a_cuenta(req, ctx)
 
 
 class _CustomLike(Protocol):
@@ -519,7 +594,12 @@ def _codigos_estandar_a_crear(
     return {req.codigo for req in catalogo}
 
 
-async def asegurar_checklist(db: AsyncSession, cuenta: CuentaCobro) -> list[DocumentoCuentaCobro]:
+async def asegurar_checklist(
+    db: AsyncSession,
+    cuenta: CuentaCobro,
+    *,
+    ctx: ChecklistAplicaCtx | None = None,
+) -> list[DocumentoCuentaCobro]:
     """Idempotent: ensure a DocumentoCuentaCobro row exists for every applicable
     requirement, merging the standard catalog with the cuenta's custom
     requisitos according to ``cuenta.requisitos_modo``:
@@ -531,7 +611,13 @@ async def asegurar_checklist(db: AsyncSession, cuenta: CuentaCobro) -> list[Docu
       maps to); the rest of the catalog is dropped.
 
     New rows always start PENDIENTE — links are never copied from a previous
-    cuenta. Returns the full list of rows (existing + newly created)."""
+    cuenta. Returns the full list of rows (existing + newly created).
+
+    ``ctx``: pass an already-built `ChecklistAplicaCtx` when the caller (e.g.
+    `construir_checklist_completo`) needs the exact same one for a later
+    read-time filter pass, to avoid building it (and its 2 DB round-trips on a
+    non-first cuenta) twice per request. Built internally when omitted.
+    """
     modo = modo_efectivo(cuenta)
     catalogo = await listar_catalogo(db)
     custom = await listar_requisitos_cuenta(db, cuenta.id)
@@ -541,12 +627,13 @@ async def asegurar_checklist(db: AsyncSession, cuenta: CuentaCobro) -> list[Docu
     por_codigo = {f.requisito_codigo: f for f in filas if f.requisito_codigo is not None}
     por_custom = {f.requisito_cuenta_id: f for f in filas if f.requisito_cuenta_id is not None}
 
-    is_first = _is_first_cuenta(cuenta)
-    ctx = await _construir_checklist_aplica_ctx(db, cuenta)
+    if ctx is None:
+        ctx = await _construir_checklist_aplica_ctx(db, cuenta)
 
     codigos_estandar = (
         _codigos_estandar_a_crear(modo, catalogo, custom) if modo != "estandar" else {req.codigo for req in catalogo}
     )
+    mapeos_por_codigo: dict[str, _CustomLike] = {c.mapea_a_estandar: c for c in custom if c.mapea_a_estandar}
 
     creadas: list[DocumentoCuentaCobro] = []
 
@@ -554,7 +641,7 @@ async def asegurar_checklist(db: AsyncSession, cuenta: CuentaCobro) -> list[Docu
     for req in catalogo:
         if req.codigo not in codigos_estandar:
             continue
-        if not requisito_aplica_a_cuenta(req, cuenta, ctx):
+        if not _aplica_con_mapeo(req, ctx, mapeos_por_codigo):
             continue
         if req.codigo in por_codigo:
             continue
@@ -572,7 +659,7 @@ async def asegurar_checklist(db: AsyncSession, cuenta: CuentaCobro) -> list[Docu
         for item in custom:
             if item.mapea_a_estandar:
                 continue
-            if item.solo_primera_cuenta and not is_first:
+            if item.solo_primera_cuenta and not ctx.is_first:
                 continue
             if item.id in por_custom:
                 continue
@@ -604,11 +691,11 @@ def previsualizar_checklist(
     """Pure, non-persisting preview of which checklist rows `asegurar_checklist`
     WOULD create for `candidatos` (freshly-inferred/structured, NOT YET
     persisted `RequisitoCuenta`) under `modo` — mirrors `asegurar_checklist`'s
-    exact row-selection logic without touching the DB or requiring the
-    candidates to exist as rows yet (billing-resilience-templates, slice #7,
-    tasks 7.4-7.5: "checklist preview reflects structured requisitos without
-    persisting until confirmed"). Applying the reviewed set still goes through
-    the existing `POST /definir` -> `asegurar_checklist` (unchanged).
+    row selection, minus the DB-dependent CONTRATO exception (billing-
+    resilience-templates, slice #7, tasks 7.4-7.5: "checklist preview reflects
+    structured requisitos without persisting until confirmed"). Applying the
+    reviewed set still goes through the existing `POST /definir` ->
+    `asegurar_checklist` (unchanged).
 
     `ctx`: since this function is pure/non-DB, it cannot look up whether a
     shared CONTRATO document or any Obligacion exists for CONTRATO's
@@ -625,13 +712,14 @@ def previsualizar_checklist(
         codigos_estandar = {req.codigo for req in catalogo}
     else:
         codigos_estandar = _codigos_estandar_a_crear(modo, catalogo, candidatos)
+    mapeos_por_codigo = {c.mapea_a_estandar: c for c in candidatos if c.mapea_a_estandar}
 
     preview: list[dict[str, str]] = []
 
     for req in catalogo:
         if req.codigo not in codigos_estandar:
             continue
-        if not requisito_aplica_a_cuenta(req, cuenta, ctx):
+        if not _aplica_con_mapeo(req, ctx, mapeos_por_codigo):
             continue
         preview.append({"requisito_codigo": req.codigo, "etiqueta": req.etiqueta, "origen": "estandar"})
 
@@ -639,7 +727,7 @@ def previsualizar_checklist(
         for item in candidatos:
             if item.mapea_a_estandar:
                 continue
-            if item.solo_primera_cuenta and not is_first:
+            if item.solo_primera_cuenta and not ctx.is_first:
                 continue
             preview.append({"requisito_codigo": item.codigo, "etiqueta": item.etiqueta, "origen": "custom"})
 
@@ -2770,6 +2858,62 @@ def _todos_los_secop_documentos(fila: DocumentoCuentaCobro) -> list[dict]:
     return resultado
 
 
+def _filtrar_filas_visibles(
+    filas_todas: list[DocumentoCuentaCobro],
+    cat_by_codigo: dict[str, RequisitoDocumento],
+    ctx: ChecklistAplicaCtx,
+) -> tuple[list[DocumentoCuentaCobro], set[uuid.UUID]]:
+    """Read-time visibility filter shared by `construir_checklist_completo` and
+    `listar_filas_visibles` (checklist/primera-cuota-2026-09-16, round 2,
+    findings #1/#3/#4) — the single seam every reader must apply instead of
+    reading `DocumentoCuentaCobro` rows raw.
+
+    A row whose standard requisito no longer `requisito_aplica_a_cuenta` is
+    hidden UNLESS it already carries real content (`_fila_tiene_contenido`):
+    row existence + content is the decision, so a reappeared CONTRATO row
+    never self-defeats the moment its document is uploaded, and a legacy
+    CEDULA/RUT/RPC/CDP row never drops a real document from every reader.
+    Returns `(filas_visibles, heredado_ids)` — `heredado_ids` are rows kept
+    ONLY because of content, so callers can flag them and keep them out of
+    `pendientes`. Custom rows always pass through untouched — their
+    `solo_primera_cuenta` gating already happens correctly at materialization
+    time in `asegurar_checklist`.
+    """
+    visibles: list[DocumentoCuentaCobro] = []
+    heredado_ids: set[uuid.UUID] = set()
+    for f in filas_todas:
+        if f.requisito_codigo is None or f.requisito_codigo not in cat_by_codigo:
+            visibles.append(f)
+            continue
+        if requisito_aplica_a_cuenta(cat_by_codigo[f.requisito_codigo], ctx):
+            visibles.append(f)
+            continue
+        if _fila_tiene_contenido(f):
+            visibles.append(f)
+            heredado_ids.add(f.id)
+    return visibles, heredado_ids
+
+
+async def listar_filas_visibles(db: AsyncSession, cuenta: CuentaCobro) -> list[DocumentoCuentaCobro]:
+    """Standard + custom checklist rows for `cuenta` filtered through the same
+    read-time visibility rule `construir_checklist_completo` applies
+    (`_filtrar_filas_visibles`) — the seam any OTHER reader (constancia,
+    future exports) must use instead of querying `DocumentoCuentaCobro`
+    directly, so it can never show a row the checklist itself decided to hide
+    (checklist/primera-cuota-2026-09-16, round 2, finding #4).
+
+    Does NOT call `asegurar_checklist` — callers that need missing rows
+    created decide that themselves; this only filters what already exists.
+    """
+    catalogo = await listar_catalogo(db)
+    cat_by_codigo = {c.codigo: c for c in catalogo}
+    res = await db.execute(select(DocumentoCuentaCobro).where(DocumentoCuentaCobro.cuenta_cobro_id == cuenta.id))
+    filas_todas = list(res.scalars().all())
+    ctx = await _construir_checklist_aplica_ctx(db, cuenta)
+    filas, _heredado_ids = _filtrar_filas_visibles(filas_todas, cat_by_codigo, ctx)
+    return filas
+
+
 async def construir_checklist_completo(
     db: AsyncSession,
     cuenta: CuentaCobro,
@@ -2788,7 +2932,11 @@ async def construir_checklist_completo(
     Keeping this False by default prevents GET requests from silently filling
     PENDIENTE rows, which would block SECOP detection on /refresh-secop.
     """
-    await asegurar_checklist(db, cuenta)
+    # Built once and threaded into `asegurar_checklist` (round 2, suggestion:
+    # avoid the ctx's 2 extra queries on a non-first cuenta running twice per
+    # request — it used to build its own internally).
+    ctx = await _construir_checklist_aplica_ctx(db, cuenta)
+    await asegurar_checklist(db, cuenta, ctx=ctx)
     if auto_vincular:
         await auto_vincular_documentos_fuente(db, cuenta)
 
@@ -2809,21 +2957,18 @@ async def construir_checklist_completo(
     )
     filas_todas = list(rows_res.scalars().all())
 
-    # Read-time filter (checklist/primera-cuota-2026-09-16, rule 1/2 — WU3):
-    # hides CEDULA/RUT/RPC/CDP/CONTRATO rows that were materialized on a
-    # non-first cuenta BEFORE this rule existed, so pre-existing data
-    # disappears from every reader (items, resumen, the radicar gate) without
-    # a data migration. Custom rows are untouched here — their
+    # Read-time filter (checklist/primera-cuota-2026-09-16, rule 1/2 — WU3;
+    # content-preserving exception added round 2, findings #1/#3): hides EMPTY
+    # CEDULA/RUT/RPC/CDP/CONTRATO rows that were materialized on a non-first
+    # cuenta BEFORE this rule existed (or whose applicability later flipped,
+    # e.g. CONTRATO's reappearance self-defeat), so pre-existing data
+    # disappears from every reader (items, resumen, the radicar gate) without a
+    # data migration — UNLESS the row already carries real content, in which
+    # case row existence + content is the decision and it stays visible
+    # (flagged `heredado`). Custom rows are untouched here — their
     # `solo_primera_cuenta` gating already happens correctly at materialization
     # time in `asegurar_checklist` (rule 3), so no old bug to retroactively fix.
-    ctx = await _construir_checklist_aplica_ctx(db, cuenta)
-    filas = [
-        f
-        for f in filas_todas
-        if f.requisito_codigo is None
-        or f.requisito_codigo not in cat_by_codigo
-        or requisito_aplica_a_cuenta(cat_by_codigo[f.requisito_codigo], cuenta, ctx)
-    ]
+    filas, heredado_ids = _filtrar_filas_visibles(filas_todas, cat_by_codigo, ctx)
 
     # EVIDENCIAS is derived state: no evidencia-attachment path updates its
     # persisted row, so derive its effective estado from actual coverage —
@@ -3070,6 +3215,10 @@ async def construir_checklist_completo(
                     cuenta.id,
                     fila.requisito_codigo if fila.requisito_codigo is not None else str(fila.requisito_cuenta_id),
                 ),
+                # Round 2, findings #1/#3: True when this row no longer formally
+                # applies (e.g. first-cuota-only) but stays visible because it
+                # already carries real content — see `_filtrar_filas_visibles`.
+                "heredado": fila.id in heredado_ids,
             }
         )
 

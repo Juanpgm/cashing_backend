@@ -1672,23 +1672,40 @@ async def generar_zip_evidencias(
     # Differential package: on a non-first cuota, first-cuota-only contract docs
     # (catalog rows with solo_primera_cuenta) were already radicated with cuota 1.
     # "First" reuses the checklist's own persisted-posicion predicate.
+    from app.models.documento_cuenta_cobro import DocumentoCuentaCobro
     from app.services import checklist_service
 
     codigos_solo_primera: set[str] = set()
     if not checklist_service._is_first_cuenta(cuenta):
         catalogo = await checklist_service.listar_catalogo(db)
-        codigos_solo_primera = {req.codigo for req in catalogo if req.solo_primera_cuenta}
-        # CONTRATO can reappear on a later cuota (checklist/primera-cuota-2026-09-16,
-        # rule 2: no shared contract-level document, or the contrato has zero
-        # Obligacion rows). When it does, the row is genuinely part of THIS
-        # cuenta's checklist and any document freshly linked to it must still
-        # package — the flat catalog-flag check above would otherwise always
-        # drop it as "already radicated with cuota 1", even though it never was.
-        contrato_req = next((r for r in catalogo if r.codigo == "CONTRATO"), None)
-        if contrato_req is not None:
-            ctx = await checklist_service._construir_checklist_aplica_ctx(db, cuenta)
-            if checklist_service.requisito_aplica_a_cuenta(contrato_req, cuenta, ctx):
-                codigos_solo_primera.discard("CONTRATO")
+        ctx = await checklist_service._construir_checklist_aplica_ctx(db, cuenta)
+        filas_por_codigo = {
+            f.requisito_codigo: f
+            for f in (
+                await db.execute(
+                    select(DocumentoCuentaCobro).where(DocumentoCuentaCobro.cuenta_cobro_id == cuenta.id)
+                )
+            )
+            .scalars()
+            .all()
+            if f.requisito_codigo is not None
+        }
+        for req in catalogo:
+            if not req.solo_primera_cuenta:
+                continue
+            if checklist_service.requisito_aplica_a_cuenta(req, ctx):
+                continue  # applies normally on THIS cuenta (nivel-contrato exempt, or CONTRATO rule 2 reappearance)
+            # Round 2, findings #1/#3: a row materialized for THIS cuenta that
+            # already carries real content (e.g. CONTRATO reappeared then got
+            # its document uploaded — self-defeating the very exception that
+            # created the row; or a legacy CEDULA/RUT/RPC/CDP row with a real
+            # upload) was never "already radicated with cuota 1" — keep it out
+            # of the omission set so both the package AND the LEEME disclosure
+            # line stay consistent with what actually ships.
+            fila = filas_por_codigo.get(req.codigo)
+            if fila is not None and checklist_service._fila_tiene_contenido(fila):
+                continue
+            codigos_solo_primera.add(req.codigo)
 
     storage = get_evidencia_storage()
 

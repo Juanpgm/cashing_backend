@@ -168,6 +168,49 @@ async def actividad_con_evidencia(db: AsyncSession, cuenta: CuentaCobro, obligac
     return act
 
 
+@pytest.fixture
+async def cuenta_recurrente(db: AsyncSession, contrato: Contrato, cuenta: CuentaCobro) -> CuentaCobro:
+    """A genuine RECURRENTE sibling of `cuenta` (same contrato, which already has
+    a real PRIMERA cuenta — required so `_construir_checklist_aplica_ctx`'s
+    guard-1 fail-safe does NOT kick in and this measures the real non-first
+    query path, not the "no active PRIMERA" fallback) — round 2 suggestion:
+    pin a query budget for the non-first ctx path too, not just PRIMERA."""
+    cc = CuentaCobro(
+        contrato_id=contrato.id,
+        mes=2,
+        anio=2024,
+        estado=EstadoCuentaCobro.BORRADOR,
+        valor=1_000_000,
+        numero_cuota=2,
+        requisitos_modo="estandar",
+        posicion=PosicionCuota.RECURRENTE,
+    )
+    db.add(cc)
+    await db.commit()
+    await db.refresh(cc)
+    return cc
+
+
+async def _completar_checklist_dinamico(client: AsyncClient, headers: dict[str, str], cuenta_id: uuid.UUID) -> None:
+    """Mark every mandatory row cumplido_manual, deriving codes from the live
+    GET /checklist response instead of a hardcoded list — a later cuota
+    legitimately lacks CEDULA/RUT/RPC/CDP rows (checklist/primera-cuota-2026-
+    09-16 rule 1), so `_CODIGOS_MANUALES` does not apply here."""
+    r = await client.get(f"/api/v1/cuentas-cobro/{cuenta_id}/checklist", headers=headers)
+    assert r.status_code == 200, r.text
+    for item in r.json()["items"]:
+        req = item["requisito"]
+        if not req["obligatorio"]:
+            continue
+        codigo = req["codigo"] or req["requisito_cuenta_id"]
+        p = await client.patch(
+            f"/api/v1/cuentas-cobro/{cuenta_id}/checklist/{codigo}",
+            headers=headers,
+            json={"cumplido_manual": True},
+        )
+        assert p.status_code == 200, p.text
+
+
 async def _completar_checklist(client: AsyncClient, headers: dict[str, str], cuenta_id: uuid.UUID) -> None:
     """Seed the checklist rows, satisfy RPC with a real uploaded document, and
     mark every other mandatory requisito as cumplido_manual — a mixed shape
@@ -290,6 +333,36 @@ async def test_query_budget_checklist(
 
     assert resp.status_code == 200, resp.text
     query_counter.assert_budget(36, label="GET /cuentas-cobro/{id}/checklist")
+
+
+async def test_query_budget_checklist_cuenta_recurrente(
+    client: AsyncClient,
+    test_user: dict[str, Any],
+    cuenta: CuentaCobro,
+    cuenta_recurrente: CuentaCobro,
+    query_counter: QueryCounter,
+) -> None:
+    """GET /api/v1/cuentas-cobro/{id}/checklist on a genuine RECURRENTE cuenta
+    (checklist/primera-cuota-2026-09-16, round 2 suggestion) — the PRIMERA
+    budget above never exercises `_construir_checklist_aplica_ctx`'s non-first
+    path (its own guard-1 EXISTS check, plus the 2 CONTRATO-doc/obligaciones
+    lookups) at all, per its own fixture docstring, so a regression there
+    (e.g. losing the ctx-threading between `asegurar_checklist` and the
+    read-time filter, reintroducing a double build) was previously unmeasured.
+
+    Measured baseline: 26 — lower than PRIMERA's 36 despite the extra ctx
+    queries, because CEDULA/RUT/RPC/CDP never materialize on this cuota at all
+    (rule 1), removing more row-driven statements than the ctx adds; CONTRATO
+    still reappears here (no shared contract-level document yet on this
+    contrato), so the reappearance path is exercised too."""
+    headers = test_user["headers"]
+    await _completar_checklist_dinamico(client, headers, cuenta_recurrente.id)
+    query_counter.reset()
+
+    resp = await client.get(f"/api/v1/cuentas-cobro/{cuenta_recurrente.id}/checklist", headers=headers)
+
+    assert resp.status_code == 200, resp.text
+    query_counter.assert_budget(26, label="GET /cuentas-cobro/{id}/checklist (RECURRENTE)")
 
 
 async def test_query_budget_radicar(
