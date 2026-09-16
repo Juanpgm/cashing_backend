@@ -201,12 +201,39 @@ def _keyword_score(obligation_text: str, evidence_text: str) -> float:
 
 def _contains_contract_number(evidence: dict, numero_variants: list[str]) -> bool:
     """True if the evidence's title/content mentions ANY contract-number
-    variant — treated as a near-certain match (evidencias/discovery-fix
-    WU4): it bypasses both the keyword threshold and the LLM relevance gate."""
+    variant (evidencias/discovery-fix WU4)."""
     if not numero_variants:
         return False
     text = f"{evidence.get('title', '')} {evidence.get('content', '')}".lower()
     return any(variant.lower() in text for variant in numero_variants)
+
+
+# Generic evidence-deliverable terms — an attachment/document whose name
+# contains one of these, mentioning the contract number, is treated as an
+# auto-match (see `_is_informe_like_document`).
+_INFORME_LIKE_TERMS = ("informe", "acta", "entrega", "soporte", "reporte", "planilla")
+
+# Capped bonus added to a candidate's blended score when it mentions the
+# contract number but ISN'T a clear document match (evidencias/discovery-fix
+# WU7 ranking item c): a number-only hit still needs the LLM's verdict unless
+# it's an attachment with an informe-like name — the bonus alone must never
+# be enough to clear a normal LLM review, only to make sure it's RANKED and
+# SEEN by the LLM (candidates_scored/TOP_N) instead of silently dropped.
+_NUMBER_MATCH_BONUS = 0.4
+
+
+def _is_informe_like_document(evidence: dict) -> bool:
+    """True if the evidence is a real attachment/document (not just email body
+    prose) whose title/filename reads like a contractual deliverable — the
+    narrow case where a contract-number hit is trusted enough to bypass the
+    LLM verdict entirely (evidencias/discovery-fix WU7 ranking item c)."""
+    is_document = (
+        bool(evidence.get("attachment_id")) or bool(evidence.get("file_id")) or evidence.get("source") == "drive"
+    )
+    if not is_document:
+        return False
+    title = str(evidence.get("title") or evidence.get("filename") or "").lower()
+    return any(term in title for term in _INFORME_LIKE_TERMS)
 
 
 def _fallback_flags(keyword_scores: list[float] | None, n: int) -> list[bool]:
@@ -378,43 +405,60 @@ async def _match_una_obligacion(
     large contrato doesn't fire dozens of simultaneous provider calls.
     """
 
-    def _score(idx: int, ev: dict) -> float:
+    def _score(idx: int, ev: dict, bonus: float = 0.0) -> float:
         kw = _keyword_score(ob_text, ev.get("content", ""))
         cos = None
         if ob_vec is not None and ev_embeddings is not None:
             cos = _cosine_similarity(ob_vec, ev_embeddings[idx])
-        return _blended_score(kw, cos)
+        return min(1.0, _blended_score(kw, cos) + bonus)
 
-    # Step 0: contract-number bypass (evidencias/discovery-fix WU4) — an
-    # evidence item mentioning the contract number is a near-certain match:
-    # score it 1.0 and skip BOTH the keyword threshold AND the LLM relevance
-    # call entirely (a false-negative LLM verdict must not be able to drop it).
+    # Step 0: contract-number signal (evidencias/discovery-fix WU4, refined by
+    # WU7 ranking item c). An attachment/document with an informe-like name
+    # (see `_is_informe_like_document`) mentioning the contract number is a
+    # near-certain match: score it 1.0 and skip BOTH the keyword threshold
+    # AND the LLM relevance call entirely. Any OTHER evidence mentioning the
+    # number (plain email prose, no document support) gets a capped bonus
+    # instead — boosted, but the LLM still has the last word, so a number-only
+    # mention without real semantic support doesn't auto-qualify.
     auto_matched: list[dict] = []
     scores_dict: dict[str, float] = {}
-    scoreable: list[tuple[int, dict]] = []
+    scoreable: list[tuple[int, dict, float]] = []
     for idx, ev in enumerate(evidence_raw):
-        if _contains_contract_number(ev, numero_variants or []):
+        has_number = _contains_contract_number(ev, numero_variants or [])
+        if has_number and _is_informe_like_document(ev):
             item = dict(ev)
             item.setdefault("matched_by", "numero_contrato")
             auto_matched.append(item)
             if "id" in ev:
                 scores_dict[ev["id"]] = 1.0
         else:
-            scoreable.append((idx, ev))
+            scoreable.append((idx, ev, _NUMBER_MATCH_BONUS if has_number else 0.0))
 
     # Step 1: blended-score filter (≥0.15 threshold) — cosine can surface a
     # candidate keyword scoring alone would miss entirely (cross-language match).
-    scored_all = [(ev, _score(idx, ev)) for idx, ev in scoreable]
-    candidates_scored = [(ev, s) for ev, s in scored_all if s >= _KEYWORD_THRESHOLD]
+    scored_all = [(ev, _score(idx, ev, bonus)) for idx, ev, bonus in scoreable]
 
-    # Max-effort fallback: an obligación with ZERO candidates above threshold
-    # would otherwise stay silently empty. Instead, take its best candidates
-    # with ANY positive score (score > 0) and still let the LLM judge them —
-    # better an obligación gets a weak-but-checked candidate than none at all.
-    if not candidates_scored:
-        positive = [(ev, s) for ev, s in scored_all if s > 0]
-        positive.sort(key=lambda pair: pair[1], reverse=True)
-        candidates_scored = positive[:3]
+    if len(scored_all) > settings.EVIDENCE_MAX_CANDIDATES_FOR_LLM:
+        # Large candidate pool (e.g. many expanded-phrase-query hits,
+        # evidencias/discovery-fix WU7): re-apply the keyword pre-gate so an
+        # obligación doesn't fan out an unbounded LLM candidate list.
+        candidates_scored = [(ev, s) for ev, s in scored_all if s >= _KEYWORD_THRESHOLD]
+
+        # Max-effort fallback: an obligación with ZERO candidates above threshold
+        # would otherwise stay silently empty. Instead, take its best candidates
+        # with ANY positive score (score > 0) and still let the LLM judge them —
+        # better an obligación gets a weak-but-checked candidate than none at all.
+        if not candidates_scored:
+            positive = [(ev, s) for ev, s in scored_all if s > 0]
+            positive.sort(key=lambda pair: pair[1], reverse=True)
+            candidates_scored = positive[:3]
+    else:
+        # Small pool: skip the keyword pre-gate entirely — a candidate found
+        # ONLY via an expanded semantic phrase query may share zero keywords
+        # with the obligación's own wording and must still reach the LLM
+        # (evidencias/discovery-fix WU7). `EVIDENCE_MATCHER_TOP_N` below still
+        # bounds the actual LLM fan-out.
+        candidates_scored = list(scored_all)
 
     # Step 2: LLM relevance on top-N candidates — ONE batched call, not one per candidate
     matched_list = list(auto_matched)
@@ -474,7 +518,15 @@ async def evidence_matcher_node(state: AgentState) -> AgentState:
     # fails open to None (keyword-only ranking) on any embedding error.
     ob_texts = [_obligacion_text(ob) for ob in obligaciones]
     ev_texts = [ev.get("content", "") for ev in evidence_raw]
-    ob_embeddings = await _embed_batch(ob_texts, llm)
+    # Embedding input ONLY (evidencias/discovery-fix WU7 ranking item a) — the
+    # contract's objeto qualifies a short/generic obligación phrase (e.g.
+    # "supervisar cronograma") with what the whole contract is actually
+    # about, which meaningfully changes its semantic embedding. `ob_texts`
+    # itself stays bare — it's still used for keyword scoring and the LLM
+    # candidate listing, which shouldn't be diluted by the objeto text.
+    objeto = str(contrato_contexto.get("objeto") or "").strip()
+    ob_embed_texts = [f"{objeto} {t}".strip() if objeto else t for t in ob_texts]
+    ob_embeddings = await _embed_batch(ob_embed_texts, llm)
     ev_embeddings = await _embed_batch(ev_texts, llm) if ob_embeddings is not None else None
 
     # Every obligación's matching runs CONCURRENTLY (radicacion-sin-friccion

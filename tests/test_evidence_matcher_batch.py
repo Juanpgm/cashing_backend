@@ -48,16 +48,23 @@ async def test_matcher_batches_one_call_per_obligation() -> None:
 
 
 @pytest.mark.asyncio
-async def test_matcher_contract_number_match_bypasses_keyword_threshold_and_llm() -> None:
-    """An evidence item whose content contains the contract number is a
-    near-certain match — it must be included even with zero keyword overlap
-    with the obligación's text, and WITHOUT spending an LLM call on it
-    (evidencias/discovery-fix WU4)."""
+async def test_matcher_contract_number_informe_attachment_bypasses_keyword_threshold_and_llm() -> None:
+    """A contract-number hit on an ATTACHMENT/document with an informe-like
+    name (informe/acta/entrega/soporte/reporte/planilla) is a near-certain
+    match — included even with zero keyword overlap with the obligación's
+    text, WITHOUT spending an LLM call on it (evidencias/discovery-fix WU4,
+    refined by WU7 item c: the number bonus alone is capped and non-document
+    hits still need an LLM verdict — see the sibling test below)."""
     fake = _CountingLLM("[]")  # if the LLM were called, it would reject everything
     state = {
         "obligaciones_extraidas": [{"id": "ob1", "descripcion": "algo completamente distinto sin relacion alguna"}],
         "evidence_raw": [
-            {"id": "a", "content": "Contrato 4161.010.26.1.027.2025 - documento adjunto"},
+            {
+                "id": "a",
+                "source": "drive",
+                "title": "Informe contrato 4161.010.26.1.027.2025.pdf",
+                "content": "Contrato 4161.010.26.1.027.2025 - documento adjunto",
+            },
         ],
         "contrato_contexto": {"numero_contrato": "4161.010.26.1.027.2025"},
     }
@@ -72,15 +79,59 @@ async def test_matcher_contract_number_match_bypasses_keyword_threshold_and_llm(
 
 
 @pytest.mark.asyncio
+async def test_matcher_contract_number_plain_content_still_requires_llm_verdict() -> None:
+    """WU7 refinement: a number-only hit WITHOUT semantic/document support
+    (plain email-style content, no attachment/informe-like name) is boosted
+    but NOT auto-bypassed — the LLM still has the last word. If the LLM
+    rejects it, it's not matched despite containing the contract number."""
+    fake = _CountingLLM("[]")
+    state = {
+        "obligaciones_extraidas": [{"id": "ob1", "descripcion": "algo completamente distinto sin relacion alguna"}],
+        "evidence_raw": [
+            {"id": "a", "content": "Contrato 4161.010.26.1.027.2025 mencionado de paso"},
+        ],
+        "contrato_contexto": {"numero_contrato": "4161.010.26.1.027.2025"},
+    }
+
+    with patch.object(evidence_matcher, "get_llm", return_value=fake):
+        result = await evidence_matcher.evidence_matcher_node(state)
+
+    assert fake.calls == 1  # reached the LLM, unlike the informe-attachment case
+    assert result["matched_evidence"]["ob1"] == []
+
+
+@pytest.mark.asyncio
+async def test_matcher_contract_number_plain_content_kept_when_llm_confirms() -> None:
+    fake = _CountingLLM("[1]")
+    state = {
+        "obligaciones_extraidas": [{"id": "ob1", "descripcion": "algo completamente distinto sin relacion alguna"}],
+        "evidence_raw": [
+            {"id": "a", "content": "Contrato 4161.010.26.1.027.2025 mencionado de paso"},
+        ],
+        "contrato_contexto": {"numero_contrato": "4161.010.26.1.027.2025"},
+    }
+
+    with patch.object(evidence_matcher, "get_llm", return_value=fake):
+        result = await evidence_matcher.evidence_matcher_node(state)
+
+    assert [e["id"] for e in result["matched_evidence"]["ob1"]] == ["a"]
+
+
+@pytest.mark.asyncio
 async def test_matcher_contract_number_match_still_allows_llm_for_other_candidates() -> None:
-    """The contract-number bypass only short-circuits the MATCHING candidate —
-    other candidates for the same obligación still go through the normal
-    keyword+LLM pipeline."""
+    """The informe-attachment bypass only short-circuits the MATCHING
+    candidate — other candidates for the same obligación still go through
+    the normal keyword+LLM pipeline."""
     fake = _CountingLLM("[1]")  # confirms the one non-number candidate sent to it
     state = {
         "obligaciones_extraidas": [{"id": "ob1", "descripcion": "informes tecnicos mensuales consultoria asesoria"}],
         "evidence_raw": [
-            {"id": "a", "content": "Contrato 4161.010.26.1.027.2025 - documento adjunto"},
+            {
+                "id": "a",
+                "source": "drive",
+                "title": "Informe contrato 4161.010.26.1.027.2025.pdf",
+                "content": "Contrato 4161.010.26.1.027.2025 - documento adjunto",
+            },
             {"id": "b", "content": "informes tecnicos mensuales consultoria realizados"},
         ],
         "contrato_contexto": {"numero_contrato": "4161.010.26.1.027.2025"},
@@ -92,6 +143,27 @@ async def test_matcher_contract_number_match_still_allows_llm_for_other_candidat
     matched_ids = {e["id"] for e in result["matched_evidence"]["ob1"]}
     assert matched_ids == {"a", "b"}
     assert fake.calls == 1  # only "b" went through the LLM batch
+
+
+@pytest.mark.asyncio
+async def test_matcher_contract_number_bonus_is_capped_at_one() -> None:
+    """The contract-number bonus must never push the blended score above 1.0."""
+    from app.agent.nodes.evidence_matcher import _NUMBER_MATCH_BONUS, _blended_score
+
+    assert _blended_score(1.0, None) + _NUMBER_MATCH_BONUS > 1.0  # bonus alone would overflow
+    # evidence_matcher_node's internal _score() must cap it — exercised end-to-end:
+    fake = _CountingLLM("[1]")
+    state = {
+        "obligaciones_extraidas": [{"id": "ob1", "descripcion": "informes tecnicos mensuales consultoria"}],
+        "evidence_raw": [
+            {"id": "a", "content": "informes tecnicos mensuales consultoria 4161.010.26.1.027.2025"},
+        ],
+        "contrato_contexto": {"numero_contrato": "4161.010.26.1.027.2025"},
+    }
+    with patch.object(evidence_matcher, "get_llm", return_value=fake):
+        result = await evidence_matcher.evidence_matcher_node(state)
+
+    assert result["matched_evidence_scores"]["ob1"]["a"] <= 1.0
 
 
 @pytest.mark.asyncio
@@ -178,6 +250,9 @@ async def test_matcher_relevance_batch_includes_contract_header_in_prompt() -> N
 
 @pytest.mark.asyncio
 async def test_matcher_empty_when_no_candidates() -> None:
+    """A small pool (evidencias/discovery-fix WU7) skips the keyword pre-gate
+    entirely — the zero-overlap candidate still reaches the LLM, which then
+    genuinely rejects it, leaving matched_evidence empty either way."""
     fake = _CountingLLM("[]")
     state = {
         "obligaciones_extraidas": [{"id": "ob1", "descripcion": "algo muy especifico xyz"}],
@@ -186,8 +261,7 @@ async def test_matcher_empty_when_no_candidates() -> None:
     with patch.object(evidence_matcher, "get_llm", return_value=fake):
         result = await evidence_matcher.evidence_matcher_node(state)
 
-    # No candidate passes the keyword filter → no LLM call at all.
-    assert fake.calls == 0
+    assert fake.calls == 1
     assert result["matched_evidence"]["ob1"] == []
 
 
