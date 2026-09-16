@@ -107,6 +107,9 @@ async def drive_fetch_node(state: AgentState, provider: IntegrationProvider = In
     fecha_inicio = str(contrato.get("fecha_inicio", ""))
     fecha_fin = str(contrato.get("fecha_fin", ""))
     numero_variants = contract_number_variants(contrato.get("numero_contrato"))
+    # LLM-generated search phrases (evidencias/discovery-fix WU7) — deliverable
+    # names, counterpart names, filename variants — keyed by obligación id.
+    expanded_terms: dict[str, list[str]] = state.get("expanded_terms") or {}
 
     # Construir queries: por obligación si existen, si no genéricas.
     max_obligaciones = settings.EVIDENCE_MAX_OBLIGACIONES_QUERIES
@@ -114,21 +117,25 @@ async def drive_fetch_node(state: AgentState, provider: IntegrationProvider = In
 
     n_generic = len(_GENERIC_TERMS)
 
-    def _split_priority_and_generic(descripcion: str) -> list[DriveQuery]:
-        """Cap the priority section (contract-number variants + obligación
-        keywords) by EVIDENCE_QUERIES_PER_OBLIGACION, but ALWAYS keep every
-        generic-term query — they used to be sliced away entirely once an
-        obligación yielded >= N keywords (evidencias/discovery-fix root
-        cause #4, pinned by test_drive_fetch_generic_terms_always_included...).
+    def _split_priority_and_generic(descripcion: str, ob_id: str = "") -> list[DriveQuery]:
+        """Cap the priority section (contract-number variants + expanded
+        phrases + obligación keywords) by EVIDENCE_QUERIES_PER_OBLIGACION, but
+        ALWAYS keep every generic-term query — they used to be sliced away
+        entirely once an obligación yielded >= N keywords (evidencias/
+        discovery-fix root cause #4, pinned by
+        test_drive_fetch_generic_terms_always_included...).
         """
-        all_queries = build_drive_queries(descripcion, fecha_inicio, fecha_fin, extra_terms=numero_variants)
+        extra_terms = list(numero_variants) + list(expanded_terms.get(ob_id) or [])
+        all_queries = build_drive_queries(descripcion, fecha_inicio, fecha_fin, extra_terms=extra_terms)
         priority, generic = all_queries[:-n_generic], all_queries[-n_generic:]
         return priority[: settings.EVIDENCE_QUERIES_PER_OBLIGACION] + generic
 
     queries: list[DriveQuery] = []
     if obligaciones:
         for oblig in obligaciones_para_query:
-            queries.extend(_split_priority_and_generic(str(oblig.get("descripcion", ""))))
+            queries.extend(
+                _split_priority_and_generic(str(oblig.get("descripcion", "")), str(oblig.get("id") or ""))
+            )
     else:
         queries = _split_priority_and_generic(state.get("user_input", ""))
 

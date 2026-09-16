@@ -624,6 +624,160 @@ async def test_gather_gmail_evidence_fires_contract_number_queries_first(monkeyp
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Semantic query expansion (evidencias/discovery-fix WU7)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_gather_gmail_evidence_fires_expanded_phrase_queries(monkeypatch) -> None:
+    from app.core.config import settings
+    from app.services import evidence_discovery_service as eds
+
+    monkeypatch.setattr(settings, "EVIDENCE_MAX_GMAIL_QUERIES", 50)
+
+    captured_queries: list[str] = []
+
+    async def _fake_search(usuario_id, query, max_results):
+        captured_queries.append(query)
+        return []
+
+    adapter = MagicMock()
+    adapter.search_messages = AsyncMock(side_effect=_fake_search)
+
+    with patch.object(eds, "GmailAdapter", return_value=adapter):
+        await eds._gather_email_evidence(
+            MagicMock(),
+            uuid.uuid4(),
+            [{"id": "ob1", "descripcion": "Entregar informe mensual de actividades"}],
+            "2024-04-01",
+            "2024-04-30",
+            None,
+            None,
+            expanded_terms={"ob1": ["planilla de seguridad social", "monthly progress report"]},
+        )
+
+    assert any("planilla de seguridad social" in q for q in captured_queries)
+    assert any("monthly progress report" in q for q in captured_queries)
+
+
+@pytest.mark.asyncio
+async def test_gather_gmail_evidence_expansion_still_respects_query_budget(monkeypatch) -> None:
+    from app.core.config import settings
+    from app.services import evidence_discovery_service as eds
+
+    monkeypatch.setattr(settings, "EVIDENCE_MAX_GMAIL_QUERIES", 3)
+
+    captured_queries: list[str] = []
+
+    async def _fake_search(usuario_id, query, max_results):
+        captured_queries.append(query)
+        return []
+
+    adapter = MagicMock()
+    adapter.search_messages = AsyncMock(side_effect=_fake_search)
+
+    with patch.object(eds, "GmailAdapter", return_value=adapter):
+        await eds._gather_email_evidence(
+            MagicMock(),
+            uuid.uuid4(),
+            [{"id": "ob1", "descripcion": "Entregar informe mensual de actividades"}],
+            "2024-04-01",
+            "2024-04-30",
+            None,
+            None,
+            expanded_terms={"ob1": ["a", "b", "c", "d", "e", "f"]},
+        )
+
+    assert len(captured_queries) <= 3
+
+
+@pytest.mark.asyncio
+async def test_descubrir_evidencias_expansion_disabled_by_default_no_extra_llm_call() -> None:
+    """The feature flag defaults OFF — expand_search_terms/get_llm must NOT be
+    invoked, and existing behavior is completely unaffected."""
+    from app.services import evidence_discovery_service as eds
+
+    req = EvidenceDiscoveryRequest(
+        obligaciones=[{"id": "ob1", "descripcion": "Entregar informe mensual de actividades"}],
+        fecha_inicio="2024-04-01",
+        fecha_fin="2024-04-30",
+    )
+    gmail = MagicMock()
+    gmail.search_messages = AsyncMock(return_value=[])
+    drive_adapter = MagicMock()
+    drive_adapter.search_files = AsyncMock(return_value=[])
+    cal_adapter = MagicMock()
+    cal_adapter.search_events = AsyncMock(return_value=[])
+    justify_llm = AsyncMock()
+    justify_llm.complete = AsyncMock(return_value=MagicMock(content="No hay evidencia."))
+    expansion_spy = AsyncMock()
+
+    only_google, only_google_statuses = _patch_only_google_connected(eds)
+    with (
+        only_google,
+        only_google_statuses,
+        patch.object(eds, "GmailAdapter", return_value=gmail),
+        patch("app.agent.nodes.drive_fetch.DriveAdapter", return_value=drive_adapter),
+        patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", return_value=cal_adapter),
+        patch("app.agent.nodes.evidence_justify.get_llm", return_value=justify_llm),
+        patch.object(eds, "expand_search_terms", expansion_spy),
+    ):
+        await eds.descubrir_evidencias(MagicMock(), uuid.uuid4(), req)
+
+    expansion_spy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_descubrir_evidencias_expansion_enabled_feeds_gmail_queries(monkeypatch) -> None:
+    """With the feature flag on, the LLM's expanded phrases must reach Gmail
+    as additional queries (evidencias/discovery-fix WU7)."""
+    from app.core.config import settings
+    from app.services import evidence_discovery_service as eds
+
+    monkeypatch.setattr(settings, "EVIDENCE_QUERY_EXPANSION_ENABLED", True)
+    monkeypatch.setattr(settings, "EVIDENCE_MAX_GMAIL_QUERIES", 50)
+
+    req = EvidenceDiscoveryRequest(
+        obligaciones=[{"id": "ob1", "descripcion": "Entregar informe mensual de actividades"}],
+        fecha_inicio="2024-04-01",
+        fecha_fin="2024-04-30",
+    )
+
+    captured_queries: list[str] = []
+
+    async def _fake_search(usuario_id, query, max_results):
+        captured_queries.append(query)
+        return []
+
+    gmail = MagicMock()
+    gmail.search_messages = AsyncMock(side_effect=_fake_search)
+    drive_adapter = MagicMock()
+    drive_adapter.search_files = AsyncMock(return_value=[])
+    cal_adapter = MagicMock()
+    cal_adapter.search_events = AsyncMock(return_value=[])
+    justify_llm = AsyncMock()
+    justify_llm.complete = AsyncMock(return_value=MagicMock(content="No hay evidencia."))
+    expansion_llm = AsyncMock()
+    expansion_llm.complete = AsyncMock(
+        return_value=MagicMock(content='{"ob1": ["planilla de seguridad social", "avance mensual", "x", "y"]}')
+    )
+
+    only_google, only_google_statuses = _patch_only_google_connected(eds)
+    with (
+        only_google,
+        only_google_statuses,
+        patch.object(eds, "GmailAdapter", return_value=gmail),
+        patch.object(eds, "get_llm", return_value=expansion_llm),
+        patch("app.agent.nodes.drive_fetch.DriveAdapter", return_value=drive_adapter),
+        patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", return_value=cal_adapter),
+        patch("app.agent.nodes.evidence_justify.get_llm", return_value=justify_llm),
+    ):
+        await eds.descubrir_evidencias(MagicMock(), uuid.uuid4(), req)
+
+    assert any("planilla de seguridad social" in q for q in captured_queries)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Date-range default from contrato when fecha_inicio/fecha_fin are omitted
 # ─────────────────────────────────────────────────────────────────────────────
 

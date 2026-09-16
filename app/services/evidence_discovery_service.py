@@ -19,6 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.email.gmail_adapter import GmailAdapter
+from app.adapters.llm import get_llm
 from app.adapters.microsoft.graph_adapter import MicrosoftGraphAdapter
 from app.agent.nodes.calendar_fetch import calendar_fetch_node
 from app.agent.nodes.drive_fetch import drive_fetch_node
@@ -27,8 +28,14 @@ from app.agent.nodes.evidence_filter import evidence_filter_node
 from app.agent.nodes.evidence_justify import evidence_justify_node
 from app.agent.nodes.evidence_matcher import evidence_matcher_node
 from app.agent.nodes.evidence_orchestrator import evidence_orchestrator_node
+from app.agent.nodes.query_expansion import expand_search_terms
 from app.agent.prompts.contract_terms import contract_number_variants
-from app.agent.prompts.email_evidence import _extract_keywords, build_contract_queries, build_obligation_queries
+from app.agent.prompts.email_evidence import (
+    _extract_keywords,
+    build_contract_queries,
+    build_expanded_phrase_queries,
+    build_obligation_queries,
+)
 from app.agent.prompts.evidence_filter import score_non_personal_email, score_non_personal_ms_email
 from app.agent.state import AgentState
 from app.core.config import settings
@@ -272,6 +279,7 @@ async def _gather_email_evidence(
     entidad: str | None,
     provider: IntegrationProvider = IntegrationProvider.GOOGLE,
     numero_contrato: str | None = None,
+    expanded_terms: dict[str, list[str]] | None = None,
 ) -> tuple[list[dict], int]:
     """Busca correos crudos como evidencia y los normaliza al formato común.
 
@@ -281,6 +289,11 @@ async def _gather_email_evidence(
     contract number, has:attachment variant, entidad and supervisor full-text
     queries — fired ONCE per discovery run (not per-obligación) and given
     priority over per-obligación keyword queries under the query budget.
+    `expanded_terms` (evidencias/discovery-fix WU7, Google only): per-obligación
+    LLM-generated search phrases (see `app.agent.nodes.query_expansion.
+    expand_search_terms`) — fired as ADDITIONAL unscoped full-text queries so
+    evidence that never mentions the contract number or the obligación's own
+    wording can still be found. Still bounded by the same query budget below.
 
     Returns (emails, filtered_count) — filtered_count is how many non-personal
     emails were dropped before they could contaminate the evidence pipeline.
@@ -304,6 +317,12 @@ async def _gather_email_evidence(
                 : settings.EVIDENCE_QUERIES_PER_OBLIGACION
             ]
         )
+        if provider == IntegrationProvider.GOOGLE and expanded_terms:
+            ob_id = str(ob.get("id") or "")
+            phrases = expanded_terms.get(ob_id) or []
+            if phrases:
+                fi, ff = _widen_gmail_window(fecha_inicio, fecha_fin, settings.EVIDENCE_WINDOW_MARGIN_DAYS)
+                queries.extend(build_expanded_phrase_queries(phrases, fi, ff))
     seen_q: set[str] = set()
     unique_queries: list[str] = []
     for q in queries:
@@ -440,6 +459,27 @@ async def descubrir_evidencias(
         if cached is not None:
             return cached
 
+    contrato_contexto: dict[str, str] = {"fecha_inicio": fecha_inicio, "fecha_fin": fecha_fin}
+    if contrato is not None:
+        contrato_contexto["numero_contrato"] = contrato.numero_contrato
+        if contrato.entidad:
+            contrato_contexto["entidad"] = contrato.entidad
+        if contrato.objeto:
+            contrato_contexto["objeto"] = contrato.objeto
+
+    # Semantic query expansion (evidencias/discovery-fix WU7) — one LLM call
+    # for search phrases beyond the contract number/obligación wording, so
+    # evidence that never mentions either can still be found. Feature-flagged
+    # OFF by default: this is a new LLM call site in a path a large slice of
+    # the existing test suite exercises without mocking an LLM.
+    expanded_terms: dict[str, list[str]] = {}
+    if not local_only and settings.EVIDENCE_QUERY_EXPANSION_ENABLED and obligaciones:
+        try:
+            expansion_llm = get_llm(model=settings.LLM_EVIDENCE_CLASSIFIER_MODEL)
+            expanded_terms = await expand_search_terms(contrato_contexto, obligaciones, expansion_llm)
+        except Exception as exc:
+            await logger.awarning("query_expansion_failed", error=str(exc))
+
     email_evidencias: list[dict] = []
     email_filtered = 0
     connected_providers: list[IntegrationProvider] = []
@@ -489,6 +529,7 @@ async def descubrir_evidencias(
                     entidad_efectiva,
                     provider,
                     numero_contrato=numero_contrato,
+                    expanded_terms=expanded_terms,
                 )
             except Exception as exc:
                 await logger.awarning("email_gather_provider_failed", provider=provider.value, error=str(exc))
@@ -504,14 +545,6 @@ async def descubrir_evidencias(
     contexto_usuario = await _contexto_usuario(db, req.cuenta_id)
     local_evidence = await _evidencias_subidas(db, req.cuenta_id)
 
-    contrato_contexto: dict[str, str] = {"fecha_inicio": fecha_inicio, "fecha_fin": fecha_fin}
-    if contrato is not None:
-        contrato_contexto["numero_contrato"] = contrato.numero_contrato
-        if contrato.entidad:
-            contrato_contexto["entidad"] = contrato.entidad
-        if contrato.objeto:
-            contrato_contexto["objeto"] = contrato.objeto
-
     # Estado compartido por los nodos del agente.
     state: AgentState = {
         "user_id": usuario_id,
@@ -523,6 +556,7 @@ async def descubrir_evidencias(
         "actividades_previas": actividades_previas,
         "contexto_usuario": contexto_usuario,
         "local_evidence": local_evidence,
+        "expanded_terms": expanded_terms,
     }
 
     # 2-3. Explorar Drive y Calendar por cada proveedor conectado (skipped entirely

@@ -163,6 +163,22 @@ def build_contract_queries(
     return queries
 
 
+def build_expanded_phrase_queries(phrases: list[str], fecha_inicio: str, fecha_fin: str) -> list[str]:
+    """Unscoped full-text Gmail queries, one per semantic search phrase
+    (evidencias/discovery-fix WU7) — e.g. a deliverable name or counterpart
+    name the LLM generated (`app.agent.nodes.query_expansion.expand_search_terms`),
+    so evidence that never mentions the contract number or the obligación's own
+    wording can still be found."""
+    noise = GMAIL_NOISE_EXCLUSIONS
+    queries: list[str] = []
+    for phrase in phrases:
+        safe = (phrase or "").replace('"', "").strip()
+        if not safe:
+            continue
+        queries.append(f'"{safe}" after:{fecha_inicio} before:{fecha_fin} {noise}')
+    return queries
+
+
 def format_emails_for_llm(emails: list[dict[str, str]]) -> str:
     """Formatea correos para el prompt de análisis del LLM."""
     if not emails:

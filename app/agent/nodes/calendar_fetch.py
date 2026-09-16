@@ -65,9 +65,12 @@ def _build_calendar_query(obligaciones: list[dict]) -> str | None:
     return " ".join(unique) if unique else None
 
 
-def _calendar_terms(contrato: dict, obligaciones: list[dict]) -> list[str]:
+def _calendar_terms(
+    contrato: dict, obligaciones: list[dict], expanded_terms: dict[str, list[str]] | None = None
+) -> list[str]:
     """One short term per Calendar API call — contract-number variants and
-    entidad first (strongest signals), then obligación keywords, bounded by
+    entidad first (strongest signals), then obligación keywords and any
+    LLM-generated expanded phrases (evidencias/discovery-fix WU7), bounded by
     `EVIDENCE_MAX_CALENDAR_TERMS`."""
     terms: list[str] = list(contract_number_variants(contrato.get("numero_contrato")))
 
@@ -75,9 +78,12 @@ def _calendar_terms(contrato: dict, obligaciones: list[dict]) -> list[str]:
     if entidad and len(str(entidad).strip()) > 3:
         terms.append(str(entidad).strip())
 
+    expanded_terms = expanded_terms or {}
     for ob in obligaciones:
         desc = ob.get("descripcion") or ""
         terms.extend(_extract_keywords(desc)[:2])
+        ob_id = str(ob.get("id") or "")
+        terms.extend(expanded_terms.get(ob_id) or [])
 
     unique = list(dict.fromkeys(t for t in terms if t))
     return unique[: settings.EVIDENCE_MAX_CALENDAR_TERMS]
@@ -154,7 +160,7 @@ async def calendar_fetch_node(
         return {**state, "calendar_evidencias": existing}
 
     obligaciones = state.get("obligaciones_contexto") or []
-    terms = _calendar_terms(contrato, obligaciones)
+    terms = _calendar_terms(contrato, obligaciones, state.get("expanded_terms"))
     queries: list[str | None] = list(terms) if terms else [None]
 
     adapter = GoogleCalendarAdapter(db) if provider == IntegrationProvider.GOOGLE else MicrosoftGraphAdapter(db)

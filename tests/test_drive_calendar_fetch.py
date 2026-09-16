@@ -136,6 +136,33 @@ async def test_drive_fetch_queries_contract_number_variants_first(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_drive_fetch_includes_expanded_phrase_queries(monkeypatch):
+    """evidencias/discovery-fix WU7: LLM-generated search phrases (e.g. a
+    deliverable name) must be queried too, not just the obligación's own
+    keywords and the contract number."""
+    from app.agent.nodes import drive_fetch as mod
+
+    monkeypatch.setattr(mod.settings, "EVIDENCE_QUERIES_PER_OBLIGACION", 10)
+
+    mock_adapter = MagicMock()
+    mock_adapter.search_files = AsyncMock(return_value=[])
+
+    state = {
+        "user_id": uuid.uuid4(),
+        "_db": MagicMock(),
+        "contrato_contexto": {"fecha_inicio": "2024-04-01", "fecha_fin": "2024-04-30"},
+        "obligaciones_contexto": [{"id": "ob1", "descripcion": "Entregar informe mensual de actividades"}],
+        "expanded_terms": {"ob1": ["planilla de seguridad social"]},
+    }
+
+    with patch.object(mod, "DriveAdapter", return_value=mock_adapter):
+        await mod.drive_fetch_node(state)
+
+    called_terms = [call.args[1].keywords[0] for call in mock_adapter.search_files.call_args_list]
+    assert "planilla de seguridad social" in called_terms
+
+
+@pytest.mark.asyncio
 async def test_drive_fetch_uses_settings_page_size(monkeypatch):
     from app.agent.nodes import drive_fetch as mod
 
@@ -398,6 +425,36 @@ async def test_calendar_fetch_fires_one_query_per_term_and_merges_by_id():
     assert mock_adapter.search_events.await_count > 1  # more than one term-scoped call
     assert len(result["calendar_evidencias"]) == 1  # merged by event id, not duplicated
     assert any(q and "4161" in q for q in call_queries)  # contract number was one of the terms
+
+
+@pytest.mark.asyncio
+async def test_calendar_fetch_includes_expanded_phrase_terms():
+    """evidencias/discovery-fix WU7: LLM-generated search phrases must also be
+    queried against Calendar (e.g. a Meet-titled term the obligación text
+    itself never mentions)."""
+    from app.agent.nodes import calendar_fetch as mod
+
+    call_queries: list[str | None] = []
+
+    async def _fake_search(usuario_id, time_min, time_max, calendar_id="primary", max_results=50, q=None):
+        call_queries.append(q)
+        return []
+
+    mock_adapter = MagicMock()
+    mock_adapter.search_events = AsyncMock(side_effect=_fake_search)
+
+    state = {
+        "user_id": uuid.uuid4(),
+        "_db": MagicMock(),
+        "contrato_contexto": {"fecha_inicio": "2024-04-01", "fecha_fin": "2024-04-30"},
+        "obligaciones_contexto": [{"id": "ob1", "descripcion": "Asistir a reuniones de seguimiento"}],
+        "expanded_terms": {"ob1": ["mesa de trabajo mensual"]},
+    }
+
+    with patch.object(mod, "GoogleCalendarAdapter", return_value=mock_adapter):
+        await mod.calendar_fetch_node(state)
+
+    assert "mesa de trabajo mensual" in call_queries
 
 
 @pytest.mark.asyncio

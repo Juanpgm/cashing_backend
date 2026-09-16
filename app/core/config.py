@@ -437,6 +437,14 @@ class Settings(BaseSettings):
     # drive_fetch: Drive API pageSize per search_files call (was a hardcoded
     # module constant of 10).
     EVIDENCE_DRIVE_PAGE_SIZE: int = 20
+    # Semantic query expansion (evidencias/discovery-fix WU7): one extra LLM
+    # call per discovery run to generate search phrases beyond the contract
+    # number/obligación wording. Defaults OFF — this is a new LLM call site
+    # in a code path (_gather_email_evidence/drive_fetch/calendar_fetch) that
+    # a large slice of the existing test suite exercises WITHOUT mocking an
+    # LLM; flipping it on is a deliberate rollout step, not a silent default
+    # change.
+    EVIDENCE_QUERY_EXPANSION_ENABLED: bool = False
 
     # Embeddings — in-memory semantic ranking signal for evidence-to-obligación
     # matching (evidence-embeddings capability). No persistent vector store:
