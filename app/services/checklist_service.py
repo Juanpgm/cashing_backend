@@ -442,17 +442,54 @@ async def _tiene_primera_activa(db: AsyncSession, contrato_id: uuid.UUID) -> boo
     ).scalar_one_or_none() is not None
 
 
+async def _es_cuenta_activa_mas_antigua(db: AsyncSession, cuenta: CuentaCobro) -> bool:
+    """Whether `cuenta` is the EARLIEST surviving cuenta of its contrato.
+
+    Round 3, finding #2: the fail-safe below used to fire on "no active PRIMERA
+    exists", which is a property of the CONTRATO, not of the cuenta — so a
+    soft-deleted (tombstoned) cuota 1 (a shape migration 025's backfill actively
+    produces: it consumed ordinal 1 and left the survivors RECURRENTE) made
+    EVERY cuota of the contrato fail safe at once and re-materialize all five
+    identity/budget rows. Asking whether THIS cuenta is the earliest survivor
+    lets exactly one cuenta take the first-cuota role.
+
+    Ordered by `numero_cuota` (nulls last — nullable at the type level only;
+    `crear_cuenta_cobro` always assigns it and migration 025 backfilled every
+    pre-existing row) with (anio, mes, id) as deterministic tie-breakers.
+    """
+    primera_id = (
+        await db.execute(
+            select(CuentaCobro.id)
+            .where(CuentaCobro.contrato_id == cuenta.contrato_id, CuentaCobro.deleted_at.is_(None))
+            .order_by(
+                CuentaCobro.numero_cuota.asc().nulls_last(),
+                CuentaCobro.anio.asc(),
+                CuentaCobro.mes.asc(),
+                CuentaCobro.id.asc(),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return primera_id == cuenta.id
+
+
 async def _construir_checklist_aplica_ctx(db: AsyncSession, cuenta: CuentaCobro) -> ChecklistAplicaCtx:
     """Build the real `ChecklistAplicaCtx` for `cuenta` — only issues the two
     extra lookups (shared CONTRATO document / contrato obligaciones) when the
     cuenta is NOT first, since a first cuenta never needs them."""
     is_first = _is_first_cuenta(cuenta)
-    if not is_first and not await _tiene_primera_activa(db, cuenta.contrato_id):
-        # Fail-safe: the contrato has no active PRIMERA cuenta at all — treat
-        # THIS cuenta as first rather than silently hiding identity/budget
-        # documents forever (finding #2). `eliminar_cuenta_cobro` also
-        # promotes a replacement PRIMERA when possible; this covers the read
-        # path for the window before/absent that promotion.
+    if (
+        not is_first
+        and not await _tiene_primera_activa(db, cuenta.contrato_id)
+        and await _es_cuenta_activa_mas_antigua(db, cuenta)
+    ):
+        # Fail-safe: the contrato has no active PRIMERA cuenta at all, and THIS
+        # cuenta is the earliest survivor — treat it as first rather than
+        # silently hiding identity/budget documents forever (round 2, finding
+        # #2). `eliminar_cuenta_cobro` also promotes a replacement PRIMERA when
+        # possible; this covers the read path for the window before/absent that
+        # promotion. The "earliest survivor" half (round 3, finding #2) keeps a
+        # tombstoned cuota 1 from making EVERY cuota fail safe at once.
         is_first = True
     if is_first:
         return ChecklistAplicaCtx(is_first=True)

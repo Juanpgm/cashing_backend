@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -311,6 +311,32 @@ async def test_asegurar_checklist_sin_primera_activa_trata_cuenta_como_primera(
 
     codigos = {f.requisito_codigo for f in filas}
     assert {"CEDULA", "RUT", "RPC", "CDP", "CONTRATO"} <= codigos
+
+
+async def test_asegurar_checklist_sin_primera_activa_solo_la_cuenta_mas_antigua_falla_segura(
+    db: AsyncSession, contrato: Contrato
+) -> None:
+    """checklist/primera-cuota-2026-09-16, round 3, finding #2 (WARNING): the
+    fail-safe asked "does an ACTIVE PRIMERA exist?", so a soft-deleted
+    (tombstoned) cuota 1 — a shape migration 025's backfill actively produces —
+    made EVERY cuota of the contrato fail safe to first and re-materialize all
+    five identity/budget rows, i.e. exactly the spam rule 1 exists to remove.
+    The question that actually matters is "is THIS cuenta the earliest
+    surviving one?", so only ONE cuenta fails safe."""
+    cuenta1 = await _make_cuenta(db, contrato, mes=1)
+    cuenta2 = await _make_cuenta(db, contrato, mes=2)
+    cuenta3 = await _make_cuenta(db, contrato, mes=3)
+    cuenta1.deleted_at = datetime(2024, 5, 1, tzinfo=UTC)
+    await db.commit()
+
+    filas2 = await checklist_service.asegurar_checklist(db, cuenta2)
+    await db.commit()
+    filas3 = await checklist_service.asegurar_checklist(db, cuenta3)
+    await db.commit()
+
+    solo_primera = {"CEDULA", "RUT", "RPC", "CDP"}
+    assert solo_primera <= {f.requisito_codigo for f in filas2}
+    assert not solo_primera & {f.requisito_codigo for f in filas3}
 
 
 async def test_asegurar_checklist_custom_mapeado_respeta_su_propio_solo_primera_cuenta(
