@@ -12,6 +12,7 @@ evidence_orchestrator → evidence_matcher → evidence_justify.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import date, timedelta
 from itertools import zip_longest
 
@@ -305,8 +306,10 @@ async def _gather_email_evidence(
     max_obligaciones = settings.EVIDENCE_MAX_OBLIGACIONES_QUERIES
     obligaciones_para_query = obligaciones if max_obligaciones <= 0 else obligaciones[:max_obligaciones]
 
-    query_budget = settings.EVIDENCE_MAX_GMAIL_QUERIES if provider == IntegrationProvider.GOOGLE else (
-        settings.EVIDENCE_MAX_QUERIES_TOTAL
+    query_budget = (
+        settings.EVIDENCE_MAX_GMAIL_QUERIES
+        if provider == IntegrationProvider.GOOGLE
+        else (settings.EVIDENCE_MAX_QUERIES_TOTAL)
     )
 
     # Two SEPARATE budgets, not one FIFO list (round-2 fix for the confirmed
@@ -639,9 +642,11 @@ async def descubrir_evidencias(
     #    a provider returning a malformed embedding batch, say — escaped as an
     #    unhandled 500 on a user-facing "descubrir" click. Discovery must
     #    degrade to whatever it already found, never fail the request.
-    async def _stage(name: str, node, st: AgentState) -> AgentState:
+    async def _stage(
+        name: str, node: Callable[[AgentState], Awaitable[AgentState]], st: AgentState
+    ) -> AgentState:
         try:
-            return await node(st)
+            return await node(st)  # type: ignore[no-any-return]
         except Exception as exc:
             await logger.aerror("evidence_pipeline_stage_failed", stage=name, error=str(exc))
             return st

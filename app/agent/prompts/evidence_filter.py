@@ -16,26 +16,28 @@ import re
 # Threshold ≥ 3 → non-personal (heuristic layer drops it, never reaches LLM).
 
 # Headers whose mere presence guarantees a bulk/automated sender.
-_DEFINITIVE_HEADERS: frozenset[str] = frozenset({
-    "list-unsubscribe",
-    "list-unsubscribe-post",
-    "list-id",
-    "list-post",
-    "list-owner",
-    "x-campaign",
-    "x-campaign-id",
-    "x-mc-campaign",
-    "x-feedback-id",
-    # Platform-injected
-    "x-github-reason",
-    "x-github-sender",
-    "x-github-target",
-    "x-notifications",
-    "x-linkedin-class",
-    "x-linkedin-id",
-    "x-atlassian-token",
-    "x-jira-fingerprint",
-})
+_DEFINITIVE_HEADERS: frozenset[str] = frozenset(
+    {
+        "list-unsubscribe",
+        "list-unsubscribe-post",
+        "list-id",
+        "list-post",
+        "list-owner",
+        "x-campaign",
+        "x-campaign-id",
+        "x-mc-campaign",
+        "x-feedback-id",
+        # Platform-injected
+        "x-github-reason",
+        "x-github-sender",
+        "x-github-target",
+        "x-notifications",
+        "x-linkedin-class",
+        "x-linkedin-id",
+        "x-atlassian-token",
+        "x-jira-fingerprint",
+    }
+)
 
 _ESP_XMAILER_NAMES: tuple[str, ...] = (
     "mailchimp",
@@ -51,25 +53,49 @@ _ESP_XMAILER_NAMES: tuple[str, ...] = (
 _PRECEDENCE_BULK_VALUES: frozenset[str] = frozenset({"bulk", "list", "junk"})
 
 # Well-known platform domains — presence alone is +4.
-_PLATFORM_DOMAINS: frozenset[str] = frozenset({
-    # Dev / CI / PM
-    "github.com", "gitlab.com", "bitbucket.org",
-    "jira.atlassian.com", "trello.com", "circleci.com",
-    "travis-ci.org", "vercel.com", "netlify.com",
-    "heroku.com", "render.com",
-    # Social
-    "linkedin.com", "twitter.com", "x.com",
-    "facebookmail.com", "instagram.com", "tiktok.com",
-    "youtube.com", "pinterest.com", "reddit.com",
-    "discord.com", "slack.com",
-    # Services / SaaS
-    "paypal.com", "stripe.com", "shopify.com",
-    "amazon.com", "apple.com", "microsoft.com",
-    "google.com", "notion.so", "figma.com",
-    "zoom.us", "dropbox.com", "samsung.com",
-    # Google notification subdomain
-    "notifications.google.com",
-})
+_PLATFORM_DOMAINS: frozenset[str] = frozenset(
+    {
+        # Dev / CI / PM
+        "github.com",
+        "gitlab.com",
+        "bitbucket.org",
+        "jira.atlassian.com",
+        "trello.com",
+        "circleci.com",
+        "travis-ci.org",
+        "vercel.com",
+        "netlify.com",
+        "heroku.com",
+        "render.com",
+        # Social
+        "linkedin.com",
+        "twitter.com",
+        "x.com",
+        "facebookmail.com",
+        "instagram.com",
+        "tiktok.com",
+        "youtube.com",
+        "pinterest.com",
+        "reddit.com",
+        "discord.com",
+        "slack.com",
+        # Services / SaaS
+        "paypal.com",
+        "stripe.com",
+        "shopify.com",
+        "amazon.com",
+        "apple.com",
+        "microsoft.com",
+        "google.com",
+        "notion.so",
+        "figma.com",
+        "zoom.us",
+        "dropbox.com",
+        "samsung.com",
+        # Google notification subdomain
+        "notifications.google.com",
+    }
+)
 
 # ESP sending domains (wildcard subdomain match) — +5.
 _ESP_DOMAIN_PATTERNS: tuple[re.Pattern, ...] = tuple(
@@ -90,22 +116,70 @@ _ESP_DOMAIN_PATTERNS: tuple[re.Pattern, ...] = tuple(
 
 # Normalized auto-prefixes (hyphens/dots stripped, lowercase).
 # "no-reply" → "noreply", "no.reply" → "noreply", etc.
-_AUTO_PREFIXES_NORMALIZED: frozenset[str] = frozenset({
-    # English
-    "noreply", "donotreply", "notifications", "notification",
-    "newsletter", "alerts", "alert", "mailer", "postmaster",
-    "bounce", "support", "help", "team", "admin", "info",
-    "marketing", "promo", "hello", "hi", "news", "updates", "update",
-    "offers", "offer", "reply", "billing", "receipts", "receipt",
-    "orders", "order", "confirm", "verify", "security",
-    "automated", "robot", "bot",
-    # Spanish equivalents
-    "facturacion", "factura", "cobros", "cobro", "pagos", "pago",
-    "soporte", "ayuda", "equipo", "noticias", "actualizaciones",
-    "actualizacion", "ofertas", "oferta", "confirmacion", "confirma",
-    "verificacion", "verifica", "seguridad", "automatizado",
-    "admisiones", "admision",
-})
+_AUTO_PREFIXES_NORMALIZED: frozenset[str] = frozenset(
+    {
+        # English
+        "noreply",
+        "donotreply",
+        "notifications",
+        "notification",
+        "newsletter",
+        "alerts",
+        "alert",
+        "mailer",
+        "postmaster",
+        "bounce",
+        "support",
+        "help",
+        "team",
+        "admin",
+        "info",
+        "marketing",
+        "promo",
+        "hello",
+        "hi",
+        "news",
+        "updates",
+        "update",
+        "offers",
+        "offer",
+        "reply",
+        "billing",
+        "receipts",
+        "receipt",
+        "orders",
+        "order",
+        "confirm",
+        "verify",
+        "security",
+        "automated",
+        "robot",
+        "bot",
+        # Spanish equivalents
+        "facturacion",
+        "factura",
+        "cobros",
+        "cobro",
+        "pagos",
+        "pago",
+        "soporte",
+        "ayuda",
+        "equipo",
+        "noticias",
+        "actualizaciones",
+        "actualizacion",
+        "ofertas",
+        "oferta",
+        "confirmacion",
+        "confirma",
+        "verificacion",
+        "verifica",
+        "seguridad",
+        "automatizado",
+        "admisiones",
+        "admision",
+    }
+)
 
 # High-confidence subject patterns → +2.
 _SUBJECT_HIGH_CONFIDENCE: tuple[re.Pattern, ...] = tuple(
@@ -164,20 +238,22 @@ _SUBJECT_HIGH_CONFIDENCE: tuple[re.Pattern, ...] = tuple(
 
 # ── Whitelist — personal and institutional domains never filtered ─────────────
 
-_PERSONAL_DOMAINS: frozenset[str] = frozenset({
-    "gmail.com",
-    "outlook.com",
-    "hotmail.com",
-    "hotmail.es",
-    "yahoo.com",
-    "yahoo.es",
-    "icloud.com",
-    "live.com",
-    "live.com.co",
-    "protonmail.com",
-    "me.com",
-    "googlemail.com",
-})
+_PERSONAL_DOMAINS: frozenset[str] = frozenset(
+    {
+        "gmail.com",
+        "outlook.com",
+        "hotmail.com",
+        "hotmail.es",
+        "yahoo.com",
+        "yahoo.es",
+        "icloud.com",
+        "live.com",
+        "live.com.co",
+        "protonmail.com",
+        "me.com",
+        "googlemail.com",
+    }
+)
 
 # Domain suffixes — any domain ending with one of these is institutional.
 _INSTITUTIONAL_SUFFIXES: tuple[str, ...] = (
@@ -238,6 +314,7 @@ def _is_platform_domain(domain: str) -> bool:
 
 # ── Public scoring API ────────────────────────────────────────────────────────
 
+
 def score_non_personal_email(
     sender: str,
     subject: str,
@@ -286,7 +363,7 @@ def score_non_personal_email(
     exempt_auto_prefix = bool(supervisor_domain) and domain == (supervisor_domain or "").strip().lower()
 
     # +5 — Gmail category labels (server-side ML classifier, highly accurate)
-    for label in (labels or []):
+    for label in labels or []:
         if label in NOISE_GMAIL_LABELS:
             return 5, f"gmail_label:{label}"
 
@@ -370,13 +447,15 @@ def score_non_personal_email(
 
 # ── Legacy boolean helpers (kept for backward compatibility) ──────────────────
 
-NOISE_GMAIL_LABELS: frozenset[str] = frozenset({
-    "CATEGORY_PROMOTIONS",
-    "CATEGORY_SOCIAL",
-    "CATEGORY_FORUMS",
-    "CATEGORY_UPDATES",
-    "SPAM",
-})
+NOISE_GMAIL_LABELS: frozenset[str] = frozenset(
+    {
+        "CATEGORY_PROMOTIONS",
+        "CATEGORY_SOCIAL",
+        "CATEGORY_FORUMS",
+        "CATEGORY_UPDATES",
+        "SPAM",
+    }
+)
 
 NOISE_SENDER_PATTERNS: list[re.Pattern] = [
     re.compile(p, re.IGNORECASE)

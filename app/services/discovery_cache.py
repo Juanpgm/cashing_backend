@@ -36,7 +36,7 @@ CacheKey = tuple[uuid.UUID, uuid.UUID, str, str, str]
 _cache: dict[CacheKey, tuple[float, EvidenceDiscoveryResponse]] = {}
 
 
-def context_fingerprint(contrato_contexto: dict | None, contexto_usuario: str | None) -> str:
+def context_fingerprint(contrato_contexto: dict[str, object] | None, contexto_usuario: str | None) -> str:
     """Short, stable hash of the non-date search inputs.
 
     Key-order independent (sorted JSON) so two equal contexts always collide,
@@ -63,11 +63,6 @@ def _key(
     context_fingerprint: str = "",
 ) -> CacheKey:
     return (usuario_id, cuenta_id, fecha_inicio, fecha_fin, context_fingerprint)
-
-
-def clear() -> None:
-    """Drop every entry — for tests and for an explicit operational reset."""
-    _cache.clear()
 
 
 def get_cached(

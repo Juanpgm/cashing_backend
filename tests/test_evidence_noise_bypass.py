@@ -17,7 +17,6 @@ Round-2 regression suite for two confirmed findings:
 from __future__ import annotations
 
 import pytest
-
 from app.agent.prompts.evidence_filter import score_non_personal_email
 
 DAGMA_NUMERO = "4161.010.26.1.027.2025"

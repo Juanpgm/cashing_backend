@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import re
 from typing import TYPE_CHECKING, Any
@@ -254,9 +255,7 @@ def _mentions_any(evidence: dict, variants: list[str]) -> bool:
     if not variants:
         return False
     text = f"{evidence.get('title', '')} {evidence.get('content', '')}".lower()
-    return any(
-        re.search(rf"(?<![0-9A-Za-z]){re.escape(variant.lower())}(?![0-9A-Za-z])", text) for variant in variants
-    )
+    return any(re.search(rf"(?<![0-9A-Za-z]){re.escape(variant.lower())}(?![0-9A-Za-z])", text) for variant in variants)
 
 
 def _contains_contract_number(evidence: dict, numero_variants: list[str]) -> bool:
@@ -414,7 +413,7 @@ def _score_ok(score: object) -> bool:
     return value >= settings.EVIDENCE_RELEVANCE_MIN
 
 
-def _extract_json_array(raw: str) -> list | None:
+def _extract_json_array(raw: str) -> list[object] | None:
     """Find the response's JSON array, tolerant of the shapes models actually emit.
 
     `re.search(r"\\[.*\\]", DOTALL)` is greedy across the WHOLE response, so a
@@ -461,9 +460,9 @@ def _extract_json_array(raw: str) -> list | None:
     return None
 
 
-def _salvage_truncated_array(fragment: str) -> list | None:
+def _salvage_truncated_array(fragment: str) -> list[object] | None:
     """Recover the complete top-level objects from an array cut off mid-item."""
-    items: list = []
+    items: list[object] = []
     depth = 0
     in_string = False
     escaped = False
@@ -486,10 +485,8 @@ def _salvage_truncated_array(fragment: str) -> list | None:
         elif ch == "}":
             depth -= 1
             if depth == 0 and obj_start >= 0:
-                try:
+                with contextlib.suppress(ValueError, TypeError):
                     items.append(json.loads(fragment[obj_start : pos + 1]))
-                except (ValueError, TypeError):
-                    pass
                 obj_start = -1
     return items or None
 

@@ -439,9 +439,7 @@ async def test_subir_evidencia_actividad_reupload_no_duplica(
 def test_dedup_keeps_recurring_calendar_events_with_distinct_event_ids():
     from app.agent.nodes.evidence_dedup import _deduplicate
 
-    events = [
-        {"source": "calendar", "event_id": f"e{i}", "content": "Comite de seguimiento"} for i in range(4)
-    ]
+    events = [{"source": "calendar", "event_id": f"e{i}", "content": "Comite de seguimiento"} for i in range(4)]
     kept = _deduplicate(events)
     assert len(kept) == 4, "recurring weekly meeting instances collapsed into one"
 
@@ -509,14 +507,22 @@ def test_dedup_cross_provider_same_file_collapses_on_name_size_mime():
 
     items = [
         {
-            "source": "drive", "file_id": "g1", "provider": "google",
-            "title": "Informe mensual.pdf", "content": "Informe mensual.pdf",
-            "size": 12345, "mime_type": "application/pdf",
+            "source": "drive",
+            "file_id": "g1",
+            "provider": "google",
+            "title": "Informe mensual.pdf",
+            "content": "Informe mensual.pdf",
+            "size": 12345,
+            "mime_type": "application/pdf",
         },
         {
-            "source": "drive", "file_id": "m1", "provider": "microsoft",
-            "title": "Informe mensual.pdf", "content": "Informe mensual.pdf",
-            "size": 12345, "mime_type": "application/pdf",
+            "source": "drive",
+            "file_id": "m1",
+            "provider": "microsoft",
+            "title": "Informe mensual.pdf",
+            "content": "Informe mensual.pdf",
+            "size": 12345,
+            "mime_type": "application/pdf",
         },
     ]
     assert len(_deduplicate(items)) == 1

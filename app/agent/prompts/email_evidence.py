@@ -104,18 +104,12 @@ def build_obligation_queries(
     #    nunca aparecía.
     if keywords:
         kw_str = " OR ".join(keywords[:4])
-        queries.append(
-            f"subject:({kw_str}) after:{fecha_inicio} before:{fecha_fin} {noise}"
-        )
-        queries.append(
-            f"({kw_str}) after:{fecha_inicio} before:{fecha_fin} {noise}"
-        )
+        queries.append(f"subject:({kw_str}) after:{fecha_inicio} before:{fecha_fin} {noise}")
+        queries.append(f"({kw_str}) after:{fecha_inicio} before:{fecha_fin} {noise}")
 
     # 2. Desde el supervisor
     if supervisor_email:
-        queries.append(
-            f"from:{supervisor_email} after:{fecha_inicio} before:{fecha_fin} {noise}"
-        )
+        queries.append(f"from:{supervisor_email} after:{fecha_inicio} before:{fecha_fin} {noise}")
 
     # 3. Patrones comunes de evidencia en función pública
     queries.append(
@@ -125,16 +119,14 @@ def build_obligation_queries(
 
     # 4. Aprobaciones y visto bueno
     queries.append(
-        f"subject:(aprobado OR aprobación OR \"visto bueno\" OR recibido OR aprobó) "
+        f'subject:(aprobado OR aprobación OR "visto bueno" OR recibido OR aprobó) '
         f"after:{fecha_inicio} before:{fecha_fin} {noise}"
     )
 
     # 5. Entidad en el cuerpo (si disponible)
     if entidad and len(entidad) > 5:
         safe_entity = _safe_entity_phrase(entidad, 40)
-        queries.append(
-            f'"{safe_entity}" after:{fecha_inicio} before:{fecha_fin} {noise}'
-        )
+        queries.append(f'"{safe_entity}" after:{fecha_inicio} before:{fecha_fin} {noise}')
 
     return queries
 
@@ -227,30 +219,50 @@ def format_obligaciones_for_llm(obligaciones: list[dict[str, str | int | None]])
         return "Sin obligaciones definidas."
     parts = []
     for o in obligaciones:
-        parts.append(
-            f"- ID: {o.get('id')} | Tipo: {o.get('tipo')} | "
-            f"Descripción: {o.get('descripcion')}"
-        )
+        parts.append(f"- ID: {o.get('id')} | Tipo: {o.get('tipo')} | Descripción: {o.get('descripcion')}")
     return "\n".join(parts)
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
 _STOPWORDS = {
-    "de", "la", "el", "en", "y", "a", "los", "las", "con", "por", "para",
-    "del", "al", "se", "que", "un", "una", "su", "sus", "es", "son",
-    "este", "esta", "esto", "como", "más", "si", "no", "le", "lo",
+    "de",
+    "la",
+    "el",
+    "en",
+    "y",
+    "a",
+    "los",
+    "las",
+    "con",
+    "por",
+    "para",
+    "del",
+    "al",
+    "se",
+    "que",
+    "un",
+    "una",
+    "su",
+    "sus",
+    "es",
+    "son",
+    "este",
+    "esta",
+    "esto",
+    "como",
+    "más",
+    "si",
+    "no",
+    "le",
+    "lo",
 }
 
 
 def _extract_keywords(text: str) -> list[str]:
     """Extrae 4-5 palabras clave relevantes de la descripción de la obligación."""
     words = text.replace(",", " ").replace(".", " ").split()
-    candidates = [
-        w.lower().strip("():;-")
-        for w in words
-        if len(w) > 4 and w.lower() not in _STOPWORDS
-    ]
+    candidates = [w.lower().strip("():;-") for w in words if len(w) > 4 and w.lower() not in _STOPWORDS]
     # Deduplicate preserving order
     seen: set[str] = set()
     unique = []

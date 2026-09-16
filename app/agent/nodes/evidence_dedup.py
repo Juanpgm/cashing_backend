@@ -30,7 +30,7 @@ def _external_id_key(evidence: dict) -> str | None:
     return f"{evidence.get('source') or ''}:{external_id}"
 
 
-def _file_identity_key(evidence: dict) -> tuple[str, object, str] | None:
+def _file_identity_key(evidence: dict[str, object]) -> tuple[str, object, str] | None:
     """`(name, size, mime)` for a file — the ONLY cross-provider dedup signal.
 
     The same document uploaded to both Google Drive and OneDrive gets different
@@ -123,8 +123,7 @@ async def evidence_dedup_node(state: AgentState) -> AgentState:
 
     # Deduplicate per-obligation evidence in matched_evidence
     deduped_matched: dict[str, list[dict]] = {
-        ob_id: _deduplicate(ev_list)
-        for ob_id, ev_list in matched_evidence.items()
+        ob_id: _deduplicate(ev_list) for ob_id, ev_list in matched_evidence.items()
     }
 
     # Final deduplicated_evidence: flat list from matched (preserving per-obligation dedup)

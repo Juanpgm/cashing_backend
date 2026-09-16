@@ -246,9 +246,7 @@ async def test_gmail_per_query_fetch_shrinks_once_the_total_pool_is_full(monkeyp
         )
 
     assert len(requested) > 5, "later queries were skipped entirely — obligaciones would go unsearched"
-    assert requested[-1] < requested[0], (
-        f"per-query fetch never shrank once the pool was full: {requested}"
-    )
+    assert requested[-1] < requested[0], f"per-query fetch never shrank once the pool was full: {requested}"
     assert sum(requested) < 25 * len(requested), "total fetch volume was not bounded"
 
 

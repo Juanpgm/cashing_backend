@@ -28,8 +28,6 @@ _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 _MAX_PHRASES_PER_OBLIGACION = 8
 
 
-
-
 def _deterministic_terms(obligaciones: list[dict]) -> dict[str, list[str]]:
     """Fallback: reuse the existing keyword extractor per obligación."""
     return {

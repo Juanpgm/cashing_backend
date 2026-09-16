@@ -16,13 +16,10 @@ obligaciones a contract has.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from typing import TypeVar
-
-T = TypeVar("T")
+from collections.abc import Hashable, Sequence
 
 
-def round_robin(groups: Sequence[Sequence[T]], budget: int) -> list[T]:
+def round_robin[T: Hashable](groups: Sequence[Sequence[T]], budget: int) -> list[T]:
     """Deal up to `budget` items from `groups`, one per group per pass.
 
     Every group contributes its first item before any group contributes a
@@ -60,7 +57,7 @@ def round_robin(groups: Sequence[Sequence[T]], budget: int) -> list[T]:
     return out
 
 
-def obligacion_key(ob: dict, index: int) -> str:
+def obligacion_key(ob: dict[str, object], index: int) -> str:
     """The ONE derivation of an obligación's `expanded_terms` key.
 
     `query_expansion` wrote `str(ob.get("id") or index)` while all three

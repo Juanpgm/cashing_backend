@@ -6,9 +6,8 @@ pre-existing keyword-only behavior whenever `embed()` errors.
 
 from __future__ import annotations
 
-from unittest.mock import patch
-
 import re
+from unittest.mock import patch
 
 import pytest
 from app.agent.nodes import evidence_matcher
