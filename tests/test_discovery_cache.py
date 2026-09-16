@@ -109,19 +109,85 @@ def test_store_overwrite_refreshes_ttl():
     assert second_value.resumen == "second"
 
 
-def test_cache_key_is_blind_to_obligaciones_content():
-    """DOCUMENTED INVARIANT: the cache key is (usuario_id, cuenta_id, ventana) only
-    — it deliberately does NOT include `obligaciones`. Two lookups for the same
-    usuario/cuenta/window but a conceptually different obligaciones set still hit
-    the same cached entry (the first one stored). Do NOT add obligaciones to the
-    key — that would defeat the point of the cache (obligaciones is exactly the
-    kind of per-call detail this cache exists to avoid recomputing)."""
+def test_cache_key_is_blind_to_obligaciones_content_when_no_fingerprint_is_supplied():
+    """The raw `_key()` tuple is (usuario_id, cuenta_id, fecha_inicio, fecha_fin,
+    context_fingerprint) — it has no dedicated `obligaciones` field of its own.
+    When a caller passes no `context_fingerprint` at all (as here), two lookups
+    for the same usuario/cuenta/window still hit the same cached entry
+    regardless of obligaciones. Callers that DO care about obligación changes
+    (like `evidence_discovery_service.descubrir_evidencias`) must fold them
+    into `context_fingerprint` themselves — see
+    `test_context_fingerprint_changes_when_the_obligacion_set_changes` below,
+    which is the round-3 fix for the cache-key gap this test used to overclaim
+    as a permanent, deliberate design choice."""
     usuario_id, cuenta_id = uuid.uuid4(), uuid.uuid4()
     first = _response("first result, obligaciones=[]")
     discovery_cache.store(usuario_id, cuenta_id, "2024-04-01", "2024-04-30", first)
 
     # A second "logically different" call (different obligaciones content, same
-    # usuario/cuenta/window) is irrelevant to the key — it's still a hit on `first`.
+    # usuario/cuenta/window, NO context_fingerprint) is irrelevant to the raw
+    # key — it's still a hit on `first`.
     cached = discovery_cache.get_cached(usuario_id, cuenta_id, "2024-04-01", "2024-04-30")
 
     assert cached is first
+
+
+def test_context_fingerprint_changes_when_the_obligacion_set_changes():
+    """WARNING regression: `context_fingerprint` hashed only contrato_contexto
+    + contexto_usuario, so adding/removing/editing an obligación (an ordinary
+    in-product action via the checklist/obligación editor) and clicking
+    'descubrir' again within the TTL served the pre-edit result — the response
+    even carries a per-obligación justification list that then structurally
+    mismatches the current obligación set."""
+    contrato_ctx = {"numero_contrato": "A-1", "entidad": "DAGMA"}
+    obligaciones_before = [{"id": "ob1", "descripcion": "Entregar informe mensual"}]
+    obligaciones_after = [
+        {"id": "ob1", "descripcion": "Entregar informe mensual"},
+        {"id": "ob2", "descripcion": "Asistir a reuniones de seguimiento"},
+    ]
+
+    fp_before = discovery_cache.context_fingerprint(contrato_ctx, "hice X", obligaciones=obligaciones_before)
+    fp_after = discovery_cache.context_fingerprint(contrato_ctx, "hice X", obligaciones=obligaciones_after)
+
+    assert fp_before != fp_after
+
+
+def test_context_fingerprint_changes_when_the_supervisor_email_changes():
+    """WARNING regression: supervisor_email drives the `from:<supervisor>`
+    contract query AND the noise-rescue domain, but was never part of the
+    fingerprint either — correcting a mistyped supervisor email and
+    re-running within the TTL was a silent no-op. Covered here directly (the
+    field already flows through contrato_contexto since round 3 wired
+    supervisor_email into it in descubrir_evidencias)."""
+    obligaciones = [{"id": "ob1", "descripcion": "Entregar informe mensual"}]
+
+    fp_before = discovery_cache.context_fingerprint(
+        {"numero_contrato": "A-1", "supervisor_email": "wrong@entidad.gov.co"}, "hice X", obligaciones=obligaciones
+    )
+    fp_after = discovery_cache.context_fingerprint(
+        {"numero_contrato": "A-1", "supervisor_email": "correct@entidad.gov.co"}, "hice X", obligaciones=obligaciones
+    )
+
+    assert fp_before != fp_after
+
+
+def test_context_fingerprint_obligaciones_order_independent():
+    """Reordering the same obligaciones (e.g. after a re-fetch) must not, by
+    itself, invalidate the cache — only actual content changes should."""
+    contrato_ctx = {"numero_contrato": "A-1"}
+    ob1 = {"id": "ob1", "descripcion": "Entregar informe mensual"}
+    ob2 = {"id": "ob2", "descripcion": "Asistir a reuniones"}
+
+    fp_a = discovery_cache.context_fingerprint(contrato_ctx, "hice X", obligaciones=[ob1, ob2])
+    fp_b = discovery_cache.context_fingerprint(contrato_ctx, "hice X", obligaciones=[ob2, ob1])
+
+    assert fp_a == fp_b
+
+
+def test_context_fingerprint_obligaciones_defaults_to_none_unchanged():
+    """Omitting `obligaciones` entirely (existing callers) must produce the
+    exact same fingerprint as before this fix — backward compatible."""
+    contrato_ctx = {"numero_contrato": "A-1"}
+    assert discovery_cache.context_fingerprint(contrato_ctx, "hice X") == discovery_cache.context_fingerprint(
+        contrato_ctx, "hice X", obligaciones=None
+    )

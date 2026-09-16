@@ -562,8 +562,12 @@ async def descubrir_evidencias(
     # INPUTS — they seed expand_search_terms and every prompt header — so they
     # belong in the key. Previously a user could edit "¿Qué hiciste este mes?",
     # click discover again and silently get the pre-edit result for the whole
-    # TTL.
-    cache_fingerprint = discovery_cache.context_fingerprint(contrato_contexto, contexto_usuario)
+    # TTL. `obligaciones` (round-3 fix, confirmed WARNING): the resolved
+    # obligación list drives every per-obligación query and the whole
+    # matcher/justify output shape and was likewise missing from the key —
+    # editing obligaciones and re-running served a response with a
+    # structurally stale obligación list for the whole TTL.
+    cache_fingerprint = discovery_cache.context_fingerprint(contrato_contexto, contexto_usuario, obligaciones)
     if cache_cuenta_id is not None and not refresh:
         cached = discovery_cache.get_cached(
             usuario_id, cache_cuenta_id, fecha_inicio, fecha_fin, context_fingerprint=cache_fingerprint

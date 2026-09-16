@@ -36,17 +36,33 @@ CacheKey = tuple[uuid.UUID, uuid.UUID, str, str, str]
 _cache: dict[CacheKey, tuple[float, EvidenceDiscoveryResponse]] = {}
 
 
-def context_fingerprint(contrato_contexto: dict[str, object] | None, contexto_usuario: str | None) -> str:
+def context_fingerprint(
+    contrato_contexto: dict[str, object] | None,
+    contexto_usuario: str | None,
+    obligaciones: list[dict[str, object]] | None = None,
+) -> str:
     """Short, stable hash of the non-date search inputs.
 
     Key-order independent (sorted JSON) so two equal contexts always collide,
     and None/empty are treated identically so an absent context behaves like an
     empty one rather than creating a second cache entry.
+
+    `obligaciones` (round-3 fix, confirmed WARNING): the resolved obligación
+    list drives every per-obligación query AND the whole matcher/justify
+    output shape, but was never part of the fingerprint — editing the
+    contract's obligaciones (a normal in-product action) and clicking
+    'descubrir' again within the TTL served a response whose obligación list
+    structurally mismatched the current set. Folded in as a sorted
+    `id:descripcion` digest so reordering the same obligaciones does not, by
+    itself, invalidate the cache — only actual content changes do. Optional
+    and defaults to `None` so existing callers are unaffected.
     """
+    ob_digest = sorted(f"{ob.get('id', '')}:{ob.get('descripcion', '')}" for ob in (obligaciones or []))
     payload = json.dumps(
         {
             "contrato": {k: v for k, v in sorted((contrato_contexto or {}).items()) if v not in (None, "")},
             "contexto_usuario": (contexto_usuario or "").strip(),
+            "obligaciones": ob_digest,
         },
         sort_keys=True,
         ensure_ascii=False,
