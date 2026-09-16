@@ -722,3 +722,40 @@ async def test_matcher_result_order_matches_obligaciones_regardless_of_completio
     assert [e["id"] for e in matched["ob0"]] == ["primera"]
     assert [e["id"] for e in matched["ob1"]] == ["segunda"]
     assert [e["id"] for e in matched["ob2"]] == ["tercera"]
+
+
+@pytest.mark.asyncio
+async def test_obligacion_exception_fallback_uses_the_same_key_as_the_task(monkeypatch):
+    """SUGGESTION regression: the task loop computed `ob_id` as
+    `ob.get("id") or str(i)`, while the `asyncio.gather(..., return_exceptions=True)`
+    fallback branch computed keys via `str(ob.get("id") or i)` — a different
+    expression that diverges for a falsy-but-not-None id or when the id is a
+    non-str object. `app.agent.prompts.query_budget.obligacion_key` is the ONE
+    designated place this derivation is supposed to live; the exception
+    fallback bypassed it. Concretely: for `{"id": None, ...}`, `str(None)` is
+    the TRUTHY string "None", so the old fallback expression
+    `str(ob.get("id")) or str(i)` never fell through to `str(i)` and keyed
+    the obligación "None" while the task loop (correctly) keys it "0"."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from app.agent.nodes import evidence_matcher as mod
+    from app.agent.prompts.query_budget import obligacion_key
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(mod, "_match_una_obligacion", _boom)
+    fake_llm = MagicMock()
+    fake_llm.embed = AsyncMock(side_effect=RuntimeError("no network in tests"))
+    monkeypatch.setattr(mod, "get_llm", lambda *a, **k: fake_llm)
+
+    obligaciones = [{"id": None, "descripcion": "x"}, {"id": "a", "descripcion": "y"}]
+    state = {
+        "obligaciones_extraidas": obligaciones,
+        "evidence_raw": [{"id": "e1", "content": "algo"}],
+    }
+    result = await mod.evidence_matcher_node(state)
+
+    expected_keys = {obligacion_key(ob, i) for i, ob in enumerate(obligaciones)}
+    assert set(result["matched_evidence"].keys()) == expected_keys
+    assert set(result["matched_evidence_scores"].keys()) == expected_keys

@@ -19,6 +19,7 @@ from app.agent.prompts.contract_terms import (
     contract_query_variants,
 )
 from app.agent.prompts.email_evidence import _STOPWORDS
+from app.agent.prompts.query_budget import obligacion_key
 from app.agent.state import AgentState
 from app.core.config import settings
 from app.schemas.agent import LLMMessage
@@ -786,17 +787,25 @@ async def evidence_matcher_node(state: AgentState) -> AgentState:
     # input order in its results regardless of completion order, so building
     # `matched`/`matched_scores` from the results afterward needs no extra
     # bookkeeping for out-of-order completions.
+    # SUGGESTION fix (round-3): the task loop and the exception-fallback list
+    # below used to compute the obligación key via two DIFFERENT expressions
+    # (`ob.get("id") or str(i)` vs. `str(ob.get("id") or i)`), which diverge
+    # whenever `str(id)` is itself a non-empty-but-"falsy-looking" string —
+    # e.g. `id=None` makes `str(None)` the TRUTHY string "None", so the old
+    # fallback expression never fell through to `str(i)` and keyed that
+    # obligación "None" while the task keyed it "0". Both branches now share
+    # the ONE designated derivation, `query_budget.obligacion_key`.
+    def _ob_id_for(ob: Any, i: int) -> str:
+        return obligacion_key(ob, i) if isinstance(ob, dict) else str(i)
+
     sem = asyncio.Semaphore(_LLM_FANOUT_CONCURRENCY)
     tareas = []
     for i, ob in enumerate(obligaciones):
         ob_text = ob_texts[i]
-        ob_id = ob.get("id") if isinstance(ob, dict) else str(i)
-        if not ob_id:
-            ob_id = str(i)
         ob_vec = ob_embeddings[i] if ob_embeddings is not None else None
         tareas.append(
             _match_una_obligacion(
-                str(ob_id),
+                _ob_id_for(ob, i),
                 ob_text,
                 ob_vec,
                 evidence_raw,
@@ -812,7 +821,7 @@ async def evidence_matcher_node(state: AgentState) -> AgentState:
     # THAT obligación to empty, not abort the whole discovery run. The caller
     # (`evidence_discovery_service.descubrir_evidencias`) invokes this node with
     # no try/except, so a propagated exception became an unhandled 500.
-    ob_ids = [str(ob.get("id") if isinstance(ob, dict) else i) or str(i) for i, ob in enumerate(obligaciones)]
+    ob_ids = [_ob_id_for(ob, i) for i, ob in enumerate(obligaciones)]
     for fallback_id, outcome in zip(ob_ids, await asyncio.gather(*tareas, return_exceptions=True), strict=True):
         if isinstance(outcome, BaseException):
             await logger.awarning("evidence_matcher_obligacion_failed", ob_id=fallback_id, error=str(outcome))
