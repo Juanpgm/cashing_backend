@@ -45,33 +45,52 @@ async def test_expansion_falls_back_to_deterministic_terms_when_llm_is_none():
 
 
 @pytest.mark.asyncio
-async def test_expansion_falls_back_when_the_llm_raises():
+async def test_expansion_falls_back_when_the_llm_raises(monkeypatch):
+    """WARNING regression: without a credentials stub the guard skips
+    llm.complete entirely, so this test passed vacuously without ever
+    exercising the exception-fallback path it claims to cover."""
+    from app.core.config import settings
     from app.agent.nodes.query_expansion import expand_search_terms
 
+    monkeypatch.setattr(settings, "GROQ_API_KEY", "sk-test")
+
     class _Boom:
+        called = False
+
         async def complete(self, messages, **kwargs):
+            self.called = True
             raise RuntimeError("provider down")
 
-    out = await expand_search_terms(
-        {}, [{"id": "ob1", "descripcion": "Elaborar informes mensuales de seguimiento"}], _Boom()
-    )
+    boom = _Boom()
+    out = await expand_search_terms({}, [{"id": "ob1", "descripcion": "Elaborar informes mensuales de seguimiento"}], boom)
+    assert boom.called, "llm.complete was never awaited — the credentials guard skipped the call under test"
     assert out["ob1"]
 
 
 @pytest.mark.asyncio
-async def test_expansion_falls_back_on_malformed_output():
+async def test_expansion_falls_back_on_malformed_output(monkeypatch):
+    """WARNING regression: see test_expansion_falls_back_when_the_llm_raises."""
+    from app.core.config import settings
     from app.agent.nodes.query_expansion import expand_search_terms
 
+    monkeypatch.setattr(settings, "GROQ_API_KEY", "sk-test")
+
     class _Garbage:
+        called = False
+
         async def complete(self, messages, **kwargs):
+            self.called = True
+
             class _R:
                 content = "lo siento, no puedo"
 
             return _R()
 
+    garbage = _Garbage()
     out = await expand_search_terms(
-        {}, [{"id": "ob1", "descripcion": "Elaborar informes mensuales de seguimiento"}], _Garbage()
+        {}, [{"id": "ob1", "descripcion": "Elaborar informes mensuales de seguimiento"}], garbage
     )
+    assert garbage.called, "llm.complete was never awaited — the credentials guard skipped the call under test"
     assert out["ob1"]
 
 

@@ -77,6 +77,52 @@ def _is_unusable_provider(llm: object) -> bool:
     return type(llm).__name__ == "FakeLLMPort"
 
 
+def _has_real_credentials(model: str) -> bool:
+    """Same provider-prefix logic as `_model_credentials_ready`, WITHOUT the
+    "ollama needs no key" allowance — used only to scan FALLBACK chain
+    entries (round-3 fix). `LLM_FALLBACK_MODEL`/`LLM_LOCAL_MODEL` both default
+    to an `ollama/...` address that may not have anything running behind it;
+    treating that default as "reachable" would make the whole-chain guard
+    below always return True, defeating its purpose and reintroducing the
+    wasted tenacity retry/backoff latency it exists to avoid.
+    """
+    model = (model or "").strip().lower()
+    if model.startswith("groq/"):
+        return bool(settings.GROQ_API_KEY)
+    if model.startswith("gemini/"):
+        return bool(settings.GEMINI_API_KEY)
+    if model.startswith(("openai/", "gpt-")):
+        return bool(settings.OPENAI_API_KEY)
+    if model.startswith(("ollama/", "ollama_chat/")):
+        return False
+    return True
+
+
+def _expansion_credentials_ready(model: str) -> bool:
+    """Can ANY model in the fallback chain the adapter would actually try
+    answer this call? (round-3 fix for a confirmed WARNING).
+
+    The old guard checked ONLY `model` (the primary) via
+    `_model_credentials_ready`, ignoring `LiteLLMAdapter._get_model_chain`'s
+    real fallback order (primary -> LLM_FALLBACK_MODEL ->
+    LLM_LOCAL_MODEL/LLM_PRODUCTION_FALLBACK_MODEL). A deployment whose primary
+    key is missing but whose fallback (Gemini, OpenAI, or a genuinely
+    configured Ollama) would succeed had expansion permanently OFF — silently
+    defeating the round-2 decision to default
+    `EVIDENCE_QUERY_EXPANSION_ENABLED=True`. The primary keeps
+    `_model_credentials_ready`'s original semantics (an explicitly configured
+    ollama PRIMARY is a deliberate dev choice and needs no key); fallback
+    entries are checked with `_has_real_credentials`, which does NOT treat an
+    unconfigured default ollama fallback as reachable.
+    """
+    if _model_credentials_ready(model):
+        return True
+    from app.adapters.llm.litellm_adapter import LiteLLMAdapter
+
+    chain = LiteLLMAdapter()._get_model_chain(model)  # noqa: SLF001 — same pattern as api/v1/health.py
+    return any(_has_real_credentials(m) for m in chain[1:])
+
+
 def _merge_unique(phrases: list[str], extra: list[str]) -> list[str]:
     """Dedupe-preserving-order merge, capped at `_MAX_PHRASES_PER_OBLIGACION`."""
     seen: set[str] = set()
@@ -156,12 +202,22 @@ async def expand_search_terms(
     # tests exercise `_gather_email_evidence` with no LLM mock, and the fake
     # provider is scripted for chat turns, not for this JSON contract, so
     # calling it would only produce an unparseable answer and this same
-    # fallback, one wasted call later.
-    if (
-        llm is None
-        or _is_unusable_provider(llm)
-        or not _model_credentials_ready(settings.LLM_EVIDENCE_CLASSIFIER_MODEL)
-    ):
+    # fallback, one wasted call later. `settings.LLM_PROVIDER == "fake"` is
+    # checked explicitly (round-3), defense-in-depth alongside the
+    # `_is_unusable_provider` duck-type check.
+    if llm is None or _is_unusable_provider(llm) or settings.LLM_PROVIDER == "fake":
+        return fallback
+
+    # Round-3 fix (confirmed WARNING): evaluate credentials over the WHOLE
+    # fallback chain, not just the primary model — and log the skip so an
+    # operator can tell "expansion ran" from "expansion silently opted out".
+    if not _expansion_credentials_ready(settings.LLM_EVIDENCE_CLASSIFIER_MODEL):
+        logger.info(
+            "query_expansion_skipped",
+            reason="no_credentials_in_chain",
+            model=settings.LLM_EVIDENCE_CLASSIFIER_MODEL,
+            n_obligaciones=len(obligaciones),
+        )
         return fallback
 
     header = contract_header(contexto)
