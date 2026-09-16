@@ -143,6 +143,25 @@ async def test_radicar_on_undefined_requisitos_modo_matches_estandar_behaviour(
     from app.services import cuenta_cobro_service
     from sqlalchemy import select
 
+    # A real PRIMERA sibling holds the cuota-position variable CONSTANT across
+    # the two cuentas under comparison, so this measures modo=None vs
+    # modo="estandar" and nothing else (checklist/primera-cuota-2026-09-16,
+    # round 3, finding #2: the "no active PRIMERA" fail-safe now promotes only
+    # the EARLIEST surviving cuenta, so without this the mes=11 cuenta would
+    # fail safe to first and the mes=12 one would not — an asymmetry that has
+    # nothing to do with requisitos_modo).
+    db.add(
+        CuentaCobro(
+            contrato_id=contrato.id,
+            mes=10,
+            anio=2024,
+            estado=EstadoCuentaCobro.BORRADOR,
+            valor=1_000_000,
+            posicion=PosicionCuota.PRIMERA,
+        )
+    )
+    await db.commit()
+
     cuenta_null = CuentaCobro(
         contrato_id=contrato.id,
         mes=11,
