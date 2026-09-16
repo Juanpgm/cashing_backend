@@ -10,13 +10,10 @@ Default de agresividad: en caso de duda conserva el item (nunca pierde evidencia
 
 from __future__ import annotations
 
-import json
-import re
-
 import structlog
 
 from app.adapters.llm import get_llm
-from app.agent.nodes.evidence_matcher import _mentions_any, contract_match_variants_of
+from app.agent.nodes.evidence_matcher import _extract_json_array, _mentions_any, contract_match_variants_of
 from app.agent.prompts.contract_terms import contract_header, contract_number_variants
 from app.agent.prompts.evidence_filter import (
     WORK_NOISE_SYSTEM_PROMPT,
@@ -34,7 +31,6 @@ from app.schemas.agent import LLMMessage
 
 logger = structlog.get_logger("agent.nodes.evidence_filter")
 
-_JSON_RE = re.compile(r"\[.*\]", re.DOTALL)
 _LLM_BATCH_SIZE = 15
 
 
@@ -89,10 +85,18 @@ async def _llm_classify_batch(
             reasoning_effort="low",
         )
         raw = resp.content or ""
-        m = _JSON_RE.search(raw)
-        if not m:
+        # Round-3 fix (confirmed WARNING): the greedy `_JSON_RE = r"\[.*\]"`
+        # spanned from the FIRST bracket to the LAST bracket in the whole
+        # response — a reasoning preamble bracket or a trailing prose bracket
+        # (both routine for `LLM_EVIDENCE_CLASSIFIER_MODEL`, a reasoning
+        # model) made the span unparseable, and the except below then kept
+        # the WHOLE batch (fail open), silently disabling the noise filter
+        # the product depends on. Reuses the same tolerant extractor
+        # `evidence_matcher._extract_json_array` already uses for the
+        # identical JSON-array contract against the same model.
+        verdicts = _extract_json_array(raw)
+        if verdicts is None:
             raise ValueError("No JSON array in LLM response")
-        verdicts: list[dict] = json.loads(m.group())
         idx_to_verdict = {int(v["idx"]): v.get("verdict", "TRABAJO") for v in verdicts if isinstance(v, dict)}
     except Exception as exc:
         await logger.awarning("evidence_filter_llm_failed", error=str(exc), batch_size=len(items))

@@ -196,6 +196,70 @@ async def test_llm_gate_keeps_on_empty_content():
     assert result == [True, True]
 
 
+# ── Round-3 fix: reuse the tolerant JSON extractor, not a greedy regex ────────
+
+
+@pytest.mark.asyncio
+async def test_llm_gate_tolerates_a_reasoning_preamble_with_brackets():
+    """WARNING regression: the greedy `_JSON_RE = r"\\[.*\\]"` spanned from the
+    FIRST bracket in a reasoning preamble to the LAST bracket in the real
+    array, producing an unparseable blob and silently disabling the noise
+    filter for the whole batch (fail-open: keep everything, i.e. the verdict
+    the classifier exists to prevent is never applied). Now reuses
+    `evidence_matcher._extract_json_array`, which recovers the real verdict
+    instead of failing the whole batch open."""
+    from app.agent.nodes.evidence_filter import _llm_classify_batch
+
+    llm = AsyncMock()
+    llm.complete = AsyncMock(
+        return_value=MagicMock(
+            content='Analizo los items [1] y [2].\n[{"idx": 0, "verdict": "RUIDO"}, {"idx": 1, "verdict": "TRABAJO"}]'
+        )
+    )
+
+    items = [_email_item("Boletin promocional"), _email_item("Informe mensual")]
+    result = await _llm_classify_batch(items, llm)
+
+    assert result == [False, True], f"tolerant parser was not used — fell back to keep-all: {result}"
+
+
+@pytest.mark.asyncio
+async def test_llm_gate_tolerates_trailing_prose_with_brackets():
+    """Same defect, trailing side: a footnote after the array containing a
+    bracket used to extend the greedy match past the real array's closing
+    bracket, making it unparseable too."""
+    from app.agent.nodes.evidence_filter import _llm_classify_batch
+
+    llm = AsyncMock()
+    llm.complete = AsyncMock(
+        return_value=MagicMock(content='[{"idx": 0, "verdict": "RUIDO"}]\nNota [1]: revisar el resto.')
+    )
+
+    items = [_email_item("Boletin promocional")]
+    result = await _llm_classify_batch(items, llm)
+
+    assert result == [False], f"tolerant parser was not used — fell back to keep-all: {result}"
+
+
+@pytest.mark.asyncio
+async def test_llm_gate_salvages_a_truncated_array():
+    """`max_tokens=700` can still cut the array mid-object for a reasoning
+    model; the complete prefix is a usable partial verdict and must not be
+    thrown away entirely."""
+    from app.agent.nodes.evidence_filter import _llm_classify_batch
+
+    llm = AsyncMock()
+    llm.complete = AsyncMock(return_value=MagicMock(content='[{"idx": 0, "verdict": "RUIDO"}, {"idx": 1, "verdict": "TR'))
+
+    items = [_email_item("Boletin promocional"), _email_item("Informe mensual")]
+    result = await _llm_classify_batch(items, llm)
+
+    # idx 0 is salvaged from the complete prefix (RUIDO -> dropped); idx 1's
+    # object was cut mid-value and is not recoverable, defaulting to TRABAJO
+    # (kept) via `idx_to_verdict.get(i, "TRABAJO")`.
+    assert result == [False, True]
+
+
 # ── groq/llama-3.1-8b-instant decommissioning fix ──────────────────────────────
 
 
