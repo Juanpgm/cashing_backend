@@ -48,6 +48,29 @@ def test_keyword_score_ignores_spanish_stopwords():
     assert _keyword_score(OBLIGACION, "los del por que con una para este como") == 0.0
 
 
+def test_short_obligacion_does_not_clear_the_fallback_bar_on_one_generic_word():
+    """SUGGESTION regression: `_keyword_score` divides by `len(ob_words)` with
+    no floor, so a short (2-3 token) obligación scores 0.33-0.5 on a SINGLE
+    shared generic word (e.g. "informe") — clearing `_FALLBACK_ACCEPT_THRESHOLD`
+    (0.30) on essentially no real overlap. Combined with the LLM-failure
+    fallback, this let one boilerplate word auto-accept unrelated noise."""
+    from app.agent.nodes.evidence_matcher import _FALLBACK_ACCEPT_THRESHOLD, _keyword_score
+
+    score = _keyword_score("Presentar informe mensual", "Informe de gestion de la plataforma Netflix tu suscripcion")
+    assert score < _FALLBACK_ACCEPT_THRESHOLD, f"one shared generic word cleared the fallback bar: {score}"
+
+
+def test_keyword_score_denominator_floor_does_not_shrink_a_real_obligacion():
+    """The floor must only raise the bar for SHORT obligaciones — a longer,
+    realistic obligación's score must be unaffected."""
+    from app.agent.nodes.evidence_matcher import _keyword_score
+
+    ob = "Apoyar a la entidad en la elaboracion de los informes de gestion que sean requeridos por el supervisor"
+    ev = "Adjunto el informe de gestion mensual requerido por el supervisor de la entidad"
+    # Same score before and after the fix — ob_words already exceeds the floor.
+    assert _keyword_score(ob, ev) > 0.3
+
+
 def test_keyword_score_is_not_broken_by_trailing_punctuation():
     """'informe.' must count as 'informe' — the glued token halved real matches."""
     from app.agent.nodes.evidence_matcher import _keyword_score

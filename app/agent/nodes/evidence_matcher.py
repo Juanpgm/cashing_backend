@@ -232,8 +232,20 @@ def _tokens(text: str) -> set[str]:
     return out
 
 
+_KEYWORD_SCORE_MIN_DENOMINATOR = 4
+
+
 def _keyword_score(obligation_text: str, evidence_text: str) -> float:
-    """Simple keyword overlap score between obligation and evidence."""
+    """Simple keyword overlap score between obligation and evidence.
+
+    SUGGESTION fix (round-3): dividing by the bare `len(ob_words)` let a
+    short (2-3 token) obligación score 0.33-0.5 on a SINGLE shared generic
+    word (e.g. "informe" against unrelated Netflix billing prose) — clearing
+    `_FALLBACK_ACCEPT_THRESHOLD` (0.30) on essentially no real overlap. The
+    denominator now has a floor so a short obligación cannot reach the
+    fallback bar on one hit; a longer, realistic obligación (already above
+    the floor) is unaffected.
+    """
     if not obligation_text or not evidence_text:
         return 0.0
 
@@ -243,7 +255,7 @@ def _keyword_score(obligation_text: str, evidence_text: str) -> float:
     if not ob_words:
         return 0.0
     overlap = ob_words & ev_words
-    return len(overlap) / len(ob_words)
+    return len(overlap) / max(len(ob_words), _KEYWORD_SCORE_MIN_DENOMINATOR)
 
 
 def _mentions_any(evidence: dict[str, object], variants: list[str]) -> bool:

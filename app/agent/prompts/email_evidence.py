@@ -290,6 +290,39 @@ _STOPWORDS = {
     "no",
     "le",
     "lo",
+    # Round-3 fix (confirmed SUGGESTION): `evidence_matcher._PROSE_TOKEN_RE`
+    # only ever emits tokens of 4+ letters, so 25 of the original 30 entries
+    # above (`de`, `la`, `los`, `del`, `por`, `que`, `con`, `un`, `su`, `es`...)
+    # can NEVER be produced by that regex — the stopword half of the round-2
+    # tokenizer fix was effectively a 5-word no-op. These are the 4+-char
+    # Spanish function words the regex actually emits, plus contract
+    # boilerplate that appears in essentially every Colombian obligación
+    # (weakening cross-obligación discrimination without them).
+    "sobre",
+    "desde",
+    "entre",
+    "cuando",
+    "donde",
+    "todos",
+    "todas",
+    "cada",
+    "debe",
+    "según",
+    "mismo",
+    "misma",
+    "dicha",
+    "dicho",
+    "cual",
+    "cuales",
+    "sean",
+    "demás",
+    "acuerdo",
+    "contractual",
+    "contractuales",
+    "cumplimiento",
+    "conforme",
+    "requeridos",
+    "requeridas",
 }
 
 
