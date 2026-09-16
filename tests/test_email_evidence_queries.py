@@ -127,3 +127,37 @@ class TestSafeEntityPhrasePreservesTrailingAcronym:
 
         assert len(result) <= 40
         assert not result.endswith((" de", " del", " la", " el"))
+
+
+class TestExtractKeywordsStripsQuoteCharacters:
+    """WARNING regression (escalated from SUGGESTION): `_extract_keywords`
+    stripped `():;-` from each token's ends but not quote characters, so an
+    obligación quoting a deliverable title silently turned the OR list into a
+    phrase search — `subject:(elaborar OR informe OR "estado OR arte")` reads
+    to Gmail as one literal phrase 'estado OR arte', nullifying the query
+    (worse: when the closing quote itself gets truncated off by the [:4]/[:5]
+    slicing, the unbalanced quote absorbs after:/before: and the noise
+    exclusions into the phrase text, nullifying them as well)."""
+
+    def test_strips_a_straight_double_quote(self) -> None:
+        from app.agent.prompts.email_evidence import _extract_keywords
+
+        keywords = _extract_keywords('Elaborar el informe "Estado del arte" del componente ambiental')
+        assert not any('"' in kw for kw in keywords), f"unstripped quote leaked into a keyword: {keywords}"
+
+    def test_subject_query_has_no_unbalanced_quote(self) -> None:
+        from app.agent.prompts.email_evidence import build_obligation_queries
+
+        queries = build_obligation_queries(
+            'Elaborar el informe "Estado del arte" del componente ambiental y su anexo',
+            "2024/04/01",
+            "2024/04/30",
+        )
+        subject_query = next(q for q in queries if q.startswith("subject:("))
+        assert subject_query.count('"') % 2 == 0, f"unbalanced quote in a Gmail query: {subject_query!r}"
+
+    def test_strips_typographic_and_single_quotes_too(self) -> None:
+        from app.agent.prompts.email_evidence import _extract_keywords
+
+        keywords = _extract_keywords("Revisar el documento 'plan maestro' y el «informe» anual")
+        assert not any(ch in kw for kw in keywords for ch in "'‘’“”«»")

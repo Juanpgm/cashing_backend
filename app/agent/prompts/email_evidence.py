@@ -284,9 +284,24 @@ _STOPWORDS = {
 
 
 def _extract_keywords(text: str) -> list[str]:
-    """Extrae 4-5 palabras clave relevantes de la descripción de la obligación."""
+    """Extrae 4-5 palabras clave relevantes de la descripción de la obligación.
+
+    Round-3 fix (confirmed WARNING, escalated from SUGGESTION): the strip set
+    didn't include quote characters, so an obligación quoting a deliverable
+    title ('Elaborar el informe "Estado del arte" ...') produced tokens like
+    `'"estado'`/`'arte"'`. Fed into `subject:(a OR b OR "estado OR arte")`,
+    Gmail reads the unstripped pair as one literal phrase — silently
+    collapsing the OR list into a phrase search that matches almost nothing,
+    and when the closing quote is itself truncated off by the `[:4]`/`[:5]`
+    slicing downstream, the resulting UNBALANCED quote absorbs `after:`/
+    `before:` and the noise exclusions into the phrase text too.
+    """
     words = text.replace(",", " ").replace(".", " ").split()
-    candidates = [w.lower().strip("():;-") for w in words if len(w) > 4 and w.lower() not in _STOPWORDS]
+    candidates = [
+        w.lower().strip("():;-\"'‘’“”«»")
+        for w in words
+        if len(w) > 4 and w.lower() not in _STOPWORDS
+    ]
     # Deduplicate preserving order
     seen: set[str] = set()
     unique = []
