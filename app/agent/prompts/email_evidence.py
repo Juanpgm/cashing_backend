@@ -207,12 +207,22 @@ def build_expanded_phrase_queries(phrases: list[str], fecha_inicio: str, fecha_f
     (evidencias/discovery-fix WU7) — e.g. a deliverable name or counterpart
     name the LLM generated (`app.agent.nodes.query_expansion.expand_search_terms`),
     so evidence that never mentions the contract number or the obligación's own
-    wording can still be found."""
+    wording can still be found.
+
+    Round-3 fix (confirmed WARNING, escalated from SUGGESTION): a single-word
+    phrase quoted as an exact-phrase query (`"elaborar" after:... before:...`)
+    is an unscoped full-text search over the whole widened window — it
+    returns essentially the mailbox, then pulls a full page of messages for
+    almost no discriminating power. The round-robin floor interleaves the
+    deterministic fallback's single keywords as phrase[0], so every
+    obligación on that path spent one of its two guaranteed query slots on
+    this near-useless query. Only genuinely multi-word phrases are emitted.
+    """
     noise = GMAIL_NOISE_EXCLUSIONS
     queries: list[str] = []
     for phrase in phrases:
         safe = (phrase or "").replace('"', "").strip()
-        if not safe:
+        if not safe or " " not in safe:
             continue
         queries.append(f'"{safe}" after:{fecha_inicio} before:{fecha_fin} {noise}')
     return queries

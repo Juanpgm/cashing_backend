@@ -38,6 +38,26 @@ async def test_llm_none_falls_back_to_deterministic_keywords() -> None:
 
 
 @pytest.mark.asyncio
+async def test_deterministic_fallback_produces_multi_word_phrases() -> None:
+    """WARNING regression (escalated from SUGGESTION): the deterministic
+    fallback used to emit the SAME single keywords `build_obligation_queries`
+    already covers via `subject:(a OR b OR c)`. Wrapped individually in quotes
+    by `build_expanded_phrase_queries`, each one became a near-useless
+    unscoped full-text query that burned a guaranteed round-robin slot. Now
+    the fallback emits multi-word phrases so they survive
+    `build_expanded_phrase_queries`'s single-word filter and add real
+    discriminating power instead of duplicating the subject: query."""
+    from app.agent.prompts.email_evidence import build_expanded_phrase_queries
+
+    obligaciones = [{"id": "ob1", "descripcion": "Elaborar informes de gestion mensual sobre arborizacion urbana"}]
+    result = await expand_search_terms({}, obligaciones, None)
+
+    assert all(" " in phrase for phrase in result["ob1"]), f"expected multi-word phrases, got: {result['ob1']}"
+    queries = build_expanded_phrase_queries(result["ob1"], "2024/04/01", "2024/04/30")
+    assert queries, "deterministic fallback phrases were all filtered out as single words"
+
+
+@pytest.mark.asyncio
 async def test_well_formed_llm_response_returns_phrases_per_obligacion(monkeypatch) -> None:
     # Expansion skips the LLM round trip when the configured model has no
     # credentials (an unauthenticated call burns tenacity's retry/backoff chain

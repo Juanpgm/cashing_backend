@@ -161,3 +161,27 @@ class TestExtractKeywordsStripsQuoteCharacters:
 
         keywords = _extract_keywords("Revisar el documento 'plan maestro' y el «informe» anual")
         assert not any(ch in kw for kw in keywords for ch in "'‘’“”«»")
+
+
+class TestBuildExpandedPhraseQueriesSkipsSingleWords:
+    """WARNING regression (escalated from SUGGESTION): a single-word phrase
+    quoted as an exact-phrase Gmail query (`"elaborar" after:... before:...`)
+    is an unscoped full-text search over the whole widened window — it
+    returns essentially the mailbox. Because the round-robin floor
+    interleaves the deterministic fallback's single keywords as phrase[0],
+    every obligación on the fallback path spent one of its guaranteed slots
+    on this near-useless query."""
+
+    def test_single_word_phrase_is_skipped(self) -> None:
+        from app.agent.prompts.email_evidence import build_expanded_phrase_queries
+
+        queries = build_expanded_phrase_queries(["elaborar", "informe de avance"], "2024/04/01", "2024/04/30")
+
+        assert not any(q.startswith('"elaborar"') for q in queries), f"single-word phrase leaked through: {queries}"
+        assert any("informe de avance" in q for q in queries)
+
+    def test_all_single_word_phrases_yields_no_queries(self) -> None:
+        from app.agent.prompts.email_evidence import build_expanded_phrase_queries
+
+        queries = build_expanded_phrase_queries(["elaborar", "realizar", "sobre"], "2024/04/01", "2024/04/30")
+        assert queries == []

@@ -30,11 +30,32 @@ _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 _MAX_PHRASES_PER_OBLIGACION = 8
 
 
+def _bigram_phrases(descripcion: str) -> list[str]:
+    """Consecutive-keyword bigrams from `_extract_keywords`'s output.
+
+    Round-3 fix (confirmed WARNING, escalated from SUGGESTION): the
+    deterministic fallback used to emit `_extract_keywords`'s bare single
+    words — the SAME words `build_obligation_queries` already covers via
+    `subject:(a OR b OR c OR d)`. Wrapped individually in quotes by
+    `build_expanded_phrase_queries`, each single word became a near-useless
+    unscoped full-text query (`"elaborar" after:... before:...` returns
+    essentially the mailbox) that burned a guaranteed round-robin slot.
+    Bigrams are genuinely more specific than either word alone and survive
+    `build_expanded_phrase_queries`'s multi-word filter, so the fallback adds
+    real discriminating power instead of duplicating the subject: query.
+    A single leftover keyword (<2 keywords total) is kept as-is — the
+    multi-word filter downstream will drop it rather than fire a bad query.
+    """
+    keywords = _extract_keywords(descripcion)
+    if len(keywords) < 2:
+        return keywords
+    return [f"{keywords[i]} {keywords[i + 1]}" for i in range(len(keywords) - 1)]
+
+
 def _deterministic_terms(obligaciones: list[dict]) -> dict[str, list[str]]:
-    """Fallback: reuse the existing keyword extractor per obligación."""
-    return {
-        _obligacion_id(ob, i): _extract_keywords(str(ob.get("descripcion") or "")) for i, ob in enumerate(obligaciones)
-    }
+    """Fallback: bigram phrases derived from the existing keyword extractor,
+    per obligación (see `_bigram_phrases`)."""
+    return {_obligacion_id(ob, i): _bigram_phrases(str(ob.get("descripcion") or "")) for i, ob in enumerate(obligaciones)}
 
 
 def _model_credentials_ready(model: str) -> bool:
