@@ -497,6 +497,64 @@ async def test_gather_gmail_evidence_widens_date_window_by_margin_setting(monkey
 
 
 @pytest.mark.asyncio
+async def test_gather_gmail_evidence_min_floor_counts_inspected_not_kept_messages(monkeypatch) -> None:
+    """WARNING regression: `per_query` chose EVIDENCE_MAX_EMAILS_PER_QUERY vs
+    EVIDENCE_MIN_EMAILS_PER_QUERY based on `len(emails_by_id)` (KEPT messages),
+    but the cost being bounded is FETCHED messages — `search_messages` issues
+    one users.messages.get per returned id regardless of whether the message
+    later gets filtered as noise. In a noise-heavy mailbox the KEPT pool never
+    grows, so the floor never engaged and every query kept fetching the full
+    per-query cap."""
+    from app.core.config import settings
+    from app.services import evidence_discovery_service as eds
+
+    monkeypatch.setattr(settings, "EVIDENCE_MAX_EMAILS_TOTAL", 10)
+    monkeypatch.setattr(settings, "EVIDENCE_MAX_EMAILS_PER_QUERY", 25)
+    monkeypatch.setattr(settings, "EVIDENCE_MIN_EMAILS_PER_QUERY", 5)
+
+    call_sizes: list[int] = []
+
+    async def _fake_search(usuario_id, query, max_results):
+        call_sizes.append(max_results)
+        # 25 promotional messages per query, none of which survive the noise
+        # filter — the KEPT pool never grows past 0.
+        return [
+            EmailMessage(
+                id=f"{query}-{i}",
+                thread_id="t",
+                subject="Oferta especial",
+                sender="promo@retail-blast.com",
+                recipients=["contratista@gmail.com"],
+                date=datetime(2024, 4, 10, tzinfo=UTC),
+                body_plain="descuentos",
+                snippet="descuentos",
+                labels=["CATEGORY_PROMOTIONS"],
+            )
+            for i in range(max_results)
+        ]
+
+    adapter = MagicMock()
+    adapter.search_messages = AsyncMock(side_effect=_fake_search)
+
+    obligaciones = [
+        {"id": f"ob{i}", "descripcion": f"{verbo.capitalize()} procesos territoriales anuales"}
+        for i, verbo in enumerate(["auditar", "certificar", "diagnosticar", "evaluar", "fiscalizar"])
+    ]
+
+    with patch.object(eds, "GmailAdapter", return_value=adapter):
+        await eds._gather_email_evidence(
+            MagicMock(), uuid.uuid4(), obligaciones, "2024-04-01", "2024-04-30", None, None
+        )
+
+    # After the first query alone (25 inspected, all noise), the pool is
+    # already past EVIDENCE_MAX_EMAILS_TOTAL=10 by INSPECTION count even
+    # though the KEPT pool is still 0 — later queries must fetch the floor.
+    assert settings.EVIDENCE_MIN_EMAILS_PER_QUERY in call_sizes, (
+        f"the per_query floor never engaged despite {sum(call_sizes)} messages inspected — sizes: {call_sizes}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_gather_gmail_evidence_uses_settings_max_emails_per_query(monkeypatch) -> None:
     from app.core.config import settings
     from app.services import evidence_discovery_service as eds

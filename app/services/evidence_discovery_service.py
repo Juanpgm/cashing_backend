@@ -389,6 +389,15 @@ async def _gather_email_evidence(
     supervisor_domain = (supervisor_email or "").split("@")[-1].strip().lower() or None if supervisor_email else None
     emails_by_id: dict[str, dict] = {}
     filtered_count = 0
+    # Round-3 fix (confirmed WARNING): the floor compared against
+    # `len(emails_by_id)` — messages that SURVIVED `score_non_personal_email` —
+    # but the cost being bounded is FETCHED messages (`search_messages` fans
+    # out one `users.messages.get` per returned id regardless of whether the
+    # message is later kept or filtered as noise). In a noise-heavy mailbox
+    # the kept pool never reached EVIDENCE_MAX_EMAILS_TOTAL, so every query
+    # kept fetching the full per-query cap and the fan-out this floor exists
+    # to bound never actually shrank. Count every message RETURNED instead.
+    messages_inspected = 0
     for query in unique_queries[:query_budget]:
         # Bound the FETCH work without skipping queries (round-2 confirmed
         # WARNING). `search_messages` fans out one `users.messages.get` per
@@ -404,7 +413,7 @@ async def _gather_email_evidence(
         # while total amplification stays bounded.
         per_query = (
             settings.EVIDENCE_MAX_EMAILS_PER_QUERY
-            if len(emails_by_id) < settings.EVIDENCE_MAX_EMAILS_TOTAL
+            if messages_inspected < settings.EVIDENCE_MAX_EMAILS_TOTAL
             else settings.EVIDENCE_MIN_EMAILS_PER_QUERY
         )
         try:
@@ -412,6 +421,7 @@ async def _gather_email_evidence(
         except Exception as exc:
             await logger.awarning("email_query_failed", query=query, error=str(exc), provider=provider.value)
             continue
+        messages_inspected += len(messages)
         for m in messages:
             if m.id not in emails_by_id:
                 contains_numero = any(
