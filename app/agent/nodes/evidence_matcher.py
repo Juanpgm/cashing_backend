@@ -10,7 +10,14 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from app.adapters.llm import get_llm
-from app.agent.prompts.contract_terms import contract_header, contract_number_variants
+from app.agent.prompts.contract_terms import (
+    OBJETO_EMBED_MAX_CHARS,
+    contract_header,
+    contract_match_variants,
+    contract_number_variants,
+    contract_query_variants,
+)
+from app.agent.prompts.email_evidence import _STOPWORDS
 from app.agent.state import AgentState
 from app.core.config import settings
 from app.schemas.agent import LLMMessage
@@ -176,13 +183,40 @@ def _obligacion_text(ob: Any) -> str:
     return str(ob)
 
 
-# Letters/digits + embedded dots/hyphens (min length 3): the old letters-only
-# `{4,}` regex could never match a contract number (all digits/dots) or a
-# hyphenated radicado code — root cause #2, evidencias/discovery-fix. Dots/
-# hyphens are only allowed AFTER the first character, so trailing punctuation
-# in prose ("actividades.") still tokenizes as "actividades" plus a lone "."
-# that itself never satisfies the {2,} minimum.
-_TOKEN_RE = re.compile(r"[a-z0-9áéíóúñü][a-z0-9áéíóúñü.\-]{2,}")
+# TWO tokenizers, not one (round-2 fix for a confirmed CRITICAL finding).
+#
+# The single `[a-z0-9áéíóúñü][a-z0-9áéíóúñü.\-]{2,}` pattern had two defects
+# that together destroyed the keyword signal:
+#
+# (a) minimum length 3 made "los"/"del"/"por"/"que"/"con" scoring tokens, so
+#     ANY Spanish text overlapped ANY obligación. Measured: a real deliverable
+#     and an unrelated marketing newsletter both scored 0.2308 — the matcher
+#     could not rank evidence above spam, and plain conversational Spanish
+#     scored 0.3846, clearing `_FALLBACK_ACCEPT_THRESHOLD` so it was emitted as
+#     evidence with no LLM verdict whenever the provider errored;
+# (b) `.`/`-` inside the class with greedy matching glued trailing punctuation:
+#     "informe." tokenized as "informe." and did NOT match "informe", halving
+#     genuine matches. (The old docstring claimed the opposite; it was wrong.)
+#
+# Prose is now letters-only with a {4,} floor and the shared Spanish stopword
+# list applied. Identifiers (contract numbers, radicado codes) get their own
+# pattern: they must contain a digit and be >= 5 chars after leading/trailing
+# `.`/`-`/`/` are stripped — which keeps root cause #2 fixed (a dotted contract
+# number is still a first-class scoring token) without admitting stopwords.
+_PROSE_TOKEN_RE = re.compile(r"[a-záéíóúñü]{4,}")
+_IDENT_TOKEN_RE = re.compile(r"[a-z0-9áéíóúñü][a-z0-9áéíóúñü.\-/]*[a-z0-9áéíóúñü]")
+_MIN_IDENT_LEN = 5
+
+
+def _tokens(text: str) -> set[str]:
+    """Scoring tokens: content-bearing prose words + identifier-like codes."""
+    lowered = text.lower()
+    out = {w for w in _PROSE_TOKEN_RE.findall(lowered) if w not in _STOPWORDS}
+    for candidate in _IDENT_TOKEN_RE.findall(lowered):
+        token = candidate.strip(".-/")
+        if len(token) >= _MIN_IDENT_LEN and any(c.isdigit() for c in token):
+            out.add(token)
+    return out
 
 
 def _keyword_score(obligation_text: str, evidence_text: str) -> float:
@@ -190,8 +224,8 @@ def _keyword_score(obligation_text: str, evidence_text: str) -> float:
     if not obligation_text or not evidence_text:
         return 0.0
 
-    ob_words = set(_TOKEN_RE.findall(obligation_text.lower()))
-    ev_words = set(_TOKEN_RE.findall(evidence_text.lower()))
+    ob_words = _tokens(obligation_text)
+    ev_words = _tokens(evidence_text)
 
     if not ob_words:
         return 0.0
@@ -199,27 +233,55 @@ def _keyword_score(obligation_text: str, evidence_text: str) -> float:
     return len(overlap) / len(ob_words)
 
 
-def _contains_contract_number(evidence: dict, numero_variants: list[str]) -> bool:
-    """True if the evidence's title/content mentions ANY contract-number
-    variant (evidencias/discovery-fix WU4)."""
-    if not numero_variants:
+def _mentions_any(evidence: dict, variants: list[str]) -> bool:
+    """Word-boundary search for any of `variants` in the evidence text.
+
+    A plain `variant in text` substring test made `ORD-41612` a hit for the
+    variant `4161` (confirmed CRITICAL finding). The lookarounds below reject a
+    match that is glued to another alphanumeric character.
+    """
+    if not variants:
         return False
     text = f"{evidence.get('title', '')} {evidence.get('content', '')}".lower()
-    return any(variant.lower() in text for variant in numero_variants)
+    return any(
+        re.search(rf"(?<![0-9A-Za-z]){re.escape(variant.lower())}(?![0-9A-Za-z])", text) for variant in variants
+    )
+
+
+def _contains_contract_number(evidence: dict, numero_variants: list[str]) -> bool:
+    """True if the evidence mentions a TRUSTWORTHY contract-number variant.
+
+    Weak derived forms (the bare dependency code `4161`, the `027-2025`
+    last-pair) are filtered out by `contract_match_variants` — on their own they
+    identify the entity or the year, not this contract.
+    """
+    return _mentions_any(evidence, contract_match_variants_of(numero_variants))
+
+
+def _has_strong_contract_number(evidence: dict, numero_variants: list[str]) -> bool:
+    """True only for the FULL number (raw or hyphen-normalized).
+
+    This is the high-specificity signal: a different contract of the same
+    entity ("4161.010.26.1.099.2025") must never satisfy it.
+    """
+    if not numero_variants:
+        return False
+    raw = numero_variants[0]
+    return _mentions_any(evidence, contract_query_variants(raw))
+
+
+def contract_match_variants_of(numero_variants: list[str]) -> list[str]:
+    """`contract_match_variants` re-derived from an already-expanded list, so
+    callers that only hold the variant list don't need the raw number."""
+    if not numero_variants:
+        return []
+    return contract_match_variants(numero_variants[0])
 
 
 # Generic evidence-deliverable terms — an attachment/document whose name
-# contains one of these, mentioning the contract number, is treated as an
-# auto-match (see `_is_informe_like_document`).
+# contains one of these, mentioning the contract number, earns the strongest
+# reserved slot in the LLM slate (see `_is_informe_like_document`).
 _INFORME_LIKE_TERMS = ("informe", "acta", "entrega", "soporte", "reporte", "planilla")
-
-# Capped bonus added to a candidate's blended score when it mentions the
-# contract number but ISN'T a clear document match (evidencias/discovery-fix
-# WU7 ranking item c): a number-only hit still needs the LLM's verdict unless
-# it's an attachment with an informe-like name — the bonus alone must never
-# be enough to clear a normal LLM review, only to make sure it's RANKED and
-# SEEN by the LLM (candidates_scored/TOP_N) instead of silently dropped.
-_NUMBER_MATCH_BONUS = 0.4
 
 
 def _is_informe_like_document(evidence: dict) -> bool:
@@ -405,67 +467,75 @@ async def _match_una_obligacion(
     large contrato doesn't fire dozens of simultaneous provider calls.
     """
 
-    def _score(idx: int, ev: dict, bonus: float = 0.0) -> float:
+    def _score(idx: int, ev: dict) -> float:
+        """PURE similarity — no contract-number bonus. The reported value feeds
+        `confidence_bucket`, so it must stay a similarity measure; the number
+        signal is applied as a reserved slot in the ranking instead."""
         kw = _keyword_score(ob_text, ev.get("content", ""))
         cos = None
         if ob_vec is not None and ev_embeddings is not None:
             cos = _cosine_similarity(ob_vec, ev_embeddings[idx])
-        return min(1.0, _blended_score(kw, cos) + bonus)
+        return min(1.0, _blended_score(kw, cos))
 
-    # Step 0: contract-number signal (evidencias/discovery-fix WU4, refined by
-    # WU7 ranking item c). An attachment/document with an informe-like name
-    # (see `_is_informe_like_document`) mentioning the contract number is a
-    # near-certain match: score it 1.0 and skip BOTH the keyword threshold
-    # AND the LLM relevance call entirely. Any OTHER evidence mentioning the
-    # number (plain email prose, no document support) gets a capped bonus
-    # instead — boosted, but the LLM still has the last word, so a number-only
-    # mention without real semantic support doesn't auto-qualify.
-    auto_matched: list[dict] = []
+    # Step 0: score everything on its OWN semantic merit, and record the
+    # contract-number signal separately as a RESERVATION priority rather than
+    # folding it into the score.
+    #
+    # Round-2 fix for two confirmed CRITICAL findings:
+    #  - an informe-like document with a number hit used to be auto-matched at
+    #    score 1.0 with the LLM skipped. Because this body runs once per
+    #    obligación, ONE Drive file attached itself to EVERY obligación of the
+    #    contract — and deciding WHICH obligaciones a deliverable covers is
+    #    exactly the LLM's job;
+    #  - the flat `+0.4` bonus was added BEFORE the TOP_N cut, so 50 items whose
+    #    only link was a 4-digit prefix filled all 8 LLM slots and the genuine
+    #    semantic match never reached the model.
+    #
+    # The number now buys a GUARANTEED SLOT, not a higher score: the reported
+    # score stays a pure similarity measure (it feeds `confidence_bucket`), and
+    # the LLM still decides relevance.
     scores_dict: dict[str, float] = {}
-    scoreable: list[tuple[int, dict, float]] = []
+    scored_all: list[tuple[dict, float, int]] = []
     for idx, ev in enumerate(evidence_raw):
-        has_number = _contains_contract_number(ev, numero_variants or [])
-        if has_number and _is_informe_like_document(ev):
-            item = dict(ev)
-            item.setdefault("matched_by", "numero_contrato")
-            auto_matched.append(item)
-            if "id" in ev:
-                scores_dict[ev["id"]] = 1.0
+        if _has_strong_contract_number(ev, numero_variants or []):
+            priority = 2 if _is_informe_like_document(ev) else 1
+        elif _contains_contract_number(ev, numero_variants or []):
+            priority = 1
         else:
-            scoreable.append((idx, ev, _NUMBER_MATCH_BONUS if has_number else 0.0))
+            priority = 0
+        scored_all.append((ev, _score(idx, ev), priority))
 
-    # Step 1: blended-score filter (≥0.15 threshold) — cosine can surface a
-    # candidate keyword scoring alone would miss entirely (cross-language match).
-    scored_all = [(ev, _score(idx, ev, bonus)) for idx, ev, bonus in scoreable]
+    # Step 1: RANK-based selection, never threshold-based.
+    #
+    # The old code re-applied the 0.15 keyword pre-gate once the pool exceeded
+    # EVIDENCE_MAX_CANDIDATES_FOR_LLM, and its rescue only kept items scoring
+    # > 0 — so an all-zero pool produced an EMPTY candidate list and the LLM was
+    # never called. Measured: pool=40 -> 8 matches, pool=41 -> 0 matches. That
+    # made discovery non-monotonic in the amount of evidence found. TOP_N
+    # already bounds the LLM fan-out, so the pre-gate bought no cost control at
+    # all; taking the best TOP_N by rank can never produce an empty slate.
+    top_n = settings.EVIDENCE_MATCHER_TOP_N
+    reserved_n = min(settings.EVIDENCE_NUMBER_RESERVED_SLOTS, top_n)
 
-    if len(scored_all) > settings.EVIDENCE_MAX_CANDIDATES_FOR_LLM:
-        # Large candidate pool (e.g. many expanded-phrase-query hits,
-        # evidencias/discovery-fix WU7): re-apply the keyword pre-gate so an
-        # obligación doesn't fan out an unbounded LLM candidate list.
-        candidates_scored = [(ev, s) for ev, s in scored_all if s >= _KEYWORD_THRESHOLD]
+    by_score = sorted(range(len(scored_all)), key=lambda i: -scored_all[i][1])
+    reserved = sorted(
+        (i for i in range(len(scored_all)) if scored_all[i][2] > 0),
+        key=lambda i: (-scored_all[i][2], -scored_all[i][1]),
+    )[:reserved_n]
 
-        # Max-effort fallback: an obligación with ZERO candidates above threshold
-        # would otherwise stay silently empty. Instead, take its best candidates
-        # with ANY positive score (score > 0) and still let the LLM judge them —
-        # better an obligación gets a weak-but-checked candidate than none at all.
-        if not candidates_scored:
-            positive = [(ev, s) for ev, s in scored_all if s > 0]
-            positive.sort(key=lambda pair: pair[1], reverse=True)
-            candidates_scored = positive[:3]
-    else:
-        # Small pool: skip the keyword pre-gate entirely — a candidate found
-        # ONLY via an expanded semantic phrase query may share zero keywords
-        # with the obligación's own wording and must still reach the LLM
-        # (evidencias/discovery-fix WU7). `EVIDENCE_MATCHER_TOP_N` below still
-        # bounds the actual LLM fan-out.
-        candidates_scored = list(scored_all)
+    chosen: list[int] = list(reserved)
+    reserved_set = set(reserved)
+    for i in by_score:
+        if len(chosen) >= top_n:
+            break
+        if i not in reserved_set:
+            chosen.append(i)
 
-    # Step 2: LLM relevance on top-N candidates — ONE batched call, not one per candidate
-    matched_list = list(auto_matched)
+    candidates_scored = sorted(((scored_all[i][0], scored_all[i][1]) for i in chosen), key=lambda p: -p[1])
+
+    # Step 2: LLM relevance on the slate — ONE batched call, not one per candidate
+    matched_list: list[dict] = []
     if candidates_scored:
-        candidates_scored = sorted(candidates_scored, key=lambda pair: pair[1], reverse=True)[
-            : settings.EVIDENCE_MATCHER_TOP_N
-        ]
         candidates = [ev for ev, _s in candidates_scored]
         blended_scores = [s for _ev, s in candidates_scored]
         async with sem:
@@ -530,7 +600,7 @@ async def evidence_matcher_node(state: AgentState) -> AgentState:
     # about, which meaningfully changes its semantic embedding. `ob_texts`
     # itself stays bare — it's still used for keyword scoring and the LLM
     # candidate listing, which shouldn't be diluted by the objeto text.
-    objeto = str(contrato_contexto.get("objeto") or "").strip()
+    objeto = str(contrato_contexto.get("objeto") or "").strip()[:OBJETO_EMBED_MAX_CHARS]
     ob_embed_texts = [f"{objeto} {t}".strip() if objeto else t for t in ob_texts]
     ob_embeddings = await _embed_batch(ob_embed_texts, llm)
     ev_embeddings = await _embed_batch(ev_texts, llm) if ob_embeddings is not None else None

@@ -435,11 +435,18 @@ class Settings(BaseSettings):
     # (JSON rubric output) once it's the source of truth, replacing the old
     # int-list-only contract.
     EVIDENCE_RELEVANCE_MIN: float = 0.5
-    # Above this many keyword/embedding candidates for one obligación, the
-    # zero-keyword-overlap pre-gate is re-applied (ranked by embeddings first)
-    # instead of sending every candidate to the LLM — bounds LLM fan-out cost
-    # for a contract with many broad expanded-phrase hits.
+    # DEPRECATED (round 2), retained only so an existing .env setting does not
+    # fail validation. It used to re-apply the 0.15 keyword pre-gate above this
+    # pool size, which made discovery non-monotonic: 40 candidates -> 8 matches,
+    # 41 -> ZERO, because the rescue only kept items scoring > 0. Candidate
+    # selection is rank-based now and EVIDENCE_MATCHER_TOP_N is the only cap.
     EVIDENCE_MAX_CANDIDATES_FOR_LLM: int = 40
+    # Slots in the per-obligación LLM slate RESERVED for evidence mentioning the
+    # contract number, so a number hit is guaranteed to be seen without being
+    # able to displace the best semantic candidates. Replaces the old additive
+    # +0.4 bonus, which let 50 items whose only link was a 4-digit prefix fill
+    # all 8 slots and push the genuine match out entirely.
+    EVIDENCE_NUMBER_RESERVED_SLOTS: int = 3
     # calendar_fetch: distinct short queries fired (one per contract-number
     # variant / entidad / obligación keyword), each a separate Calendar API
     # call merged by event id — replaces the old single AND-of-everything query

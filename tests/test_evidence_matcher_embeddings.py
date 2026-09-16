@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import re
+
 import pytest
 from app.agent.nodes import evidence_matcher
 from app.agent.nodes.evidence_matcher import _blended_score, _cosine_similarity, confidence_bucket
@@ -251,13 +253,21 @@ async def test_zero_keyword_overlap_candidate_reaches_llm_when_pool_small() -> N
 
 
 async def test_keyword_pregate_reapplied_when_pool_exceeds_budget(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Once the candidate pool exceeds EVIDENCE_MAX_CANDIDATES_FOR_LLM, the
-    keyword pre-gate is re-applied — an obligación shouldn't fan out an
-    unbounded LLM candidate list just because expansion produced many
-    zero-overlap hits."""
+    """A large, all-zero-overlap candidate pool is still SENT to the LLM, bounded
+    by EVIDENCE_MATCHER_TOP_N — it never collapses to an empty slate.
+
+    Round 2: this test previously asserted `fake.complete.assert_not_awaited()`
+    and `matched_evidence["ob1"] == []`, i.e. it pinned the confirmed CRITICAL
+    "candidate-pool cliff" as intended behaviour. Re-applying the 0.15 keyword
+    pre-gate above EVIDENCE_MAX_CANDIDATES_FOR_LLM made discovery non-monotonic
+    in the amount of evidence found: a pool of 40 produced 8 matches and a pool
+    of 41 produced ZERO, because the rescue only kept items scoring > 0.
+    Selection is now rank-based, and TOP_N (which always bounded the fan-out)
+    is the only cap needed.
+    """
     from unittest.mock import AsyncMock, MagicMock
 
-    monkeypatch.setattr(settings, "EVIDENCE_MAX_CANDIDATES_FOR_LLM", 2)
+    monkeypatch.setattr(settings, "EVIDENCE_MATCHER_TOP_N", 3)
 
     fake = AsyncMock()
     fake.complete = AsyncMock(return_value=MagicMock(content="[]"))
@@ -271,9 +281,11 @@ async def test_keyword_pregate_reapplied_when_pool_exceeds_budget(monkeypatch: p
     with patch.object(evidence_matcher, "get_llm", return_value=fake):
         result = await evidence_matcher.evidence_matcher_node(state)
 
-    # Pool of 5 > budget of 2: pre-gate re-applied, all score 0 → no candidates
-    # clear it → no LLM call at all.
-    fake.complete.assert_not_awaited()
+    # The LLM IS consulted (exactly once, batched), on at most TOP_N items...
+    fake.complete.assert_awaited_once()
+    listado = fake.complete.await_args.args[0][1].content
+    assert len(re.findall(r"^\d+\. ", listado, flags=re.M)) <= 3
+    # ...and its "nothing is relevant" verdict is honoured.
     assert result["matched_evidence"]["ob1"] == []
 
 

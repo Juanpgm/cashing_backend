@@ -423,16 +423,26 @@ def test_score_noreply_prefix_returns_3():
     assert "auto_prefix" in reason
 
 
-def test_score_contains_contract_number_is_never_noise():
-    """An email mentioning the contract number is real contractual evidence,
-    never noise — regardless of what other signals its sender/subject carry
-    (evidencias/discovery-fix WU4)."""
+def test_score_contains_contract_number_exempts_the_weak_heuristics():
+    """An email mentioning the contract number survives the HEURISTIC signals
+    (auto prefixes, ESP-ish domains, subject patterns) — evidencias/discovery-fix
+    WU4.
+
+    Round 2: this test used to assert the exemption beat a CATEGORY_PROMOTIONS
+    label too, which is the confirmed CRITICAL defect — the branch deliberately
+    fires a bare `"4161"` Gmail query, so an entire promotional result set
+    entered the pipeline with the deterministic filter disarmed. Definitive
+    signals now outrank the exemption; see
+    tests/test_evidence_noise_bypass.py for that half.
+    """
     from app.agent.prompts.evidence_filter import score_non_personal_email
 
     score, reason = score_non_personal_email(
-        sender="noreply@notificaciones-dagma.gov.co",
+        # NOT whitelisted (.com), so the exemption is what does the work here —
+        # a .gov.co sender would short-circuit on the whitelist instead.
+        sender="noreply@notificaciones-interventoria.com",
         subject="50% OFF descuento oferta exclusiva",
-        labels=["CATEGORY_PROMOTIONS"],
+        labels=[],
         contains_contract_number=True,
     )
     assert score == 0

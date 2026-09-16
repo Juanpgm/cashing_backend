@@ -16,6 +16,18 @@ import re
 _SEGMENT_RE = re.compile(r"[A-Za-z0-9]+")
 _YEAR_RE = re.compile(r"^(19|20)\d{2}$")
 _MIN_TOKEN_LEN = 3
+# A DERIVED variant must be at least this long to be trusted as a MATCH signal.
+# "4161" (the entity's dependency code) and "027-2025" (the consecutive/year
+# pair, shared by every contract in that range) are below it — they are fine as
+# ranking hints but must never mark evidence as belonging to THIS contract.
+_MIN_MATCH_LEN = 8
+
+# Cap applied to the contract `objeto` before it is prefixed to an obligación's
+# embedding input. Colombian objetos routinely run 500-2000 chars while an
+# obligación is 50-150, so an untruncated shared prefix dominates the pooled
+# vector and every obligación embeds to nearly the same point. Mirrors the cap
+# `contract_header` already applies to the same field for prompts.
+OBJETO_EMBED_MAX_CHARS = 300
 
 # Legal-entity suffixes stripped from `entidad` before it's used as a search
 # term (order matters: longer/more specific forms first so a shorter suffix
@@ -212,3 +224,35 @@ def contract_search_terms(contexto: dict[str, object] | None) -> list[str]:
             seen.add(term)
             out.append(term)
     return out
+
+
+def contract_match_variants(numero: object | None) -> list[str]:
+    """Variants trusted to decide "this evidence mentions THIS contract".
+
+    Round-2 fix for a confirmed CRITICAL finding: `_contains_contract_number`
+    tested every variant, including the bare first segment `4161`, with a plain
+    substring check. `4161` is the entity's dependency code — shared by every
+    contract DAGMA issues — so an unrelated `ORD-41612` order confirmation was
+    treated as contractual evidence, disarming the noise filter and earning the
+    ranking bonus.
+
+    The raw number is always kept. Derived forms must be at least
+    `_MIN_MATCH_LEN` chars AND must not be one of the explicitly weak forms
+    (bare first segment, last-pair). All forms remain available for the looser
+    `contract_number_variants` vocabulary.
+    """
+    variants = contract_number_variants(numero)
+    if not variants:
+        return []
+
+    raw = variants[0]
+    weak: set[str] = set()
+    segments = _SEGMENT_RE.findall(raw)
+    if len(segments) > 1:
+        weak.add("-".join(segments[-2:]))
+        weak.add(".".join(segments[-2:]))
+        first = segments[0]
+        if len(first) >= 4 and not _YEAR_RE.match(first):
+            weak.add(first)
+
+    return [v for v in variants if v == raw or (v not in weak and len(v) >= _MIN_MATCH_LEN)]

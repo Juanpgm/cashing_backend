@@ -48,14 +48,20 @@ async def test_matcher_batches_one_call_per_obligation() -> None:
 
 
 @pytest.mark.asyncio
-async def test_matcher_contract_number_informe_attachment_bypasses_keyword_threshold_and_llm() -> None:
+async def test_matcher_contract_number_informe_attachment_is_guaranteed_an_llm_slot() -> None:
     """A contract-number hit on an ATTACHMENT/document with an informe-like
     name (informe/acta/entrega/soporte/reporte/planilla) is a near-certain
-    match — included even with zero keyword overlap with the obligación's
-    text, WITHOUT spending an LLM call on it (evidencias/discovery-fix WU4,
-    refined by WU7 item c: the number bonus alone is capped and non-document
-    hits still need an LLM verdict — see the sibling test below)."""
-    fake = _CountingLLM("[]")  # if the LLM were called, it would reject everything
+    match, so it is GUARANTEED a reserved slot in the LLM slate even with zero
+    keyword overlap with the obligación's text.
+
+    Round 2: this test used to assert the document bypassed the LLM entirely
+    and was scored 1.0. Because the matcher body runs once per obligación, that
+    made ONE Drive file attach itself to EVERY obligación of the contract at
+    full confidence (confirmed CRITICAL finding) — and choosing WHICH
+    obligaciones a deliverable covers is precisely the LLM's job. The number is
+    now a guaranteed slot, not a verdict.
+    """
+    fake = _CountingLLM("[]")  # the LLM rejects everything
     state = {
         "obligaciones_extraidas": [{"id": "ob1", "descripcion": "algo completamente distinto sin relacion alguna"}],
         "evidence_raw": [
@@ -72,10 +78,31 @@ async def test_matcher_contract_number_informe_attachment_bypasses_keyword_thres
     with patch.object(evidence_matcher, "get_llm", return_value=fake):
         result = await evidence_matcher.evidence_matcher_node(state)
 
-    assert fake.calls == 0  # bypassed the LLM gate entirely
-    matched = result["matched_evidence"]["ob1"]
-    assert [e["id"] for e in matched] == ["a"]
-    assert result["matched_evidence_scores"]["ob1"]["a"] == 1.0
+    assert fake.calls == 1  # it REACHED the LLM instead of bypassing it
+    assert result["matched_evidence"]["ob1"] == []  # and the LLM's "no" is honoured
+
+
+@pytest.mark.asyncio
+async def test_matcher_contract_number_informe_attachment_kept_when_llm_confirms() -> None:
+    """The other half: when the LLM agrees, the deliverable is matched."""
+    fake = _CountingLLM("[1]")
+    state = {
+        "obligaciones_extraidas": [{"id": "ob1", "descripcion": "algo completamente distinto sin relacion alguna"}],
+        "evidence_raw": [
+            {
+                "id": "a",
+                "source": "drive",
+                "title": "Informe contrato 4161.010.26.1.027.2025.pdf",
+                "content": "Contrato 4161.010.26.1.027.2025 - documento adjunto",
+            },
+        ],
+        "contrato_contexto": {"numero_contrato": "4161.010.26.1.027.2025"},
+    }
+
+    with patch.object(evidence_matcher, "get_llm", return_value=fake):
+        result = await evidence_matcher.evidence_matcher_node(state)
+
+    assert [e["id"] for e in result["matched_evidence"]["ob1"]] == ["a"]
 
 
 @pytest.mark.asyncio
@@ -119,10 +146,15 @@ async def test_matcher_contract_number_plain_content_kept_when_llm_confirms() ->
 
 @pytest.mark.asyncio
 async def test_matcher_contract_number_match_still_allows_llm_for_other_candidates() -> None:
-    """The informe-attachment bypass only short-circuits the MATCHING
-    candidate — other candidates for the same obligación still go through
-    the normal keyword+LLM pipeline."""
-    fake = _CountingLLM("[1]")  # confirms the one non-number candidate sent to it
+    """A number-bearing deliverable and an ordinary semantic candidate reach the
+    SAME batched LLM call — the deliverable via its reserved slot, the other on
+    its own score.
+
+    Round 2: this used to assert `fake.calls == 1` meaning "only b went through
+    the LLM", because the deliverable bypassed it. Both now go, still in one
+    batched call.
+    """
+    fake = _CountingLLM("[1, 2]")  # confirms both candidates in the batch
     state = {
         "obligaciones_extraidas": [{"id": "ob1", "descripcion": "informes tecnicos mensuales consultoria asesoria"}],
         "evidence_raw": [
@@ -142,16 +174,20 @@ async def test_matcher_contract_number_match_still_allows_llm_for_other_candidat
 
     matched_ids = {e["id"] for e in result["matched_evidence"]["ob1"]}
     assert matched_ids == {"a", "b"}
-    assert fake.calls == 1  # only "b" went through the LLM batch
+    assert fake.calls == 1  # ONE batched call for both, not one per candidate
 
 
 @pytest.mark.asyncio
-async def test_matcher_contract_number_bonus_is_capped_at_one() -> None:
-    """The contract-number bonus must never push the blended score above 1.0."""
-    from app.agent.nodes.evidence_matcher import _NUMBER_MATCH_BONUS, _blended_score
+async def test_matcher_reported_score_stays_a_pure_similarity_measure() -> None:
+    """The reported score feeds `confidence_bucket` (alta >= 0.75 auto-confirms
+    a link), so it must remain a similarity value in [0, 1] with no
+    contract-number inflation.
 
-    assert _blended_score(1.0, None) + _NUMBER_MATCH_BONUS > 1.0  # bonus alone would overflow
-    # evidence_matcher_node's internal _score() must cap it — exercised end-to-end:
+    Round 2: the old additive `_NUMBER_MATCH_BONUS = 0.4` was written into
+    `matched_evidence_scores` verbatim, so a number mention could promote a link
+    from MEDIA to ALTA. The bonus is gone — the number now buys a reserved slot
+    in the LLM slate instead (EVIDENCE_NUMBER_RESERVED_SLOTS).
+    """
     fake = _CountingLLM("[1]")
     state = {
         "obligaciones_extraidas": [{"id": "ob1", "descripcion": "informes tecnicos mensuales consultoria"}],

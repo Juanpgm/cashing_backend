@@ -16,7 +16,8 @@ import re
 import structlog
 
 from app.adapters.llm import get_llm
-from app.agent.prompts.contract_terms import contract_header
+from app.agent.nodes.evidence_matcher import _mentions_any, contract_match_variants_of
+from app.agent.prompts.contract_terms import contract_header, contract_number_variants
 from app.agent.prompts.evidence_filter import (
     WORK_NOISE_SYSTEM_PROMPT,
     build_work_noise_prompt,
@@ -51,7 +52,16 @@ async def _llm_classify_batch(
         return []
 
     indexed = [
-        {"idx": i, "source": it["source"], "title": it["title"], "content": it["content"]} for i, it in enumerate(items)
+        {
+            "idx": i,
+            "source": it["source"],
+            "title": it["title"],
+            "content": it["content"],
+            # Round-2: the sender is what makes the contract header actionable
+            # (see build_work_noise_prompt) — it was never passed before.
+            "sender": (it.get("metadata") or {}).get("sender") or "",
+        }
+        for i, it in enumerate(items)
     ]
     prompt = build_work_noise_prompt(indexed, header=contract_header(contrato_contexto))
 
@@ -92,13 +102,23 @@ async def _llm_classify_batch(
     return [idx_to_verdict.get(i, "TRABAJO") != "RUIDO" for i in range(len(items))]
 
 
-def _heuristic_is_noise(item: dict) -> bool:
+def _heuristic_is_noise(
+    item: dict,
+    numero_variants: list[str] | None = None,
+    supervisor_domain: str | None = None,
+) -> bool:
     """Capa 1: heurísticas deterministas por (source, provider). True = descartar.
 
     Dispatches to the Microsoft counterpart when `metadata.provider ==
     "microsoft"`; defaults to "google" (the Google heuristics) for legacy
     items that predate the provider marker (microsoft-noise-heuristics spec:
     "each item scored by its own provider's heuristic").
+
+    Round-2 fix (confirmed WARNING): `numero_variants`/`supervisor_domain` were
+    wired ONLY at the service pre-filter. This node then re-scored the very same
+    emails without them and silently undid the WU4 contract-number rescue one
+    layer later — the same message was saved at layer 1 and killed at layer 2.
+    Both default to None so every existing caller keeps working.
     """
     source = item.get("source", "")
     meta = item.get("metadata") or {}
@@ -110,12 +130,25 @@ def _heuristic_is_noise(item: dict) -> bool:
         labels = meta.get("labels") or []
         title = item.get("title") or ""
         headers = meta.get("headers") or {}
+        contains_numero = _mentions_any(item, contract_match_variants_of(numero_variants or []))
         if is_microsoft:
             score, _ = score_non_personal_ms_email(
-                sender, title, categories=labels, inference_classification=headers.get("inferenceClassification", "")
+                sender,
+                title,
+                categories=labels,
+                inference_classification=headers.get("inferenceClassification", ""),
+                supervisor_domain=supervisor_domain,
+                contains_contract_number=contains_numero,
             )
         else:
-            score, _ = score_non_personal_email(sender, title, labels, headers)
+            score, _ = score_non_personal_email(
+                sender,
+                title,
+                labels,
+                headers,
+                supervisor_domain=supervisor_domain,
+                contains_contract_number=contains_numero,
+            )
         return score >= 3
 
     if source == "calendar":
@@ -144,11 +177,19 @@ async def evidence_filter_node(state: AgentState) -> AgentState:
     if not evidence_raw:
         return {**state, "evidencias_descartadas": 0, "current_phase": "evidence_filter"}
 
+    # Contract-number / supervisor signals, so layer 1 here reaches the SAME
+    # verdict as the service pre-filter instead of reverting its rescue
+    # (round-2 confirmed WARNING).
+    contrato_ctx = state.get("contrato_contexto") or {}
+    numero_variants = contract_number_variants(contrato_ctx.get("numero_contrato"))
+    supervisor_email = str(contrato_ctx.get("supervisor_email") or "")
+    supervisor_domain = supervisor_email.split("@")[-1].strip().lower() if "@" in supervisor_email else None
+
     # Capa 1: heurísticas deterministas
     after_heuristics: list[dict] = []
     heuristic_dropped = 0
     for item in evidence_raw:
-        if _heuristic_is_noise(item):
+        if _heuristic_is_noise(item, numero_variants, supervisor_domain):
             heuristic_dropped += 1
             await logger.adebug(
                 "evidence_filter_heuristic_drop",
