@@ -1678,6 +1678,17 @@ async def generar_zip_evidencias(
     if not checklist_service._is_first_cuenta(cuenta):
         catalogo = await checklist_service.listar_catalogo(db)
         codigos_solo_primera = {req.codigo for req in catalogo if req.solo_primera_cuenta}
+        # CONTRATO can reappear on a later cuota (checklist/primera-cuota-2026-09-16,
+        # rule 2: no shared contract-level document, or the contrato has zero
+        # Obligacion rows). When it does, the row is genuinely part of THIS
+        # cuenta's checklist and any document freshly linked to it must still
+        # package — the flat catalog-flag check above would otherwise always
+        # drop it as "already radicated with cuota 1", even though it never was.
+        contrato_req = next((r for r in catalogo if r.codigo == "CONTRATO"), None)
+        if contrato_req is not None:
+            ctx = await checklist_service._construir_checklist_aplica_ctx(db, cuenta)
+            if checklist_service.requisito_aplica_a_cuenta(contrato_req, cuenta, ctx):
+                codigos_solo_primera.discard("CONTRATO")
 
     storage = get_evidencia_storage()
 

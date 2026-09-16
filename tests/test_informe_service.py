@@ -943,14 +943,24 @@ async def _setup_docs_contrato(
     cuenta: CuentaCobro,
 ) -> dict[str, Any]:
     """Checklist + links: an uploaded CONTRATO doc, a SECOP RPC doc and an
-    unlinked OTROS SECOP doc (context). Returns the created objects."""
+    unlinked OTROS SECOP doc (context). Returns the created objects.
+
+    Forces `cuenta.posicion = PRIMERA`: this is generic DOCUMENTOS_CONTRATO
+    packaging plumbing (real bytes, skip-on-error, secret scan), not the
+    differential-package omission rule (covered separately) — RPC is now
+    first-cuota-only (checklist/primera-cuota-2026-09-16, rule 1), so its row
+    only materializes on a first cuenta.
+    """
     from app.models.categoria_documento import CategoriaDocumento
+    from app.models.cuenta_cobro import PosicionCuota
     from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
     from app.models.secop import SecopDocumento
     from app.services import checklist_service
 
     contrato_id = cuenta.contrato_id
     user = test_user["user"]
+    cuenta.posicion = PosicionCuota.PRIMERA
+    await db.commit()
     await checklist_service.asegurar_checklist(db, cuenta)
 
     doc_contrato = DocumentoFuente(
@@ -1615,12 +1625,21 @@ async def test_zip_evidencia_link_only_no_genera_carpeta_ni_se_cuela_en_sin_clas
 
 async def _vincular_cedula(db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro) -> None:
     """Checklist + an uploaded CEDULA doc linked to its (nivel-contrato,
-    solo_primera_cuenta) checklist row."""
+    solo_primera_cuenta) checklist row.
+
+    checklist/primera-cuota-2026-09-16: on a genuinely later cuenta,
+    `asegurar_checklist` no longer materializes a CEDULA row at all (rule 1) —
+    there is nothing left to link through the normal API. This helper's later-
+    cuenta callers are exercising the differential PACKAGE's omission of
+    already-radicated docs, which is exactly the scenario a LEGACY row
+    (materialized before this rule shipped) represents, so simulate that
+    instead of going through `asegurar_checklist`/`vincular_documento_fuente`.
+    """
     from app.models.categoria_documento import CategoriaDocumento
+    from app.models.documento_cuenta_cobro import DocumentoCuentaCobro, DocumentoRequisitoVinculo, EstadoRequisito
     from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
     from app.services import checklist_service
 
-    await checklist_service.asegurar_checklist(db, cuenta)
     doc = DocumentoFuente(
         usuario_id=test_user["user"].id,
         contrato_id=cuenta.contrato_id,
@@ -1631,7 +1650,23 @@ async def _vincular_cedula(db: AsyncSession, test_user: dict[str, Any], cuenta: 
     )
     db.add(doc)
     await db.commit()
-    await checklist_service.vincular_documento_fuente(db, cuenta.id, "CEDULA", doc.id)
+
+    if checklist_service._is_first_cuenta(cuenta):
+        await checklist_service.asegurar_checklist(db, cuenta)
+        await checklist_service.vincular_documento_fuente(db, cuenta.id, "CEDULA", doc.id)
+        await db.commit()
+        return
+
+    # Later cuenta: simulate a legacy row + vinculo directly (no live materialize path).
+    fila = DocumentoCuentaCobro(
+        cuenta_cobro_id=cuenta.id,
+        requisito_codigo="CEDULA",
+        estado=EstadoRequisito.CARGADO,
+        documento_fuente_id=doc.id,
+    )
+    db.add(fila)
+    await db.flush()
+    db.add(DocumentoRequisitoVinculo(documento_cuenta_cobro_id=fila.id, documento_fuente_id=doc.id))
     await db.commit()
 
 
@@ -1672,6 +1707,135 @@ async def test_zip_incluye_docs_solo_primera_en_cuota_primera(
         root = zf.read("LEEME.txt").decode("utf-8")
     assert "DOCUMENTOS_CONTRATO/CEDULA/cedula.pdf" in names
     assert "Documentos de primera cuota omitidos" not in root
+
+
+# ── checklist/primera-cuota-2026-09-16 (WU4): RPC/CDP join the differential
+# package (now solo_primera_cuenta too, symmetric with CEDULA/RUT); CONTRATO's
+# reappearance exception must still package a document freshly linked on the
+# later cuenta instead of being blanket-omitted by the catalog flag alone. ──
+
+
+async def _vincular_doc(
+    db: AsyncSession,
+    test_user: dict[str, Any],
+    cuenta: CuentaCobro,
+    codigo: str,
+    tipo: TipoDocumentoFuente,
+    nombre: str,
+    *,
+    cuenta_scoped: bool = False,
+) -> None:
+    from app.models.documento_fuente import DocumentoFuente
+    from app.services import checklist_service
+
+    await checklist_service.asegurar_checklist(db, cuenta)
+    doc = DocumentoFuente(
+        usuario_id=test_user["user"].id,
+        contrato_id=cuenta.contrato_id,
+        cuenta_cobro_id=cuenta.id if cuenta_scoped else None,
+        storage_key=f"docs/{uuid.uuid4()}/{nombre}",
+        nombre=nombre,
+        tipo=tipo,
+    )
+    db.add(doc)
+    await db.commit()
+    await checklist_service.vincular_documento_fuente(db, cuenta.id, codigo, doc.id)
+    await db.commit()
+
+
+async def test_zip_omite_rpc_y_cdp_legacy_solo_primera_en_cuota_no_primera(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RPC and CDP are now solo_primera_cuenta too — same differential-package
+    treatment CEDULA/RUT already had, applied symmetrically. `asegurar_checklist`
+    itself no longer materializes RPC/CDP rows on a later cuenta at all (rule 1),
+    so this exercises a LEGACY row (materialized before this rule shipped, same
+    as the read-time-filter tests in test_checklist_service.py) to confirm the
+    package still omits it correctly rather than crashing or double-shipping."""
+    from app.models.documento_cuenta_cobro import DocumentoCuentaCobro, DocumentoRequisitoVinculo, EstadoRequisito
+    from app.models.documento_fuente import DocumentoFuente
+    from app.models.documento_fuente import TipoDocumentoFuente as _Tipo
+
+    user = test_user["user"]
+    assert cuenta.posicion == PosicionCuota.RECURRENTE
+
+    for codigo, tipo, nombre in (("RPC", _Tipo.RPC, "rpc.pdf"), ("CDP", _Tipo.CDP, "cdp.pdf")):
+        doc = DocumentoFuente(
+            usuario_id=user.id,
+            contrato_id=cuenta.contrato_id,
+            cuenta_cobro_id=None,
+            storage_key=f"docs/{uuid.uuid4()}/{nombre}",
+            nombre=nombre,
+            tipo=tipo,
+        )
+        db.add(doc)
+        await db.flush()
+        fila = DocumentoCuentaCobro(
+            cuenta_cobro_id=cuenta.id,
+            requisito_codigo=codigo,
+            estado=EstadoRequisito.CARGADO,
+            documento_fuente_id=doc.id,
+        )
+        db.add(fila)
+        await db.flush()
+        db.add(DocumentoRequisitoVinculo(documento_cuenta_cobro_id=fila.id, documento_fuente_id=doc.id))
+    await db.commit()
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: _fake_storage())
+
+    content, _filename = await informe_service.generar_zip_evidencias(db, user.id, cuenta.id)
+
+    with zipfile.ZipFile(io.BytesIO(content)) as zf:
+        names = zf.namelist()
+        root = zf.read("LEEME.txt").decode("utf-8")
+    assert not any(n.startswith("DOCUMENTOS_CONTRATO/RPC/") for n in names)
+    assert not any(n.startswith("DOCUMENTOS_CONTRATO/CDP/") for n in names)
+    assert "RPC" in root
+    assert "CDP" in root
+
+
+async def test_zip_incluye_contrato_reaparecido_en_cuota_no_primera(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """checklist/primera-cuota-2026-09-16 rule 2a: no shared CONTRATO document
+    exists, so CONTRATO reappears on the later cuota — the document the user
+    links for THIS cuenta must still package, not be dropped as "already
+    radicated with cuota 1" (the catalog-flag-only omission would wrongly drop
+    it, since CONTRATO.solo_primera_cuenta is now True)."""
+    from app.models.documento_fuente import TipoDocumentoFuente as _Tipo
+
+    user = test_user["user"]
+    assert cuenta.posicion == PosicionCuota.RECURRENTE
+    # `cuenta` fixture's contrato already has 3 obligaciones — isolates rule 2a
+    # (no shared doc) from rule 2b (no obligaciones).
+    await _vincular_doc(db, test_user, cuenta, "CONTRATO", _Tipo.CONTRATO, "contrato_v2.pdf", cuenta_scoped=True)
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: _fake_storage())
+
+    content, _filename = await informe_service.generar_zip_evidencias(db, user.id, cuenta.id)
+
+    with zipfile.ZipFile(io.BytesIO(content)) as zf:
+        names = zf.namelist()
+    assert "DOCUMENTOS_CONTRATO/CONTRATO/contrato_v2.pdf" in names
+
+
+async def test_zip_omite_contrato_solo_primera_en_cuota_no_primera_sin_reaparicion(
+    db: AsyncSession, test_user: dict[str, Any], cuenta: CuentaCobro, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No exception applies (shared document exists, obligaciones exist) →
+    CONTRATO stays in the differential package omission, same as CEDULA/RUT."""
+    from app.models.documento_fuente import TipoDocumentoFuente as _Tipo
+
+    user = test_user["user"]
+    assert cuenta.posicion == PosicionCuota.RECURRENTE
+    await _vincular_doc(db, test_user, cuenta, "CONTRATO", _Tipo.CONTRATO, "contrato.pdf")
+    monkeypatch.setattr(informe_service, "_get_storage", lambda *_a, **_k: _fake_storage())
+
+    content, _filename = await informe_service.generar_zip_evidencias(db, user.id, cuenta.id)
+
+    with zipfile.ZipFile(io.BytesIO(content)) as zf:
+        names = zf.namelist()
+        root = zf.read("LEEME.txt").decode("utf-8")
+    assert not any(n.startswith("DOCUMENTOS_CONTRATO/CONTRATO/") for n in names)
+    assert "CONTRATO" in root
 
 
 # ── Adaptive generation (billing-resilience-templates, slice #6) ───────────
