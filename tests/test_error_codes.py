@@ -23,7 +23,7 @@ import pytest
 from app.core.exceptions import ValidationError
 from app.models.actividad import Actividad
 from app.models.contrato import Contrato
-from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
+from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro, PosicionCuota
 from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
 from app.models.obligacion import Obligacion, TipoObligacion
 from app.services import informe_service
@@ -250,18 +250,6 @@ async def test_evidencias_descubrir_no_provider_connected_returns_code(
     assert body["code"] == "NO_PROVIDER_CONNECTED"
 
 
-_CODIGOS_OBLIGATORIOS_RADICAR = [
-    "CONTRATO",
-    "RPC",
-    "SEGURIDAD_SOCIAL",
-    "INFORME_ACTIVIDADES",
-    "INFORME_SUPERVISION",
-    "EVIDENCIAS",
-    "CEDULA",
-    "RUT",
-    "ACTA_INICIO",
-]
-
 
 async def test_radicar_coherence_hard_finding_returns_coherence_check_failed_code(
     client: AsyncClient, db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
@@ -277,6 +265,7 @@ async def test_radicar_coherence_hard_finding_returns_coherence_check_failed_cod
         estado=EstadoCuentaCobro.BORRADOR,
         valor=1_000_000,
         requisitos_modo="estandar",
+        posicion=PosicionCuota.PRIMERA,
     )
     cuenta2 = CuentaCobro(
         contrato_id=contrato.id,
@@ -285,6 +274,7 @@ async def test_radicar_coherence_hard_finding_returns_coherence_check_failed_cod
         estado=EstadoCuentaCobro.BORRADOR,
         valor=1_000_000,
         requisitos_modo="estandar",
+        posicion=PosicionCuota.RECURRENTE,
     )
     db.add_all([cuenta1, cuenta2])
     await db.commit()
@@ -305,7 +295,18 @@ async def test_radicar_coherence_hard_finding_returns_coherence_check_failed_cod
 
     r = await client.get(f"/api/v1/cuentas-cobro/{cuenta2.id}/checklist", headers=test_user["headers"])
     assert r.status_code == 200, r.text
-    for codigo in _CODIGOS_OBLIGATORIOS_RADICAR:
+    # checklist/primera-cuota-2026-09-16: cuenta2 is genuinely the SECOND cuenta
+    # of this contrato — CEDULA/RUT/RPC/CDP legitimately don't appear as rows at
+    # all here, so derive the codes to complete from the actual response rather
+    # than a fixed list (would 404 on them).
+    codigos_pendientes = [
+        item["requisito"]["codigo"]
+        for item in r.json()["items"]
+        if item["requisito"]["obligatorio"]
+        and item["requisito"]["codigo"] is not None
+        and item["estado"] not in ("cargado", "detectado", "cumplido_manual")
+    ]
+    for codigo in codigos_pendientes:
         p = await client.patch(
             f"/api/v1/cuentas-cobro/{cuenta2.id}/checklist/{codigo}",
             headers=test_user["headers"],

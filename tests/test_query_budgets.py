@@ -36,7 +36,7 @@ from app.api.deps import get_pdf_storage
 from app.main import app as fastapi_app
 from app.models.actividad import Actividad
 from app.models.contrato import Contrato
-from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
+from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro, PosicionCuota
 from app.models.evidencia import Evidencia
 from app.models.obligacion import Obligacion, TipoObligacion
 from app.services import paquete_job_service
@@ -116,7 +116,16 @@ async def obligacion(db: AsyncSession, contrato: Contrato) -> Obligacion:
 
 @pytest.fixture
 async def cuenta(db: AsyncSession, contrato: Contrato) -> CuentaCobro:
-    """Cuenta in BORRADOR with the checklist gate already resolved (estandar)."""
+    """Cuenta in BORRADOR with the checklist gate already resolved (estandar).
+
+    posicion=PRIMERA: the only cuenta this contrato fixture ever gets in this
+    file (`numero_cuota=1` alone doesn't set it — see the model docstring).
+    checklist/primera-cuota-2026-09-16 makes CEDULA/RUT/RPC/CDP key off
+    `_is_first_cuenta`, so this must be explicit — the RPC-real-upload +
+    cumplido_manual completion routine below (`_completar_checklist`) is
+    query-count-sensitive and deliberately NOT rewritten to derive codes
+    dynamically, unlike the other fixed-list call sites elsewhere.
+    """
     cc = CuentaCobro(
         contrato_id=contrato.id,
         mes=1,
@@ -125,6 +134,7 @@ async def cuenta(db: AsyncSession, contrato: Contrato) -> CuentaCobro:
         valor=1_000_000,
         numero_cuota=1,
         requisitos_modo="estandar",
+        posicion=PosicionCuota.PRIMERA,
     )
     db.add(cc)
     await db.commit()

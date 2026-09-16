@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from app.models.contrato import Contrato
-from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
+from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro, PosicionCuota
 from app.tools.invoke import invoke_tool as real_invoke_tool
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -66,7 +66,13 @@ async def contrato(db: AsyncSession, test_user: dict[str, Any]) -> Contrato:
 
 @pytest.fixture
 async def cuenta(db: AsyncSession, contrato: Contrato) -> CuentaCobro:
-    """Cuenta in BORRADOR with the checklist gate already resolved (estandar)."""
+    """Cuenta in BORRADOR with the checklist gate already resolved (estandar).
+
+    posicion=PRIMERA: this is the only cuenta this contrato fixture ever gets
+    in this file — checklist/primera-cuota-2026-09-16 makes CEDULA/RUT/RPC/CDP
+    key off `_is_first_cuenta`, so it must be explicit rather than the model's
+    RECURRENTE default.
+    """
     cc = CuentaCobro(
         contrato_id=contrato.id,
         mes=1,
@@ -74,6 +80,7 @@ async def cuenta(db: AsyncSession, contrato: Contrato) -> CuentaCobro:
         estado=EstadoCuentaCobro.BORRADOR,
         valor=1_000_000,
         requisitos_modo="estandar",
+        posicion=PosicionCuota.PRIMERA,
     )
     db.add(cc)
     await db.commit()
