@@ -78,6 +78,24 @@ async def _make_cuenta(db: AsyncSession, contrato: Contrato, mes: int, anio: int
     return cc
 
 
+# ── _CATALOGO_SEED flags (WU1) ──────────────────────────────────────────────
+
+
+def test_catalogo_seed_rpc_cdp_contrato_son_solo_primera_cuenta() -> None:
+    """checklist/primera-cuota-2026-09-16, rule 1/2: RPC, CDP and CONTRATO join
+    CEDULA/RUT as solo_primera_cuenta in the code-side catalog seed. This alone
+    only affects a brand-new/test DB (`_seed_catalogo_si_vacio` never UPDATEs an
+    already-seeded row) — existing deployments need migration
+    043_checklist_primera_cuota_flags."""
+    seed_by_codigo = {item["codigo"]: item for item in checklist_service._CATALOGO_SEED}
+    for codigo in ("CEDULA", "RUT", "RPC", "CDP", "CONTRATO"):
+        assert seed_by_codigo[codigo]["solo_primera_cuenta"] is True, codigo
+    # obligatorio values are untouched by this change.
+    assert seed_by_codigo["CONTRATO"]["obligatorio"] is True
+    assert seed_by_codigo["RPC"]["obligatorio"] is True
+    assert seed_by_codigo["CDP"]["obligatorio"] is False
+
+
 # ── asegurar_checklist ─────────────────────────────────────────────────────
 
 
