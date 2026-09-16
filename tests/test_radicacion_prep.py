@@ -22,7 +22,7 @@ from app.core.config import settings
 from app.core.exceptions import ValidationError
 from app.models.actividad import Actividad
 from app.models.contrato import Contrato
-from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
+from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro, PosicionCuota
 from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
 from app.models.evidencia import Evidencia
 from app.models.obligacion import Obligacion, TipoObligacion
@@ -87,6 +87,17 @@ async def obligacion(db: AsyncSession, contrato: Contrato) -> Obligacion:
 
 
 async def _make_cuenta(db: AsyncSession, contrato: Contrato, mes: int, anio: int = 2024) -> CuentaCobro:
+    """Same `posicion` auto-derivation as `test_checklist_service._make_cuenta`
+    (checklist/primera-cuota-2026-09-16): mirrors
+    `cuenta_cobro_service.crear_cuenta_cobro` — the first cuenta inserted for a
+    contrato is PRIMERA, every later one RECURRENTE. Load-bearing now that
+    CEDULA/RUT/RPC/CDP (and conditionally CONTRATO) key off `_is_first_cuenta`.
+    """
+    from sqlalchemy import select
+
+    existe_previa = (
+        await db.execute(select(CuentaCobro.id).where(CuentaCobro.contrato_id == contrato.id).limit(1))
+    ).scalar_one_or_none()
     cc = CuentaCobro(
         contrato_id=contrato.id,
         mes=mes,
@@ -94,6 +105,7 @@ async def _make_cuenta(db: AsyncSession, contrato: Contrato, mes: int, anio: int
         estado=EstadoCuentaCobro.BORRADOR,
         valor=1_000_000,
         requisitos_modo="estandar",
+        posicion=PosicionCuota.RECURRENTE if existe_previa is not None else PosicionCuota.PRIMERA,
     )
     db.add(cc)
     await db.commit()
@@ -102,9 +114,22 @@ async def _make_cuenta(db: AsyncSession, contrato: Contrato, mes: int, anio: int
 
 
 async def _completar_checklist(client: AsyncClient, headers: dict[str, str], cuenta_id: Any) -> None:
+    """Marks every OBLIGATORIO, not-yet-satisfied standard requisito as
+    cumplido_manual. Reads the actual checklist response rather than a fixed
+    `_CODIGOS_OBLIGATORIOS` list (checklist/primera-cuota-2026-09-16:
+    CEDULA/RUT/RPC/CDP — and, on some cuentas, CONTRATO — legitimately don't
+    appear as rows at all on a later cuenta, so a hardcoded list would 404)."""
     r = await client.get(f"/api/v1/cuentas-cobro/{cuenta_id}/checklist", headers=headers)
     assert r.status_code == 200, r.text
-    for codigo in _CODIGOS_OBLIGATORIOS:
+    payload = r.json()
+    codigos = [
+        item["requisito"]["codigo"]
+        for item in payload["items"]
+        if item["requisito"]["obligatorio"]
+        and item["requisito"]["codigo"] is not None
+        and item["estado"] not in ("cargado", "detectado", "cumplido_manual")
+    ]
+    for codigo in codigos:
         p = await client.patch(
             f"/api/v1/cuentas-cobro/{cuenta_id}/checklist/{codigo}",
             headers=headers,
