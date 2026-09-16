@@ -39,7 +39,7 @@ from app.core.text_match import solo_digitos as _solo_digitos
 from app.models.actividad import Actividad
 from app.models.categoria_documento import CategoriaDocumento
 from app.models.contrato import Contrato
-from app.models.cuenta_cobro import CuentaCobro, PosicionCuota
+from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro, PosicionCuota
 from app.models.documento_cuenta_cobro import (
     DocumentoChecklistCandidato,
     DocumentoCuentaCobro,
@@ -515,6 +515,18 @@ async def _construir_checklist_aplica_ctx(db: AsyncSession, cuenta: CuentaCobro)
     )
 
 
+# A cuenta in one of these estados is SETTLED: its checklist is a historical
+# record of what was radicated, so `asegurar_checklist` never adds requisitos to
+# it after the fact (round 3, finding #9). RECHAZADA is deliberately absent —
+# a rejected cuenta goes back to being edited. Without this guard, promoting a
+# closed cuenta to PRIMERA (which `eliminar_cuenta_cobro` legitimately does when
+# the real first cuota is deleted) materialized fresh PENDIENTE CEDULA/RUT/RPC/
+# CDP rows on it and flipped its `radicacion_lista` back to False.
+_ESTADOS_CUENTA_CERRADA = frozenset(
+    {EstadoCuentaCobro.ENVIADA, EstadoCuentaCobro.APROBADA, EstadoCuentaCobro.PAGADA}
+)
+
+
 # Standard catalog codes hidden entirely on a later cuota, unconditionally
 # (checklist/primera-cuota-2026-09-16, rule 1) — identity/budget documents
 # requested once per contract. CONTRATO is deliberately excluded from this set:
@@ -676,6 +688,9 @@ async def asegurar_checklist(
     New rows always start PENDIENTE — links are never copied from a previous
     cuenta. Returns the full list of rows (existing + newly created).
 
+    A cuenta in `_ESTADOS_CUENTA_CERRADA` never gets NEW rows: its checklist is
+    the historical record of what was radicated (round 3, finding #9).
+
     ``ctx``: pass an already-built `ChecklistAplicaCtx` when the caller (e.g.
     `construir_checklist_completo`) needs the exact same one for a later
     read-time filter pass, to avoid building it (and its 2 DB round-trips on a
@@ -700,8 +715,15 @@ async def asegurar_checklist(
 
     creadas: list[DocumentoCuentaCobro] = []
 
+    # A settled cuenta keeps exactly the checklist it was radicated with — see
+    # `_ESTADOS_CUENTA_CERRADA` (round 3, finding #9). Existing rows are still
+    # returned (and still readable/filterable); only NEW ones are refused.
+    puede_materializar = cuenta.estado not in _ESTADOS_CUENTA_CERRADA
+
     # Standard rows
     for req in catalogo:
+        if not puede_materializar:
+            break
         if req.codigo not in codigos_estandar:
             continue
         if not _aplica_con_mapeo(req, ctx, mapeos_por_codigo):
@@ -718,7 +740,7 @@ async def asegurar_checklist(
 
     # Custom rows (only when the mode includes custom requisitos). A custom item
     # mapped to a standard code is already covered by the standard row above.
-    if modo in ("augment", "reemplazar"):
+    if puede_materializar and modo in ("augment", "reemplazar"):
         for item in custom:
             if item.mapea_a_estandar:
                 continue

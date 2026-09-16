@@ -328,6 +328,14 @@ async def test_preparar_radicacion_on_undefined_requisitos_modo_materializes_est
     from app.models.documento_cuenta_cobro import DocumentoCuentaCobro
     from sqlalchemy import select
 
+    # A real PRIMERA sibling holds the cuota-position variable CONSTANT across
+    # the two cuentas under comparison, so this measures modo=None vs
+    # modo="estandar" and nothing else (round 3, finding #2: the "no active
+    # PRIMERA" fail-safe now promotes only the EARLIEST surviving cuenta, so
+    # without this the mes=2 cuenta would fail safe to first and the mes=3 one
+    # would not — an asymmetry that has nothing to do with requisitos_modo).
+    await _make_cuenta(db, contrato, mes=1)
+
     cuenta_null = CuentaCobro(
         contrato_id=contrato.id,
         mes=2,
