@@ -467,6 +467,11 @@ async def descubrir_evidencias(
         if contrato.objeto:
             contrato_contexto["objeto"] = contrato.objeto
 
+    # Contexto libre del usuario ("qué hice este mes") — cargado aquí (antes de
+    # la expansión semántica) porque alimenta AMBAS cosas: expand_search_terms
+    # (evidencias/discovery-fix WU7b) y, más abajo, el estado del agente.
+    contexto_usuario = await _contexto_usuario(db, req.cuenta_id)
+
     # Semantic query expansion (evidencias/discovery-fix WU7) — one LLM call
     # for search phrases beyond the contract number/obligación wording, so
     # evidence that never mentions either can still be found. Feature-flagged
@@ -476,7 +481,9 @@ async def descubrir_evidencias(
     if not local_only and settings.EVIDENCE_QUERY_EXPANSION_ENABLED and obligaciones:
         try:
             expansion_llm = get_llm(model=settings.LLM_EVIDENCE_CLASSIFIER_MODEL)
-            expanded_terms = await expand_search_terms(contrato_contexto, obligaciones, expansion_llm)
+            expanded_terms = await expand_search_terms(
+                contrato_contexto, obligaciones, expansion_llm, contexto_usuario=contexto_usuario
+            )
         except Exception as exc:
             await logger.awarning("query_expansion_failed", error=str(exc))
 
@@ -540,9 +547,9 @@ async def descubrir_evidencias(
     # Actividades de meses anteriores del mismo contrato (grounding para no repetir texto).
     actividades_previas = await _actividades_previas(db, contrato_id, req.cuenta_id)
 
-    # Contexto libre del usuario ("qué hice este mes") + evidencias subidas con su
-    # texto extraído — ambos alimentan la generación junto con lo descubierto en Google.
-    contexto_usuario = await _contexto_usuario(db, req.cuenta_id)
+    # Evidencias subidas con su texto extraído — alimenta la generación junto
+    # con lo descubierto en Google/Microsoft. (contexto_usuario ya se cargó
+    # arriba, antes de la expansión semántica.)
     local_evidence = await _evidencias_subidas(db, req.cuenta_id)
 
     # Estado compartido por los nodos del agente.

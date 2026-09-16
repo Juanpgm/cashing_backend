@@ -99,6 +99,64 @@ async def test_llm_response_missing_an_obligacion_still_gets_fallback_for_it() -
 
 
 @pytest.mark.asyncio
+async def test_contexto_usuario_included_as_primary_hint_in_prompt() -> None:
+    """evidencias/discovery-fix WU7b: the contratista's own monthly summary
+    ("¿Qué hiciste este mes?") must reach the expansion prompt as the primary
+    hint of what was actually done this period."""
+    obligaciones = [{"id": "ob1", "descripcion": "Entregar informe mensual"}]
+    llm = AsyncMock()
+    llm.complete = AsyncMock(return_value=_FakeResp('{"ob1": ["a", "b", "c", "d"]}'))
+
+    await expand_search_terms(
+        {}, obligaciones, llm, contexto_usuario="Entregué el informe y asistí a 2 reuniones con el supervisor"
+    )
+
+    prompt = llm.complete.call_args.args[0][1].content
+    assert "Entregué el informe y asistí a 2 reuniones con el supervisor" in prompt
+
+
+@pytest.mark.asyncio
+async def test_contexto_usuario_adds_derived_phrases_without_llm() -> None:
+    """Fallback path (llm=None): 2-4 phrases derived from contexto_usuario
+    must still be added — this is deterministic, not LLM-dependent."""
+    obligaciones = [{"id": "ob1", "descripcion": "Entregar informe mensual de actividades"}]
+
+    result = await expand_search_terms(
+        {}, obligaciones, None, contexto_usuario="Coordiné la logística del evento anual con proveedores externos"
+    )
+
+    assert any(term in result["ob1"] for term in ("coordiné", "logística", "evento", "proveedores"))
+
+
+@pytest.mark.asyncio
+async def test_contexto_usuario_phrases_merged_even_when_llm_ignores_them() -> None:
+    """Phrases derived from contexto_usuario must be present in the final
+    result even when the LLM's own answer doesn't mention them at all —
+    this is an unconditional addition, not a suggestion the LLM can drop."""
+    obligaciones = [{"id": "ob1", "descripcion": "Entregar informe mensual"}]
+    llm = AsyncMock()
+    llm.complete = AsyncMock(return_value=_FakeResp('{"ob1": ["informe de avance", "reporte", "x", "y"]}'))
+
+    result = await expand_search_terms(
+        {}, obligaciones, llm, contexto_usuario="Coordiné la logística del evento anual"
+    )
+
+    assert any(term in result["ob1"] for term in ("coordiné", "logística", "evento"))
+
+
+@pytest.mark.asyncio
+async def test_no_contexto_usuario_behaves_exactly_as_before() -> None:
+    """Fallback: empty/None contexto_usuario → behavior unchanged."""
+    obligaciones = [{"id": "ob1", "descripcion": "Entregar informe mensual de actividades del contrato"}]
+
+    without = await expand_search_terms({}, obligaciones, None)
+    with_none = await expand_search_terms({}, obligaciones, None, contexto_usuario=None)
+    with_empty = await expand_search_terms({}, obligaciones, None, contexto_usuario="")
+
+    assert without == with_none == with_empty
+
+
+@pytest.mark.asyncio
 async def test_prompt_includes_contract_header() -> None:
     obligaciones = [{"id": "ob1", "descripcion": "Entregar informe mensual"}]
     llm = AsyncMock()

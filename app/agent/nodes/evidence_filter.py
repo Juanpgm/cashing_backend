@@ -167,9 +167,17 @@ async def evidence_filter_node(state: AgentState) -> AgentState:
     llm = get_llm(model=settings.LLM_EVIDENCE_CLASSIFIER_MODEL)
     llm_dropped = 0
 
+    # Merge in the contratista's own monthly summary (evidencias/discovery-fix
+    # WU7b) for the shared header WITHOUT mutating `state["contrato_contexto"]`.
+    contrato_contexto = state.get("contrato_contexto") or {}
+    contexto_usuario_val = state.get("contexto_usuario")
+    contrato_contexto_for_prompt = (
+        {**contrato_contexto, "contexto_usuario": contexto_usuario_val} if contexto_usuario_val else contrato_contexto
+    )
+
     for batch_start in range(0, len(clasificables), _LLM_BATCH_SIZE):
         batch = clasificables[batch_start : batch_start + _LLM_BATCH_SIZE]
-        keep_flags = await _llm_classify_batch(batch, llm, state.get("contrato_contexto"))
+        keep_flags = await _llm_classify_batch(batch, llm, contrato_contexto_for_prompt)
         for item, keep in zip(batch, keep_flags, strict=True):
             if keep:
                 kept.append(item)

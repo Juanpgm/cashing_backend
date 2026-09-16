@@ -511,6 +511,12 @@ async def evidence_matcher_node(state: AgentState) -> AgentState:
 
     contrato_contexto = state.get("contrato_contexto") or {}
     numero_variants = contract_number_variants(contrato_contexto.get("numero_contrato"))
+    # Merge in the contratista's own monthly summary (evidencias/discovery-fix
+    # WU7b) for the shared header WITHOUT mutating `state["contrato_contexto"]`.
+    contexto_usuario_val = state.get("contexto_usuario")
+    contrato_contexto_for_prompt = (
+        {**contrato_contexto, "contexto_usuario": contexto_usuario_val} if contexto_usuario_val else contrato_contexto
+    )
 
     # Embed once for the whole run (per-contrato reuse, not once per evidence file):
     # one batch call for every obligación text, one for every evidence text. Skips
@@ -547,7 +553,15 @@ async def evidence_matcher_node(state: AgentState) -> AgentState:
         ob_vec = ob_embeddings[i] if ob_embeddings is not None else None
         tareas.append(
             _match_una_obligacion(
-                str(ob_id), ob_text, ob_vec, evidence_raw, ev_embeddings, llm, sem, numero_variants, contrato_contexto
+                str(ob_id),
+                ob_text,
+                ob_vec,
+                evidence_raw,
+                ev_embeddings,
+                llm,
+                sem,
+                numero_variants,
+                contrato_contexto_for_prompt,
             )
         )
 

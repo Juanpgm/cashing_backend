@@ -255,6 +255,26 @@ async def test_evidence_filter_node_passes_contrato_contexto_to_llm_batch():
 
 
 @pytest.mark.asyncio
+async def test_evidence_filter_node_passes_contexto_usuario_to_llm_batch():
+    """evidencias/discovery-fix WU7b: the contratista's monthly summary must
+    reach the work-noise prompt via the shared header."""
+    from app.agent.nodes import evidence_filter as mod
+
+    llm = AsyncMock()
+    llm.complete = AsyncMock(return_value=MagicMock(content='[{"idx": 0, "verdict": "TRABAJO"}]'))
+
+    state = {
+        "evidence_raw": [_email_item("Informe mensual", sender="supervisor@entidad.gov.co")],
+        "contexto_usuario": "Entregué el informe y asistí a 2 reuniones con el supervisor",
+    }
+    with patch.object(mod, "get_llm", return_value=llm):
+        await mod.evidence_filter_node(state)
+
+    prompt = llm.complete.call_args.args[0][1].content
+    assert "Entregué el informe y asistí a 2 reuniones con el supervisor" in prompt
+
+
+@pytest.mark.asyncio
 async def test_evidence_filter_node_constructs_llm_against_live_groq_model():
     """groq/llama-3.1-8b-instant was decommissioned by Groq — evidence_filter_node
     must build its LLM client against the current model."""

@@ -777,6 +777,102 @@ async def test_descubrir_evidencias_expansion_enabled_feeds_gmail_queries(monkey
     assert any("planilla de seguridad social" in q for q in captured_queries)
 
 
+@pytest.mark.asyncio
+async def test_gather_gmail_evidence_fires_context_derived_phrase_query(monkeypatch) -> None:
+    """A phrase derived from contexto_usuario (surfaced via expanded_terms)
+    must reach Gmail as a query — the same generic expanded_terms plumbing
+    WU7 already wires, closing the loop for WU7b's context phrases too."""
+    from app.core.config import settings
+    from app.services import evidence_discovery_service as eds
+
+    monkeypatch.setattr(settings, "EVIDENCE_MAX_GMAIL_QUERIES", 50)
+
+    captured_queries: list[str] = []
+
+    async def _fake_search(usuario_id, query, max_results):
+        captured_queries.append(query)
+        return []
+
+    adapter = MagicMock()
+    adapter.search_messages = AsyncMock(side_effect=_fake_search)
+
+    with patch.object(eds, "GmailAdapter", return_value=adapter):
+        await eds._gather_email_evidence(
+            MagicMock(),
+            uuid.uuid4(),
+            [{"id": "ob1", "descripcion": "Entregar informe mensual de actividades"}],
+            "2024-04-01",
+            "2024-04-30",
+            None,
+            None,
+            expanded_terms={"ob1": ["logística evento anual"]},  # derived from contexto_usuario
+        )
+
+    assert any("logística evento anual" in q for q in captured_queries)
+
+
+@pytest.mark.asyncio
+async def test_descubrir_evidencias_passes_contexto_usuario_to_expansion(db: AsyncSession) -> None:
+    """evidencias/discovery-fix WU7b: CuentaCobro.contexto_usuario ("¿Qué
+    hiciste este mes?") must reach expand_search_terms as the primary hint —
+    verified end-to-end through descubrir_evidencias with the feature flag on."""
+    from app.core.config import settings
+    from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
+    from app.services import evidence_discovery_service as eds
+
+    original_flag = settings.EVIDENCE_QUERY_EXPANSION_ENABLED
+    settings.EVIDENCE_QUERY_EXPANSION_ENABLED = True
+    try:
+        user = await _make_user(db)
+        contrato = await _make_contrato(db, user.id)
+        cuenta = CuentaCobro(
+            contrato_id=contrato.id,
+            mes=4,
+            anio=2024,
+            estado=EstadoCuentaCobro.BORRADOR,
+            valor=1_000_000,
+            contexto_usuario="Coordiné la logística del evento anual con proveedores externos",
+        )
+        db.add(cuenta)
+        await db.commit()
+
+        req = EvidenceDiscoveryRequest(
+            obligaciones=[{"id": "ob1", "descripcion": "Entregar informe mensual"}],
+            cuenta_id=cuenta.id,
+            fecha_inicio="2024-04-01",
+            fecha_fin="2024-04-30",
+        )
+
+        expansion_spy = AsyncMock(return_value={"ob1": ["x", "y", "z"]})
+        gmail = MagicMock()
+        gmail.search_messages = AsyncMock(return_value=[])
+        drive_adapter = MagicMock()
+        drive_adapter.search_files = AsyncMock(return_value=[])
+        cal_adapter = MagicMock()
+        cal_adapter.search_events = AsyncMock(return_value=[])
+        justify_llm = AsyncMock()
+        justify_llm.complete = AsyncMock(return_value=MagicMock(content="No hay evidencia."))
+
+        with (
+            patch.object(eds.integration_service, "has_any_connected_provider", AsyncMock(return_value=True)),
+            patch.object(
+                eds.integration_service, "list_integration_statuses", AsyncMock(return_value=[_connected_status()])
+            ),
+            patch.object(eds, "GmailAdapter", return_value=gmail),
+            patch.object(eds, "expand_search_terms", expansion_spy),
+            patch("app.agent.nodes.drive_fetch.DriveAdapter", return_value=drive_adapter),
+            patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", return_value=cal_adapter),
+            patch("app.agent.nodes.evidence_justify.get_llm", return_value=justify_llm),
+        ):
+            await eds.descubrir_evidencias(db, user.id, req)
+
+        expansion_spy.assert_awaited_once()
+        call_kwargs = expansion_spy.await_args.kwargs
+        assert call_kwargs.get("contexto_usuario") == "Coordiné la logística del evento anual con proveedores externos"
+    finally:
+        settings.EVIDENCE_QUERY_EXPANSION_ENABLED = original_flag
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Date-range default from contrato when fecha_inicio/fecha_fin are omitted
 # ─────────────────────────────────────────────────────────────────────────────

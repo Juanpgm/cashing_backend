@@ -208,6 +208,32 @@ async def test_evidence_justify_includes_contract_header_in_prompt():
 
 
 @pytest.mark.asyncio
+async def test_evidence_justify_header_includes_contexto_usuario_label():
+    """evidencias/discovery-fix WU7b: the shared contract_header() block
+    (not just the pre-existing separate "## Resumen del usuario" section)
+    must also carry the contratista's monthly context."""
+    from app.agent.nodes import evidence_justify as mod
+
+    fake_resp = MagicMock()
+    fake_resp.content = "ACTIVIDAD: Actividad.\nJUSTIFICACION: Justificación distinta y suficiente."
+    mock_llm = AsyncMock()
+    mock_llm.complete = AsyncMock(return_value=fake_resp)
+
+    state = {
+        "obligaciones_contexto": [{"id": "ob1", "descripcion": "Entregar informe mensual"}],
+        "matched_evidence": {"ob1": [{"source": "drive", "title": "informe.pdf", "link": "https://drive/x"}]},
+        "contrato_contexto": {"numero_contrato": "CTR-001"},
+        "contexto_usuario": "Entregué el informe y asistí a 2 reuniones con el supervisor",
+    }
+
+    with patch.object(mod, "get_llm", return_value=mock_llm):
+        await mod.evidence_justify_node(state)
+
+    prompt = mock_llm.complete.call_args.args[0][1].content
+    assert "Contexto del período (según el contratista)" in prompt
+
+
+@pytest.mark.asyncio
 async def test_evidence_justify_near_identical_llm_output_falls_back_deterministically():
     """If the LLM (despite the FORBID rules) returns the SAME text for both ACTIVIDAD
     and JUSTIFICACION, the node must not persist two copies — justificacion falls

@@ -28,11 +28,18 @@ obligación y el valor es un array de frases:
 """
 
 
-def build_query_expansion_prompt(header: str, obligaciones: list[dict]) -> str:
-    """Build the user prompt: contract header (if any) + one line per obligación."""
+def build_query_expansion_prompt(header: str, obligaciones: list[dict], contexto_usuario: str | None = None) -> str:
+    """Build the user prompt: contract header (if any) + the contratista's own
+    monthly summary as the PRIMARY hint (evidencias/discovery-fix WU7b) + one
+    line per obligación."""
     parts: list[str] = []
     if header:
         parts.append(header)
+    if contexto_usuario and contexto_usuario.strip():
+        parts.append(
+            "Lo que el contratista dice que hizo este período (pista principal, "
+            f"úsala para orientar las frases): {contexto_usuario.strip()}"
+        )
     parts.append("Obligaciones (usa el id EXACTO como clave en tu respuesta):")
     for i, ob in enumerate(obligaciones):
         ob_id = str(ob.get("id") or i)

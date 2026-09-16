@@ -126,6 +126,16 @@ def contract_header(contexto: dict[str, object] | None) -> str:
     if fecha_inicio or fecha_fin:
         lines.append(f"Período: {fecha_inicio or '?'} a {fecha_fin or '?'}")
 
+    # "¿Qué hiciste este mes?" — the contratista's own free-text summary
+    # (evidencias/discovery-fix WU7b). Primary hint of what was actually
+    # done this period, shared across matcher/noise/justify prompts.
+    contexto_usuario = contexto.get("contexto_usuario")
+    if isinstance(contexto_usuario, str) and contexto_usuario.strip():
+        texto = contexto_usuario.strip()
+        if len(texto) > 300:
+            texto = texto[:300].rstrip() + "…"
+        lines.append(f"Contexto del período (según el contratista): {texto}")
+
     if not lines:
         return ""
     return "Contexto del contrato:\n" + "\n".join(lines)

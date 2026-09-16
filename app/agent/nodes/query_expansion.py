@@ -38,6 +38,26 @@ def _deterministic_terms(obligaciones: list[dict]) -> dict[str, list[str]]:
     }
 
 
+def _merge_unique(phrases: list[str], extra: list[str]) -> list[str]:
+    """Dedupe-preserving-order merge, capped at `_MAX_PHRASES_PER_OBLIGACION`."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for term in [*phrases, *extra]:
+        if term and term not in seen:
+            seen.add(term)
+            out.append(term)
+    return out[:_MAX_PHRASES_PER_OBLIGACION]
+
+
+def _context_usuario_phrases(contexto_usuario: str | None) -> list[str]:
+    """2-4 search phrases derived from the contratista's own monthly summary
+    ("¿Qué hiciste este mes?") — evidencias/discovery-fix WU7b. Unconditional:
+    always added regardless of what the LLM itself returns."""
+    if not contexto_usuario or not contexto_usuario.strip():
+        return []
+    return _extract_keywords(contexto_usuario)[:4]
+
+
 def _parse_expansion_response(raw: str, valid_ids: set[str]) -> dict[str, list[str]] | None:
     """Parse `{"<id>": ["frase", ...], ...}`. Returns None on ANY parse/shape
     failure so the caller falls back to deterministic terms entirely — a
@@ -62,7 +82,12 @@ def _parse_expansion_response(raw: str, valid_ids: set[str]) -> dict[str, list[s
     return result or None
 
 
-async def expand_search_terms(contexto: dict | None, obligaciones: list[dict], llm) -> dict[str, list[str]]:
+async def expand_search_terms(
+    contexto: dict | None,
+    obligaciones: list[dict],
+    llm,
+    contexto_usuario: str | None = None,
+) -> dict[str, list[str]]:
     """Return `{obligacion_id: [search phrase, ...]}` — one LLM call total.
 
     `llm=None` (no provider available) skips the call entirely and returns
@@ -70,16 +95,27 @@ async def expand_search_terms(contexto: dict | None, obligaciones: list[dict], l
     cover (missing key, or the whole response is unparseable) still gets its
     deterministic fallback terms — this never returns an empty phrase list
     for an obligación that has a description.
+
+    `contexto_usuario` (evidencias/discovery-fix WU7b) — the contratista's
+    own "¿Qué hiciste este mes?" summary — feeds the prompt as the PRIMARY
+    hint, and 2-4 phrases derived from it are ALWAYS merged into every
+    obligación's result, whether or not the LLM itself used them. Fallback:
+    empty/None `contexto_usuario` leaves behavior exactly as before.
     """
     if not obligaciones:
         return {}
 
+    context_phrases = _context_usuario_phrases(contexto_usuario)
+
     fallback = _deterministic_terms(obligaciones)
+    if context_phrases:
+        fallback = {ob_id: _merge_unique(phrases, context_phrases) for ob_id, phrases in fallback.items()}
+
     if llm is None:
         return fallback
 
     header = contract_header(contexto)
-    prompt = build_query_expansion_prompt(header, obligaciones)
+    prompt = build_query_expansion_prompt(header, obligaciones, contexto_usuario)
     valid_ids = set(fallback.keys())
 
     try:
@@ -102,6 +138,9 @@ async def expand_search_terms(contexto: dict | None, obligaciones: list[dict], l
 
     # Merge: any obligación the LLM didn't answer for keeps its deterministic
     # fallback instead of being silently left with zero search phrases.
+    # contexto_usuario-derived phrases are merged into EVERY obligación
+    # unconditionally, whether or not the LLM's own answer mentioned them.
     merged = dict(fallback)
-    merged.update(parsed)
+    for ob_id, phrases in parsed.items():
+        merged[ob_id] = _merge_unique(phrases, context_phrases) if context_phrases else phrases
     return merged

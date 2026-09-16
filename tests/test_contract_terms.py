@@ -137,3 +137,19 @@ class TestContractHeader:
         assert "CTR-001" in header
         assert "Entidad" not in header
         assert "Objeto" not in header
+
+    def test_includes_contexto_usuario_line_when_present(self) -> None:
+        header = contract_header(
+            {"numero_contrato": "CTR-001", "contexto_usuario": "Entregué el informe y asistí a 2 reuniones"}
+        )
+        assert "Contexto del período (según el contratista)" in header
+        assert "Entregué el informe y asistí a 2 reuniones" in header
+
+    def test_omits_contexto_usuario_line_when_absent(self) -> None:
+        header = contract_header({"numero_contrato": "CTR-001"})
+        assert "Contexto del período" not in header
+
+    def test_truncates_long_contexto_usuario(self) -> None:
+        header = contract_header({"contexto_usuario": "y" * 500})
+        line = next(line for line in header.splitlines() if line.startswith("Contexto del período"))
+        assert len(line) < 350

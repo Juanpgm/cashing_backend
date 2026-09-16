@@ -223,6 +223,35 @@ async def test_matcher_relevance_batch_max_tokens_raised_to_800() -> None:
 
 
 @pytest.mark.asyncio
+async def test_matcher_relevance_batch_includes_contexto_usuario_in_prompt() -> None:
+    """evidencias/discovery-fix WU7b: the contratista's own monthly context
+    ("¿Qué hiciste este mes?") must reach the matcher prompt via the shared
+    contract header."""
+
+    class _CapturingLLM:
+        def __init__(self, content: str) -> None:
+            self.content = content
+            self.last_messages: list | None = None
+
+        async def complete(self, messages, temperature=0.0, max_tokens=64, **kwargs) -> _FakeResp:
+            self.last_messages = messages
+            return _FakeResp(self.content)
+
+    fake = _CapturingLLM("[1]")
+    state = {
+        "obligaciones_extraidas": [{"id": "ob1", "descripcion": "realizar informes tecnicos mensuales consultoria"}],
+        "evidence_raw": [{"id": "a", "content": "informes tecnicos mensuales realizados consultoria"}],
+        "contexto_usuario": "Entregué el informe y asistí a 2 reuniones con el supervisor",
+    }
+
+    with patch.object(evidence_matcher, "get_llm", return_value=fake):
+        await evidence_matcher.evidence_matcher_node(state)
+
+    prompt_text = "\n".join(m.content for m in fake.last_messages)
+    assert "Entregué el informe y asistí a 2 reuniones con el supervisor" in prompt_text
+
+
+@pytest.mark.asyncio
 async def test_matcher_relevance_batch_includes_contract_header_in_prompt() -> None:
     class _CapturingLLM:
         def __init__(self, content: str) -> None:
