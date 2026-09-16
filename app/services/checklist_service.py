@@ -109,7 +109,10 @@ _CATALOGO_SEED: list[dict] = [
         "etiqueta": "Contrato / minuta / clausulado",
         "descripcion": "Documento del contrato firmado.",
         "obligatorio": True,
-        "solo_primera_cuenta": False,
+        # First-cuota-only (checklist/primera-cuota-2026-09-16, rule 2) — but
+        # unlike CEDULA/RUT/RPC/CDP this one can reappear on a later cuota; see
+        # `requisito_aplica_a_cuenta`'s CONTRATO special case.
+        "solo_primera_cuenta": True,
         "permite_autogen": False,
         "tipo_documento_fuente": "contrato",
         "keywords_deteccion": ["contrato", "minuta", "clausulado"],
@@ -120,7 +123,9 @@ _CATALOGO_SEED: list[dict] = [
         "etiqueta": "Registro Presupuestal (RPC/RP)",
         "descripcion": "Registro Presupuestal del Compromiso.",
         "obligatorio": True,
-        "solo_primera_cuenta": False,
+        # First-cuota-only, unconditionally (checklist/primera-cuota-2026-09-16,
+        # rule 1) — the budget commitment is registered once per contract.
+        "solo_primera_cuenta": True,
         "permite_autogen": False,
         "tipo_documento_fuente": "rpc",
         "keywords_deteccion": ["rpc", "registro presupuestal", "rp ", "compromiso presupuestal"],
@@ -137,7 +142,10 @@ _CATALOGO_SEED: list[dict] = [
         # slice 1 (radicacion-stepper design section 3). Promotion to
         # obligatorio=True is a later, separate product decision.
         "obligatorio": False,
-        "solo_primera_cuenta": False,
+        # First-cuota-only, unconditionally (checklist/primera-cuota-2026-09-16,
+        # rule 1) — the budget availability certificate is issued once per
+        # contract, same reasoning as RPC.
+        "solo_primera_cuenta": True,
         "permite_autogen": False,
         "tipo_documento_fuente": "cdp",
         # Keyword-distinct from RPC ("compromiso presupuestal"): CDP keys on
@@ -395,6 +403,90 @@ def _is_first_cuenta(cuenta: CuentaCobro) -> bool:
     return cuenta.posicion == PosicionCuota.PRIMERA
 
 
+@dataclass(frozen=True)
+class ChecklistAplicaCtx:
+    """Per-cuenta context `requisito_aplica_a_cuenta` needs to decide whether a
+    first-cuota-only requisito still applies to THIS cuenta (checklist/primera-
+    cuota-2026-09-16). `tiene_doc_contrato_compartido` and
+    `contrato_tiene_obligaciones` only matter for the CONTRATO exception (rule
+    2) on a non-first cuenta — both default True so a first-cuenta caller, or a
+    caller without DB access (`previsualizar_checklist`), never accidentally
+    triggers CONTRATO's reappearance.
+    """
+
+    is_first: bool
+    tiene_doc_contrato_compartido: bool = True
+    contrato_tiene_obligaciones: bool = True
+
+
+async def _construir_checklist_aplica_ctx(db: AsyncSession, cuenta: CuentaCobro) -> ChecklistAplicaCtx:
+    """Build the real `ChecklistAplicaCtx` for `cuenta` — only issues the two
+    extra lookups (shared CONTRATO document / contrato obligaciones) when the
+    cuenta is NOT first, since a first cuenta never needs them."""
+    is_first = _is_first_cuenta(cuenta)
+    if is_first:
+        return ChecklistAplicaCtx(is_first=True)
+
+    tiene_doc = (
+        await db.execute(
+            select(DocumentoFuente.id)
+            .where(
+                DocumentoFuente.contrato_id == cuenta.contrato_id,
+                DocumentoFuente.cuenta_cobro_id.is_(None),
+                DocumentoFuente.tipo == TipoDocumentoFuente.CONTRATO,
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none() is not None
+    tiene_obligaciones = (
+        await db.execute(select(Obligacion.id).where(Obligacion.contrato_id == cuenta.contrato_id).limit(1))
+    ).scalar_one_or_none() is not None
+    return ChecklistAplicaCtx(
+        is_first=False,
+        tiene_doc_contrato_compartido=tiene_doc,
+        contrato_tiene_obligaciones=tiene_obligaciones,
+    )
+
+
+# Standard catalog codes hidden entirely on a later cuota, unconditionally
+# (checklist/primera-cuota-2026-09-16, rule 1) — identity/budget documents
+# requested once per contract. CONTRATO is deliberately excluded from this set:
+# it is first-cuota-only too, but can reappear later (rule 2) — see the
+# CONTRATO branch in `requisito_aplica_a_cuenta`. FICHA_TECNICA and ACTA_INICIO
+# keep their pre-existing "always visible, shared nivel-contrato doc" behaviour
+# unchanged — they are out of this rule's scope.
+_PRIMERA_CUOTA_OCULTOS = frozenset({"CEDULA", "RUT", "RPC", "CDP"})
+
+
+def requisito_aplica_a_cuenta(req: "RequisitoDocumento | _CustomLike", cuenta: CuentaCobro, ctx: ChecklistAplicaCtx) -> bool:
+    """Whether `req` (a standard `RequisitoDocumento` catalog row, or a custom
+    `_CustomLike` item) should materialize/appear on `cuenta`.
+
+    Single source of truth shared by `asegurar_checklist` (persisting),
+    `previsualizar_checklist` (pure preview) and `construir_checklist_completo`
+    (read-time filtering of rows materialized before this rule existed, so no
+    data migration is needed to hide them retroactively).
+
+    - First cuota: everything applies.
+    - CEDULA/RUT/RPC/CDP: first-cuota-only, unconditionally (rule 1).
+    - CONTRATO: first-cuota-only, EXCEPT it reappears when there is no shared
+      contract-level document, or the contrato has zero Obligacion rows (rule 2).
+    - Any other `solo_primera_cuenta` requisito (custom `RequisitoCuenta` rows;
+      FICHA_TECNICA/ACTA_INICIO are nivel-contrato and stay exempt): pre-existing
+      behaviour — hidden on a later cuota unless it is nivel-contrato.
+    """
+    if ctx.is_first:
+        return True
+    codigo = req.codigo
+    if codigo == "CONTRATO":
+        return (not ctx.tiene_doc_contrato_compartido) or (not ctx.contrato_tiene_obligaciones)
+    if codigo in _PRIMERA_CUOTA_OCULTOS:
+        return False
+    if req.solo_primera_cuenta and not es_nivel_contrato(codigo):
+        return False
+    return True
+
+
 class _CustomLike(Protocol):
     """Structural type: anything with `mapea_a_estandar` and `solo_primera_cuenta`
     — satisfied by both the persisted `RequisitoCuenta` ORM model AND the
@@ -450,6 +542,7 @@ async def asegurar_checklist(db: AsyncSession, cuenta: CuentaCobro) -> list[Docu
     por_custom = {f.requisito_cuenta_id: f for f in filas if f.requisito_cuenta_id is not None}
 
     is_first = _is_first_cuenta(cuenta)
+    ctx = await _construir_checklist_aplica_ctx(db, cuenta)
 
     codigos_estandar = (
         _codigos_estandar_a_crear(modo, catalogo, custom) if modo != "estandar" else {req.codigo for req in catalogo}
@@ -461,9 +554,7 @@ async def asegurar_checklist(db: AsyncSession, cuenta: CuentaCobro) -> list[Docu
     for req in catalogo:
         if req.codigo not in codigos_estandar:
             continue
-        # Contract-level requisitos appear on EVERY cuenta (auto-fulfilled by the
-        # shared contract-level document), so solo_primera_cuenta never hides them.
-        if req.solo_primera_cuenta and not is_first and not es_nivel_contrato(req.codigo):
+        if not requisito_aplica_a_cuenta(req, cuenta, ctx):
             continue
         if req.codigo in por_codigo:
             continue
@@ -507,6 +598,8 @@ def previsualizar_checklist(
     catalogo: list[RequisitoDocumento],
     candidatos: Sequence[_CustomLike],
     modo: str,
+    *,
+    ctx: ChecklistAplicaCtx | None = None,
 ) -> list[dict[str, str]]:
     """Pure, non-persisting preview of which checklist rows `asegurar_checklist`
     WOULD create for `candidatos` (freshly-inferred/structured, NOT YET
@@ -516,8 +609,18 @@ def previsualizar_checklist(
     tasks 7.4-7.5: "checklist preview reflects structured requisitos without
     persisting until confirmed"). Applying the reviewed set still goes through
     the existing `POST /definir` -> `asegurar_checklist` (unchanged).
+
+    `ctx`: since this function is pure/non-DB, it cannot look up whether a
+    shared CONTRATO document or any Obligacion exists for CONTRATO's
+    reappearance exception (checklist/primera-cuota-2026-09-16, rule 2). A
+    caller with DB access may pass a real `ChecklistAplicaCtx`; otherwise this
+    defaults to `is_first` alone (CONTRATO never reappears in the preview,
+    same as the other first-cuota-only codes) — a conservative default matching
+    `asegurar_checklist`'s common case.
     """
     is_first = _is_first_cuenta(cuenta)
+    if ctx is None:
+        ctx = ChecklistAplicaCtx(is_first=is_first)
     if modo == "estandar":
         codigos_estandar = {req.codigo for req in catalogo}
     else:
@@ -528,7 +631,7 @@ def previsualizar_checklist(
     for req in catalogo:
         if req.codigo not in codigos_estandar:
             continue
-        if req.solo_primera_cuenta and not is_first and not es_nivel_contrato(req.codigo):
+        if not requisito_aplica_a_cuenta(req, cuenta, ctx):
             continue
         preview.append({"requisito_codigo": req.codigo, "etiqueta": req.etiqueta, "origen": "estandar"})
 

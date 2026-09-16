@@ -10,7 +10,7 @@ import pytest
 from app.models.actividad import Actividad
 from app.models.categoria_documento import CategoriaDocumento
 from app.models.contrato import Contrato
-from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
+from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro, PosicionCuota
 from app.models.documento_cuenta_cobro import (
     DocumentoChecklistCandidato,
     DocumentoCuentaCobro,
@@ -53,12 +53,24 @@ async def contrato(db: AsyncSession, test_user: dict[str, Any]) -> Contrato:
 
 
 async def _make_cuenta(db: AsyncSession, contrato: Contrato, mes: int, anio: int = 2024) -> CuentaCobro:
+    """Mirrors `cuenta_cobro_service.crear_cuenta_cobro`'s own `posicion` derivation
+    (checklist/primera-cuota-2026-09-16): the first `CuentaCobro` inserted for a
+    given contrato is PRIMERA, every later one RECURRENTE. Before this fix every
+    test cuenta silently defaulted to the model's RECURRENTE default regardless
+    of intent — harmless while nivel-contrato codes were unconditionally exempt
+    from `solo_primera_cuenta`, but load-bearing now that CEDULA/RUT/RPC/CDP (and
+    conditionally CONTRATO) actually key off `_is_first_cuenta`.
+    """
+    existe_previa = (
+        await db.execute(select(CuentaCobro.id).where(CuentaCobro.contrato_id == contrato.id).limit(1))
+    ).scalar_one_or_none()
     cc = CuentaCobro(
         contrato_id=contrato.id,
         mes=mes,
         anio=anio,
         estado=EstadoCuentaCobro.BORRADOR,
         valor=1_000_000,
+        posicion=PosicionCuota.RECURRENTE if existe_previa is not None else PosicionCuota.PRIMERA,
     )
     db.add(cc)
     await db.commit()
@@ -85,10 +97,12 @@ async def test_asegurar_checklist_creates_rows_first_cuenta(db: AsyncSession, co
     assert "ACTA_INICIO" in codigos
 
 
-async def test_asegurar_checklist_contract_level_appears_every_cuenta(db: AsyncSession, contrato: Contrato) -> None:
-    """Contract-level requisitos (CONTRATO, RUT, CEDULA, ACTA_INICIO) appear on EVERY
-    cuenta — they are auto-fulfilled by the shared contract-level document, so
-    solo_primera_cuenta no longer hides them on later cuentas."""
+async def test_asegurar_checklist_identity_docs_hidden_on_later_cuenta(db: AsyncSession, contrato: Contrato) -> None:
+    """checklist/primera-cuota-2026-09-16: CEDULA, RUT, RPC and CDP are requested
+    ONLY on the first cuota — on a later cuota they must not appear as rows at
+    all, unconditionally (rule 1). ACTA_INICIO is untouched by this rule and
+    keeps its pre-existing "always visible, shared nivel-contrato doc" behaviour.
+    CONTRATO is covered separately (it can reappear — see the CONTRATO tests)."""
     # Earlier cuenta
     await _make_cuenta(db, contrato, mes=1)
     # Later cuenta
@@ -98,10 +112,159 @@ async def test_asegurar_checklist_contract_level_appears_every_cuenta(db: AsyncS
     await db.commit()
 
     codigos = {f.requisito_codigo for f in filas}
+    assert "CEDULA" not in codigos
+    assert "RUT" not in codigos
+    assert "RPC" not in codigos
+    assert "CDP" not in codigos
+    assert "ACTA_INICIO" in codigos  # unaffected, out of scope for this rule
+
+
+async def test_asegurar_checklist_contrato_hidden_on_later_cuenta_when_doc_and_obligaciones_exist(
+    db: AsyncSession, contrato: Contrato, test_user: dict[str, Any]
+) -> None:
+    """checklist/primera-cuota-2026-09-16 rule 2: CONTRATO is first-cuota-only
+    too, but ONLY when both exceptions are absent — a shared contract-level
+    CONTRATO document exists AND the contrato has at least one Obligacion."""
+    user = test_user["user"]
+    await _make_cuenta(db, contrato, mes=1)
+
+    db.add(
+        DocumentoFuente(
+            usuario_id=user.id,
+            contrato_id=contrato.id,
+            cuenta_cobro_id=None,
+            storage_key="k/contrato",
+            nombre="contrato.pdf",
+            tipo=TipoDocumentoFuente.CONTRATO,
+        )
+    )
+    db.add(
+        Obligacion(
+            contrato_id=contrato.id,
+            descripcion="Obligación 1",
+            tipo=TipoObligacion.GENERAL,
+            orden=1,
+        )
+    )
+    await db.commit()
+
+    cuenta2 = await _make_cuenta(db, contrato, mes=2)
+    filas = await checklist_service.asegurar_checklist(db, cuenta2)
+    await db.commit()
+
+    codigos = {f.requisito_codigo for f in filas}
+    assert "CONTRATO" not in codigos
+
+
+async def test_asegurar_checklist_contrato_reaparece_sin_documento_compartido(
+    db: AsyncSession, contrato: Contrato
+) -> None:
+    """Rule 2a: no shared contract-level CONTRATO document → CONTRATO reappears
+    on a later cuota (obligaciones present, isolating this exception)."""
+    await _make_cuenta(db, contrato, mes=1)
+
+    db.add(
+        Obligacion(
+            contrato_id=contrato.id,
+            descripcion="Obligación 1",
+            tipo=TipoObligacion.GENERAL,
+            orden=1,
+        )
+    )
+    await db.commit()
+
+    cuenta2 = await _make_cuenta(db, contrato, mes=2)
+    filas = await checklist_service.asegurar_checklist(db, cuenta2)
+    await db.commit()
+
+    codigos = {f.requisito_codigo for f in filas}
     assert "CONTRATO" in codigos
-    assert "CEDULA" in codigos  # contract-level → shared, appears on every cuenta
-    assert "RUT" in codigos
-    assert "ACTA_INICIO" in codigos
+    # The other 4 identity docs stay hidden — only CONTRATO reappears.
+    assert "CEDULA" not in codigos
+    assert "RUT" not in codigos
+    assert "RPC" not in codigos
+    assert "CDP" not in codigos
+
+
+async def test_asegurar_checklist_contrato_reaparece_sin_obligaciones(
+    db: AsyncSession, contrato: Contrato, test_user: dict[str, Any]
+) -> None:
+    """Rule 2b: the contrato has zero Obligacion rows (could not be computed) →
+    CONTRATO reappears on a later cuota, even with a shared document present."""
+    user = test_user["user"]
+    await _make_cuenta(db, contrato, mes=1)
+
+    db.add(
+        DocumentoFuente(
+            usuario_id=user.id,
+            contrato_id=contrato.id,
+            cuenta_cobro_id=None,
+            storage_key="k/contrato",
+            nombre="contrato.pdf",
+            tipo=TipoDocumentoFuente.CONTRATO,
+        )
+    )
+    await db.commit()
+
+    cuenta2 = await _make_cuenta(db, contrato, mes=2)
+    filas = await checklist_service.asegurar_checklist(db, cuenta2)
+    await db.commit()
+
+    codigos = {f.requisito_codigo for f in filas}
+    assert "CONTRATO" in codigos
+    assert "CEDULA" not in codigos
+    assert "RUT" not in codigos
+
+
+async def test_asegurar_checklist_custom_solo_primera_cuenta_unaffected(
+    db: AsyncSession, contrato: Contrato
+) -> None:
+    """Rule 3: custom (augment) `RequisitoCuenta` rows keep their existing
+    `solo_primera_cuenta` behaviour — hidden on a later cuenta, same as before
+    this change, with no CONTRATO-style exception."""
+    cuenta1 = await _make_cuenta_custom(db, contrato, mes=1)
+    await _make_requisito_custom(db, cuenta1, "POLIZA_CUMPLIMIENTO", "Póliza de cumplimiento")
+    custom_first_only = RequisitoCuenta(
+        cuenta_cobro_id=cuenta1.id,
+        codigo="CARNET_VACUNAS",
+        etiqueta="Carnet de vacunas",
+        obligatorio=True,
+        solo_primera_cuenta=True,
+        keywords_deteccion=[],
+        orden=501,
+        origen="inferido",
+        activo=True,
+    )
+    db.add(custom_first_only)
+    await db.commit()
+
+    cuenta2 = await _make_cuenta_custom(db, contrato, mes=2)
+    # Custom rows are per-cuenta (only propagate to cuentas created after them via
+    # `listar_requisitos_cuenta`, which is cuenta_cobro_id-scoped) — recreate the
+    # same first-only custom item on cuenta2 to exercise the hiding rule itself.
+    await _make_requisito_custom(db, cuenta2, "POLIZA_CUMPLIMIENTO", "Póliza de cumplimiento")
+    custom_first_only_c2 = RequisitoCuenta(
+        cuenta_cobro_id=cuenta2.id,
+        codigo="CARNET_VACUNAS",
+        etiqueta="Carnet de vacunas",
+        obligatorio=True,
+        solo_primera_cuenta=True,
+        keywords_deteccion=[],
+        orden=501,
+        origen="inferido",
+        activo=True,
+    )
+    db.add(custom_first_only_c2)
+    await db.commit()
+
+    filas = await checklist_service.asegurar_checklist(db, cuenta2)
+    await db.commit()
+
+    custom_codigos = {
+        (await db.get(RequisitoCuenta, f.requisito_cuenta_id)).codigo for f in filas if f.requisito_cuenta_id
+    }
+    assert "POLIZA_CUMPLIMIENTO" in custom_codigos  # not solo_primera_cuenta → always applies
+    assert "CARNET_VACUNAS" not in custom_codigos  # solo_primera_cuenta, later cuenta → hidden
 
 
 async def test_asegurar_checklist_is_idempotent(db: AsyncSession, contrato: Contrato) -> None:
@@ -457,7 +620,13 @@ async def test_computar_resumen_radicacion_no_lista_si_falta(db: AsyncSession, c
 
 
 async def _make_cuenta_custom(db: AsyncSession, contrato: Contrato, mes: int, anio: int = 2024) -> CuentaCobro:
-    """A cuenta in 'augment' mode so custom RequisitoCuenta rows materialize."""
+    """A cuenta in 'augment' mode so custom RequisitoCuenta rows materialize.
+
+    Same `posicion` auto-derivation as `_make_cuenta` — see its docstring.
+    """
+    existe_previa = (
+        await db.execute(select(CuentaCobro.id).where(CuentaCobro.contrato_id == contrato.id).limit(1))
+    ).scalar_one_or_none()
     cc = CuentaCobro(
         contrato_id=contrato.id,
         mes=mes,
@@ -465,6 +634,7 @@ async def _make_cuenta_custom(db: AsyncSession, contrato: Contrato, mes: int, an
         estado=EstadoCuentaCobro.BORRADOR,
         valor=1_000_000,
         requisitos_modo="augment",
+        posicion=PosicionCuota.RECURRENTE if existe_previa is not None else PosicionCuota.PRIMERA,
     )
     db.add(cc)
     await db.commit()
