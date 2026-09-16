@@ -355,6 +355,15 @@ def score_non_personal_email(
             return 0, "contains_contract_number"
         return None
 
+    # +5 — SPAM / CATEGORY_PROMOTIONS outrank the whitelist (round-3 narrow
+    # fix): Gmail's own ML classifier verdict, sender-agnostic, strictly
+    # better evidence than "the domain is gmail.com". Checked BEFORE the
+    # whitelist; every other signal (the rest of NOISE_GMAIL_LABELS, and the
+    # header-based checks below) stays AFTER it.
+    for label in labels or []:
+        if label in _DEFINITIVE_GMAIL_LABELS:
+            return 5, f"gmail_label:{label}"
+
     # Whitelist — personal providers and institutional domains are never filtered.
     domain = _extract_domain(sender)
     if domain and _is_whitelisted(domain):
@@ -456,6 +465,16 @@ NOISE_GMAIL_LABELS: frozenset[str] = frozenset(
         "SPAM",
     }
 )
+
+# The subset of NOISE_GMAIL_LABELS trusted to outrank the domain whitelist
+# (round-3 narrow fix, confirmed SUGGESTION). SPAM/CATEGORY_PROMOTIONS are
+# sender-agnostic server-side ML verdicts with no known false-positive class
+# against this feature's evidence (unlike List-Unsubscribe/List-Id/Precedence/
+# X-Mailer, which routinely appear on legitimate Calendar invites and Google
+# Groups mail sent from a personal gmail.com address — see
+# test_score_gmail_sender_never_filtered). CATEGORY_SOCIAL/FORUMS/UPDATES stay
+# checked in their original post-whitelist position.
+_DEFINITIVE_GMAIL_LABELS: frozenset[str] = frozenset({"SPAM", "CATEGORY_PROMOTIONS"})
 
 NOISE_SENDER_PATTERNS: list[re.Pattern] = [
     re.compile(p, re.IGNORECASE)

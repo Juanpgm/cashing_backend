@@ -653,6 +653,42 @@ def test_score_gmail_sender_never_filtered():
     assert score == 0
 
 
+def test_score_gmail_category_label_still_wins_over_a_whitelisted_domain():
+    """SUGGESTION regression, narrow fix: `CATEGORY_PROMOTIONS`/`SPAM` are
+    Gmail's own server-side ML classifier verdicts — sender-agnostic and
+    strictly better evidence than "the domain is gmail.com" (small Colombian
+    vendors and many mailing lists send from gmail.com/outlook.com too). Only
+    these two labels are moved above the whitelist; List-Unsubscribe/
+    Precedence/X-Mailer stay below it (see
+    test_score_gmail_sender_never_filtered above — a personal Calendar invite
+    routinely carries List-Unsubscribe and must still pass through)."""
+    from app.agent.prompts.evidence_filter import score_non_personal_email
+
+    score, reason = score_non_personal_email(
+        sender="promos@gmail.com",
+        subject="Oferta especial de la semana",
+        labels=["CATEGORY_PROMOTIONS"],
+        headers={},
+    )
+    assert score >= 3, f"Gmail's own promotions classifier disarmed by the whitelist: {(score, reason)}"
+
+
+def test_score_gmail_list_id_header_still_loses_to_the_whitelist():
+    """The narrow fix must NOT move List-Unsubscribe/Precedence/X-Mailer/List-Id
+    above the whitelist — those false-positive on legitimate Calendar invites
+    and Google Groups mail sent to/from a personal gmail.com address (see
+    test_score_gmail_sender_never_filtered)."""
+    from app.agent.prompts.evidence_filter import score_non_personal_email
+
+    score, _ = score_non_personal_email(
+        sender="equipo@gmail.com",
+        subject="Actualización del equipo",
+        labels=[],
+        headers={"List-Id": "<grupo.googlegroups.com>"},
+    )
+    assert score == 0
+
+
 def test_score_gov_co_domain_never_filtered():
     """Emails from .gov.co domains must always pass through."""
     from app.agent.prompts.evidence_filter import score_non_personal_email
