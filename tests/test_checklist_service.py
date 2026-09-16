@@ -1080,6 +1080,45 @@ async def test_construir_checklist_completo_conserva_fila_legacy_con_documento(
     assert "CEDULA" not in payload["resumen"]["lista_pendientes"]
 
 
+async def test_construir_checklist_completo_fila_heredada_pendiente_no_bloquea_la_radicacion(
+    db: AsyncSession, contrato: Contrato
+) -> None:
+    """checklist/primera-cuota-2026-09-16, round 3, finding #3 (WARNING): a
+    `heredado` row (kept visible only because it carries content, for a
+    requisito that no longer applies to this cuota) must never re-enter
+    `lista_pendientes` — the schema documents that guarantee but nothing
+    enforced it, so a heredado row left PENDIENTE hard-blocked radicación on a
+    requisito the cuota is formally not being asked for."""
+    await _make_cuenta(db, contrato, mes=1)
+    cuenta2 = await _make_cuenta(db, contrato, mes=2)
+
+    sdoc = SecopDocumento(
+        id_documento_secop="DOC-HEREDADO",
+        numero_contrato=contrato.numero_contrato,
+        nombre_archivo="cedula.pdf",
+        descripcion="Cédula",
+        datos_raw={},
+    )
+    db.add(sdoc)
+    await db.flush()
+    # Legacy row: content (a SECOP link) but still PENDIENTE.
+    db.add(
+        DocumentoCuentaCobro(
+            cuenta_cobro_id=cuenta2.id,
+            requisito_codigo="CEDULA",
+            estado=EstadoRequisito.PENDIENTE,
+            secop_documento_id=sdoc.id,
+        )
+    )
+    await db.commit()
+
+    payload = await checklist_service.construir_checklist_completo(db, cuenta2)
+
+    cedula_item = next(i for i in payload["items"] if i["requisito"]["codigo"] == "CEDULA")
+    assert cedula_item["heredado"] is True
+    assert "CEDULA" not in payload["resumen"]["lista_pendientes"]
+
+
 async def test_construir_checklist_completo_muestra_custom_mapeado_a_codigo_de_primera_cuota(
     db: AsyncSession, contrato: Contrato
 ) -> None:

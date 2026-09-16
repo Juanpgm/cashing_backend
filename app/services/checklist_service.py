@@ -2777,12 +2777,22 @@ def computar_resumen(
     catalogo: list[RequisitoDocumento],
     custom_by_id: dict[uuid.UUID, RequisitoCuenta] | None = None,
     estado_overrides: dict[str, EstadoRequisito] | None = None,
+    heredado_ids: set[uuid.UUID] | None = None,
 ) -> dict:
     """`estado_overrides` maps requisito_codigo → effective estado for rows whose
-    persisted estado is derived (e.g. EVIDENCIAS coverage) rather than stored."""
+    persisted estado is derived (e.g. EVIDENCIAS coverage) rather than stored.
+
+    `heredado_ids` (from `_filtrar_filas_visibles`) are rows that no longer
+    formally apply to this cuenta and stay visible ONLY because they already
+    carry content. They are skipped exactly like NO_APLICA (round 3, finding
+    #3): the schema has always documented that a heredado row is never counted
+    in `pendientes`, but nothing enforced it, so a heredado row left PENDIENTE
+    hard-blocked radicación on a requisito the cuota is not being asked for.
+    """
     cat_by_codigo = {c.codigo: c for c in catalogo}
     custom_by_id = custom_by_id or {}
     estado_overrides = estado_overrides or {}
+    heredado_ids = heredado_ids or set()
     total = 0
     cumplidos = 0
     pendientes: list[str] = []
@@ -2793,6 +2803,8 @@ def computar_resumen(
             continue
         obligatorio, ref, desc = meta
         if not obligatorio:
+            continue
+        if fila.id in heredado_ids:
             continue
         estado = estado_overrides.get(fila.requisito_codigo or "", fila.estado)
         if estado == EstadoRequisito.NO_APLICA:
@@ -3252,7 +3264,7 @@ async def construir_checklist_completo(
             }
         )
 
-    resumen = computar_resumen(filas, catalogo, custom_by_id, estado_overrides)
+    resumen = computar_resumen(filas, catalogo, custom_by_id, estado_overrides, heredado_ids)
     requisitos_con_error = sum(1 for it in items if it["deteccion_error"] is not None)
 
     return {
