@@ -1687,7 +1687,10 @@ async def generar_zip_evidencias(
         # while the checklist was still asking the user for it.
         mapeos = checklist_service._mapeos_por_codigo(await checklist_service.listar_requisitos_cuenta(db, cuenta.id))
         # `vinculos` is eager-loaded because `_fila_tiene_contenido` reads it
-        # (round 3, finding #5) — lazy-loading it raises MissingGreenlet.
+        # (round 3, finding #5). It is declared lazy="raise", so a missed
+        # eager-load raises sqlalchemy.exc.InvalidRequestError — NOT
+        # MissingGreenlet, which would point the next debugger at an async
+        # context boundary instead of the raiseload contract (round 4, #8).
         filas_por_codigo = {
             f.requisito_codigo: f
             for f in (
