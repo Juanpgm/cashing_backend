@@ -870,6 +870,184 @@ async def test_descubrir_evidencias_refresh_true_bypasses_and_repopulates_cache(
     assert gmail_ctor.call_count == 2
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# contrato_contexto: numero_contrato/entidad/objeto must reach the agent state
+# (evidencias/discovery-fix root cause #1 — these were never loaded before).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_descubrir_evidencias_llena_contrato_contexto_con_numero_entidad_objeto(db: AsyncSession) -> None:
+    """contrato_contexto must carry numero_contrato/entidad/objeto (not just
+    fecha_inicio/fecha_fin) so the query builders and matcher can use the
+    contract number and entidad as search/scoring signals."""
+    from app.services import evidence_discovery_service as eds
+
+    user = await _make_user(db)
+    contrato = Contrato(
+        usuario_id=user.id,
+        numero_contrato="4161.010.26.1.027.2025",
+        objeto="Prestación de servicios profesionales de apoyo a la gestión ambiental",
+        valor_total=36_000_000,
+        valor_mensual=3_000_000,
+        fecha_inicio=date(2024, 2, 1),
+        fecha_fin=date(2024, 12, 31),
+        entidad="DAGMA - Departamento Administrativo de Gestión del Medio Ambiente",
+    )
+    db.add(contrato)
+    await db.commit()
+
+    req = EvidenceDiscoveryRequest(
+        obligaciones=[{"id": "ob1", "descripcion": "Entregar informe mensual de actividades"}],
+        contrato_id=contrato.id,
+        fecha_inicio="2024-04-01",
+        fecha_fin="2024-04-30",
+    )
+
+    captured: dict[str, Any] = {}
+
+    async def _spy_drive_fetch(state, provider=IntegrationProvider.GOOGLE):
+        captured["contrato_contexto"] = dict(state.get("contrato_contexto") or {})
+        return {**state, "drive_evidencias": []}
+
+    gmail = MagicMock()
+    gmail.search_messages = AsyncMock(return_value=[])
+    cal_adapter = MagicMock()
+    cal_adapter.search_events = AsyncMock(return_value=[])
+    justify_llm = AsyncMock()
+    justify_llm.complete = AsyncMock(return_value=MagicMock(content="No hay evidencia."))
+
+    only_google, only_google_statuses = _patch_only_google_connected(eds)
+    with (
+        only_google,
+        only_google_statuses,
+        patch.object(eds, "GmailAdapter", return_value=gmail),
+        patch.object(eds, "drive_fetch_node", _spy_drive_fetch),
+        patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", return_value=cal_adapter),
+        patch("app.agent.nodes.evidence_justify.get_llm", return_value=justify_llm),
+    ):
+        await eds.descubrir_evidencias(db, user.id, req)
+
+    ctx = captured["contrato_contexto"]
+    assert ctx["numero_contrato"] == "4161.010.26.1.027.2025"
+    assert "DAGMA" in ctx["entidad"]
+    assert "gestión" in ctx["objeto"].lower()
+    assert ctx["fecha_inicio"] == "2024-04-01"
+    assert ctx["fecha_fin"] == "2024-04-30"
+
+
+@pytest.mark.asyncio
+async def test_descubrir_evidencias_contrato_sin_entidad_ni_objeto_no_falla(db: AsyncSession) -> None:
+    """A contrato with no entidad still fills numero_contrato/objeto without KeyError."""
+    from app.services import evidence_discovery_service as eds
+
+    user = await _make_user(db)
+    contrato = await _make_contrato(db, user.id)  # no entidad set
+    await db.commit()
+
+    req = EvidenceDiscoveryRequest(
+        obligaciones=[{"id": "ob1", "descripcion": "Entregar informe mensual"}],
+        contrato_id=contrato.id,
+        fecha_inicio="2024-04-01",
+        fecha_fin="2024-04-30",
+    )
+
+    captured: dict[str, Any] = {}
+
+    async def _spy_drive_fetch(state, provider=IntegrationProvider.GOOGLE):
+        captured["contrato_contexto"] = dict(state.get("contrato_contexto") or {})
+        return {**state, "drive_evidencias": []}
+
+    gmail = MagicMock()
+    gmail.search_messages = AsyncMock(return_value=[])
+    cal_adapter = MagicMock()
+    cal_adapter.search_events = AsyncMock(return_value=[])
+    justify_llm = AsyncMock()
+    justify_llm.complete = AsyncMock(return_value=MagicMock(content="No hay evidencia."))
+
+    only_google, only_google_statuses = _patch_only_google_connected(eds)
+    with (
+        only_google,
+        only_google_statuses,
+        patch.object(eds, "GmailAdapter", return_value=gmail),
+        patch.object(eds, "drive_fetch_node", _spy_drive_fetch),
+        patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", return_value=cal_adapter),
+        patch("app.agent.nodes.evidence_justify.get_llm", return_value=justify_llm),
+    ):
+        await eds.descubrir_evidencias(db, user.id, req)
+
+    ctx = captured["contrato_contexto"]
+    assert ctx["numero_contrato"] == "CTR-DISC-001"
+    assert "entidad" not in ctx
+    assert ctx["fecha_inicio"] == "2024-04-01"
+
+
+@pytest.mark.asyncio
+async def test_descubrir_evidencias_obligaciones_explicitas_sin_contrato_id_no_carga_contexto() -> None:
+    """Explicit obligaciones with no contrato_id/cuenta_id must not attempt to
+    load a Contrato — contrato_contexto stays limited to the date range."""
+    from app.services import evidence_discovery_service as eds
+
+    req = EvidenceDiscoveryRequest(
+        obligaciones=[{"id": "ob1", "descripcion": "Entregar informe mensual de actividades del contrato"}],
+        fecha_inicio="2024-04-01",
+        fecha_fin="2024-04-30",
+    )
+
+    captured: dict[str, Any] = {}
+
+    async def _spy_drive_fetch(state, provider=IntegrationProvider.GOOGLE):
+        captured["contrato_contexto"] = dict(state.get("contrato_contexto") or {})
+        return {**state, "drive_evidencias": []}
+
+    gmail = MagicMock()
+    gmail.search_messages = AsyncMock(return_value=[])
+    cal_adapter = MagicMock()
+    cal_adapter.search_events = AsyncMock(return_value=[])
+    justify_llm = AsyncMock()
+    justify_llm.complete = AsyncMock(return_value=MagicMock(content="No hay evidencia."))
+
+    only_google, only_google_statuses = _patch_only_google_connected(eds)
+    with (
+        only_google,
+        only_google_statuses,
+        patch.object(eds, "GmailAdapter", return_value=gmail),
+        patch.object(eds, "drive_fetch_node", _spy_drive_fetch),
+        patch("app.agent.nodes.calendar_fetch.GoogleCalendarAdapter", return_value=cal_adapter),
+        patch("app.agent.nodes.evidence_justify.get_llm", return_value=justify_llm),
+    ):
+        await eds.descubrir_evidencias(MagicMock(), uuid.uuid4(), req)
+
+    ctx = captured["contrato_contexto"]
+    assert "numero_contrato" not in ctx
+    assert set(ctx.keys()) == {"fecha_inicio", "fecha_fin"}
+
+
+@pytest.mark.asyncio
+async def test_descubrir_evidencias_contrato_no_encontrado_al_cargar_contexto_lanza_not_found() -> None:
+    """If the contrato vanishes between the ownership check and the context
+    load, the service must raise the existing domain NotFoundError, not 500."""
+    from app.core.exceptions import NotFoundError
+    from app.services import evidence_discovery_service as eds
+
+    contrato_id = uuid.uuid4()
+    req = EvidenceDiscoveryRequest(
+        obligaciones=[{"id": "ob1", "descripcion": "Entregar informe"}],
+        contrato_id=contrato_id,
+        fecha_inicio="2024-04-01",
+        fecha_fin="2024-04-30",
+    )
+
+    db = MagicMock()
+    execute_result = MagicMock()
+    execute_result.first.return_value = (contrato_id,)  # ownership check passes
+    db.execute = AsyncMock(return_value=execute_result)
+    db.get = AsyncMock(return_value=None)  # contrato vanished before context load
+
+    with pytest.raises(NotFoundError):
+        await eds.descubrir_evidencias(db, uuid.uuid4(), req)
+
+
 @pytest.mark.asyncio
 async def test_descubrir_evidencias_local_only_false_still_requires_provider_gate() -> None:
     """Explicit local_only=False (or omitted — the default) preserves the

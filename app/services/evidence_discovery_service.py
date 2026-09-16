@@ -364,9 +364,16 @@ async def descubrir_evidencias(
     fecha_inicio = req.fecha_inicio
     fecha_fin = req.fecha_fin
     contrato: Contrato | None = None
-    if contrato_id and (not fecha_inicio or not fecha_fin):
+    if contrato_id:
+        # SIEMPRE se carga el Contrato cuando hay contrato_id (antes solo se
+        # cargaba si faltaban las fechas): numero_contrato/entidad/objeto son
+        # las señales de búsqueda más fuertes (número de contrato exacto,
+        # nombre de la entidad) y nunca llegaban a contrato_contexto, así que
+        # ninguna query de Gmail/Drive/Calendar podía usarlas.
         contrato = await db.get(Contrato, contrato_id)
-        if contrato is not None:
+        if contrato is None:
+            raise NotFoundError("Contrato", str(contrato_id))
+        if not fecha_inicio or not fecha_fin:
             fecha_inicio = fecha_inicio or contrato.fecha_inicio.isoformat()
             # Local "today" (not UTC): for a Colombia-time user, the default period
             # end must be their calendar today. Using UTC pushed fecha_fin to
@@ -431,11 +438,19 @@ async def descubrir_evidencias(
     contexto_usuario = await _contexto_usuario(db, req.cuenta_id)
     local_evidence = await _evidencias_subidas(db, req.cuenta_id)
 
+    contrato_contexto: dict[str, str] = {"fecha_inicio": fecha_inicio, "fecha_fin": fecha_fin}
+    if contrato is not None:
+        contrato_contexto["numero_contrato"] = contrato.numero_contrato
+        if contrato.entidad:
+            contrato_contexto["entidad"] = contrato.entidad
+        if contrato.objeto:
+            contrato_contexto["objeto"] = contrato.objeto
+
     # Estado compartido por los nodos del agente.
     state: AgentState = {
         "user_id": usuario_id,
         "_db": db,
-        "contrato_contexto": {"fecha_inicio": fecha_inicio, "fecha_fin": fecha_fin},
+        "contrato_contexto": contrato_contexto,
         "obligaciones_contexto": obligaciones,
         "obligaciones_extraidas": obligaciones,  # evidence_matcher lee esta key
         "email_evidencias": email_evidencias,
