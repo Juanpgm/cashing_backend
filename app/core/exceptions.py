@@ -15,6 +15,14 @@ ACTIVIDADES_MISSING = "ACTIVIDADES_MISSING"
 # is gone).
 NO_PROVIDER_CONNECTED = "NO_PROVIDER_CONNECTED"
 CHECKLIST_INCOMPLETE = "CHECKLIST_INCOMPLETE"
+# A write that would RESTRUCTURE the checklist of a cuenta already in
+# `checklist_service._ESTADOS_CUENTA_CERRADA` (ENVIADA/APROBADA/PAGADA). Such a
+# checklist is the historical record of what was radicated: `asegurar_checklist`
+# refuses to materialize new rows on it, so any caller that first DELETES rows
+# and then relies on that rebuild (`requisito_cuenta_service.definir_set`) would
+# erase the record with nothing to restore it. The refusal is up-front, before
+# anything is deleted (checklist/primera-cuota-2026-09-16, round 4 BLOCKER).
+CHECKLIST_CUENTA_CERRADA = "CHECKLIST_CUENTA_CERRADA"
 # Pre-radicación coherence validator (billing-resilience-templates, slice #1): one or
 # more HARD findings from `coherence_validator_service` block `radicar_cuenta`.
 COHERENCE_CHECK_FAILED = "COHERENCE_CHECK_FAILED"

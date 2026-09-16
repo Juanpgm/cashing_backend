@@ -527,6 +527,19 @@ _ESTADOS_CUENTA_CERRADA = frozenset(
 )
 
 
+def cuenta_esta_cerrada(cuenta: CuentaCobro) -> bool:
+    """Whether `cuenta`'s checklist is FROZEN as a historical record — the public
+    seam over `_ESTADOS_CUENTA_CERRADA` so other services (notably
+    `requisito_cuenta_service.definir_set`) can refuse a restructuring write
+    without reaching into a private, and so the set stays monkeypatchable in one
+    place. Read at call time on purpose.
+
+    Callers that DELETE checklist rows must check this BEFORE deleting anything:
+    `asegurar_checklist` will not rebuild what they removed (round 4, BLOCKER).
+    """
+    return cuenta.estado in _ESTADOS_CUENTA_CERRADA
+
+
 # Standard catalog codes hidden entirely on a later cuota, unconditionally
 # (checklist/primera-cuota-2026-09-16, rule 1) — identity/budget documents
 # requested once per contract. CONTRATO is deliberately excluded from this set:
