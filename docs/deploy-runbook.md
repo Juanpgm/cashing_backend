@@ -47,7 +47,17 @@ deploy pasó".
   aprobación explícita del responsable, en el momento, para ese comando exacto.
 - Las migraciones deben ser idempotentes (helpers de `app/core/migration_helpers.py`);
   ver `CLAUDE.md`. Una migración que haga `create_table`/`create_index`/`add_column`
-  a pelo repite el incidente de la 042.
+  a pelo repite el incidente de la 042. Ojo: `make migration` (autogenerate) genera
+  justamente esas llamadas a pelo y archivos con nombre hash; hay que editarlas
+  antes de hacer merge. El test guardián **no es exhaustivo** (no ve constraints
+  `CHECK`/`PRIMARY KEY`, tipos enum ni DDL construido en variables): esas
+  migraciones requieren idempotencia manual o un `# migration-guard: ignore <motivo>`
+  explícito.
+- La forma de una tabla que `create_all` ya creó es **permanente**: p. ej. en
+  producción `paquete_job.status` solo tiene default del lado de Python (la
+  migración 042 declara `server_default="pending"`). Los helpers idempotentes solo
+  comprueban existencia: no corrigen diferencias de forma ni añaden una
+  constraint única o un default faltante en una tabla existente.
 
 ---
 
@@ -80,9 +90,15 @@ Criterios:
 
 ## 2. Estado de la base ANTES de desplegar (solo lectura)
 
-`scripts/check_alembic_state.py` solo hace `SELECT`, dentro de una transacción
-`SET TRANSACTION READ ONLY` (el propio servidor rechaza cualquier escritura), y
-**nunca imprime el DSN**: ante un fallo solo muestra el nombre de la excepción.
+`scripts/check_alembic_state.py` solo emite `SELECT` y, en PostgreSQL, abre la
+sesión pidiendo al servidor una transacción `SET TRANSACTION READ ONLY` (con lo
+que el servidor debería rechazar cualquier escritura). Esa petición se prueba
+contra un PostgreSQL real únicamente en la suite PG (`TestReadOnlyOnPostgres`,
+`scripts/test-postgres.sh`); la suite SQLite por defecto solo comprueba que el
+código fuente contiene SELECTs y que la sentencia se emite primero. Además **no
+imprime nada que identifique la base** (ni DSN, ni host, ni usuario, ni password,
+ni nombre de la base): solo el dialecto; ante un fallo solo muestra el nombre de
+la excepción.
 
 ```powershell
 railway run --service cashin-api -- uv run python scripts/check_alembic_state.py
@@ -182,6 +198,13 @@ significa que el contenedor arrancó.
    el release incluía una migración de datos, los valores esperados (para la 043:
    `RPC`, `CDP`, `CONTRATO` en `True`).
 
+   > Las comprobaciones concretas del script (índice `ix_paquete_job_cuenta_cobro_id`,
+   > tabla `paquete_job`, flags `solo_primera_cuenta`) son **específicas de este
+   > release** (042/043). En cada release nuevo hay que actualizar `_INDEX` y las
+   > consultas de `scripts/check_alembic_state.py` (y su test) para que verifiquen
+   > lo que ese release cambia; la comparación `alembic_version` vs `head` sí es
+   > genérica.
+
 3. **Huella del código (OpenAPI).** Como `/health` no cambia de versión, elegir
    un campo o una ruta **introducidos por este release** y comprobar que está en
    el esquema vivo:
@@ -208,9 +231,16 @@ significa que el contenedor arrancó.
    ```powershell
    $env:SMOKE_BASE_URL = "https://cashin-api-production.up.railway.app"
    $env:SMOKE_USER = "<cuenta de prueba dedicada>"
-   $env:SMOKE_PASS = "<su password, solo en esta sesión>"
+   $secure = Read-Host "SMOKE_PASS" -AsSecureString   # no se muestra ni queda en el historial
+   $env:SMOKE_PASS = [System.Net.NetworkCredential]::new("", $secure).Password
    uv run python scripts/smoke_prod.py
+   Remove-Item Env:SMOKE_PASS; Remove-Variable secure   # limpiar al terminar
    ```
+
+   **No** escribir el password literal en la línea de comandos
+   (`$env:SMOKE_PASS = "..."`): queda en el historial de la shell (mismo aviso que
+   en la sección 3). La conversión desde `SecureString` ocurre solo en el proceso
+   de la sesión; cerrar la terminal al terminar también descarta la variable.
 
 El deploy se da por bueno solo si los cinco puntos pasan.
 
@@ -250,7 +280,11 @@ Producción se reparó a mano con un `stamp` 041→042. Correcciones:
 
 - `042` ahora crea la tabla y el índice solo si faltan.
 - Helpers reutilizables en `app/core/migration_helpers.py`.
-- `tests/test_migration_convention_guard.py` falla si una migración posterior a la
-  043 llama a `op.create_table`/`op.create_index`/`op.add_column` directamente.
+- `tests/test_migration_convention_guard.py` falla si una migración no histórica
+  (todo salvo las <= 043, incluidas las generadas con nombre hash) llama a
+  `op.create_table`/`op.create_index`/`op.add_column`/`op.create_unique_constraint`/
+  `op.create_foreign_key` directamente (también por alias, con `batch_alter_table`
+  o con DDL crudo en `op.execute` sin `IF NOT EXISTS`). No es exhaustivo; ver
+  *Reglas que no se negocian*.
 - Este runbook y `scripts/check_alembic_state.py` convierten "confirmar
   `alembic_ok` y la versión" en un paso obligatorio.

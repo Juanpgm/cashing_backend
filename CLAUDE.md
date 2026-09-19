@@ -162,10 +162,25 @@ Full procedure, checks and rollback: [`docs/deploy-runbook.md`](docs/deploy-runb
   (`alembic_failed`), never a crash, so a deploy can look green while migrations did not run. After EVERY deploy
   confirm the log line `alembic_ok` and check the data/`alembic_version` (`scripts/check_alembic_state.py`).
 - **Migrations MUST be idempotent**, because `create_all` has already built the current models when they run. Never
-  call `op.create_table` / `op.create_index` / `op.add_column` directly in a migration numbered above 043; use the
-  helpers in `app/core/migration_helpers.py` (`create_table_if_missing`, `create_index_if_missing`,
-  `add_column_if_missing`). `tests/test_migration_convention_guard.py` fails the suite otherwise. (Migration `042`
-  did a bare `create_table`, hit `DuplicateTable` in production, and left `043` unapplied.)
+  call `op.create_table` / `op.create_index` / `op.add_column` / `op.create_unique_constraint` /
+  `op.create_foreign_key` directly in a new migration; use the helpers in `app/core/migration_helpers.py`
+  (`create_table_if_missing`, `create_index_if_missing`, `add_column_if_missing`,
+  `create_unique_constraint_if_missing`, `create_foreign_key_if_missing`). `tests/test_migration_convention_guard.py`
+  fails the suite otherwise. Only legacy migrations numbered <= 043 are exempt: every OTHER file under
+  `alembic/versions/` is scanned, including hash-named ones. **`make migration` (autogenerate) emits bare
+  `op.create_table` / `op.add_column` calls and names files `<hash>_<slug>.py`: edit its output to use the helpers
+  before merging.** (Migration `042` did a bare `create_table`, hit `DuplicateTable` in production, and left `043`
+  unapplied.)
+  - The guard is **not exhaustive**: `op.create_check_constraint`, `op.create_primary_key`, PostgreSQL enum creation
+    and DDL built in variables or run through `bind.execute` are not detected and have no helper. Make those
+    idempotent by hand (existence check / `DO` block) or mark the call `# migration-guard: ignore <reason>` (the
+    reason is mandatory). Constraint helpers match by NAME only.
+  - Offline SQL (`alembic upgrade --sql`) works, but cannot be idempotent: the helpers emit the plain DDL there.
+- **`create_all` shape is permanent for tables it built.** Production's `paquete_job` (and any table `create_all`
+  created before its migration ran) has the `create_all` shape, not the migration's: e.g. `status` has a Python-side
+  default only, while migration `042` declares `server_default="pending"`. The idempotent helpers only check
+  existence: they do not repair shape divergence and do not add a missing unique constraint or server default to an
+  existing table. Fixing that is a dedicated migration.
 - **No redeploy rollback:** older deployments become `REMOVED`, so there is nothing to redeploy. To roll back, build a
   worktree at the previous commit and `railway up` from it.
 - **Secrets:** NEVER run `railway variables --kv` (it dumps every secret into the terminal/logs); list variable
