@@ -5,9 +5,14 @@ and its index exist, and the `solo_primera_cuenta` flag of every
 `requisitos_documento` row (RPC/CDP/CONTRATO flip to True in migration 043).
 
 SAFE AGAINST PROD, by construction:
-  * every statement is a SELECT, issued inside a `SET TRANSACTION READ ONLY`
-    transaction on PostgreSQL, so the server itself refuses any write;
-  * the database URL and credentials are never printed — on failure only the
+  * every statement is a SELECT, and on PostgreSQL the session first asks the
+    server for a READ ONLY transaction (`SET TRANSACTION READ ONLY`), so the
+    server should refuse any write. That request is verified against a real
+    PostgreSQL only by the PG test suite (`TestReadOnlyOnPostgres`, run with
+    `scripts/test-postgres.sh`); the default SQLite suite checks the source
+    (SELECT-only literals) and that the statement is issued first;
+  * nothing that identifies the database is printed: no URL, host, user,
+    password or database name — only the dialect. On failure only the
     exception CLASS NAME is shown, because driver messages can echo the DSN.
 
 Usage (from the repo root; DATABASE_URL must resolve to a PUBLIC host, the
@@ -25,7 +30,6 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
-from urllib.parse import urlsplit
 
 _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
@@ -34,9 +38,13 @@ if str(_ROOT) not in sys.path:
 import sqlalchemy as sa  # noqa: E402
 from alembic.config import Config  # noqa: E402
 from alembic.script import ScriptDirectory  # noqa: E402
-from sqlalchemy.ext.asyncio import create_async_engine  # noqa: E402
+from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine  # noqa: E402
 from sqlalchemy.pool import NullPool  # noqa: E402
 
+# RELEASE-SPECIFIC: the index below, the `paquete_job` table checks in `_inspect` and the
+# `solo_primera_cuenta` flags query are what release 042/043 needed to verify. Update them
+# for every release whose migrations change what "healthy" looks like (docs/deploy-runbook.md,
+# section 5.2). The generic part is the alembic_version vs repo head comparison.
 _INDEX = "ix_paquete_job_cuenta_cobro_id"
 
 
@@ -68,6 +76,11 @@ def _inspect(sync_conn: sa.Connection) -> dict[str, object]:
     }
 
 
+async def _begin_read_only(conn: AsyncConnection) -> None:
+    """Ask the server for a READ ONLY transaction. Must be the FIRST statement of the transaction."""
+    await conn.execute(sa.text("SET TRANSACTION READ ONLY"))
+
+
 async def collect(url: str) -> dict[str, object]:
     """Read the state of the database at `url` (read-only) and compare it with the repo head."""
     from app.core.db_ssl import prepare_pg_url
@@ -77,9 +90,7 @@ async def collect(url: str) -> dict[str, object]:
     try:
         async with engine.connect() as conn:
             if engine.dialect.name == "postgresql":
-                # Must be the FIRST statement of the transaction: from here on the
-                # server rejects every write.
-                await conn.execute(sa.text("SET TRANSACTION READ ONLY"))
+                await _begin_read_only(conn)
             report = await conn.run_sync(_inspect)
             await conn.rollback()
     finally:
@@ -91,8 +102,9 @@ async def collect(url: str) -> dict[str, object]:
     return report
 
 
-def _print(report: dict[str, object], host: str) -> None:
-    print(f"database        : {report['dialect']} host={host}")
+def _print(report: dict[str, object]) -> None:
+    # Dialect only: no host, user, password or database name may reach the terminal.
+    print(f"database        : {report['dialect']}")
     print(f"alembic_version : {report['alembic_version'] or '(none)'}")
     print(f"repo head       : {report['head']}")
     print(f"at head         : {'YES' if report['at_head'] else 'NO'}")
@@ -103,18 +115,18 @@ def _print(report: dict[str, object], host: str) -> None:
 
 
 def main(url: str | None = None) -> int:
-    if url is None:
-        from app.core.config import settings
-
-        url = settings.DATABASE_URL
-    host = urlsplit(url).hostname or "(local file)"
     try:
+        if url is None:
+            from app.core.config import settings
+
+            url = settings.DATABASE_URL
         report = asyncio.run(collect(url))
     except Exception as exc:
-        # Class name only: driver messages can contain the DSN.
+        # Class name only: driver messages and pydantic's ValidationError embed the DSN /
+        # input values, and nothing may escape as a traceback either.
         print(f"check failed: {type(exc).__name__}")
         return 1
-    _print(report, host)
+    _print(report)
     return 0 if report["at_head"] else 2
 
 
