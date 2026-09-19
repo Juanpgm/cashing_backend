@@ -180,6 +180,14 @@ async def _upsert_job(db: AsyncSession, cuenta_id: uuid.UUID, total: int) -> tup
             job.total = total
             job.procesadas = 0
             job.error = None
+            # Force this explicitly rather than relying on `onupdate=func.now()`
+            # alone: SQLAlchemy emits NO UPDATE when every assigned attribute
+            # equals its current value. A stale `pending` row with the same
+            # `total`, `procesadas == 0` and `error is None` would otherwise
+            # keep its old `updated_at`, so a second concurrent caller would
+            # also see it as stale and also "win" the reset (duplicate enqueue).
+            # Mirrors `paquete_job_service._upsert_job`.
+            job.updated_at = datetime.now(UTC)
             await db.commit()
             await db.refresh(job)
             return job, True
