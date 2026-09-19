@@ -165,6 +165,17 @@ async def _upsert_job(db: AsyncSession, cuenta_id: uuid.UUID, total: int) -> tup
                 select(ClasificacionEvidenciasJob)
                 .where(ClasificacionEvidenciasJob.cuenta_cobro_id == cuenta_id)
                 .with_for_update()
+                # Load-bearing, not cosmetic: the plain SELECT above already put
+                # `job` in this session's identity map, and SQLAlchemy returns an
+                # already-loaded, non-expired instance AS-IS (it discards the
+                # freshly locked row's values) unless `populate_existing` is set.
+                # Without it a caller that read the row before a winner committed
+                # its reset keeps the stale `status`/`updated_at` and duplicates
+                # the enqueue. See `cuenta_cobro_service._reload_cuenta_response`.
+                # Safe here only because the session runs with autoflush=True so
+                # the reload never loses an uncommitted write; under no_autoflush
+                # populate_existing would silently discard it.
+                .execution_options(populate_existing=True)
             )
             job = lock_result.scalar_one()
 
@@ -180,6 +191,14 @@ async def _upsert_job(db: AsyncSession, cuenta_id: uuid.UUID, total: int) -> tup
             job.total = total
             job.procesadas = 0
             job.error = None
+            # Force this explicitly rather than relying on `onupdate=func.now()`
+            # alone: SQLAlchemy emits NO UPDATE when every assigned attribute
+            # equals its current value. A stale `pending` row with the same
+            # `total`, `procesadas == 0` and `error is None` would otherwise
+            # keep its old `updated_at`, so a second concurrent caller would
+            # also see it as stale and also "win" the reset (duplicate enqueue).
+            # Mirrors `paquete_job_service._upsert_job`.
+            job.updated_at = datetime.now(UTC)
             await db.commit()
             await db.refresh(job)
             return job, True
