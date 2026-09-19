@@ -44,7 +44,7 @@ from sqlalchemy.pool import NullPool  # noqa: E402
 # RELEASE-SPECIFIC: the index below, the `paquete_job` table checks in `_inspect` and the
 # `solo_primera_cuenta` flags query are what release 042/043 needed to verify. Update them
 # for every release whose migrations change what "healthy" looks like (docs/deploy-runbook.md,
-# section 5.2). The generic part is the alembic_version vs repo head comparison.
+# section 5, "Verificación posterior"). The generic part is the alembic_version vs repo head comparison.
 _INDEX = "ix_paquete_job_cuenta_cobro_id"
 
 

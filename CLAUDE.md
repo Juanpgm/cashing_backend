@@ -165,7 +165,10 @@ Full procedure, checks and rollback: [`docs/deploy-runbook.md`](docs/deploy-runb
   call `op.create_table` / `op.create_index` / `op.add_column` / `op.create_unique_constraint` /
   `op.create_foreign_key` directly in a new migration; use the helpers in `app/core/migration_helpers.py`
   (`create_table_if_missing`, `create_index_if_missing`, `add_column_if_missing`,
-  `create_unique_constraint_if_missing`, `create_foreign_key_if_missing`). `tests/test_migration_convention_guard.py`
+  `create_unique_constraint_if_missing`, `create_foreign_key_if_missing`). The two constraint helpers are
+  **PostgreSQL-only**: SQLite cannot ALTER constraints, so on a live SQLite connection they skip when the constraint
+  already exists and raise `NotImplementedError` when it does not (use `op.batch_alter_table` marked
+  `# migration-guard: ignore <reason>` there). `tests/test_migration_convention_guard.py`
   fails the suite otherwise. Only legacy migrations numbered <= 043 are exempt: every OTHER file under
   `alembic/versions/` is scanned, including hash-named ones. **`make migration` (autogenerate) emits bare
   `op.create_table` / `op.add_column` calls and names files `<hash>_<slug>.py`: edit its output to use the helpers
@@ -175,6 +178,11 @@ Full procedure, checks and rollback: [`docs/deploy-runbook.md`](docs/deploy-runb
     and DDL built in variables or run through `bind.execute` are not detected and have no helper. Make those
     idempotent by hand (existence check / `DO` block) or mark the call `# migration-guard: ignore <reason>` (the
     reason is mandatory). Constraint helpers match by NAME only.
+  - Other known blind spots of the guard: a parameter/local variable named `op` is flagged (use the marker); raw
+    DDL text inside a data statement (`op.execute("UPDATE ... SET note='CREATE TABLE x'")`) is flagged (use the
+    marker); a batch context re-bound through another name (`c = b`) is not resolved; DDL built in variables or via
+    `bind.execute` is not seen. The marker is read only from real comments and covers a whole physical line, so keep
+    one call per line. Inside a batch context there is no idempotent helper: guard by hand or use the marker.
   - Offline SQL (`alembic upgrade --sql`) works, but cannot be idempotent: the helpers emit the plain DDL there.
 - **`create_all` shape is permanent for tables it built.** Production's `paquete_job` (and any table `create_all`
   created before its migration ran) has the `create_all` shape, not the migration's: e.g. `status` has a Python-side
