@@ -151,8 +151,25 @@ Pydantic Settings (`core/config.py`) loads from `.env` (see `.env.example` for a
 ### Deployment
 
 MVP deployed on **Railway** (Docker container). No dependency on AWS, GCP, or Azure.
+Full procedure, checks and rollback: [`docs/deploy-runbook.md`](docs/deploy-runbook.md).
 
-- Railway provides managed PostgreSQL and zero-config CI/CD from GitHub push
+- **The backend is deployed MANUALLY.** Service `cashin-api` (Railway project `cashing_backend`, environment
+  `production`) ships with `railway up --service cashin-api --detach -m "<message>"`, run from
+  `cashing-backend-master`. There is NO auto-deploy from GitHub and no deploy job (GitHub Actions is billing-locked),
+  so merging to `master` deploys nothing. The frontend on Vercel does auto-deploy from `master`.
+- **Boot sequence:** `app.main.lifespan` runs `Base.metadata.create_all` first, then `alembic upgrade head` (or
+  `stamp head` when `alembic_version` is empty) as a subprocess. An alembic failure is only a `warning`
+  (`alembic_failed`), never a crash, so a deploy can look green while migrations did not run. After EVERY deploy
+  confirm the log line `alembic_ok` and check the data/`alembic_version` (`scripts/check_alembic_state.py`).
+- **Migrations MUST be idempotent**, because `create_all` has already built the current models when they run. Never
+  call `op.create_table` / `op.create_index` / `op.add_column` directly in a migration numbered above 043; use the
+  helpers in `app/core/migration_helpers.py` (`create_table_if_missing`, `create_index_if_missing`,
+  `add_column_if_missing`). `tests/test_migration_convention_guard.py` fails the suite otherwise. (Migration `042`
+  did a bare `create_table`, hit `DuplicateTable` in production, and left `043` unapplied.)
+- **No redeploy rollback:** older deployments become `REMOVED`, so there is nothing to redeploy. To roll back, build a
+  worktree at the previous commit and `railway up` from it.
+- **Secrets:** NEVER run `railway variables --kv` (it dumps every secret into the terminal/logs); list variable
+  names only.
 - Storage: Cloudflare R2 (prod), MinIO (dev) — both S3-compatible
 - Cloud provider migration requires only writing new adapters in `app/adapters/` — the core never imports cloud SDKs
 
