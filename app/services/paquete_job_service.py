@@ -122,8 +122,14 @@ async def _upsert_job(db: AsyncSession, cuenta_id: uuid.UUID) -> tuple[PaqueteJo
         job = result.scalar_one_or_none()
 
         if job is not None:
+            # `populate_existing=True` is load-bearing (see the identical guard in
+            # `evidence_classification_service._upsert_job`): without it the
+            # already-mapped `job` keeps its stale pre-lock `status`/`updated_at`.
             lock_result = await db.execute(
-                select(PaqueteJob).where(PaqueteJob.cuenta_cobro_id == cuenta_id).with_for_update()
+                select(PaqueteJob)
+                .where(PaqueteJob.cuenta_cobro_id == cuenta_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
             )
             job = lock_result.scalar_one()
 

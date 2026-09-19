@@ -433,6 +433,115 @@ async def test_stale_pending_paquete_job_reset_is_not_re_stale_for_a_second_call
         assert len(await _job_rows(otra_sesion, cuenta_lista.id)) == 1  # never duplicated
 
 
+# ── identity-map staleness under interleaving (review round 2, CRITICAL-1) ──
+#
+# Same defect class as `evidence_classification_service._upsert_job`: the plain
+# SELECT puts the job in the session's identity map, and the `FOR UPDATE`
+# re-SELECT returns that SAME instance without refreshing its attributes unless
+# `populate_existing` is set. A caller B that read the row BEFORE winner A
+# committed its reset keeps the stale `status`/`updated_at` and also "wins".
+
+
+async def _interleave_winner_then_loser(
+    db: AsyncSession,
+    user_id: Any,
+    cuenta_id: Any,
+    *,
+    seed_status: str,
+    winner_finishes_job: bool = False,
+    winner_acts: bool = True,
+) -> tuple[PaqueteJob, int]:
+    """Seed a STALE job, have loser session B cache it with a plain SELECT, let
+    winner session A reset+commit it (optionally finishing it), then call
+    `encolar_generacion_paquete` on B. Returns `(job_B_returned, tasks_by_B)`."""
+    job = PaqueteJob(cuenta_cobro_id=cuenta_id, status=seed_status)
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
+    stale_time = datetime.now(UTC) - timedelta(seconds=settings.PAQUETE_JOB_STALE_SECONDS + 30)
+    await db.execute(update(PaqueteJob).where(PaqueteJob.id == job.id).values(updated_at=stale_time))
+    await db.commit()
+
+    async with async_session_test() as sesion_b:
+        cached = (
+            await sesion_b.execute(select(PaqueteJob).where(PaqueteJob.cuenta_cobro_id == cuenta_id))
+        ).scalar_one()
+        # Guard against a tautological test: B really holds the STALE row.
+        assert cached.status == seed_status
+        cached_updated_at = cached.updated_at.replace(tzinfo=cached.updated_at.tzinfo or UTC)
+        assert (datetime.now(UTC) - cached_updated_at).total_seconds() >= settings.PAQUETE_JOB_STALE_SECONDS
+
+        if winner_acts:
+            async with async_session_test() as sesion_a:
+                bg_a = BackgroundTasks()
+                await paquete_job_service.encolar_generacion_paquete(sesion_a, bg_a, user_id, cuenta_id)
+                assert len(bg_a.tasks) == 1  # A is the legitimate winner of the stale reset
+                if winner_finishes_job:
+                    await sesion_a.execute(
+                        update(PaqueteJob)
+                        .where(PaqueteJob.cuenta_cobro_id == cuenta_id)
+                        .values(status=EstadoPaqueteJob.DONE.value)
+                    )
+                    await sesion_a.commit()
+
+        bg_b = BackgroundTasks()
+        returned = await paquete_job_service.encolar_generacion_paquete(sesion_b, bg_b, user_id, cuenta_id)
+        return returned, len(bg_b.tasks)
+
+
+@pytest.mark.parametrize("seed_status", [EstadoPaqueteJob.PENDING.value, EstadoPaqueteJob.RUNNING.value])
+async def test_loser_with_stale_identity_map_sees_winners_fresh_reset_and_does_not_enqueue(
+    db: AsyncSession, test_user: dict[str, Any], cuenta_lista: CuentaCobro, seed_status: str
+) -> None:
+    """Stale PENDING/RUNNING read by B before A reset+committed it: B must see
+    A's fresh `updated_at` after the lock and NOT schedule a duplicate run."""
+    returned, scheduled_by_b = await _interleave_winner_then_loser(
+        db, test_user["user"].id, cuenta_lista.id, seed_status=seed_status
+    )
+
+    assert scheduled_by_b == 0  # duplicate pipeline run if B trusts its stale cached row
+    assert returned.status == EstadoPaqueteJob.PENDING.value
+    returned_updated_at = returned.updated_at.replace(tzinfo=returned.updated_at.tzinfo or UTC)
+    assert (datetime.now(UTC) - returned_updated_at).total_seconds() < settings.PAQUETE_JOB_STALE_SECONDS
+
+
+async def test_loser_with_stale_identity_map_after_winner_finished_job_resets_from_fresh_state(
+    db: AsyncSession, test_user: dict[str, Any], cuenta_lista: CuentaCobro
+) -> None:
+    """A reset the job AND its run already finished it (DONE). DONE is terminal
+    so B may re-trigger it (existing semantics) — but from the FRESH row: with a
+    stale identity map B's reassignment of `status = pending` is a no-op against
+    its cached `pending`, so no status UPDATE is emitted and the row stays
+    `done` in the DB while a run is scheduled for it (lost update)."""
+    returned, scheduled_by_b = await _interleave_winner_then_loser(
+        db,
+        test_user["user"].id,
+        cuenta_lista.id,
+        seed_status=EstadoPaqueteJob.PENDING.value,
+        winner_finishes_job=True,
+    )
+
+    assert scheduled_by_b == 1  # DONE is terminal -> re-triggerable
+    assert returned.status == EstadoPaqueteJob.PENDING.value
+
+
+async def test_loser_is_still_reset_when_row_is_genuinely_stale_and_winner_did_nothing(
+    db: AsyncSession, test_user: dict[str, Any], cuenta_lista: CuentaCobro
+) -> None:
+    """Control: `populate_existing` must not over-suppress. With no winner and a
+    genuinely stale row, B still resets and enqueues exactly once."""
+    returned, scheduled_by_b = await _interleave_winner_then_loser(
+        db,
+        test_user["user"].id,
+        cuenta_lista.id,
+        seed_status=EstadoPaqueteJob.PENDING.value,
+        winner_acts=False,
+    )
+
+    assert scheduled_by_b == 1
+    assert returned.status == EstadoPaqueteJob.PENDING.value
+
+
 # ── first-ever trigger, same cuenta: phantom-insert race retry-and-recover ──
 
 

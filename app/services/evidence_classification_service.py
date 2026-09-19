@@ -165,6 +165,14 @@ async def _upsert_job(db: AsyncSession, cuenta_id: uuid.UUID, total: int) -> tup
                 select(ClasificacionEvidenciasJob)
                 .where(ClasificacionEvidenciasJob.cuenta_cobro_id == cuenta_id)
                 .with_for_update()
+                # Load-bearing, not cosmetic: the plain SELECT above already put
+                # `job` in this session's identity map, and SQLAlchemy returns an
+                # already-loaded, non-expired instance AS-IS (it discards the
+                # freshly locked row's values) unless `populate_existing` is set.
+                # Without it a caller that read the row before a winner committed
+                # its reset keeps the stale `status`/`updated_at` and duplicates
+                # the enqueue. See `cuenta_cobro_service._reload_cuenta_response`.
+                .execution_options(populate_existing=True)
             )
             job = lock_result.scalar_one()
 
