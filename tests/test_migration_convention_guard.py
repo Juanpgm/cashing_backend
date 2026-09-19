@@ -34,12 +34,29 @@ opt-out on the call line or on the comment line right above it:
     op.create_check_constraint(...)  # migration-guard: ignore <why this is safe>
 
 The reason after `ignore` is mandatory; a bare marker does not suppress anything.
+The marker is read only from real comments (via `tokenize`), never from string
+literals. It is matched per PHYSICAL line, not per call: one marker also covers a
+second call on the same line (`op.create_table("a"); op.create_table("b")  # ...`).
+Put one call per line.
+
+KNOWN BLIND SPOTS (false negatives and false positives, by design of a static scan):
+  * a parameter or local variable named `op` is treated as `alembic.op` (flagged;
+    use the marker);
+  * raw DDL text inside a data statement, e.g.
+    `op.execute("UPDATE t SET note='CREATE TABLE x'")`, is flagged (use the marker);
+  * a batch context re-bound through another name (`c = b`) is not resolved;
+  * DDL built in variables or run through `bind.execute` is not seen.
+
+A file that cannot be read or parsed (SyntaxError, UnicodeDecodeError) is reported
+as an `unparseable migration file` violation instead of crashing the scan.
 """
 
 from __future__ import annotations
 
 import ast
+import io
 import re
+import tokenize
 from pathlib import Path
 
 import pytest
@@ -118,20 +135,29 @@ class _Scope:
         )
 
 
-def _suppressed(lines: list[str], lineno: int) -> bool:
-    """Opt-out marker with a reason on the call's line, or on a comment-only line right above."""
-    if _IGNORE.search(lines[lineno - 1]):
+def _comments(source: str) -> dict[int, str]:
+    """Real comments by line number (via `tokenize`): text inside string literals never counts."""
+    found: dict[int, str] = {}
+    for tok in tokenize.generate_tokens(io.StringIO(source).readline):
+        if tok.type == tokenize.COMMENT:
+            found[tok.start[0]] = tok.string
+    return found
+
+
+def _suppressed(lines: list[str], comments: dict[int, str], lineno: int) -> bool:
+    """Opt-out marker with a reason in a real comment on the call's line, or on a comment-only line right above."""
+    if _IGNORE.search(comments.get(lineno, "")):
         return True
     if lineno >= 2:
-        above = lines[lineno - 2].strip()
-        return above.startswith("#") and _IGNORE.search(above) is not None
+        return lines[lineno - 2].strip().startswith("#") and _IGNORE.search(comments.get(lineno - 1, "")) is not None
     return False
 
 
 def _string_content(call: ast.Call) -> str:
-    """Every string literal fragment inside the call's arguments (text("..."), f-strings, concatenations)."""
+    """Every string literal fragment inside the call's positional AND keyword arguments (`sqltext=...`)."""
+    values = [*call.args, *(kw.value for kw in call.keywords)]
     return " ".join(
-        n.value for arg in call.args for n in ast.walk(arg) if isinstance(n, ast.Constant) and isinstance(n.value, str)
+        n.value for arg in values for n in ast.walk(arg) if isinstance(n, ast.Constant) and isinstance(n.value, str)
     )
 
 
@@ -157,7 +183,11 @@ def _classify(node: ast.Call, scope: _Scope) -> str | None:
         func.value
     )
     if on_batch and func.attr in _BATCH_FORBIDDEN:
-        return f"batch.{func.attr}() -> use {_BATCH_FORBIDDEN[func.attr]}()"
+        # The *_if_missing helpers call the module-level `op`: they cannot run inside a batch context.
+        return (
+            f"batch.{func.attr}() has no idempotent helper — "
+            "guard it by hand or mark it '# migration-guard: ignore <reason>'"
+        )
     return None
 
 
@@ -167,15 +197,21 @@ def find_violations(versions_dir: Path, last_grandfathered: int = _LAST_GRANDFAT
     for path in sorted(versions_dir.glob("*.py")):
         if path.name == "__init__.py" or _is_legacy(path.name, last_grandfathered):
             continue
-        source = path.read_text(encoding="utf-8")
+        try:
+            source = path.read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=str(path))
+            comments = _comments(source)
+        except (SyntaxError, UnicodeDecodeError, tokenize.TokenError) as exc:
+            line = getattr(exc, "lineno", None) or 1
+            violations.append(f"{path.name}:{line}: unparseable migration file ({type(exc).__name__}: {exc})")
+            continue
         lines = source.splitlines()
-        tree = ast.parse(source, filename=str(path))
         scope = _Scope(tree)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
             label = _classify(node, scope)
-            if label is not None and not _suppressed(lines, node.lineno):
+            if label is not None and not _suppressed(lines, comments, node.lineno):
                 violations.append(f"{path.name}:{node.lineno}: {label}")
     return violations
 
@@ -419,6 +455,25 @@ class TestBatchEvasions:
 
         assert len(_scan(tmp_path, body)) == 1
 
+    @pytest.mark.parametrize(
+        "op_name", ["add_column", "create_index", "create_unique_constraint", "create_foreign_key"]
+    )
+    def test_batch_violation_does_not_recommend_a_module_level_helper(self, tmp_path: Path, op_name: str) -> None:
+        # The *_if_missing helpers call the module-level `op` and cannot work inside a batch context.
+        body = (
+            "from alembic import op\n\n\n"
+            "def upgrade() -> None:\n"
+            '    with op.batch_alter_table("t") as b:\n'
+            f"        b.{op_name}(None)\n"
+        )
+
+        violations = _scan(tmp_path, body)
+
+        assert len(violations) == 1
+        assert "_if_missing" not in violations[0]
+        assert f"batch.{op_name}() has no idempotent helper" in violations[0]
+        assert "migration-guard: ignore" in violations[0]
+
     def test_batch_alter_and_drop_are_not_flagged(self, tmp_path: Path) -> None:
         body = (
             "from alembic import op\n\n\n"
@@ -481,6 +536,27 @@ class TestRawDdlInExecute:
 
         assert _scan(tmp_path, body) == []
 
+    @pytest.mark.parametrize(
+        "call",
+        [
+            'op.execute(sqltext="CREATE TABLE t (id INT)")',
+            'op.execute(sqltext=sa.text("CREATE INDEX ix ON t (a)"))',
+            'op.execute(sqltext=("ALTER TABLE t " "ADD COLUMN c INT"))',
+        ],
+    )
+    def test_keyword_argument_ddl_is_flagged(self, tmp_path: Path, call: str) -> None:
+        body = "import sqlalchemy as sa\nfrom alembic import op\n\n\ndef upgrade() -> None:\n" + f"    {call}\n"
+
+        violations = _scan(tmp_path, body)
+
+        assert len(violations) == 1
+        assert "op.execute()" in violations[0]
+
+    def test_keyword_argument_ddl_with_if_not_exists_passes(self, tmp_path: Path) -> None:
+        body = _HEADER + '    op.execute(sqltext="CREATE TABLE IF NOT EXISTS t (id INT)")\n'
+
+        assert _scan(tmp_path, body) == []
+
     def test_ddl_text_outside_op_execute_is_not_flagged(self, tmp_path: Path) -> None:
         body = '"""Explains that CREATE TABLE t is now guarded."""\nMESSAGE = "CREATE TABLE only when missing"\n'
 
@@ -510,3 +586,50 @@ class TestIgnoreMarker:
 
         assert len(violations) == 1
         assert violations[0].startswith("044_x.py:6:")
+
+    def test_marker_inside_a_string_literal_does_not_suppress(self, tmp_path: Path) -> None:
+        body = _HEADER + '    op.create_table("t", comment="# migration-guard: ignore lol")\n'
+
+        assert len(_scan(tmp_path, body)) == 1
+
+    def test_marker_inside_a_multiline_string_above_the_call_does_not_suppress(self, tmp_path: Path) -> None:
+        # The physical line right above the call starts with `#` but is the tail of a string.
+        body = _HEADER + '    NOTE = """\n# migration-guard: ignore sneaky"""\n' + '    op.create_table("t")\n'
+
+        assert len(_scan(tmp_path, body)) == 1
+
+    def test_marker_in_a_real_comment_after_a_string_containing_a_hash_still_suppresses(self, tmp_path: Path) -> None:
+        body = _HEADER + '    op.create_table("t", comment="a # b")  # migration-guard: ignore real reason\n'
+
+        assert _scan(tmp_path, body) == []
+
+    def test_one_marker_covers_every_call_on_its_physical_line(self, tmp_path: Path) -> None:
+        # Documented limit (see the module docstring): the marker is matched per PHYSICAL
+        # line, not per call span, so it also covers a second call on the same line.
+        body = _HEADER + '    op.create_table("a"); op.create_table("b")  # migration-guard: ignore both are safe\n'
+
+        assert _scan(tmp_path, body) == []
+
+
+class TestUnreadableMigrationFiles:
+    def test_syntax_error_is_reported_as_a_violation_not_a_raw_exception(self, tmp_path: Path) -> None:
+        violations = _scan(tmp_path, "def upgrade(:\n", name="044_broken.py")
+
+        assert len(violations) == 1
+        assert violations[0].startswith("044_broken.py:")
+        assert "unparseable" in violations[0]
+
+    def test_undecodable_bytes_are_reported_as_a_violation(self, tmp_path: Path) -> None:
+        (tmp_path / "045_bytes.py").write_bytes(b"x = '\xff\xfe'\n")
+
+        violations = find_violations(tmp_path)
+
+        assert len(violations) == 1
+        assert violations[0].startswith("045_bytes.py:")
+        assert "unparseable" in violations[0]
+
+    def test_a_broken_file_does_not_hide_offenders_in_other_files(self, tmp_path: Path) -> None:
+        (tmp_path / "044_broken.py").write_text("def upgrade(:\n", encoding="utf-8")
+        (tmp_path / "045_bad.py").write_text(_HEADER + '    op.create_table("t")\n', encoding="utf-8")
+
+        assert len(find_violations(tmp_path)) == 2
