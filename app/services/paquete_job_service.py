@@ -125,6 +125,10 @@ async def _upsert_job(db: AsyncSession, cuenta_id: uuid.UUID) -> tuple[PaqueteJo
             # `populate_existing=True` is load-bearing (see the identical guard in
             # `evidence_classification_service._upsert_job`): without it the
             # already-mapped `job` keeps its stale pre-lock `status`/`updated_at`.
+            # Safe here only because the session runs with autoflush=True so the
+            # reload never loses an uncommitted write; under no_autoflush
+            # populate_existing would silently discard it (see
+            # `cuenta_cobro_service._reload_cuenta_response`).
             lock_result = await db.execute(
                 select(PaqueteJob)
                 .where(PaqueteJob.cuenta_cobro_id == cuenta_id)
@@ -144,6 +148,18 @@ async def _upsert_job(db: AsyncSession, cuenta_id: uuid.UUID) -> tuple[PaqueteJo
             job.status = EstadoPaqueteJob.PENDING.value
             job.error = None
             job.error_code = None
+            # Clear the previous run's result payload too: `PaqueteJobResponse`
+            # documents these as "all None until status == 'done'", and a
+            # `pending` row that still carries the old `storage_key`/
+            # `listo_para_radicar` would let a poller download/radicate the
+            # PREVIOUS package while the new run is in flight.
+            job.storage_key = None
+            job.filename = None
+            job.size_bytes = None
+            job.listo_para_radicar = None
+            job.pendientes = None
+            job.advertencias_coherencia = None
+            job.es_borrador = None
             # Force this explicitly rather than relying on `onupdate=func.now()`
             # alone: SQLAlchemy's dirty-checking (`History.from_scalar_attribute`)
             # compares old vs new with `==` and emits NO UPDATE at all for an

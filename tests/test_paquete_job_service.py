@@ -224,6 +224,48 @@ async def _job_rows(db: AsyncSession, cuenta_id: Any) -> list[PaqueteJob]:
     return list(rows.scalars().all())
 
 
+# Every column a `done` run populates from `RadicacionPrepResultado`; a re-trigger
+# must clear ALL of them (`PaqueteJobResponse` documents them as "all None until
+# status == 'done'").
+_RESULT_PAYLOAD: dict[str, Any] = {
+    "storage_key": "paquetes/u/c/paquete_old.zip",
+    "filename": "paquete_old.zip",
+    "size_bytes": 12345,
+    "listo_para_radicar": True,
+    "pendientes": 2,
+    "es_borrador": False,
+    "advertencias_coherencia": [
+        {"rule_id": "R-OLD", "severity": "soft", "codigo": "OLD", "mensaje": "previous run", "contexto": {}}
+    ],
+}
+
+
+def _assert_result_payload_cleared(job: PaqueteJob) -> None:
+    for column in _RESULT_PAYLOAD:
+        assert getattr(job, column) is None, f"{column} leaked from the previous run"
+
+
+async def _seed_job_row(
+    db: AsyncSession,
+    cuenta_id: Any,
+    *,
+    status: str,
+    payload: dict[str, Any] | None = None,
+    error: str | None = None,
+    error_code: str | None = None,
+    stale: bool = True,
+) -> PaqueteJob:
+    job = PaqueteJob(cuenta_cobro_id=cuenta_id, status=status, error=error, error_code=error_code, **(payload or {}))
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
+    updated_at = datetime.now(UTC) - timedelta(seconds=settings.PAQUETE_JOB_STALE_SECONDS + 30 if stale else 0)
+    await db.execute(update(PaqueteJob).where(PaqueteJob.id == job.id).values(updated_at=updated_at))
+    await db.commit()
+    await db.refresh(job)
+    return job
+
+
 # ── async-vs-async: exactly one background run scheduled ────────────────────
 
 
@@ -433,6 +475,101 @@ async def test_stale_pending_paquete_job_reset_is_not_re_stale_for_a_second_call
         assert len(await _job_rows(otra_sesion, cuenta_lista.id)) == 1  # never duplicated
 
 
+# ── reset clears the previous run's result payload (review round 3, WARNING) ─
+#
+# A re-trigger reset used to null only `error`/`error_code`, so a `pending` row
+# kept the PREVIOUS run's `storage_key`/`listo_para_radicar`/... and a poller
+# keying off those fields could download/radicate the previous package.
+
+
+@pytest.mark.parametrize(
+    ("status", "payload", "error", "error_code"),
+    [
+        (EstadoPaqueteJob.DONE.value, _RESULT_PAYLOAD, None, None),
+        (EstadoPaqueteJob.FAILED.value, None, "boom", "CHECKLIST_INCOMPLETE"),
+        (EstadoPaqueteJob.FAILED.value, _RESULT_PAYLOAD, "boom", "CHECKLIST_INCOMPLETE"),
+        (EstadoPaqueteJob.PENDING.value, None, None, None),
+        (EstadoPaqueteJob.RUNNING.value, None, None, None),
+    ],
+    ids=["done", "failed-no-payload", "failed-with-leftover-payload", "stale-pending", "stale-running"],
+)
+async def test_reset_clears_previous_run_result_payload(
+    db: AsyncSession,
+    test_user: dict[str, Any],
+    cuenta_lista: CuentaCobro,
+    status: str,
+    payload: dict[str, Any] | None,
+    error: str | None,
+    error_code: str | None,
+) -> None:
+    await _seed_job_row(db, cuenta_lista.id, status=status, payload=payload, error=error, error_code=error_code)
+
+    bg = BackgroundTasks()
+    returned = await paquete_job_service.encolar_generacion_paquete(db, bg, test_user["user"].id, cuenta_lista.id)
+
+    assert len(bg.tasks) == 1
+    assert returned.status == EstadoPaqueteJob.PENDING.value
+    _assert_result_payload_cleared(returned)
+    assert returned.error is None
+    assert returned.error_code is None
+
+    # Persisted, not just the in-memory instance: a genuinely separate session
+    # (what `GET /paquete/job` uses) must see the cleared row too.
+    async with async_session_test() as otra_sesion:
+        persisted = (await _job_rows(otra_sesion, cuenta_lista.id))[0]
+        assert persisted.status == EstadoPaqueteJob.PENDING.value
+        _assert_result_payload_cleared(persisted)
+        estado = await paquete_job_service.obtener_estado_paquete_job(
+            otra_sesion, test_user["user"].id, cuenta_lista.id
+        )
+    assert estado.status == EstadoPaqueteJob.PENDING.value
+    assert estado.storage_key is None
+    assert estado.filename is None
+    assert estado.size_bytes is None
+    assert estado.listo_para_radicar is None
+    assert estado.pendientes is None
+    assert estado.es_borrador is None
+    assert estado.advertencias_coherencia == []  # schema coerces NULL -> [] (response shape unchanged)
+
+
+async def test_fresh_in_flight_job_is_a_no_op_and_keeps_its_row_untouched(
+    db: AsyncSession, test_user: dict[str, Any], cuenta_lista: CuentaCobro
+) -> None:
+    """Control: only the RESET branch clears the payload. A fresh running job is
+    an idempotent no-op that must not be mutated (marker payload proves it)."""
+    job = await _seed_job_row(
+        db, cuenta_lista.id, status=EstadoPaqueteJob.RUNNING.value, payload=_RESULT_PAYLOAD, stale=False
+    )
+
+    bg = BackgroundTasks()
+    returned = await paquete_job_service.encolar_generacion_paquete(db, bg, test_user["user"].id, cuenta_lista.id)
+
+    assert len(bg.tasks) == 0
+    assert returned.id == job.id
+    assert returned.status == EstadoPaqueteJob.RUNNING.value
+    assert returned.storage_key == _RESULT_PAYLOAD["storage_key"]
+    assert returned.advertencias_coherencia == _RESULT_PAYLOAD["advertencias_coherencia"]
+
+
+async def test_polling_a_done_job_preserves_its_result_payload(
+    db: AsyncSession, test_user: dict[str, Any], cuenta_lista: CuentaCobro
+) -> None:
+    """Control: a legitimately `done` job that is NOT re-triggered keeps every
+    result field (`GET /paquete/job` is read-only)."""
+    await _seed_job_row(db, cuenta_lista.id, status=EstadoPaqueteJob.DONE.value, payload=_RESULT_PAYLOAD, stale=False)
+
+    estado = await paquete_job_service.obtener_estado_paquete_job(db, test_user["user"].id, cuenta_lista.id)
+
+    assert estado.status == EstadoPaqueteJob.DONE.value
+    assert estado.storage_key == _RESULT_PAYLOAD["storage_key"]
+    assert estado.filename == _RESULT_PAYLOAD["filename"]
+    assert estado.size_bytes == _RESULT_PAYLOAD["size_bytes"]
+    assert estado.listo_para_radicar is True
+    assert estado.pendientes == 2
+    assert estado.es_borrador is False
+    assert len(estado.advertencias_coherencia) == 1
+
+
 # ── identity-map staleness under interleaving (review round 2, CRITICAL-1) ──
 #
 # Same defect class as `evidence_classification_service._upsert_job`: the plain
@@ -480,7 +617,7 @@ async def _interleave_winner_then_loser(
                     await sesion_a.execute(
                         update(PaqueteJob)
                         .where(PaqueteJob.cuenta_cobro_id == cuenta_id)
-                        .values(status=EstadoPaqueteJob.DONE.value)
+                        .values(status=EstadoPaqueteJob.DONE.value, **_RESULT_PAYLOAD)
                     )
                     await sesion_a.commit()
 
@@ -523,6 +660,8 @@ async def test_loser_with_stale_identity_map_after_winner_finished_job_resets_fr
 
     assert scheduled_by_b == 1  # DONE is terminal -> re-triggerable
     assert returned.status == EstadoPaqueteJob.PENDING.value
+    # The winner's finished payload must not survive B's reset (round 3).
+    _assert_result_payload_cleared(returned)
 
 
 async def test_loser_is_still_reset_when_row_is_genuinely_stale_and_winner_did_nothing(

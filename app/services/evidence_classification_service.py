@@ -172,6 +172,9 @@ async def _upsert_job(db: AsyncSession, cuenta_id: uuid.UUID, total: int) -> tup
                 # Without it a caller that read the row before a winner committed
                 # its reset keeps the stale `status`/`updated_at` and duplicates
                 # the enqueue. See `cuenta_cobro_service._reload_cuenta_response`.
+                # Safe here only because the session runs with autoflush=True so
+                # the reload never loses an uncommitted write; under no_autoflush
+                # populate_existing would silently discard it.
                 .execution_options(populate_existing=True)
             )
             job = lock_result.scalar_one()

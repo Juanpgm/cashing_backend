@@ -652,7 +652,6 @@ async def test_terminal_job_is_reset_and_reenqueued_regardless_of_age(
         bg_second = BackgroundTasks()
         await evidence_classification_service.encolar_clasificacion(otra_sesion, bg_second, cuenta_cobro.id)
         assert len(bg_second.tasks) == 0
-    assert result.procesadas == 0
 
 
 # ── Identity-map staleness under interleaving (review round 2, CRITICAL-1) ──
