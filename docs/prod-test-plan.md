@@ -5,6 +5,10 @@ oro: **nada que escriba datos de negocio corre contra producción**. Producción
 solo se toca en modo lectura; todo lo destructivo corre contra el stack local
 (que aquí llamamos *staging*).
 
+> Para **desplegar** el backend (manual, con `railway up`) y verificar migraciones
+> tras el deploy, ver [`docs/deploy-runbook.md`](deploy-runbook.md). Este plan
+> asume que el deploy ya ocurrió.
+
 ---
 
 ## Estrategia de 3 capas

@@ -12,6 +12,14 @@ New-table-only migration: does NOT alter any column on `cuentas_cobro` or any
 other existing table — safe under local SQLite `create_all` and mirrored here
 for Postgres.
 
+IDEMPOTENT by design: `app.main.lifespan` runs `Base.metadata.create_all` BEFORE
+`alembic upgrade head`, so on any already-booted deployment `paquete_job` (with
+`uq_paquete_job_cuenta` and `ix_paquete_job_cuenta_cobro_id`) already exists by
+the time this runs. A bare `op.create_table` raised `DuplicateTable`, aborted the
+upgrade at 041 and skipped 043 (production hit this). The table and the index are
+therefore created only when missing — see `app.core.migration_helpers`. The
+downgrade is unchanged.
+
 Revision ID: 042_paquete_job
 Revises: 041_cdp_enum_uppercase
 Create Date: 2026-09-14
@@ -21,6 +29,7 @@ from __future__ import annotations
 
 import sqlalchemy as sa
 from alembic import op
+from app.core.migration_helpers import create_index_if_missing, create_table_if_missing
 
 revision = "042_paquete_job"
 down_revision = "041_cdp_enum_uppercase"
@@ -29,7 +38,7 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.create_table(
+    create_table_if_missing(
         "paquete_job",
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("cuenta_cobro_id", sa.Uuid(), nullable=False),
@@ -49,7 +58,7 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["cuenta_cobro_id"], ["cuentas_cobro.id"], name="fk_paquete_job_cuenta_cobro_id"),
         sa.UniqueConstraint("cuenta_cobro_id", name="uq_paquete_job_cuenta"),
     )
-    op.create_index("ix_paquete_job_cuenta_cobro_id", "paquete_job", ["cuenta_cobro_id"])
+    create_index_if_missing("ix_paquete_job_cuenta_cobro_id", "paquete_job", ["cuenta_cobro_id"])
 
 
 def downgrade() -> None:
