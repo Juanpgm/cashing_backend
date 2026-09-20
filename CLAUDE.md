@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+**Resuming work from another machine or session?** Read [`docs/handoff/2026-09-19/HANDOFF.md`](docs/handoff/2026-09-19/HANDOFF.md) first: current state, ordered pending work, gotchas, what does not travel through git, and the `backup/*` branches.
+
 ## Commands
 
 **Package manager:** `uv`
