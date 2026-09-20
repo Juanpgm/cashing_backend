@@ -1393,6 +1393,8 @@ async def listar_arbol_evidencias(db: AsyncSession, cuenta: CuentaCobro) -> list
                                 "nombre_archivo": e.nombre_archivo,
                                 "tipo_archivo": e.tipo_archivo,
                                 "tamano_bytes": e.tamano_bytes,
+                                "fuente": e.fuente,
+                                "url": e.url,
                             }
                             for e in a.evidencias
                         ],
@@ -1407,23 +1409,43 @@ async def listar_arbol_evidencias(db: AsyncSession, cuenta: CuentaCobro) -> list
 # ── summary ────────────────────────────────────────────────────────────────
 
 
-def _fila_obligatorio_y_ref(
+def _descripcion_legible(codigo: str, etiqueta: str) -> str:
+    """Human-readable "codigo — etiqueta" label for an error message.
+
+    Falls back to the bare codigo when etiqueta is empty/whitespace-only, so a
+    blank etiqueta never produces a dangling "CODIGO — " separator.
+    """
+    etiqueta = (etiqueta or "").strip()
+    if not etiqueta:
+        return codigo
+    return f"{codigo} — {etiqueta}"
+
+
+def _fila_obligatorio_ref_y_descripcion(
     fila: DocumentoCuentaCobro,
     cat_by_codigo: dict[str, RequisitoDocumento],
     custom_by_id: dict[uuid.UUID, RequisitoCuenta],
-) -> tuple[bool, str] | None:
-    """Return (obligatorio, public_ref) for a checklist row, or None if its
-    definition cannot be resolved (e.g. an orphaned/custom-disabled row)."""
+) -> tuple[bool, str, str] | None:
+    """Return (obligatorio, public_ref, descripcion_legible) for a checklist
+    row, or None if its definition cannot be resolved (e.g. an
+    orphaned/custom-disabled row).
+
+    ``public_ref`` is the machine identifier (catalog codigo, or the raw
+    ``requisito_cuenta_id`` UUID for custom rows) — this is a load-bearing
+    contract consumed elsewhere (`_get_fila`, the PATCH endpoint, and the
+    frontend's `requisitoRef()`), so it MUST NOT change. ``descripcion_legible``
+    is a separate, human-readable label meant for user-facing messages only.
+    """
     if fila.requisito_codigo is not None:
         req = cat_by_codigo.get(fila.requisito_codigo)
         if req is None:
             return None
-        return req.obligatorio, fila.requisito_codigo
+        return req.obligatorio, fila.requisito_codigo, _descripcion_legible(req.codigo, req.etiqueta)
     if fila.requisito_cuenta_id is not None:
         item = custom_by_id.get(fila.requisito_cuenta_id)
         if item is None:
             return None
-        return item.obligatorio, str(fila.requisito_cuenta_id)
+        return item.obligatorio, str(fila.requisito_cuenta_id), _descripcion_legible(item.codigo, item.etiqueta)
     return None
 
 
@@ -1437,11 +1459,12 @@ def computar_resumen(
     total = 0
     cumplidos = 0
     pendientes: list[str] = []
+    pendientes_desc: list[str] = []
     for fila in filas:
-        meta = _fila_obligatorio_y_ref(fila, cat_by_codigo, custom_by_id)
+        meta = _fila_obligatorio_ref_y_descripcion(fila, cat_by_codigo, custom_by_id)
         if meta is None:
             continue
-        obligatorio, ref = meta
+        obligatorio, ref, descripcion = meta
         if not obligatorio:
             continue
         if fila.estado == EstadoRequisito.NO_APLICA:
@@ -1455,11 +1478,13 @@ def computar_resumen(
             cumplidos += 1
         else:
             pendientes.append(ref)
+            pendientes_desc.append(descripcion)
     return {
         "total": total,
         "cumplidos": cumplidos,
         "pendientes": len(pendientes),
         "lista_pendientes": pendientes,
+        "lista_pendientes_desc": pendientes_desc,
         "radicacion_lista": len(pendientes) == 0 and total > 0,
     }
 

@@ -135,6 +135,21 @@ class SecopScraper:
                 pass
         return False
 
+    async def _wait_for_manual_captcha_solve(self, page: Page, timeout_ms: int) -> bool:
+        """Give a human time to solve the reCAPTCHA in a visible (headed) browser.
+
+        Polls until the captcha marker disappears (the site navigates away
+        from the ReCaptcha interstitial once solved) or the timeout elapses.
+        Only meaningful when SECOP_HEADLESS=false — nothing can click the
+        checkbox in a headless run, so callers should not invoke this then.
+        """
+        deadline = time.monotonic() + timeout_ms / 1000
+        while time.monotonic() < deadline:
+            if not await self._is_captcha_blocked(page):
+                return True
+            await asyncio.sleep(1.0)
+        return not await self._is_captcha_blocked(page)
+
     async def _click_contract_tab(self, page: Page) -> None:
         for label in _TAB_CONTRACT_DOCS_TEXTS:
             try:
@@ -240,12 +255,37 @@ class SecopScraper:
                 try:
                     await page.goto(target, wait_until="domcontentloaded", timeout=settings.SECOP_NAV_TIMEOUT_MS)
                     if await self._is_captcha_blocked(page):
-                        await log.awarning(
-                            "scraper.captcha_blocked", attempt=attempt, notice_uid=notice_uid
-                        )
-                        last_exc = CaptchaRequired("Page is captcha-gated")
-                        await ctx.close()
-                        continue
+                        if not settings.SECOP_HEADLESS:
+                            await log.awarning(
+                                "scraper.captcha_blocked_awaiting_manual_solve",
+                                attempt=attempt,
+                                notice_uid=notice_uid,
+                                timeout_ms=settings.SECOP_MANUAL_SOLVE_TIMEOUT_MS,
+                            )
+                            solved = await self._wait_for_manual_captcha_solve(
+                                page, settings.SECOP_MANUAL_SOLVE_TIMEOUT_MS
+                            )
+                            if solved:
+                                # The interstitial may not auto-redirect back to the
+                                # target page; force a fresh navigation now that the
+                                # session cookie should be past the challenge.
+                                await page.goto(
+                                    target, wait_until="domcontentloaded", timeout=settings.SECOP_NAV_TIMEOUT_MS
+                                )
+                            if not solved or await self._is_captcha_blocked(page):
+                                await log.awarning(
+                                    "scraper.captcha_manual_solve_timeout", attempt=attempt, notice_uid=notice_uid
+                                )
+                                last_exc = CaptchaRequired("Manual captcha solve timed out")
+                                await ctx.close()
+                                continue
+                        else:
+                            await log.awarning(
+                                "scraper.captcha_blocked", attempt=attempt, notice_uid=notice_uid
+                            )
+                            last_exc = CaptchaRequired("Page is captcha-gated")
+                            await ctx.close()
+                            continue
 
                     await self._click_contract_tab(page)
                     await page.wait_for_load_state("networkidle", timeout=settings.SECOP_NAV_TIMEOUT_MS)

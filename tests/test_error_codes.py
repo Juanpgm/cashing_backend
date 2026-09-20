@@ -118,6 +118,50 @@ async def test_radicar_checklist_incompleto_returns_checklist_incomplete_code(
     assert body["code"] == "CHECKLIST_INCOMPLETE"
 
 
+async def test_radicar_checklist_incompleto_message_names_custom_requisito_not_bare_uuid(
+    client: AsyncClient,
+    test_user: dict[str, Any],
+    db: AsyncSession,
+    cuenta_para_radicar: CuentaCobro,
+) -> None:
+    """Same bug as radicacion_prep_service, but via `radicar_cuenta`'s own
+    duplicated CHECKLIST_INCOMPLETE message builder (cuenta_cobro_service.py)."""
+    from app.models.documento_cuenta_cobro import DocumentoCuentaCobro, EstadoRequisito
+    from app.models.requisito_cuenta import RequisitoCuenta
+
+    custom = RequisitoCuenta(
+        cuenta_cobro_id=cuenta_para_radicar.id,
+        codigo="POLIZA_CUMPLIMIENTO",
+        etiqueta="Póliza de cumplimiento",
+        obligatorio=True,
+        keywords_deteccion=[],
+        orden=500,
+        origen="manual",
+        activo=True,
+    )
+    db.add(custom)
+    await db.commit()
+    await db.refresh(custom)
+    db.add(
+        DocumentoCuentaCobro(
+            cuenta_cobro_id=cuenta_para_radicar.id,
+            requisito_cuenta_id=custom.id,
+            estado=EstadoRequisito.PENDIENTE,
+        )
+    )
+    await db.commit()
+
+    resp = await client.post(
+        f"/api/v1/cuentas-cobro/{cuenta_para_radicar.id}/radicar",
+        headers=test_user["headers"],
+    )
+    assert resp.status_code in (400, 422), resp.text
+    body = resp.json()
+    assert body["code"] == "CHECKLIST_INCOMPLETE"
+    assert str(custom.id) not in body["detail"]
+    assert "Póliza de cumplimiento" in body["detail"]
+
+
 async def test_evidencias_descubrir_google_not_connected_returns_code(
     client: AsyncClient, test_user: dict[str, Any]
 ) -> None:

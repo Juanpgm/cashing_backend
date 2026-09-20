@@ -34,14 +34,23 @@ tipo_adicion_enum = sa.Enum(*_TIPO_VALUES, name="tipo_adicion")
 
 
 def upgrade() -> None:
-    bind = op.get_bind()
-    tipo_adicion_enum.create(bind, checkfirst=True)
-
+    # No separate `tipo_adicion_enum.create(...)` here: `op.create_table` below
+    # creates the enum type itself as part of creating this brand-new table (the
+    # type is used by no other table). A prior version of this migration called
+    # `.create(bind, checkfirst=True)` explicitly *and* let the column's own Enum
+    # try again during create_table — Alembic's create_table dispatches table DDL
+    # with `checkfirst=False` regardless of the column's `create_type` flag, so
+    # the second attempt always fired and failed with "type already exists" on
+    # a database where this migration runs for the first time (found running
+    # against a truly fresh Postgres/Neon database — the SQLite test DB and the
+    # historically create_all-provisioned local/prod databases never hit this
+    # because the type already implicitly existed or the path never executed
+    # twice; see the alembic-chain-broken finding in project memory).
     op.create_table(
         "adiciones_contrato",
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("contrato_id", sa.Uuid(), nullable=False),
-        sa.Column("tipo", sa.Enum(*_TIPO_VALUES, name="tipo_adicion", create_type=False), nullable=False),
+        sa.Column("tipo", sa.Enum(*_TIPO_VALUES, name="tipo_adicion"), nullable=False),
         sa.Column("numero", sa.Integer(), nullable=False),
         sa.Column("rpc_nuevo", sa.String(length=50), nullable=True),
         sa.Column("cdp_nuevo", sa.String(length=50), nullable=True),

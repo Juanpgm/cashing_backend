@@ -94,6 +94,15 @@ class CuentaCobroUpdate(BaseModel):
             "it set raises CUOTA_POSITION_CONFLICT."
         ),
     )
+    fecha_transaccion: date | None = Field(
+        default=None,
+        description=(
+            "Transaction/payment date (radicacion-stepper, work unit B1). Editable in "
+            "stepper step-2 resume mode. Because null is a meaningful value (clears the "
+            "date), the service distinguishes 'omitted' from 'explicit null' via "
+            "model_fields_set — send the field to set/clear it, omit it to leave it untouched."
+        ),
+    )
 
     model_config = {"json_schema_extra": {"example": {"mes": 4, "anio": 2026, "valor": "2500000.00"}}}
 

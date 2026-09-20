@@ -196,6 +196,45 @@ async def test_preparar_radicacion_raises_checklist_incomplete_when_pending(
     assert excinfo.value.code == "CHECKLIST_INCOMPLETE"
 
 
+async def test_preparar_radicacion_checklist_incomplete_message_names_custom_requisito_not_bare_uuid(
+    db: AsyncSession, test_user: dict[str, Any], contrato: Contrato
+) -> None:
+    """Bug repro: a pending CUSTOM (per-cuenta) requisito must be named by its
+    etiqueta in the CHECKLIST_INCOMPLETE message, never by its raw UUID."""
+    from app.models.documento_cuenta_cobro import DocumentoCuentaCobro, EstadoRequisito
+    from app.models.requisito_cuenta import RequisitoCuenta
+
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    custom = RequisitoCuenta(
+        cuenta_cobro_id=cuenta.id,
+        codigo="POLIZA_CUMPLIMIENTO",
+        etiqueta="Póliza de cumplimiento",
+        obligatorio=True,
+        keywords_deteccion=[],
+        orden=500,
+        origen="manual",
+        activo=True,
+    )
+    db.add(custom)
+    await db.commit()
+    await db.refresh(custom)
+    db.add(
+        DocumentoCuentaCobro(
+            cuenta_cobro_id=cuenta.id,
+            requisito_cuenta_id=custom.id,
+            estado=EstadoRequisito.PENDIENTE,
+        )
+    )
+    await db.commit()
+
+    with pytest.raises(ValidationError) as excinfo:
+        await radicacion_prep_service.preparar_radicacion(db, test_user["user"].id, cuenta.id)
+
+    assert excinfo.value.code == "CHECKLIST_INCOMPLETE"
+    assert str(custom.id) not in excinfo.value.detail
+    assert "Póliza de cumplimiento" in excinfo.value.detail
+
+
 # ── 7.8-7.9 — HARD coherence finding halts BEFORE packaging ─────────────────
 
 

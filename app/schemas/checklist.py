@@ -106,14 +106,30 @@ class ChecklistResumen(BaseModel):
     cumplidos: int
     pendientes: int
     lista_pendientes: list[str] = Field(default_factory=list)
+    lista_pendientes_desc: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Human-readable label per pending requisito, index-aligned with "
+            "`lista_pendientes` (which stays the machine ref — codigo or "
+            "requisito_cuenta_id — for identifier consumers)."
+        ),
+    )
     radicacion_lista: bool
 
 
 class ArbolEvidenciaItem(BaseModel):
     id: uuid.UUID
     nombre_archivo: str
-    tipo_archivo: str
-    tamano_bytes: int
+    # Nullable: link-evidence (Gmail/Drive/Calendar discovery) has no file, so
+    # evidence_persist_service creates it with both fields NULL on purpose —
+    # mirrors app.models.evidencia.Evidencia (both columns nullable=True).
+    tipo_archivo: str | None = None
+    tamano_bytes: int | None = None
+    # External-link fields — set for link evidence (Gmail/Drive/Calendar
+    # discovery), NULL for uploaded files. Mirrors EvidenciaResponse: without
+    # these, a link-evidencia in the árbol has no way to be opened/identified.
+    fuente: str | None = None
+    url: str | None = None
 
 
 class ArbolActividadItem(BaseModel):

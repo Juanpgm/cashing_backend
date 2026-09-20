@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import date
 from decimal import Decimal
 from typing import Any
@@ -15,6 +16,7 @@ from app.models.documento_cuenta_cobro import (
     EstadoRequisito,
 )
 from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
+from app.models.requisito_cuenta import RequisitoCuenta
 from app.models.secop import SecopDocumento
 from app.services import checklist_service
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -359,6 +361,197 @@ async def test_computar_resumen_radicacion_no_lista_si_falta(db: AsyncSession, c
     resumen = checklist_service.computar_resumen(filas, catalogo)
     assert resumen["pendientes"] > 0
     assert resumen["radicacion_lista"] is False
+
+
+# ── resumen: human-readable lista_pendientes_desc (bug: bare UUID for custom) ─
+
+
+async def _make_custom_requisito(
+    db: AsyncSession,
+    cuenta: CuentaCobro,
+    codigo: str = "CDP_CUSTOM",
+    etiqueta: str = "Certificado de disponibilidad presupuestal",
+    obligatorio: bool = True,
+    activo: bool = True,
+) -> RequisitoCuenta:
+    rc = RequisitoCuenta(
+        cuenta_cobro_id=cuenta.id,
+        codigo=codigo,
+        etiqueta=etiqueta,
+        obligatorio=obligatorio,
+        keywords_deteccion=[],
+        orden=500,
+        origen="manual",
+        activo=activo,
+    )
+    db.add(rc)
+    await db.commit()
+    await db.refresh(rc)
+    return rc
+
+
+async def test_computar_resumen_custom_pendiente_keeps_uuid_ref_and_adds_readable_desc(
+    db: AsyncSession, contrato: Contrato
+) -> None:
+    """Boundary: mixed catalog + custom pendientes.
+
+    `lista_pendientes` MUST keep the raw UUID (it is a load-bearing identifier
+    used by `_get_fila` / PATCH matching elsewhere) but `lista_pendientes_desc`
+    must carry a human-readable label instead of the bare UUID.
+    """
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    custom = await _make_custom_requisito(db, cuenta)
+    fila = DocumentoCuentaCobro(
+        cuenta_cobro_id=cuenta.id,
+        requisito_cuenta_id=custom.id,
+        estado=EstadoRequisito.PENDIENTE,
+    )
+    db.add(fila)
+    await db.commit()
+    await db.refresh(fila)
+
+    resumen = checklist_service.computar_resumen([fila], catalogo=[], custom_by_id={custom.id: custom})
+
+    assert resumen["lista_pendientes"] == [str(custom.id)]
+    assert "lista_pendientes_desc" in resumen
+    assert len(resumen["lista_pendientes_desc"]) == 1
+    desc = resumen["lista_pendientes_desc"][0]
+    assert str(custom.id) not in desc
+    assert custom.etiqueta in desc
+    assert custom.codigo in desc
+
+
+async def test_computar_resumen_pendientes_desc_index_aligned_with_pendientes(
+    db: AsyncSession, contrato: Contrato
+) -> None:
+    """Boundary: mixed catalog + custom pendientes, multiple rows.
+
+    `lista_pendientes` and `lista_pendientes_desc` must stay the same length
+    and index-aligned (never reorder/filter one without the other).
+    """
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    filas = await checklist_service.asegurar_checklist(db, cuenta)
+    await db.commit()
+    custom = await _make_custom_requisito(db, cuenta, codigo="POLIZA", etiqueta="Póliza de cumplimiento")
+    fila_custom = DocumentoCuentaCobro(
+        cuenta_cobro_id=cuenta.id,
+        requisito_cuenta_id=custom.id,
+        estado=EstadoRequisito.PENDIENTE,
+    )
+    db.add(fila_custom)
+    await db.commit()
+    await db.refresh(fila_custom)
+    todas = [*filas, fila_custom]
+
+    catalogo = await checklist_service.listar_catalogo(db)
+    resumen = checklist_service.computar_resumen(todas, catalogo, custom_by_id={custom.id: custom})
+
+    assert len(resumen["lista_pendientes"]) == len(resumen["lista_pendientes_desc"])
+    assert len(resumen["lista_pendientes"]) == resumen["pendientes"]
+    idx = resumen["lista_pendientes"].index(str(custom.id))
+    assert custom.etiqueta in resumen["lista_pendientes_desc"][idx]
+
+
+async def test_computar_resumen_orphaned_custom_requisito_skipped_from_both_lists(
+    db: AsyncSession, contrato: Contrato
+) -> None:
+    """Empty/malformed input: a fila whose requisito_cuenta_id is NOT present in
+    custom_by_id (deactivated/orphaned RequisitoCuenta) must be silently skipped
+    from BOTH lists, never raise."""
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    orphan_id = uuid.uuid4()
+    fila = DocumentoCuentaCobro(
+        cuenta_cobro_id=cuenta.id,
+        requisito_cuenta_id=orphan_id,
+        estado=EstadoRequisito.PENDIENTE,
+    )
+    db.add(fila)
+    await db.commit()
+    await db.refresh(fila)
+
+    resumen = checklist_service.computar_resumen([fila], catalogo=[], custom_by_id={})
+
+    assert resumen["total"] == 0
+    assert resumen["lista_pendientes"] == []
+    assert resumen["lista_pendientes_desc"] == []
+
+
+async def test_computar_resumen_zero_pendientes_lista_desc_empty(db: AsyncSession, contrato: Contrato) -> None:
+    """Boundary: exactly 0 pendientes -> lista_pendientes_desc is an empty list."""
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    await checklist_service.asegurar_checklist(db, cuenta)
+    await db.commit()
+    catalogo = await checklist_service.listar_catalogo(db)
+
+    from sqlalchemy import select
+
+    res = await db.execute(select(DocumentoCuentaCobro).where(DocumentoCuentaCobro.cuenta_cobro_id == cuenta.id))
+    filas = list(res.scalars().all())
+    for fila in filas:
+        req = next(c for c in catalogo if c.codigo == fila.requisito_codigo)
+        fila.estado = EstadoRequisito.CUMPLIDO_MANUAL if req.obligatorio else EstadoRequisito.NO_APLICA
+    await db.commit()
+
+    resumen = checklist_service.computar_resumen(filas, catalogo)
+    assert resumen["lista_pendientes_desc"] == []
+    assert resumen["radicacion_lista"] is True
+
+
+async def test_computar_resumen_only_no_aplica_items_total_zero(db: AsyncSession, contrato: Contrato) -> None:
+    """Boundary: checklist with only optional/no-aplica items -> total stays 0,
+    radicacion_lista stays False (not vacuously True)."""
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    filas = await checklist_service.asegurar_checklist(db, cuenta)
+    await db.commit()
+    for fila in filas:
+        fila.estado = EstadoRequisito.NO_APLICA
+    await db.commit()
+    catalogo = await checklist_service.listar_catalogo(db)
+
+    resumen = checklist_service.computar_resumen(filas, catalogo)
+    assert resumen["total"] == 0
+    assert resumen["radicacion_lista"] is False
+    assert resumen["lista_pendientes_desc"] == []
+
+
+async def test_computar_resumen_custom_requisito_empty_etiqueta_does_not_crash(
+    db: AsyncSession, contrato: Contrato
+) -> None:
+    """Empty/null input: a custom requisito with a blank etiqueta must not crash
+    and must fall back to a still-readable description (the codigo alone)
+    instead of a dangling separator like 'CODIGO — '."""
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    custom = await _make_custom_requisito(db, cuenta, codigo="SIN_ETIQUETA", etiqueta="   ")
+    fila = DocumentoCuentaCobro(
+        cuenta_cobro_id=cuenta.id,
+        requisito_cuenta_id=custom.id,
+        estado=EstadoRequisito.PENDIENTE,
+    )
+    db.add(fila)
+    await db.commit()
+    await db.refresh(fila)
+
+    resumen = checklist_service.computar_resumen([fila], catalogo=[], custom_by_id={custom.id: custom})
+
+    assert resumen["lista_pendientes_desc"] == ["SIN_ETIQUETA"]
+
+
+async def test_computar_resumen_only_catalog_pendientes_desc_uses_codigo_and_etiqueta(
+    db: AsyncSession, contrato: Contrato
+) -> None:
+    """Boundary: only catalog (standard) items pending -> descripcion also uses
+    'codigo — etiqueta' shape, consistent with the custom branch."""
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    filas = await checklist_service.asegurar_checklist(db, cuenta)
+    await db.commit()
+    catalogo = await checklist_service.listar_catalogo(db)
+
+    resumen = checklist_service.computar_resumen(filas, catalogo)
+    assert len(resumen["lista_pendientes_desc"]) > 0
+    cat_by_codigo = {c.codigo: c for c in catalogo}
+    for ref, desc in zip(resumen["lista_pendientes"], resumen["lista_pendientes_desc"], strict=True):
+        req = cat_by_codigo[ref]
+        assert desc == f"{req.codigo} — {req.etiqueta}"
 
 
 # ── 1:N document links per requisito ────────────────────────────────────────

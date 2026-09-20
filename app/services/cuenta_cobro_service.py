@@ -855,7 +855,7 @@ async def radicar_cuenta(
     payload = await checklist_service.construir_checklist_completo(db, cuenta)
     resumen = payload["resumen"]
     if not resumen["radicacion_lista"]:
-        pendientes = ", ".join(resumen["lista_pendientes"]) or "requisitos pendientes por definir"
+        pendientes = ", ".join(resumen["lista_pendientes_desc"]) or "requisitos pendientes por definir"
         raise ValidationError(
             f"No se puede radicar: faltan requisitos del checklist. Pendientes: {pendientes}.",
             code=CHECKLIST_INCOMPLETE,
@@ -1020,6 +1020,11 @@ async def actualizar_cuenta_cobro(
         if data.informe_final:
             await _verificar_conflicto_posicion(db, cuenta.contrato_id, informe_final=True, excluir_cuenta_id=cuenta.id)
         cuenta.informe_final = data.informe_final
+
+    # fecha_transaccion is nullable: null is a meaningful value (clears the date),
+    # so we key off model_fields_set (was the field sent?) rather than `is not None`.
+    if "fecha_transaccion" in data.model_fields_set:
+        cuenta.fecha_transaccion = data.fecha_transaccion
 
     await db.flush()
     await logger.ainfo(

@@ -7,9 +7,12 @@ from datetime import date
 from typing import Any
 
 import pytest
+from app.models.actividad import Actividad
 from app.models.contrato import Contrato
 from app.models.cuenta_cobro import CuentaCobro, EstadoCuentaCobro
 from app.models.documento_fuente import DocumentoFuente, TipoDocumentoFuente
+from app.models.evidencia import Evidencia
+from app.models.obligacion import Obligacion, TipoObligacion
 from app.models.secop import SecopDocumento
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -471,3 +474,218 @@ async def test_upload_batch_3_files_to_rpc_creates_3_vinculos(
     assert len(item["documentos_fuente"]) == 3
     uploaded_ids = {d["id"] for d in uploaded}
     assert {d["id"] for d in item["documentos_fuente"]} == uploaded_ids
+
+
+# ── GET checklist 500 on link-evidence with null tipo_archivo/tamano_bytes ──
+#
+# Bug: link evidence created by the Gmail/Drive/Calendar discovery agent
+# (evidence_persist_service.py) sets tipo_archivo=None, tamano_bytes=None on
+# purpose (there is no file, only a URL). ArbolEvidenciaItem declared both as
+# required non-nullable str/int, so pydantic raised a ValidationError inside
+# `ChecklistResponse(**payload)` and it propagated as an UNHANDLED 500 — every
+# subsequent GET on a cuenta that has ever run evidence discovery broke
+# permanently. This must return 200 with tipo_archivo/tamano_bytes as null.
+
+
+@pytest.fixture
+async def obligacion(db: AsyncSession, contrato: Contrato) -> Obligacion:
+    ob = Obligacion(
+        contrato_id=contrato.id,
+        descripcion="Obligación contractual con evidencias de prueba",
+        tipo=TipoObligacion.GENERAL,
+        orden=0,
+    )
+    db.add(ob)
+    await db.commit()
+    await db.refresh(ob)
+    return ob
+
+
+async def _make_actividad(db: AsyncSession, cuenta: CuentaCobro, obligacion: Obligacion) -> Actividad:
+    act = Actividad(
+        cuenta_cobro_id=cuenta.id,
+        obligacion_id=obligacion.id,
+        descripcion="Actividad de prueba",
+    )
+    db.add(act)
+    await db.commit()
+    await db.refresh(act)
+    return act
+
+
+async def test_get_checklist_with_link_evidencia_null_tipo_y_tamano_returns_200(
+    client: AsyncClient,
+    test_user: dict[str, Any],
+    db: AsyncSession,
+    cuenta: CuentaCobro,
+    obligacion: Obligacion,
+) -> None:
+    """Empty/null input: link-evidence (Gmail/Drive/Calendar discovery) has both
+    tipo_archivo and tamano_bytes NULL by design. GET must not 500."""
+    act = await _make_actividad(db, cuenta, obligacion)
+    evidencia = Evidencia(
+        actividad_id=act.id,
+        fuente="gmail",
+        url="https://mail.google.com/mail/u/0/#inbox/abc123",
+        nombre_archivo="Correo de soporte",
+        storage_key=None,
+        tipo_archivo=None,
+        tamano_bytes=None,
+    )
+    db.add(evidencia)
+    await db.commit()
+
+    r = await client.get(
+        f"/api/v1/cuentas-cobro/{cuenta.id}/checklist",
+        headers=test_user["headers"],
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    obl = next(o for o in body["arbol_evidencias"] if o["obligacion_id"] == str(obligacion.id))
+    actividad = next(a for a in obl["actividades"] if a["id"] == str(act.id))
+    assert len(actividad["evidencias"]) == 1
+    ev = actividad["evidencias"][0]
+    assert ev["tipo_archivo"] is None
+    assert ev["tamano_bytes"] is None
+    assert ev["nombre_archivo"] == "Correo de soporte"
+
+
+async def test_get_checklist_link_evidencia_exposes_fuente_y_url(
+    client: AsyncClient,
+    test_user: dict[str, Any],
+    db: AsyncSession,
+    cuenta: CuentaCobro,
+    obligacion: Obligacion,
+) -> None:
+    """A link-evidencia (Gmail/Drive/Calendar discovery) has no stored file, so
+    fuente/url are the ONLY way to identify/open it from the árbol de evidencias.
+    Regression: these were silently dropped by ArbolEvidenciaItem/
+    listar_arbol_evidencias even though the ORM row carries real values
+    (mirrors the fuente/url fix already applied to EvidenciaResponse)."""
+    act = await _make_actividad(db, cuenta, obligacion)
+    evidencia = Evidencia(
+        actividad_id=act.id,
+        fuente="gmail",
+        url="https://mail.google.com/mail/u/0/#inbox/abc123",
+        nombre_archivo="Correo de soporte",
+        storage_key=None,
+        tipo_archivo=None,
+        tamano_bytes=None,
+    )
+    db.add(evidencia)
+    await db.commit()
+
+    r = await client.get(
+        f"/api/v1/cuentas-cobro/{cuenta.id}/checklist",
+        headers=test_user["headers"],
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    obl = next(o for o in body["arbol_evidencias"] if o["obligacion_id"] == str(obligacion.id))
+    actividad = next(a for a in obl["actividades"] if a["id"] == str(act.id))
+    assert len(actividad["evidencias"]) == 1
+    ev = actividad["evidencias"][0]
+    assert ev["fuente"] == "gmail"
+    assert ev["url"] == "https://mail.google.com/mail/u/0/#inbox/abc123"
+
+
+async def test_get_checklist_arbol_evidencias_mixed_file_and_link(
+    client: AsyncClient,
+    test_user: dict[str, Any],
+    db: AsyncSession,
+    cuenta: CuentaCobro,
+    obligacion: Obligacion,
+) -> None:
+    """Boundary: mixed evidencias in the same actividad — one uploaded file
+    (both fields set) and one link (both fields null) — both must serialize."""
+    act = await _make_actividad(db, cuenta, obligacion)
+    db.add_all(
+        [
+            Evidencia(
+                actividad_id=act.id,
+                fuente=None,
+                url=None,
+                nombre_archivo="soporte.pdf",
+                storage_key="k/soporte.pdf",
+                tipo_archivo="application/pdf",
+                tamano_bytes=2048,
+            ),
+            Evidencia(
+                actividad_id=act.id,
+                fuente="drive",
+                url="https://drive.google.com/file/d/xyz",
+                nombre_archivo="Evidencia en Drive",
+                storage_key=None,
+                tipo_archivo=None,
+                tamano_bytes=None,
+            ),
+        ]
+    )
+    await db.commit()
+
+    r = await client.get(
+        f"/api/v1/cuentas-cobro/{cuenta.id}/checklist",
+        headers=test_user["headers"],
+    )
+    assert r.status_code == 200, r.text
+    obl = next(o for o in r.json()["arbol_evidencias"] if o["obligacion_id"] == str(obligacion.id))
+    actividad = next(a for a in obl["actividades"] if a["id"] == str(act.id))
+    evidencias_by_nombre = {e["nombre_archivo"]: e for e in actividad["evidencias"]}
+    assert evidencias_by_nombre["soporte.pdf"]["tipo_archivo"] == "application/pdf"
+    assert evidencias_by_nombre["soporte.pdf"]["tamano_bytes"] == 2048
+    assert evidencias_by_nombre["Evidencia en Drive"]["tipo_archivo"] is None
+    assert evidencias_by_nombre["Evidencia en Drive"]["tamano_bytes"] is None
+
+
+async def test_get_checklist_actividad_con_cero_evidencias(
+    client: AsyncClient,
+    test_user: dict[str, Any],
+    db: AsyncSession,
+    cuenta: CuentaCobro,
+    obligacion: Obligacion,
+) -> None:
+    """Boundary: an actividad with zero evidencias -> empty list, still 200."""
+    act = await _make_actividad(db, cuenta, obligacion)
+
+    r = await client.get(
+        f"/api/v1/cuentas-cobro/{cuenta.id}/checklist",
+        headers=test_user["headers"],
+    )
+    assert r.status_code == 200, r.text
+    obl = next(o for o in r.json()["arbol_evidencias"] if o["obligacion_id"] == str(obligacion.id))
+    actividad = next(a for a in obl["actividades"] if a["id"] == str(act.id))
+    assert actividad["evidencias"] == []
+
+
+async def test_get_checklist_cuenta_ya_radicada_still_returns_200_not_500(
+    client: AsyncClient,
+    test_user: dict[str, Any],
+    db: AsyncSession,
+    cuenta: CuentaCobro,
+    obligacion: Obligacion,
+) -> None:
+    """State-machine: a cuenta already radicada (estado=ENVIADA, the state
+    `radicar_cuenta` transitions into) with legacy link-evidence must still be
+    readable via GET, not 500. The endpoint has no estado gate today — this
+    guards that re-reading the checklist after the state transition keeps
+    working once the null-field bug is fixed."""
+    act = await _make_actividad(db, cuenta, obligacion)
+    db.add(
+        Evidencia(
+            actividad_id=act.id,
+            fuente="calendar",
+            url="https://calendar.google.com/event?eid=abc",
+            nombre_archivo="Reunión de seguimiento",
+            storage_key=None,
+            tipo_archivo=None,
+            tamano_bytes=None,
+        )
+    )
+    cuenta.estado = EstadoCuentaCobro.ENVIADA
+    await db.commit()
+
+    r = await client.get(
+        f"/api/v1/cuentas-cobro/{cuenta.id}/checklist",
+        headers=test_user["headers"],
+    )
+    assert r.status_code == 200, r.text

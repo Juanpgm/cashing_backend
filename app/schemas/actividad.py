@@ -7,17 +7,24 @@ from datetime import date, datetime
 
 from pydantic import BaseModel, Field
 
-
 # ── Evidencia (nested inside actividad responses) ────────────────────────────
 
 
 class EvidenciaResponse(BaseModel):
     id: uuid.UUID
     actividad_id: uuid.UUID
-    storage_key: str
+    # Nullable: link-evidence (Gmail/Drive/Calendar discovery) has no file, so
+    # evidence_persist_service creates it with these fields NULL on purpose —
+    # mirrors app.models.evidencia.Evidencia (all three columns nullable=True).
+    storage_key: str | None = None
     nombre_archivo: str
-    tipo_archivo: str
-    tamano_bytes: int
+    tipo_archivo: str | None = None
+    tamano_bytes: int | None = None
+    # External-link fields — set for link evidence (Gmail/Drive/Calendar), left
+    # NULL for uploaded files. Mirrors app.schemas.evidencia.EvidenciaResponse,
+    # which already reads these from the same Evidencia model correctly.
+    fuente: str | None = None
+    url: str | None = None
     created_at: datetime
 
     model_config = {"from_attributes": True}

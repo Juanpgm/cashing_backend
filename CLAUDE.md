@@ -17,7 +17,16 @@ make test-cov       # Run tests with HTML coverage report (70% threshold require
 make lint           # Ruff check + format check + mypy strict
 make format         # Auto-fix code style with Ruff
 make security       # Bandit + pip-audit vulnerability scan
+make lock           # Regenerate uv.lock + requirements*.txt after editing deps
 ```
+
+**Dependencies — single source of truth:** declare/version ALL dependencies in
+`pyproject.toml` only (`[project.dependencies]` for runtime, `[dependency-groups].dev`
+for tooling). `uv.lock`, `requirements.txt`, and `requirements-dev.txt` are GENERATED
+artifacts — never hand-edit them. After changing a dependency, run `make lock` (regenerates
+the lockfile and re-exports both requirements files, which are what Docker/Railway install).
+`make setup` uses `uv sync` off the lock. This prevents the old drift where requirements.txt
+pinned different versions than the working venv.
 
 **Run a single test:**
 

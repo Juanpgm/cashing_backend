@@ -1,10 +1,16 @@
-.PHONY: setup run dev up down migrate test lint security clean start-local kill-local
+.PHONY: setup lock run dev up down migrate test lint security clean start-local kill-local
 
-# Setup
+# Setup — installs runtime + dev deps from pyproject.toml via the uv.lock (single source of truth)
 setup:
-	uv venv
-	uv pip install -r requirements-dev.txt
+	uv sync
 	uv run pre-commit install
+
+# Regenerate the lockfile + the GENERATED requirements*.txt consumed by Docker/Railway.
+# Run this after editing dependencies in pyproject.toml — the ONLY place deps are declared by hand.
+lock:
+	uv lock
+	uv export --no-hashes --no-default-groups --no-emit-project --format requirements-txt -o requirements.txt
+	uv export --no-hashes --no-emit-project --format requirements-txt -o requirements-dev.txt
 
 # Run
 run:

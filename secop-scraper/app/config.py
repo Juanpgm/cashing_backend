@@ -26,5 +26,10 @@ class Settings(BaseSettings):
     # Max captcha retries before giving up with 503.
     SECOP_CAPTCHA_MAX_RETRIES: int = 3
 
+    # When SECOP_HEADLESS=false, how long (ms) to wait for a human to solve
+    # the reCAPTCHA challenge in the visible browser window before giving up
+    # on that attempt. Ignored when headless=true (no one can click it).
+    SECOP_MANUAL_SOLVE_TIMEOUT_MS: int = 120_000
+
 
 settings = Settings()
