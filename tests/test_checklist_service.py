@@ -24,7 +24,10 @@ from app.models.requisito_cuenta import RequisitoCuenta
 from app.models.secop import SecopDocumento
 from app.services import checklist_service
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from tests.conftest import _IS_PG
 
 pytestmark = pytest.mark.asyncio
 
@@ -95,6 +98,43 @@ def test_catalogo_seed_rpc_cdp_contrato_son_solo_primera_cuenta() -> None:
     assert seed_by_codigo["CONTRATO"]["obligatorio"] is True
     assert seed_by_codigo["RPC"]["obligatorio"] is True
     assert seed_by_codigo["CDP"]["obligatorio"] is False
+
+
+@pytest.mark.skipif(
+    not _IS_PG,
+    reason=(
+        "FK enforcement is only observable under real Postgres — SQLite (the default "
+        "test DB) does not enforce FOREIGN KEY constraints unless PRAGMA foreign_keys=ON "
+        "is set, which this suite does not do. Run with TEST_DATABASE_URL=postgresql://... "
+        "(see scripts/test-postgres.sh) to exercise this."
+    ),
+)
+async def test_documento_cuenta_cobro_rejects_unknown_requisito_codigo(
+    db: AsyncSession, contrato: Contrato
+) -> None:
+    """Data-integrity contract for `documentos_cuenta_cobro.requisito_codigo`:
+    it MUST reference an existing `requisitos_documento.codigo` row (alembic
+    011's `documentos_cuenta_cobro_requisito_codigo_fkey`).
+
+    Regression coverage: a raw `DocumentoCuentaCobro(...)` insert in a test that
+    never seeds the `requisitos_documento` catalog first (via
+    `asegurar_checklist`/`listar_catalogo`) used to pass silently on SQLite —
+    the in-memory test DB never enforced this FK — and only surfaced as
+    `ForeignKeyViolationError` the first time the suite ran against real
+    Postgres. This test pins the FK's actual behavior directly, independent of
+    catalog-seeding order in any other test.
+    """
+    cuenta = await _make_cuenta(db, contrato, mes=1)
+    db.add(
+        DocumentoCuentaCobro(
+            cuenta_cobro_id=cuenta.id,
+            requisito_codigo="CODIGO_INEXISTENTE",
+            estado=EstadoRequisito.PENDIENTE,
+        )
+    )
+    with pytest.raises(IntegrityError):
+        await db.commit()
+    await db.rollback()
 
 
 # ── asegurar_checklist ─────────────────────────────────────────────────────
@@ -1011,7 +1051,10 @@ async def test_construir_checklist_completo_hides_legacy_identity_rows_on_later_
     cuenta2 = await _make_cuenta(db, contrato, mes=2)
 
     # Simulate rows materialized before this fix: a direct insert, not via
-    # asegurar_checklist (which would now correctly skip these codes).
+    # asegurar_checklist (which would now correctly skip these codes). A raw
+    # insert still needs the requisitos_documento catalog seeded first — the
+    # FK is real (Postgres enforces it; SQLite silently doesn't).
+    await checklist_service.listar_catalogo(db)
     for codigo in ("CEDULA", "RUT", "RPC", "CDP"):
         db.add(
             DocumentoCuentaCobro(
@@ -1051,6 +1094,8 @@ async def test_construir_checklist_completo_hides_legacy_contrato_row_when_no_ex
     await db.commit()
 
     cuenta2 = await _make_cuenta(db, contrato, mes=2)
+    # Raw insert needs the requisitos_documento catalog seeded first (FK).
+    await checklist_service.listar_catalogo(db)
     db.add(
         DocumentoCuentaCobro(
             cuenta_cobro_id=cuenta2.id,
@@ -1093,6 +1138,8 @@ async def test_construir_checklist_completo_conserva_fila_legacy_con_documento(
     )
     db.add(doc)
     await db.flush()
+    # Raw insert needs the requisitos_documento catalog seeded first (FK).
+    await checklist_service.listar_catalogo(db)
     fila = DocumentoCuentaCobro(
         cuenta_cobro_id=cuenta2.id,
         requisito_codigo="CEDULA",
@@ -1146,6 +1193,8 @@ async def test_auto_vincular_self_heal_promueve_el_vinculo_del_tier_correcto(
     )
     db.add_all([doc_malo, doc_bueno])
     await db.flush()
+    # Raw insert needs the requisitos_documento catalog seeded first (FK).
+    await checklist_service.listar_catalogo(db)
     fila = DocumentoCuentaCobro(
         cuenta_cobro_id=cuenta2.id,
         requisito_codigo="CEDULA",
@@ -1199,6 +1248,8 @@ async def test_auto_vincular_self_heal_deriva_el_estado_del_vinculo_secop_restan
     )
     db.add_all([sdoc, doc_malo])
     await db.flush()
+    # Raw insert needs the requisitos_documento catalog seeded first (FK).
+    await checklist_service.listar_catalogo(db)
     fila = DocumentoCuentaCobro(
         cuenta_cobro_id=cuenta1.id,
         requisito_codigo="CEDULA",
@@ -1236,6 +1287,8 @@ async def test_construir_checklist_completo_conserva_fila_con_decision_manual(
     radicar gate — visibility, not arithmetic, is what is restored."""
     await _make_cuenta(db, contrato, mes=1)
     cuenta2 = await _make_cuenta(db, contrato, mes=2)
+    # Raw insert needs the requisitos_documento catalog seeded first (FK).
+    await checklist_service.listar_catalogo(db)
     db.add(DocumentoCuentaCobro(cuenta_cobro_id=cuenta2.id, requisito_codigo="CEDULA", estado=estado))
     await db.commit()
 
@@ -1272,6 +1325,8 @@ async def test_construir_checklist_completo_conserva_fila_legacy_con_solo_un_vin
     )
     db.add(doc)
     await db.flush()
+    # Raw insert needs the requisitos_documento catalog seeded first (FK).
+    await checklist_service.listar_catalogo(db)
     fila = DocumentoCuentaCobro(
         cuenta_cobro_id=cuenta2.id,
         requisito_codigo="CEDULA",
@@ -1314,6 +1369,8 @@ async def test_construir_checklist_completo_fila_heredada_pendiente_no_bloquea_l
     )
     db.add(sdoc)
     await db.flush()
+    # Raw insert needs the requisitos_documento catalog seeded first (FK).
+    await checklist_service.listar_catalogo(db)
     # Legacy row: content (a SECOP link) but still PENDIENTE.
     db.add(
         DocumentoCuentaCobro(
@@ -1949,6 +2006,8 @@ async def test_fila_pendiente_sin_artefacto_sigue_oculta(db: AsyncSession, contr
     row and stays hidden (round 3, finding #6 — unchanged)."""
     await _make_cuenta(db, contrato, mes=1)
     cuenta2 = await _make_cuenta(db, contrato, mes=2)
+    # Raw insert needs the requisitos_documento catalog seeded first (FK).
+    await checklist_service.listar_catalogo(db)
     db.add(
         DocumentoCuentaCobro(cuenta_cobro_id=cuenta2.id, requisito_codigo="CEDULA", estado=EstadoRequisito.PENDIENTE)
     )
@@ -1988,6 +2047,8 @@ async def test_self_heal_borra_todo_vinculo_fuera_del_pool_no_solo_el_primario(
         db.add(d)
         docs.append(d)
     await db.flush()
+    # Raw insert needs the requisitos_documento catalog seeded first (FK).
+    await checklist_service.listar_catalogo(db)
     fila = DocumentoCuentaCobro(
         cuenta_cobro_id=cuenta2.id,
         requisito_codigo="CEDULA",
@@ -2047,6 +2108,8 @@ async def test_self_heal_conserva_los_vinculos_que_si_estan_en_el_pool(
     )
     db.add_all([malo, bueno])
     await db.flush()
+    # Raw insert needs the requisitos_documento catalog seeded first (FK).
+    await checklist_service.listar_catalogo(db)
     fila = DocumentoCuentaCobro(
         cuenta_cobro_id=cuenta1.id,
         requisito_codigo="CEDULA",

@@ -345,6 +345,8 @@ async def test_step3_predicate_complete_when_ss_requisito_cumplido_manual(db: As
     from app.models.documento_cuenta_cobro import DocumentoCuentaCobro, EstadoRequisito
 
     cuenta = await _make_cuenta(db, contrato, requisitos_modo="estandar")
+    # Raw insert needs the requisitos_documento catalog seeded first (FK).
+    await checklist_service.listar_catalogo(db)
     db.add(
         DocumentoCuentaCobro(
             cuenta_cobro_id=cuenta.id,
