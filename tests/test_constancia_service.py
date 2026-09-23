@@ -253,6 +253,11 @@ async def test_constancia_oculta_filas_legacy_primera_cuota_en_cuenta_recurrente
     db.add(cuenta)
     await db.flush()
 
+    # Raw insert needs the requisitos_documento catalog seeded first (FK) —
+    # Postgres enforces it even though SQLite silently doesn't.
+    catalogo = await checklist_service.listar_catalogo(db)
+    etiquetas_ocultas = {r.etiqueta for r in catalogo if r.codigo in {"CEDULA", "RUT", "RPC", "CDP"}}
+
     # Legacy rows materialized before this rule shipped — empty, no linked doc.
     for codigo in ("CEDULA", "RUT", "RPC", "CDP"):
         db.add(
@@ -263,9 +268,6 @@ async def test_constancia_oculta_filas_legacy_primera_cuota_en_cuenta_recurrente
             )
         )
     await db.commit()
-
-    catalogo = await checklist_service.listar_catalogo(db)
-    etiquetas_ocultas = {r.etiqueta for r in catalogo if r.codigo in {"CEDULA", "RUT", "RPC", "CDP"}}
 
     with patch(
         "app.services.constancia_service.generate_pdf_from_template",
@@ -315,6 +317,9 @@ async def test_constancia_de_cuenta_cerrada_conserva_una_fila_cumplida_manualmen
     )
     db.add(cuenta)
     await db.flush()
+    # Raw insert needs the requisitos_documento catalog seeded first (FK).
+    catalogo = await checklist_service.listar_catalogo(db)
+    etiqueta_cedula = next(r.etiqueta for r in catalogo if r.codigo == "CEDULA")
     db.add(
         DocumentoCuentaCobro(
             cuenta_cobro_id=cuenta.id,
@@ -324,9 +329,6 @@ async def test_constancia_de_cuenta_cerrada_conserva_una_fila_cumplida_manualmen
         )
     )
     await db.commit()
-
-    catalogo = await checklist_service.listar_catalogo(db)
-    etiqueta_cedula = next(r.etiqueta for r in catalogo if r.codigo == "CEDULA")
 
     etiquetas_por_render = []
     for _ in range(2):

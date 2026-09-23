@@ -161,6 +161,10 @@ class TestRetryRepairsTheLink:
 
             # Simulate the requisito row now existing (e.g. checklist was generated
             # after the first failed attempt) — same shape "Reintentar" would hit.
+            # Raw insert needs the requisitos_documento catalog seeded first (FK).
+            from app.services import checklist_service
+
+            await checklist_service.listar_catalogo(db)
             db.add(DocumentoCuentaCobro(cuenta_cobro_id=cuenta.id, requisito_codigo="EVIDENCIAS"))
             await db.commit()
 

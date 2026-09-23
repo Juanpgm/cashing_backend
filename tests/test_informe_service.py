@@ -1677,7 +1677,9 @@ async def _vincular_cedula(db: AsyncSession, test_user: dict[str, Any], cuenta: 
         await db.commit()
         return
 
-    # Later cuenta: simulate a legacy row + vinculo directly (no live materialize path).
+    # Later cuenta: simulate a legacy row + vinculo directly (no live materialize
+    # path). Raw insert needs the requisitos_documento catalog seeded first (FK).
+    await checklist_service.listar_catalogo(db)
     fila = DocumentoCuentaCobro(
         cuenta_cobro_id=cuenta.id,
         requisito_codigo="CEDULA",
@@ -1722,9 +1724,12 @@ async def test_zip_omite_legacy_cedula_vacia_en_cuota_no_primera(
     omitted — the content-preserving exception (round 2, finding #3) only
     exempts rows that carry a real document."""
     from app.models.documento_cuenta_cobro import DocumentoCuentaCobro, EstadoRequisito
+    from app.services import checklist_service
 
     user = test_user["user"]
     assert cuenta.posicion == PosicionCuota.RECURRENTE
+    # Raw insert needs the requisitos_documento catalog seeded first (FK).
+    await checklist_service.listar_catalogo(db)
     db.add(
         DocumentoCuentaCobro(cuenta_cobro_id=cuenta.id, requisito_codigo="CEDULA", estado=EstadoRequisito.PENDIENTE)
     )
@@ -1808,10 +1813,13 @@ async def test_zip_incluye_legacy_rpc_y_cdp_con_documento_en_cuota_no_primera(
     from app.models.documento_cuenta_cobro import DocumentoCuentaCobro, DocumentoRequisitoVinculo, EstadoRequisito
     from app.models.documento_fuente import DocumentoFuente
     from app.models.documento_fuente import TipoDocumentoFuente as _Tipo
+    from app.services import checklist_service
 
     user = test_user["user"]
     assert cuenta.posicion == PosicionCuota.RECURRENTE
 
+    # Raw insert needs the requisitos_documento catalog seeded first (FK).
+    await checklist_service.listar_catalogo(db)
     for codigo, tipo, nombre in (("RPC", _Tipo.RPC, "rpc.pdf"), ("CDP", _Tipo.CDP, "cdp.pdf")):
         doc = DocumentoFuente(
             usuario_id=user.id,
@@ -1855,9 +1863,12 @@ async def test_zip_omite_legacy_rpc_y_cdp_vacias_en_cuota_no_primera(
     real document (mirrors `test_zip_omite_legacy_cedula_vacia_en_cuota_no_
     primera`)."""
     from app.models.documento_cuenta_cobro import DocumentoCuentaCobro, EstadoRequisito
+    from app.services import checklist_service
 
     user = test_user["user"]
     assert cuenta.posicion == PosicionCuota.RECURRENTE
+    # Raw insert needs the requisitos_documento catalog seeded first (FK).
+    await checklist_service.listar_catalogo(db)
     for codigo in ("RPC", "CDP"):
         db.add(DocumentoCuentaCobro(cuenta_cobro_id=cuenta.id, requisito_codigo=codigo, estado=EstadoRequisito.PENDIENTE))
     await db.commit()
@@ -2472,9 +2483,12 @@ async def test_zip_no_declara_ya_radicada_una_fila_marcada_no_aplica(
     the package handed to the supervisor. A human decision counts as content, so
     the code no longer enters the omission set."""
     from app.models.documento_cuenta_cobro import DocumentoCuentaCobro, EstadoRequisito
+    from app.services import checklist_service
 
     user = test_user["user"]
     assert cuenta.posicion == PosicionCuota.RECURRENTE
+    # Raw insert needs the requisitos_documento catalog seeded first (FK).
+    await checklist_service.listar_catalogo(db)
     db.add(
         DocumentoCuentaCobro(cuenta_cobro_id=cuenta.id, requisito_codigo="CEDULA", estado=EstadoRequisito.NO_APLICA)
     )
